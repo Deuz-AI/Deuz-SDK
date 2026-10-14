@@ -40,6 +40,8 @@ export interface TranscriptContractOptions {
    * inside a longer word.
    */
   matching?: 'token' | 'substring';
+  /** Per-test timeout in ms (a live server). Default: vitest's. */
+  timeout?: number;
 }
 
 const user = (content: string): Message => ({ role: 'user', content });
@@ -71,7 +73,7 @@ export function transcriptIndexContracts(
     return { clock, ...harness, done: async () => harness.close?.() };
   };
 
-  describe(name, () => {
+  describe(name, { ...(options.timeout !== undefined ? { timeout: options.timeout } : {}) }, () => {
     it('finds an indexed message with its id, position and content, best score 1', async () => {
       const { index, done } = await setup();
       const record = chatRecord(

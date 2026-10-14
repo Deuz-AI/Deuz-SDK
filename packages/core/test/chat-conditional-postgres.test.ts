@@ -9,7 +9,7 @@
  */
 import { PGlite } from '@electric-sql/pglite';
 import pg from 'pg';
-import { afterAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { PgPoolClientLike, PgPoolLike } from '../src/node/pg-tx';
 import { createPostgresConditionalChatStore } from '../src/node/chat-conditional-postgres';
 import { pglitePool } from './fixtures/pg-pool';
@@ -51,6 +51,10 @@ const liteSchema = async (): Promise<string> => {
   await litePool.query(`CREATE SCHEMA ${schema}`);
   return schema;
 };
+// PGlite boots on its first statement (seconds on a loaded runner): pay it in a hook.
+beforeAll(async () => {
+  await litePool.query('SELECT 1');
+}, SLOW_HOOK_TIMEOUT_MS);
 afterAll(async () => {
   await lite.close();
 });
@@ -155,15 +159,23 @@ describe.runIf(url)('PostgreSQL conditional chat store (live server)', () => {
     await pool.end();
   }, SLOW_HOOK_TIMEOUT_MS);
 
-  conditionalChatStoreContracts('live conditional chat store', async (clock) => {
-    const store = createPostgresConditionalChatStore({ pool, schema: await liveSchema(), clock });
-    return { store, transcript: store.transcript, close: () => store.close() };
-  });
+  conditionalChatStoreContracts(
+    'live conditional chat store',
+    async (clock) => {
+      const store = createPostgresConditionalChatStore({ pool, schema: await liveSchema(), clock });
+      return { store, transcript: store.transcript, close: () => store.close() };
+    },
+    { timeout: SLOW_TEST_TIMEOUT_MS },
+  );
 
-  transcriptIndexContracts('live transcript index', async (clock) => {
-    const store = createPostgresConditionalChatStore({ pool, schema: await liveSchema(), clock });
-    return { index: store.transcript, close: () => store.close() };
-  });
+  transcriptIndexContracts(
+    'live transcript index',
+    async (clock) => {
+      const store = createPostgresConditionalChatStore({ pool, schema: await liveSchema(), clock });
+      return { index: store.transcript, close: () => store.close() };
+    },
+    { timeout: SLOW_TEST_TIMEOUT_MS },
+  );
 
   it(
     'never loses an update between truly concurrent writers',

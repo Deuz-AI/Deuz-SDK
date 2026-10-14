@@ -25,6 +25,7 @@ import type {
   TranscriptIndex,
 } from '../../src/types/chat-conditional';
 import type { Message } from '../../src/types/message';
+import { SLOW_TEST_TIMEOUT_MS } from '../fixtures/timeouts';
 import { scenario } from './registry';
 
 const ADA = { userId: 'ada' };
@@ -45,64 +46,68 @@ async function inTempDir<T>(fn: (dir: string) => Promise<T>): Promise<T> {
 const textsOf = (read: ConditionalChatRead): string[] =>
   read.status === 'found' ? read.record.messages.map((message) => String(message.content)) : [];
 
-scenario('chat-stream-react', 'conditional-write-cas', () =>
-  inTempDir(async (dir) => {
-    // Two writers (two hosts) on one database file, both starting from revision 1.
-    const path = join(dir, 'chats.db');
-    const a = createSqliteConditionalChatStore({ path });
-    const b = createSqliteConditionalChatStore({ path });
-    try {
-      const base: ChatRecord = {
-        chatId: 'shared',
-        scope: ADA,
-        messages: [user('plan the trip')],
-        updatedAt: 1,
-      };
-      expect((await a.writeChat(base, { expectedRevision: 0 })).status).toBe('committed');
-      const seenByB = await b.readChat('shared');
-      expect(seenByB).toMatchObject({ status: 'found', record: { revision: 1 } });
+scenario(
+  'chat-stream-react',
+  'conditional-write-cas',
+  () =>
+    inTempDir(async (dir) => {
+      // Two writers (two hosts) on one database file, both starting from revision 1.
+      const path = join(dir, 'chats.db');
+      const a = createSqliteConditionalChatStore({ path });
+      const b = createSqliteConditionalChatStore({ path });
+      try {
+        const base: ChatRecord = {
+          chatId: 'shared',
+          scope: ADA,
+          messages: [user('plan the trip')],
+          updatedAt: 1,
+        };
+        expect((await a.writeChat(base, { expectedRevision: 0 })).status).toBe('committed');
+        const seenByB = await b.readChat('shared');
+        expect(seenByB).toMatchObject({ status: 'found', record: { revision: 1 } });
 
-      // A commits first. B's write at the revision it read is refused, whole.
-      const fromA = { ...base, messages: [...base.messages, user('book the ferry')] };
-      expect((await a.writeChat(fromA, { expectedRevision: 1 })).status).toBe('committed');
-      const stale = { ...base, messages: [...base.messages, user('book the hotel')] };
-      const refused = await b.writeChat(stale, { expectedRevision: 1 });
-      expect(refused).toMatchObject({ status: 'conflict', current: { record: { revision: 2 } } });
+        // A commits first. B's write at the revision it read is refused, whole.
+        const fromA = { ...base, messages: [...base.messages, user('book the ferry')] };
+        expect((await a.writeChat(fromA, { expectedRevision: 1 })).status).toBe('committed');
+        const stale = { ...base, messages: [...base.messages, user('book the hotel')] };
+        const refused = await b.writeChat(stale, { expectedRevision: 1 });
+        expect(refused).toMatchObject({ status: 'conflict', current: { record: { revision: 2 } } });
 
-      // B re-reads and merges onto what A stored: nothing is lost.
-      const merged = await updateConditionalChat(b, 'shared', (current) =>
-        current.status === 'found'
-          ? { ...current.record, messages: [...current.record.messages, user('book the hotel')] }
-          : undefined,
-      );
-      expect(merged).toMatchObject({ revision: 3 });
-      expect(textsOf(await a.readChat('shared'))).toEqual([
-        'plan the trip',
-        'book the ferry',
-        'book the hotel',
-      ]);
-      // The index moved with the committed writes only.
-      const hits = await a.transcript.search(ADA, 'ferry hotel');
-      expect(hits.map((hit) => hit.index).sort()).toEqual([1, 2]);
+        // B re-reads and merges onto what A stored: nothing is lost.
+        const merged = await updateConditionalChat(b, 'shared', (current) =>
+          current.status === 'found'
+            ? { ...current.record, messages: [...current.record.messages, user('book the hotel')] }
+            : undefined,
+        );
+        expect(merged).toMatchObject({ revision: 3 });
+        expect(textsOf(await a.readChat('shared'))).toEqual([
+          'plan the trip',
+          'book the ferry',
+          'book the hotel',
+        ]);
+        // The index moved with the committed writes only.
+        const hits = await a.transcript.search(ADA, 'ferry hotel');
+        expect(hits.map((hit) => hit.index).sort()).toEqual([1, 2]);
 
-      // Writers that never stop colliding give up loudly, never silently.
-      const busy: ConditionalChatStore = {
-        ...b,
-        async writeChat(record, options) {
-          await a.saveChat({ ...base, messages: [user('someone else')] });
-          return b.writeChat(record, options);
-        },
-      };
-      await expect(
-        updateConditionalChat(busy, 'shared', (current) =>
-          current.status === 'found' ? current.record : undefined,
-        ),
-      ).rejects.toBeInstanceOf(RevisionConflictError);
-    } finally {
-      await a.close();
-      await b.close();
-    }
-  }),
+        // Writers that never stop colliding give up loudly, never silently.
+        const busy: ConditionalChatStore = {
+          ...b,
+          async writeChat(record, options) {
+            await a.saveChat({ ...base, messages: [user('someone else')] });
+            return b.writeChat(record, options);
+          },
+        };
+        await expect(
+          updateConditionalChat(busy, 'shared', (current) =>
+            current.status === 'found' ? current.record : undefined,
+          ),
+        ).rejects.toBeInstanceOf(RevisionConflictError);
+      } finally {
+        await a.close();
+        await b.close();
+      }
+    }),
+  { timeout: SLOW_TEST_TIMEOUT_MS },
 );
 
 scenario(
@@ -174,7 +179,7 @@ scenario(
         await after.close();
       }
     }),
-  { fault: true },
+  { fault: true, timeout: SLOW_TEST_TIMEOUT_MS },
 );
 
 scenario('transcript', 'scope-filter-and-tombstone', async () => {

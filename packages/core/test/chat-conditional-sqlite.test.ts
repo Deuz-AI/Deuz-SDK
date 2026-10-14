@@ -16,6 +16,7 @@ import { afterAll, describe, expect, it } from 'vitest';
 import { createSqliteConditionalChatStore } from '../src/node/chat-conditional-sqlite';
 import { createSqliteStores, type SqliteDatabaseLike } from '../src/node/store-sqlite';
 import { chat, conditionalChatStoreContracts } from './fixtures/conditional-chat-store-conformance';
+import { SLOW_TEST_TIMEOUT_MS } from './fixtures/timeouts';
 import { transcriptIndexContracts } from './fixtures/transcript-index-conformance';
 
 /** Whether this runtime's SQLite has FTS5 (Node 22.14's does not). */
@@ -60,38 +61,46 @@ for (const fts of [true, false]) {
 const scope = { userId: 'ada' };
 
 describe('SQLite conditional chat store', () => {
-  it('keeps its version in its own table and leaves the legacy pack untouched', async () => {
-    const path = tempFile('shared.db');
-    const legacy = createSqliteStores({ path });
-    await legacy.chats.saveChat(chat('legacy', ['kept as is']));
-    const store = createSqliteConditionalChatStore({ path });
-    await store.saveChat(chat('conditional', ['new tables']));
-    await store.close();
-    await legacy.close();
+  it(
+    'keeps its version in its own table and leaves the legacy pack untouched',
+    { timeout: SLOW_TEST_TIMEOUT_MS },
+    async () => {
+      const path = tempFile('shared.db');
+      const legacy = createSqliteStores({ path });
+      await legacy.chats.saveChat(chat('legacy', ['kept as is']));
+      const store = createSqliteConditionalChatStore({ path });
+      await store.saveChat(chat('conditional', ['new tables']));
+      await store.close();
+      await legacy.close();
 
-    const db = new DatabaseSync(path);
-    expect(db.prepare('SELECT version FROM deuz_chat_conditional_schema').get()).toEqual({
-      version: 1,
-    });
-    expect(db.prepare('PRAGMA user_version').get()).toEqual({ user_version: 1 });
-    expect(db.prepare('SELECT chat_id FROM deuz_chats').all()).toEqual([{ chat_id: 'legacy' }]);
-    db.close();
-    // The legacy pack reopens the file and still reads its chat.
-    const reopened = createSqliteStores({ path });
-    expect((await reopened.chats.loadChat('legacy'))!.messages).toHaveLength(1);
-    expect(await reopened.chats.loadChat('conditional')).toBeUndefined();
-    await reopened.close();
-  });
+      const db = new DatabaseSync(path);
+      expect(db.prepare('SELECT version FROM deuz_chat_conditional_schema').get()).toEqual({
+        version: 1,
+      });
+      expect(db.prepare('PRAGMA user_version').get()).toEqual({ user_version: 1 });
+      expect(db.prepare('SELECT chat_id FROM deuz_chats').all()).toEqual([{ chat_id: 'legacy' }]);
+      db.close();
+      // The legacy pack reopens the file and still reads its chat.
+      const reopened = createSqliteStores({ path });
+      expect((await reopened.chats.loadChat('legacy'))!.messages).toHaveLength(1);
+      expect(await reopened.chats.loadChat('conditional')).toBeUndefined();
+      await reopened.close();
+    },
+  );
 
-  it('never sets PRAGMA user_version on a database of its own', async () => {
-    const path = tempFile('alone.db');
-    const store = createSqliteConditionalChatStore({ path });
-    await store.saveChat(chat('c', ['x']));
-    await store.close();
-    const db = new DatabaseSync(path);
-    expect(db.prepare('PRAGMA user_version').get()).toEqual({ user_version: 0 });
-    db.close();
-  });
+  it(
+    'never sets PRAGMA user_version on a database of its own',
+    { timeout: SLOW_TEST_TIMEOUT_MS },
+    async () => {
+      const path = tempFile('alone.db');
+      const store = createSqliteConditionalChatStore({ path });
+      await store.saveChat(chat('c', ['x']));
+      await store.close();
+      const db = new DatabaseSync(path);
+      expect(db.prepare('PRAGMA user_version').get()).toEqual({ user_version: 0 });
+      db.close();
+    },
+  );
 
   it('borrows a handle it is given and leaves it open on close', async () => {
     const database = new DatabaseSync(':memory:');
@@ -105,33 +114,37 @@ describe('SQLite conditional chat store', () => {
     await expect(store.loadChat('c')).rejects.toThrow(/closed/);
   });
 
-  it('keeps revisions, tombstones and the index across a restart', async () => {
-    const path = tempFile('restart.db');
-    const first = createSqliteConditionalChatStore({ path });
-    await first.writeChat(chat('kept', ['ferry to bodrum'], { messageIds: ['m'] }), {
-      expectedRevision: 0,
-    });
-    await first.writeChat(chat('gone', ['x']), { expectedRevision: 0 });
-    await first.tombstoneChat('gone', { expectedRevision: 1 });
-    await first.close();
+  it(
+    'keeps revisions, tombstones and the index across a restart',
+    { timeout: SLOW_TEST_TIMEOUT_MS },
+    async () => {
+      const path = tempFile('restart.db');
+      const first = createSqliteConditionalChatStore({ path });
+      await first.writeChat(chat('kept', ['ferry to bodrum'], { messageIds: ['m'] }), {
+        expectedRevision: 0,
+      });
+      await first.writeChat(chat('gone', ['x']), { expectedRevision: 0 });
+      await first.tombstoneChat('gone', { expectedRevision: 1 });
+      await first.close();
 
-    const second = createSqliteConditionalChatStore({ path });
-    expect(await second.readChat('kept')).toMatchObject({
-      status: 'found',
-      record: { revision: 1 },
-    });
-    expect(await second.readChat('gone')).toMatchObject({
-      status: 'deleted',
-      tombstone: { revision: 2 },
-    });
-    expect((await second.transcript.search(scope, 'bodrum')).map((hit) => hit.messageId)).toEqual([
-      'm',
-    ]);
-    expect((await second.writeChat(chat('gone', ['late']), { expectedRevision: 0 })).status).toBe(
-      'conflict',
-    );
-    await second.close();
-  });
+      const second = createSqliteConditionalChatStore({ path });
+      expect(await second.readChat('kept')).toMatchObject({
+        status: 'found',
+        record: { revision: 1 },
+      });
+      expect(await second.readChat('gone')).toMatchObject({
+        status: 'deleted',
+        tombstone: { revision: 2 },
+      });
+      expect((await second.transcript.search(scope, 'bodrum')).map((hit) => hit.messageId)).toEqual(
+        ['m'],
+      );
+      expect((await second.writeChat(chat('gone', ['late']), { expectedRevision: 0 })).status).toBe(
+        'conflict',
+      );
+      await second.close();
+    },
+  );
 
   it('commits a chat write and its index update together, or neither', async () => {
     const inner = new DatabaseSync(':memory:');
@@ -166,53 +179,61 @@ describe('SQLite conditional chat store', () => {
     inner.close();
   });
 
-  it('compares and sets across two connections on one file', async () => {
-    const path = tempFile('two.db');
-    const a = createSqliteConditionalChatStore({ path });
-    const b = createSqliteConditionalChatStore({ path });
-    expect((await a.writeChat(chat('c', ['from a']), { expectedRevision: 0 })).status).toBe(
-      'committed',
-    );
-    const refused = await b.writeChat(chat('c', ['from b']), { expectedRevision: 0 });
-    expect(refused).toMatchObject({ status: 'conflict', current: { record: { revision: 1 } } });
-    expect((await b.writeChat(chat('c', ['from b']), { expectedRevision: 1 })).status).toBe(
-      'committed',
-    );
-    await b.tombstoneChat('c', { expectedRevision: 2 });
-    expect((await a.writeChat(chat('c', ['late a']), { expectedRevision: 2 })).status).toBe(
-      'conflict',
-    );
-    expect(await a.transcript.search(scope, 'from')).toEqual([]);
-    await a.close();
-    await b.close();
-  });
+  it(
+    'compares and sets across two connections on one file',
+    { timeout: SLOW_TEST_TIMEOUT_MS },
+    async () => {
+      const path = tempFile('two.db');
+      const a = createSqliteConditionalChatStore({ path });
+      const b = createSqliteConditionalChatStore({ path });
+      expect((await a.writeChat(chat('c', ['from a']), { expectedRevision: 0 })).status).toBe(
+        'committed',
+      );
+      const refused = await b.writeChat(chat('c', ['from b']), { expectedRevision: 0 });
+      expect(refused).toMatchObject({ status: 'conflict', current: { record: { revision: 1 } } });
+      expect((await b.writeChat(chat('c', ['from b']), { expectedRevision: 1 })).status).toBe(
+        'committed',
+      );
+      await b.tombstoneChat('c', { expectedRevision: 2 });
+      expect((await a.writeChat(chat('c', ['late a']), { expectedRevision: 2 })).status).toBe(
+        'conflict',
+      );
+      expect(await a.transcript.search(scope, 'from')).toEqual([]);
+      await a.close();
+      await b.close();
+    },
+  );
 
-  it.runIf(HAS_FTS5)('rebuilds an FTS5 index a process without it wrote past', async () => {
-    const path = tempFile('fts.db');
-    const withFts = createSqliteConditionalChatStore({ path });
-    await withFts.saveChat(chat('c', ['original ferry'], { messageIds: ['m0'] }));
-    expect(await withFts.transcript.search(scope, 'ferry')).toHaveLength(1);
-    // Another process, without FTS5, rewrites the chat and adds one.
-    const withoutFts = createSqliteConditionalChatStore({ path, fts: false });
-    await withoutFts.saveChat(chat('c', ['replaced bus'], { messageIds: ['m1'] }));
-    await withoutFts.saveChat(chat('d', ['another bus'], { messageIds: ['m2'] }));
-    await withoutFts.close();
-    expect(
-      (await withFts.transcript.search(scope, 'bus')).map((hit) => hit.messageId).sort(),
-    ).toEqual(['m1', 'm2']);
-    expect(await withFts.transcript.search(scope, 'ferry')).toEqual([]);
-    // Writes through the FTS5 index go on cleanly after the rebuild.
-    await withFts.saveChat(chat('c', ['third tram'], { messageIds: ['m3'] }));
-    expect((await withFts.transcript.search(scope, 'tram')).map((hit) => hit.messageId)).toEqual([
-      'm3',
-    ]);
-    await withFts.close();
-    const db = new DatabaseSync(path);
-    db.exec(
-      "INSERT INTO deuz_chat_transcript_fts(deuz_chat_transcript_fts) VALUES('integrity-check')",
-    );
-    db.close();
-  });
+  it.runIf(HAS_FTS5)(
+    'rebuilds an FTS5 index a process without it wrote past',
+    { timeout: SLOW_TEST_TIMEOUT_MS },
+    async () => {
+      const path = tempFile('fts.db');
+      const withFts = createSqliteConditionalChatStore({ path });
+      await withFts.saveChat(chat('c', ['original ferry'], { messageIds: ['m0'] }));
+      expect(await withFts.transcript.search(scope, 'ferry')).toHaveLength(1);
+      // Another process, without FTS5, rewrites the chat and adds one.
+      const withoutFts = createSqliteConditionalChatStore({ path, fts: false });
+      await withoutFts.saveChat(chat('c', ['replaced bus'], { messageIds: ['m1'] }));
+      await withoutFts.saveChat(chat('d', ['another bus'], { messageIds: ['m2'] }));
+      await withoutFts.close();
+      expect(
+        (await withFts.transcript.search(scope, 'bus')).map((hit) => hit.messageId).sort(),
+      ).toEqual(['m1', 'm2']);
+      expect(await withFts.transcript.search(scope, 'ferry')).toEqual([]);
+      // Writes through the FTS5 index go on cleanly after the rebuild.
+      await withFts.saveChat(chat('c', ['third tram'], { messageIds: ['m3'] }));
+      expect((await withFts.transcript.search(scope, 'tram')).map((hit) => hit.messageId)).toEqual([
+        'm3',
+      ]);
+      await withFts.close();
+      const db = new DatabaseSync(path);
+      db.exec(
+        "INSERT INTO deuz_chat_transcript_fts(deuz_chat_transcript_fts) VALUES('integrity-check')",
+      );
+      db.close();
+    },
+  );
 
   it('a backfill never puts a tombstoned chat back into search', async () => {
     const store = createSqliteConditionalChatStore({ path: ':memory:' });

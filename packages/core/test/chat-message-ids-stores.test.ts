@@ -6,7 +6,7 @@
  * source reference, a search hit and a rendered bubble agree on one id.
  */
 import { PGlite } from '@electric-sql/pglite';
-import { afterAll, describe, expect, it, vi } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { createInMemoryAgentRunStore, runAgent } from '../src/agent-run';
 import { uiFromMessages } from '../src/chat';
 import {
@@ -18,9 +18,14 @@ import { createSqliteConditionalChatStore } from '../src/node/chat-conditional-s
 import { createMockModel } from '../src/testing';
 import type { ConditionalChatStore, TranscriptIndex } from '../src/types/chat-conditional';
 import { pglitePool } from './fixtures/pg-pool';
+import { SLOW_HOOK_TIMEOUT_MS } from './fixtures/timeouts';
 
 const lite = new PGlite();
 const litePool = pglitePool(lite);
+// PGlite boots on its first statement (seconds on a loaded runner): pay it in a hook.
+beforeAll(async () => {
+  await litePool.query('SELECT 1');
+}, SLOW_HOOK_TIMEOUT_MS);
 afterAll(async () => {
   await lite.close();
 });

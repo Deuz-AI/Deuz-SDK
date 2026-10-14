@@ -47,6 +47,9 @@ function committed(result: ConditionalChatWriteResult) {
 export function conditionalChatStoreContracts(
   name: string,
   make: (clock: Clock) => ConditionalChatHarness | Promise<ConditionalChatHarness>,
+  options: {
+    /** Per-test timeout in ms (a live server). Default: vitest's. */ timeout?: number;
+  } = {},
 ): void {
   const setup = async (start = 1_000) => {
     const clock = settableClock(start);
@@ -54,7 +57,7 @@ export function conditionalChatStoreContracts(
     return { clock, ...harness, done: async () => harness.close?.() };
   };
 
-  describe(name, () => {
+  describe(name, { ...(options.timeout !== undefined ? { timeout: options.timeout } : {}) }, () => {
     it('is marked conditional and starts empty', async () => {
       const { store, done } = await setup();
       expect(store.conditional).toBe(true);
