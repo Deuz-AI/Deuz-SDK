@@ -115,7 +115,17 @@ export type GoalEvidenceSource =
   | 'external'
   | 'model';
 
-/** A reference to evidence kept elsewhere: a test report, a file, a review, a run. */
+/** The host verifier that produced evidence (2.4): its id and the version of its checks. */
+export interface GoalVerifierRef {
+  id: string;
+  version: string;
+}
+
+/**
+ * A reference to evidence kept elsewhere: a test report, a file, a review, a
+ * run. The 2.4 fields bind it to what it was produced from; each is optional,
+ * and a record written by 2.3 carries none of them.
+ */
 export interface GoalEvidence {
   id: string;
   source: GoalEvidenceSource;
@@ -128,6 +138,23 @@ export interface GoalEvidence {
   runId?: string;
   /** When it was recorded, epoch ms. */
   at: number;
+  /**
+   * The criterion it was produced for (2.4). Evidence that names a criterion
+   * supports a verdict on that criterion only.
+   */
+  criterionId?: string;
+  /** The host verifier that produced it, and the version of its checks (2.4). */
+  verifier?: GoalVerifierRef;
+  /**
+   * The goal's spec generation it was produced against (2.4). On a goal with
+   * a `specGeneration`, only evidence of the current generation supports a
+   * pass; evidence recorded without one is stamped with the current one.
+   */
+  specGeneration?: number;
+  /** `sha256:<hex>` of the artifact it was checked against (2.4). */
+  artifactDigest?: `sha256:${string}`;
+  /** The `deuz-workspace-v1` digest of the workspace it was checked against (2.4). */
+  workspaceDigest?: `sha256:${string}`;
 }
 
 /** A criterion's verdict. */
@@ -209,6 +236,17 @@ export interface GoalRecord {
   updatedAt: number;
   /** Application data, JSON. */
   meta?: Record<string, unknown>;
+  /**
+   * The generation of the goal's spec (2.4), present only on a goal that opted
+   * in (`createGoal({ specGeneration })`, a supervisor, or a `revise` with
+   * `nextSpecGeneration`). A change of the objective or the criteria, or a
+   * `revise` that names a changed host constraint or verifier, starts the next
+   * generation, and every verdict reached before it becomes `'inconclusive'`.
+   * Without it a goal keeps the 2.3 rules: a `revise` drops only the verdict of
+   * a criterion whose text changed, and a new objective keeps the verdicts.
+   * Charges, maintenance and every other change leave it, and the evidence, alone.
+   */
+  specGeneration?: number;
 }
 
 /** A reference to an event's payload, kept in your storage rather than in the envelope. */
@@ -253,7 +291,10 @@ export interface GoalEvent {
 /** A criterion as given to `createGoal` or `revise`. */
 export type GoalCriterionInput = GoalCriterion;
 
-/** Evidence as given to a command; `at` defaults to the transition's time. */
+/**
+ * Evidence as given to a command; `at` defaults to the transition's time and,
+ * on a goal with a `specGeneration`, `specGeneration` to the current one.
+ */
 export type GoalEvidenceInput = Omit<GoalEvidence, 'at'> & { at?: number };
 
 /** A verdict as given to `evaluate`; `evidence` defaults to none, `at` to the transition's time. */
@@ -288,6 +329,13 @@ export type GoalCommand =
       budget?: GoalBudget | null;
       deadline?: number | null;
       meta?: Record<string, unknown> | null;
+      /**
+       * A relevant host constraint or a verifier changed (2.4): start the next
+       * spec generation even when the objective and criteria stay the same,
+       * which makes every earlier verdict `'inconclusive'`. On a goal without a
+       * `specGeneration` this opts it in at generation 1.
+       */
+      nextSpecGeneration?: boolean;
     }
   /** Name the native run that works on the goal now. */
   | { type: 'link-run'; runId: string }

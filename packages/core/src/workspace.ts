@@ -12,6 +12,8 @@ import type { JSONSchema } from './types/schema';
 import type { Tool, ToolSet } from './types/tool';
 import type { Workspace, WorkspaceEntry } from './types/workspace';
 import { InvalidRequestError } from './errors';
+import { digestWorkspaceEntries, workspaceDigestEntry, type Sha256Digest } from './internal/digest';
+import { mapWithConcurrency } from './internal/p-limit';
 
 export type { Workspace, WorkspaceEntry } from './types/workspace';
 
@@ -123,6 +125,103 @@ export function createInMemoryWorkspace(options: { now?: () => number } = {}): W
       times.delete(key);
     },
   };
+}
+
+/** Which files `digestWorkspace` covers (2.4). */
+export interface DigestWorkspaceOptions {
+  /**
+   * Globs of the files to cover; default every file. A glob is a relative
+   * path anchored at the workspace root: `*` matches within one path segment,
+   * `?` one character of it, `**` any number of whole segments, and every
+   * other character itself. A glob that matches a directory covers every file
+   * below it, so `'src'` and `'src/**'` are the same. Use `'**\/*.ts'` for
+   * files at any depth.
+   */
+  include?: readonly string[];
+  /** Globs of files to leave out, as `include`; exclusion wins. */
+  exclude?: readonly string[];
+}
+
+/** Files a workspace digest reads at once. */
+const DIGEST_CONCURRENCY = 8;
+
+/** A digest glob as a regular expression over normalized paths. */
+function globPattern(glob: unknown, label: string): RegExp {
+  if (typeof glob !== 'string' || glob === '')
+    throw new TypeError(`${label} globs must be nonempty strings`);
+  const norm = glob.replace(/^\.\//, '');
+  if (
+    norm === '' ||
+    norm.includes('\\') ||
+    norm.includes('\0') ||
+    norm.startsWith('/') ||
+    /^[a-zA-Z]:/.test(norm) ||
+    norm.split('/').some((segment) => segment === '' || segment === '.' || segment === '..')
+  )
+    throw new TypeError(
+      `${label} glob ${JSON.stringify(glob)} must be a relative path: forward slashes, no '.', '..' or empty segment`,
+    );
+  const segments = norm.split('/');
+  let source = '';
+  segments.forEach((segment, index) => {
+    const last = index === segments.length - 1;
+    if (segment === '**') {
+      source += last ? '.*' : '(?:[^/]+/)*';
+      return;
+    }
+    for (const char of segment)
+      source +=
+        char === '*'
+          ? '[^/]*'
+          : char === '?'
+            ? '[^/]'
+            : char.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    if (!last) source += '/';
+  });
+  // A match on a directory covers everything below it.
+  return new RegExp(`^${source}(?:/.*)?$`, 'u');
+}
+
+function globs(value: unknown, label: string): RegExp[] | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value)) throw new TypeError(`${label} must be an array of globs`);
+  return value.map((glob: unknown) => globPattern(glob, label));
+}
+
+/**
+ * The digest of a workspace's files (2.4, spec §3.5): `deuz-workspace-v1`,
+ * the SHA-256 of the canonical JSON of `{ path, size, digest }` entries
+ * sorted by the UTF-8 bytes of their paths, where `digest` is `sha256:<hex>`
+ * of the file's bytes. The same files give the same digest on any backend and
+ * in the Docker runner's artifacts; a changed byte, path or file set changes
+ * it. Use it as `GoalEvidence.workspaceDigest` and in a
+ * `GoalArtifactResolver` for `verifyGoalAcceptance`.
+ *
+ * Files come from `workspace.list()` and are read with `readBytes` when the
+ * backend has it, otherwise with `read` (whose UTF-8 encoding is hashed).
+ * `include` and `exclude` choose files by glob (see `DigestWorkspaceOptions`);
+ * a malformed glob throws a TypeError. A file that disappears while the
+ * workspace is read rejects; digest again once writes settle. Edge-safe
+ * (WebCrypto); nothing is cached or written.
+ */
+export async function digestWorkspace(
+  workspace: Workspace,
+  options: DigestWorkspaceOptions = {},
+): Promise<Sha256Digest> {
+  const include = globs(options.include, 'include');
+  const exclude = globs(options.exclude, 'exclude') ?? [];
+  const chosen = (await workspace.list()).filter(
+    ({ path }) =>
+      (include === undefined || include.some((glob) => glob.test(path))) &&
+      !exclude.some((glob) => glob.test(path)),
+  );
+  const entries = await mapWithConcurrency(chosen, DIGEST_CONCURRENCY, async ({ path }) =>
+    workspaceDigestEntry(
+      path,
+      workspace.readBytes ? await workspace.readBytes(path) : await workspace.read(path),
+    ),
+  );
+  return digestWorkspaceEntries(entries);
 }
 
 export interface WorkspaceToolsOptions {
