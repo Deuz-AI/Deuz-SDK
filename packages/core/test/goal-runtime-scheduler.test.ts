@@ -5,7 +5,7 @@
  * the `deuz.schedule.delivery` span. Runs on the L5 store double; the
  * scenarios in `scenarios-2-4/l5.test.ts` run on the real store once it lands.
  */
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { GoalError, createGoal } from '../src/goal';
 import { createDurableScheduler } from '../src/goal/runtime/scheduler';
 import type { DurableSchedulerOptions } from '../src/goal/runtime/scheduler';
@@ -26,10 +26,24 @@ const MINUTE = 60_000;
 type SetupOptions = Partial<DurableSchedulerOptions> & {
   /** Wraps the store the scheduler sees (the test keeps the plain double). */
   wrap?: (store: ScheduleStoreDouble) => GoalRuntimeStore;
+  /** The timer-firing manual clock, for `start()`; otherwise a clock that only moves. */
+  timers?: boolean;
 };
 
-async function setup({ wrap, ...options }: SetupOptions = {}, start = T0) {
-  const time = manualClock(start);
+/** A clock that moves only when told and fires no timers: ticks are driven by hand. */
+function steppedClock(start: number): ReturnType<typeof manualClock> {
+  let now = start;
+  return {
+    clock: { now: () => now, setTimeout: () => () => {} },
+    advance: async (ms) => {
+      now += ms;
+    },
+    pending: () => 0,
+  };
+}
+
+async function setup({ wrap, timers, ...options }: SetupOptions = {}, start = T0) {
+  const time = timers ? manualClock(start) : steppedClock(start);
   const events: ObserveEvent[] = [];
   const logged: { message: string; fields?: Record<string, unknown> }[] = [];
   const store = createScheduleStoreDouble({ deps: { clock: time.clock } });
@@ -564,5 +578,99 @@ describe('createDurableScheduler: catch-up and backlog', () => {
     const idle = await scheduler.tick();
     expect(idle.occurrences).toEqual([]);
     expect((await store.schedules.get('tenant', 's'))?.scheduleCursor).toBe(T0 + 30 * MINUTE);
+  });
+});
+
+describe('createDurableScheduler: start', () => {
+  /** Moves the clock one poll at a time, each time once the loop has armed its next timer. */
+  async function polls(time: ReturnType<typeof manualClock>, count: number, pollMs = 30_000) {
+    for (let index = 0; index < count; index++) {
+      await vi.waitFor(() => expect(time.pending()).toBe(1));
+      await time.advance(pollMs);
+    }
+  }
+
+  it('ticks every pollMs on the injected clock until stopped', { timeout: 20_000 }, async () => {
+    const { scheduler, store, time } = await setup({ pollMs: MINUTE, timers: true });
+    await scheduler.put(input({ spec: { cron: '* * * * *' } }));
+    const loop = scheduler.start();
+    await polls(time, 3, MINUTE);
+    await vi.waitFor(() => expect(time.pending()).toBe(1));
+    expect(await pending(store)).toEqual([1, 2, 3].map((m) => `s@${T0 + m * MINUTE}`));
+    await loop.stop();
+    expect(time.pending()).toBe(0);
+    await time.advance(5 * MINUTE);
+    expect(await pending(store)).toHaveLength(3);
+  });
+
+  it('stops once the tick in flight finished', { timeout: 20_000 }, async () => {
+    let release: () => void = () => {};
+    let entered: () => void = () => {};
+    const inFlight = new Promise<void>((resolve) => (entered = resolve));
+    const { scheduler, store, time } = await setup({
+      pollMs: 30_000,
+      timers: true,
+      wrap: (double) => ({
+        ...double,
+        schedules: {
+          ...double.schedules,
+          advance: async (advance) => {
+            entered();
+            await new Promise<void>((resolve) => (release = resolve));
+            return double.schedules.advance(advance);
+          },
+        },
+      }),
+    });
+    await scheduler.put(input({ spec: { cron: '* * * * *' } }));
+    const loop = scheduler.start();
+    await polls(time, 2);
+    await inFlight;
+    let stopped = false;
+    const stopping = loop.stop().then(() => (stopped = true));
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(stopped).toBe(false);
+    release();
+    await stopping;
+    expect(await pending(store)).toEqual([`s@${T0 + MINUTE}`]);
+  });
+
+  it('stops on its signal, and refuses a second start while running', async () => {
+    const { scheduler, time } = await setup({ timers: true });
+    const controller = new AbortController();
+    const loop = scheduler.start({ signal: controller.signal });
+    expect(() => scheduler.start()).toThrow(/already started/);
+    controller.abort();
+    await loop.stop();
+    expect(time.pending()).toBe(0);
+    // Once stopped it can start again; an aborted signal stops it at once.
+    const aborted = new AbortController();
+    aborted.abort();
+    await scheduler.start({ signal: aborted.signal }).stop();
+  });
+
+  it('logs a tick that throws and goes on', { timeout: 20_000 }, async () => {
+    let failures = 1;
+    const { scheduler, store, time, logged } = await setup({
+      pollMs: 30_000,
+      timers: true,
+      wrap: (double) => ({
+        ...double,
+        schedules: {
+          ...double.schedules,
+          list: async (query) => {
+            if (failures-- > 0) throw new Error('store unavailable');
+            return double.schedules.list(query);
+          },
+        },
+      }),
+    });
+    await scheduler.put(input({ spec: { cron: '* * * * *' } }));
+    const loop = scheduler.start();
+    await polls(time, 2);
+    await vi.waitFor(() => expect(time.pending()).toBe(1));
+    await loop.stop();
+    expect(logged.map((entry) => entry.message)).toContain('durable scheduler tick failed');
+    expect(await pending(store)).toEqual([`s@${T0 + MINUTE}`]);
   });
 });
