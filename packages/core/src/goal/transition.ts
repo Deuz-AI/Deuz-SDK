@@ -13,6 +13,7 @@ import {
   checkBudget,
   checkCriteria,
   checkEvidence,
+  checkGeneration,
   checkGoalEvent,
   checkResult,
   checkWaitDetails,
@@ -49,6 +50,11 @@ export interface CreateGoalInput {
   /** Epoch ms, after `now`. */
   deadline?: number;
   meta?: Record<string, unknown>;
+  /**
+   * Opt the goal into spec generations (2.4), starting at this one (usually
+   * 1): see `GoalRecord.specGeneration`. Left out, the goal keeps the 2.3 rules.
+   */
+  specGeneration?: number;
 }
 
 /** The time a goal function works at, and the revision it expects. */
@@ -112,24 +118,49 @@ function addedFields(criterion: GoalCriterion | undefined): Record<string, unkno
   return added;
 }
 
-const evidenceOf = (input: GoalEvidenceInput, now: number): GoalEvidence => ({
-  id: input.id,
-  source: input.source,
-  ref: input.ref,
-  ...(input.digest !== undefined ? { digest: input.digest } : {}),
-  ...(input.summary !== undefined ? { summary: input.summary } : {}),
-  ...(input.runId !== undefined ? { runId: input.runId } : {}),
-  at: input.at ?? now,
-});
+/**
+ * Evidence as a goal records it. On a goal with a spec generation, evidence
+ * given without one was produced against the current spec (2.4).
+ */
+const evidenceOf = (
+  input: GoalEvidenceInput,
+  now: number,
+  specGeneration: number | undefined,
+): GoalEvidence => {
+  const generation = input.specGeneration ?? specGeneration;
+  return {
+    id: input.id,
+    source: input.source,
+    ref: input.ref,
+    ...(input.digest !== undefined ? { digest: input.digest } : {}),
+    ...(input.summary !== undefined ? { summary: input.summary } : {}),
+    ...(input.runId !== undefined ? { runId: input.runId } : {}),
+    at: input.at ?? now,
+    ...(input.criterionId !== undefined ? { criterionId: input.criterionId } : {}),
+    ...(input.verifier !== undefined
+      ? { verifier: { id: input.verifier.id, version: input.verifier.version } }
+      : {}),
+    ...(generation !== undefined ? { specGeneration: generation } : {}),
+    ...(input.artifactDigest !== undefined ? { artifactDigest: input.artifactDigest } : {}),
+    ...(input.workspaceDigest !== undefined ? { workspaceDigest: input.workspaceDigest } : {}),
+  };
+};
 
 /**
  * Evidence that says the same, whenever it was recorded, on the fields this
- * build knows: what a later 2.x release added to it makes no conflict.
+ * build knows: what a later 2.x release added to it makes no conflict. A
+ * spec generation counts only when the new evidence names one; otherwise it
+ * would be stamped with the current one, and the stored evidence stands as it
+ * was recorded.
  */
-const sameEvidence = (left: GoalEvidence, right: GoalEvidence): boolean =>
-  (['id', 'source', 'ref', 'digest', 'summary', 'runId'] as const).every(
-    (field) => left[field] === right[field],
-  );
+const sameEvidence = (stored: GoalEvidence, input: GoalEvidenceInput): boolean =>
+  (
+    ['id', 'source', 'ref', 'digest', 'summary', 'runId', 'criterionId', 'artifactDigest'] as const
+  ).every((field) => stored[field] === input[field]) &&
+  stored.workspaceDigest === input.workspaceDigest &&
+  stored.verifier?.id === input.verifier?.id &&
+  stored.verifier?.version === input.verifier?.version &&
+  (input.specGeneration === undefined || stored.specGeneration === input.specGeneration);
 
 /**
  * A new goal (2.3): `active`, at revision 1. Without criteria, the objective
@@ -153,6 +184,8 @@ export function createGoal(input: CreateGoalInput, options: { now: number }): Go
     check.object(fields.meta, 'meta');
     check.json(fields.meta, 'meta');
   }
+  if (fields.specGeneration !== undefined)
+    checkGeneration(check, fields.specGeneration, 'specGeneration');
   return readGoal({
     kind: 'deuz-goal',
     version: GOAL_RECORD_VERSION,
@@ -174,6 +207,7 @@ export function createGoal(input: CreateGoalInput, options: { now: number }): Go
     createdAt: now,
     updatedAt: now,
     ...(input.meta !== undefined ? { meta: structuredClone(input.meta) } : {}),
+    ...(input.specGeneration !== undefined ? { specGeneration: input.specGeneration } : {}),
   });
 }
 
@@ -217,6 +251,8 @@ function checkCommand(command: GoalCommand): void {
       check.object(fields.meta, 'meta');
       check.json(fields.meta, 'meta');
     }
+    if (fields.nextSpecGeneration !== undefined && typeof fields.nextSpecGeneration !== 'boolean')
+      check.fail('nextSpecGeneration', 'must be a boolean');
   } else if (type === 'link-run') check.string(fields.runId, 'runId');
 }
 
@@ -569,12 +605,12 @@ function addEvidence(
   const known = new Map(draft.current.evidence.map((item) => [item.id, item]));
   const added: GoalEvidence[] = [];
   for (const input of inputs) {
-    const evidence = evidenceOf(input, draft.now);
-    const existing = known.get(evidence.id);
+    const existing = known.get(input.id);
     if (existing) {
-      if (!sameEvidence(existing, evidence)) return 'evidence-conflict';
+      if (!sameEvidence(existing, input)) return 'evidence-conflict';
       continue;
     }
+    const evidence = evidenceOf(input, draft.now, draft.current.specGeneration);
     known.set(evidence.id, evidence);
     added.push(evidence);
   }
