@@ -30,6 +30,7 @@ import {
   checkEnqueue,
   checkGoal,
   checkIntentInput,
+  checkIntentRecordOptions,
   checkMark,
   checkPruneOptions,
   checkRuntimeState,
@@ -294,10 +295,11 @@ export function createPostgresGoalRuntimeStore(
       },
     },
     intents: {
-      async record(intent) {
+      async record(intent, recordOptions) {
         const next = checkIntentInput(intent);
+        const along = checkIntentRecordOptions(recordOptions);
         const now = clock.now();
-        return transact(() => SQL.operations.recordIntent(next, now));
+        return transact(() => SQL.operations.recordIntent(next, along, now));
       },
       async get(scope, intentId) {
         return query(SQL.lookups.intent(scope, intentId));

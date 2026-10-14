@@ -1178,6 +1178,41 @@ export function goalRuntimeStoreContracts(
 
     describe('run intents', () => {
       it(
+        'records an intent with the runtime state and the goal in one write, fenced by both',
+        withStore(async (store) => {
+          const goal = runtimeGoal('g');
+          await store.runtime.save(runtimeState(goal), goal);
+          // A stale view of either refuses the whole write.
+          expect(
+            await store.intents.record(runIntent(goal, 'retry-1', { kind: 'retry' }), {
+              runtime: runtimeState(goal, 1),
+            }),
+          ).toEqual({ status: 'conflict', reason: 'runtime-revision' });
+          expect(
+            await store.intents.record(runIntent(goal, 'retry-1', { kind: 'retry' }), {
+              runtime: runtimeState(goal, 2),
+              goal: goal,
+            }),
+          ).toEqual({ status: 'conflict', reason: 'goal-revision' });
+          expect(
+            await store.intents.record(runIntent(goal, 'retry-1'), {
+              runtime: runtimeState({ goalId: 'g', scope: 'other' }, 2),
+            }),
+          ).toEqual({ status: 'conflict', reason: 'scope-mismatch' });
+          expect(await store.intents.get('tenant', 'retry-1')).toBeUndefined();
+          expect(
+            await store.intents.record(runIntent(goal, 'retry-1', { kind: 'retry' }), {
+              runtime: runtimeState(goal, 2, { phase: 'dispatching', retries: 1 }),
+              goal: nextGoal(goal),
+            }),
+          ).toEqual({ status: 'committed' });
+          expect((await store.intents.get('tenant', 'retry-1'))?.kind).toBe('retry');
+          expect((await store.runtime.get('tenant', 'g'))?.retries).toBe(1);
+          expect((await store.load('g'))?.revision).toBe(2);
+        }),
+      );
+
+      it(
         'records an intent once, for a goal of its scope',
         withStore(async (store, time) => {
           const goal = runtimeGoal('g');

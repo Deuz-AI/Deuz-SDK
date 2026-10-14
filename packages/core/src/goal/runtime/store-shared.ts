@@ -686,16 +686,50 @@ function newIntent(input: GoalRunIntentInput, now: number): GoalRunIntent {
   return { ...input, status: 'pending', revision: 1, recordedAt: now, updatedAt: now };
 }
 
-/** `intents.record`: a new id, for a goal stored in the intent's scope. */
+/** The optional state an intent is recorded with, checked and copied. Throws a TypeError. */
+export function checkIntentRecordOptions(value: unknown): {
+  runtime?: GoalRuntimeState;
+  goal?: GoalRecord;
+} {
+  if (value === undefined) return {};
+  const options = new RuntimeChecker('intent record options').object(value, 'options');
+  return {
+    ...(options.runtime !== undefined ? { runtime: checkRuntimeState(options.runtime) } : {}),
+    ...(options.goal !== undefined ? { goal: checkGoal(options.goal) } : {}),
+  };
+}
+
+/**
+ * `intents.record`: a new id, for a goal stored in the intent's scope; with
+ * `runtime` and `goal`, those at their stored revisions plus one, together.
+ */
 export function planIntentRecord(
-  snapshot: { intent: GoalRunIntent | undefined; goal: StoredGoal | undefined },
+  snapshot: {
+    intent: GoalRunIntent | undefined;
+    goal: StoredGoal | undefined;
+    runtime: GoalRuntimeState | undefined;
+  },
   input: GoalRunIntentInput,
+  options: { runtime?: GoalRuntimeState; goal?: GoalRecord },
   now: number,
 ): GoalRuntimePlan<GoalRuntimeCommitResult> {
-  if (snapshot.goal === undefined || snapshot.goal.scope !== input.scope)
+  const owner = { goalId: input.goalId, scope: input.scope };
+  if (!goalInScope(snapshot.goal, input.scope, options.goal)) return refused('scope-mismatch');
+  if (options.goal !== undefined && !namesGoal(owner, options.goal))
     return refused('scope-mismatch');
+  const runtime = runtimePart(snapshot, owner, options.runtime, options.goal);
+  if (runtime === 'scope-mismatch') return refused(runtime);
   if (snapshot.intent !== undefined) return refused('intent-exists');
-  return committed([{ kind: 'intent', intent: newIntent(input, now), created: true }]);
+  const goal = goalPart(snapshot.goal, owner, options.goal);
+  if (typeof goal === 'string') return refused(goal);
+  if (typeof runtime === 'string') return refused(runtime);
+  if (options.runtime !== undefined) assertCancelKept(snapshot.runtime, options.runtime);
+  const writes: GoalRuntimeWrite[] = [
+    { kind: 'intent', intent: newIntent(input, now), created: true },
+  ];
+  if (goal) writes.push(goal);
+  if (runtime) writes.push(runtime);
+  return committed(writes);
 }
 
 /** Checks a claim. Throws a TypeError. */

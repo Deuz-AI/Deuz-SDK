@@ -466,10 +466,15 @@ export function goalRuntimeSql(d: GoalRuntimeDialect) {
         : new Set<string>();
       return planAdvance({ schedule, entries, recorded }, step, deliveryKey, now);
     },
-    *recordIntent(input: GoalRunIntentInput, now: number) {
-      const goal = yield* get(reads.storedGoal(input.goalId, false));
+    *recordIntent(
+      input: GoalRunIntentInput,
+      options: { runtime?: GoalRuntimeState; goal?: GoalRecord },
+      now: number,
+    ) {
+      const goal = yield* get(reads.storedGoal(input.goalId, options.goal !== undefined));
+      const runtime = options.runtime ? yield* get(reads.runtime(input.goalId)) : undefined;
       const intent = yield* get(reads.intent(input.scope, input.intentId));
-      return planIntentRecord({ intent, goal }, input, now);
+      return planIntentRecord({ intent, goal, runtime }, input, options, now);
     },
     *claimIntent(
       scope: string,

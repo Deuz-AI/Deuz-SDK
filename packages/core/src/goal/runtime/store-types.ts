@@ -541,8 +541,16 @@ export interface GoalRuntimeStore extends GoalStore {
   };
 
   intents: {
-    /** Records a new intent (`'intent-exists'` for a known id). */
-    record(intent: GoalRunIntentInput): Promise<GoalRuntimeCommitResult>;
+    /**
+     * Records a new intent (`'intent-exists'` for a known id). With `runtime`
+     * (and `goal`), saves them in the same transaction at their stored
+     * revisions plus one, so a supervisor whose view is stale cannot record a
+     * retry or a command's run (the second argument is a 2.4 addition).
+     */
+    record(
+      intent: GoalRunIntentInput,
+      options?: { runtime?: GoalRuntimeState; goal?: GoalRecord },
+    ): Promise<GoalRuntimeCommitResult>;
     get(scope: string, intentId: string): Promise<GoalRunIntent | undefined>;
     /**
      * Claims a pending intent (or one claimed under a lower token) for an

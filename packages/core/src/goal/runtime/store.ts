@@ -15,6 +15,7 @@ import {
   checkEnqueue,
   checkGoal,
   checkIntentInput,
+  checkIntentRecordOptions,
   checkMark,
   checkPruneOptions,
   checkWatermarkAdvance,
@@ -343,15 +344,18 @@ export function createInMemoryGoalRuntimeStore(options?: {
       },
     },
     intents: {
-      async record(intent) {
+      async record(intent, recordOptions) {
         const next = checkIntentInput(intent);
+        const along = checkIntentRecordOptions(recordOptions);
         return commit(
           planIntentRecord(
             {
               intent: intents.get(scoped(next.scope, next.intentId)),
               goal: goals.get(next.goalId),
+              runtime: runtimes.get(next.goalId),
             },
             next,
+            along,
             clock.now(),
           ),
         );
