@@ -455,15 +455,15 @@ function lexicalSearch(s: State, c: Candidates, tokens: string[], take: number):
     try {
       const rows = all(
         s,
-        `SELECT r.record, bm25(deuz_vmem_fts) AS rank FROM deuz_vmem_fts ` +
+        `SELECT r.record, bm25(deuz_vmem_fts) AS lexical_rank FROM deuz_vmem_fts ` +
           `JOIN deuz_vmem_revisions r ON r.seq = deuz_vmem_fts.rowid ${c.joins} ` +
-          `WHERE deuz_vmem_fts MATCH ? AND ${c.where} ORDER BY rank, r.recorded_at DESC, r.id LIMIT ?`,
+          `WHERE deuz_vmem_fts MATCH ? AND ${c.where} ORDER BY lexical_rank, r.recorded_at DESC, r.id LIMIT ?`,
         [tokens.map((t) => `"${t}"`).join(' OR '), ...c.params, take],
       );
       // bm25 is negative (better = more negative): flip and normalize against the best hit.
       const raw = rows.map((row) => ({
         record: decodeRecord(text(row.record)),
-        score: -num(row.rank),
+        score: -num(row.lexical_rank),
       }));
       const best = raw[0]?.score ?? 0;
       return raw.map((hit) => ({ record: hit.record, score: best > 0 ? hit.score / best : 1 }));

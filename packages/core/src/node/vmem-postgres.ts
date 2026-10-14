@@ -512,14 +512,14 @@ export function createPostgresVersionedMemoryStore(
     const terms = bind.add(tokens.map((token) => `'${token}'`).join(' | '));
     const c = candidates(bind, key, query, now);
     const rows = await read(
-      `SELECT r.record, ts_rank(r.tsv, q.query) AS rank FROM to_tsquery('simple', ${terms}) AS q(query), ` +
+      `SELECT r.record, ts_rank(r.tsv, q.query) AS lexical_rank FROM to_tsquery('simple', ${terms}) AS q(query), ` +
         `${t('revisions')} r ${c.joins} WHERE r.tsv @@ q.query AND ${c.where} ` +
-        `ORDER BY rank DESC, r.recorded_at DESC, r.id LIMIT ${bind.add(take)}`,
+        `ORDER BY lexical_rank DESC, r.recorded_at DESC, r.id LIMIT ${bind.add(take)}`,
       bind.params,
     );
     const raw = rows.map((row) => ({
       record: decodeRecord(str(row.record)),
-      score: num(row.rank),
+      score: num(row.lexical_rank),
     }));
     const best = raw[0]?.score ?? 0;
     return raw.map((hit) => ({ record: hit.record, score: best > 0 ? hit.score / best : 1 }));
