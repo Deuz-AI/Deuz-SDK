@@ -160,7 +160,7 @@ export type WorkingMemoryOperation =
       outcome: WorkingMemoryAttempt['outcome'];
       detail?: string;
     }
-  /** Host only for constraints' lists; a model may remove only items it wrote. */
+  /** The host may remove any item; a model only items it wrote (`'forbidden'` otherwise). */
   | { op: 'remove'; list: WorkingMemoryList; id: string };
 
 /**
