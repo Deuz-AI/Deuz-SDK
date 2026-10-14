@@ -240,4 +240,11 @@ export interface WorkingMemoryToolsOptions {
   memory: WorkingMemoryHandle;
   /** Tool name prefix. Default `'working_memory'`. */
   prefix?: string;
+  /**
+   * The agent the memory belongs to, as `ToolExecuteContext.agentPath` names
+   * it. Default `[]`, the root run. A write from another agent path (a
+   * sub-agent the tools were handed to) is refused: sub-agents get no shared
+   * writable working memory. Reads are allowed.
+   */
+  agentPath?: readonly string[];
 }

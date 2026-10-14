@@ -4,8 +4,8 @@
  * published from `@deuz-sdk/core/context`.
  */
 import type { AgentToolSet } from '../../types/agent-run';
-import { notImplemented } from '../../internal/not-implemented';
 import { applyPatch, createSnapshot } from './patch';
+import { createWorkingMemoryTools } from './tools';
 import type {
   ApplyWorkingMemoryPatchOptions,
   CreateWorkingMemoryInput,
@@ -57,6 +57,6 @@ export function applyWorkingMemoryPatch(
  * `'duplicate'`); a refusal is returned to the model as a tool error. The
  * tools never persist anything themselves: the run's checkpoint does.
  */
-export function workingMemoryTools(_options: WorkingMemoryToolsOptions): AgentToolSet {
-  return notImplemented('workingMemoryTools');
+export function workingMemoryTools(options: WorkingMemoryToolsOptions): AgentToolSet {
+  return createWorkingMemoryTools(options);
 }
