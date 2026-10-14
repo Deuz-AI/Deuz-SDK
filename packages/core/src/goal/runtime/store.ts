@@ -9,6 +9,7 @@ import { notImplemented } from '../../internal/not-implemented';
 import { planGoalList, goalListCursor } from '../store';
 import type { GoalRecord } from '../types';
 import {
+  checkAdvance,
   checkApplication,
   checkEnqueue,
   checkGoal,
@@ -22,13 +23,18 @@ import {
   isPendingDeliveryOf,
   jsonCopy,
   matchesInboxList,
+  matchesOccurrenceList,
   matchesScheduleList,
+  occurrenceKey,
+  occurrencesOldestFirst,
   pageOf,
+  planAdvance,
   planApply,
   planEnqueue,
   planGoalSave,
   planInboxList,
   planIntentRecord,
+  planOccurrenceList,
   planRuntimeSave,
   planScheduleCancel,
   planScheduleList,
@@ -42,6 +48,7 @@ import {
 } from './store-shared';
 import type {
   DurableSchedule,
+  GoalInboxEnqueue,
   GoalInboxEntry,
   GoalRunIntent,
   GoalRuntimePolicy,
@@ -74,6 +81,13 @@ export function goalInboxKey(scope: string, namespace: string, deliveryId: strin
       throw new TypeError(`An inbox ${name} must be a nonempty string`);
   }
   return `inbox:${JSON.stringify([scope, namespace, deliveryId])}`;
+}
+
+/** The inbox entry id of a delivery. */
+export function deliveryKey(
+  delivery: Pick<GoalInboxEnqueue, 'scope' | 'namespace' | 'deliveryId'>,
+) {
+  return goalInboxKey(delivery.scope, delivery.namespace, delivery.deliveryId);
 }
 
 /**
@@ -268,7 +282,42 @@ export function createInMemoryGoalRuntimeStore(options?: {
         );
         return commit(planScheduleCancel({ schedule, pending }, change, clock.now()));
       },
-      advance: todo,
+      async advance(step) {
+        const next = checkAdvance(step);
+        const known = new Map<string, GoalInboxEntry>();
+        const recorded = new Set<string>();
+        for (const { occurrenceId, delivery } of next.occurrences) {
+          if (occurrences.has(scoped(next.scope, occurrenceId))) recorded.add(occurrenceId);
+          if (delivery === undefined) continue;
+          const id = deliveryKey(delivery);
+          const entry = entries.get(id);
+          if (entry) known.set(id, entry);
+        }
+        return commit(
+          planAdvance(
+            {
+              schedule: schedules.get(scoped(next.scope, next.scheduleId)),
+              entries: known,
+              recorded,
+            },
+            next,
+            deliveryKey,
+            clock.now(),
+          ),
+        );
+      },
+      async occurrences(query) {
+        const plan = planOccurrenceList(query);
+        const rows = [...occurrences.values()]
+          .filter((record) => matchesOccurrenceList(record, plan))
+          .sort(occurrencesOldestFirst);
+        const page = pageOf(rows, plan.limit, occurrenceKey);
+        return jsonCopy(
+          page.cursor
+            ? { occurrences: page.rows, cursor: page.cursor }
+            : { occurrences: page.rows },
+        );
+      },
     },
     intents: {
       async record(intent) {

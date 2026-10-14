@@ -319,6 +319,21 @@ export type ScheduleAdvanceResult =
   /** The revision or cursor moved, or the schedule is no longer active: nothing written. */
   | { status: 'conflict'; schedule?: DurableSchedule };
 
+/** Which occurrence records to list (2.4). */
+export interface ScheduleOccurrenceQuery {
+  scope: string;
+  scheduleId?: string;
+  /** 1..1000. Default 100. Oldest occurrence first. */
+  limit?: number;
+  cursor?: string;
+}
+
+/** A page of occurrence records, by occurrence time, then occurrence id. */
+export interface ScheduleOccurrencePage {
+  occurrences: ScheduleOccurrenceRecord[];
+  cursor?: string;
+}
+
 /** Which schedules to list. */
 export interface DurableScheduleQuery {
   scope?: string;
@@ -518,6 +533,11 @@ export interface GoalRuntimeStore extends GoalStore {
     ): Promise<{ status: 'committed'; schedule: DurableSchedule } | { status: 'conflict' }>;
     /** Moves the cursor and commits the occurrences into the inbox atomically. */
     advance(advance: ScheduleAdvance): Promise<ScheduleAdvanceResult>;
+    /**
+     * The occurrence records the scheduler wrote, oldest occurrence first. Optional in
+     * the interface; the in-memory, SQLite and PostgreSQL stores all have it.
+     */
+    occurrences?(query: ScheduleOccurrenceQuery): Promise<ScheduleOccurrencePage>;
   };
 
   intents: {

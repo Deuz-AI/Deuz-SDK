@@ -30,6 +30,9 @@ import type {
   GoalRuntimeCommitResult,
   GoalRuntimePhase,
   GoalRuntimeState,
+  ScheduleAdvance,
+  ScheduleAdvanceResult,
+  ScheduleOccurrenceQuery,
   ScheduleOccurrenceRecord,
 } from './store-types';
 
@@ -939,5 +942,195 @@ export function matchesScheduleList(schedule: DurableSchedule, plan: ScheduleLis
   if (plan.statuses !== undefined && !plan.statuses.includes(schedule.status)) return false;
   if (plan.after !== undefined)
     return schedulesById(schedule, { scheduleId: plan.after[0], scope: plan.after[1] }) > 0;
+  return true;
+}
+
+// ===================================================================
+// Schedule advance and occurrence records
+// ===================================================================
+
+const OCCURRENCE_REASONS: readonly NonNullable<ScheduleOccurrenceRecord['reason']>[] = [
+  'dst-gap-skip',
+  'catch-up-none',
+  'catch-up-latest',
+  'paused',
+  'cancelled',
+];
+
+/**
+ * A checked advance, its deliveries checked and copied. Each occurrence lies in
+ * `(fromCursor, toCursor]`, belongs to the schedule and its scope, appears
+ * once, and is delivered to its own goal exactly when it is `'delivered'`.
+ * Throws a TypeError.
+ */
+export function checkAdvance(value: unknown): ScheduleAdvance {
+  const check = new RuntimeChecker('schedule advance');
+  const advance = check.object(value, 'advance');
+  const scope = check.string(advance.scope, 'scope');
+  const scheduleId = check.string(advance.scheduleId, 'scheduleId');
+  check.count(advance.expectedRevision, 'expectedRevision', 1);
+  const from = check.time(advance.fromCursor, 'fromCursor');
+  const to = check.time(advance.toCursor, 'toCursor');
+  if (to < from) check.fail('toCursor', 'must not be before fromCursor');
+  check.optionalTime(advance.scanTo, 'scanTo');
+  if (!Array.isArray(advance.occurrences)) check.fail('occurrences', 'must be an array');
+  const seen = new Set<string>();
+  const occurrences = (advance.occurrences as unknown[]).map((item, index) => {
+    const path = `occurrences[${index}]`;
+    const occurrence = check.object(item, path);
+    const occurrenceId = check.string(occurrence.occurrenceId, `${path}.occurrenceId`);
+    if (seen.has(occurrenceId)) check.fail(`${path}.occurrenceId`, `repeats ${occurrenceId}`);
+    seen.add(occurrenceId);
+    if (occurrence.scheduleId !== scheduleId)
+      check.fail(`${path}.scheduleId`, `must be ${scheduleId}`);
+    if (occurrence.scope !== scope) check.fail(`${path}.scope`, `must be ${scope}`);
+    const goalId = check.string(occurrence.goalId, `${path}.goalId`);
+    const at = check.time(occurrence.at, `${path}.at`);
+    if (!(at > from && at <= to)) check.fail(`${path}.at`, 'must lie in (fromCursor, toCursor]');
+    const disposition = check.oneOf(
+      occurrence.disposition,
+      ['delivered', 'skipped'] as const,
+      `${path}.disposition`,
+    );
+    if (occurrence.reason !== undefined)
+      check.oneOf(occurrence.reason, OCCURRENCE_REASONS, `${path}.reason`);
+    if ((disposition === 'delivered') !== (occurrence.delivery !== undefined))
+      check.fail(`${path}.delivery`, "is required exactly when the occurrence is 'delivered'");
+    if (occurrence.delivery === undefined) return jsonCopy(occurrence);
+    const delivery = checkEnqueue(occurrence.delivery);
+    if (delivery.scope !== scope || delivery.goalId !== goalId)
+      check.fail(`${path}.delivery`, "must go to the occurrence's goal in its scope");
+    return { ...jsonCopy(occurrence), delivery };
+  });
+  return { ...jsonCopy(advance), occurrences } as unknown as ScheduleAdvance;
+}
+
+/** What `schedules.advance` reads before it plans. */
+export interface AdvanceSnapshot {
+  schedule: DurableSchedule | undefined;
+  /** The stored inbox entries under the advance's delivery ids. */
+  entries: ReadonlyMap<string, GoalInboxEntry>;
+  /** The occurrence ids of the advance already recorded in its scope. */
+  recorded: ReadonlySet<string>;
+}
+
+/**
+ * `schedules.advance`: only for an active schedule at `expectedRevision` with
+ * its cursor at `fromCursor`. Records each occurrence once (a recorded one is
+ * kept), queues each delivery whose entry id is new and counts the others as
+ * duplicates (the first delivery stands), and moves the cursor and the
+ * unfinished scan. The revision stays: the cursor is its own fence.
+ */
+export function planAdvance(
+  snapshot: AdvanceSnapshot,
+  advance: ScheduleAdvance,
+  entryId: (delivery: GoalInboxEnqueue) => string,
+  now: number,
+): GoalRuntimePlan<ScheduleAdvanceResult> {
+  const stored = snapshot.schedule;
+  if (
+    stored === undefined ||
+    stored.status !== 'active' ||
+    stored.revision !== advance.expectedRevision ||
+    stored.scheduleCursor !== advance.fromCursor
+  )
+    return {
+      result:
+        stored === undefined ? { status: 'conflict' } : { status: 'conflict', schedule: stored },
+      writes: [],
+    };
+  const writes: GoalRuntimeWrite[] = [];
+  const queued = new Set<string>();
+  let enqueued = 0;
+  let duplicates = 0;
+  for (const { delivery, ...occurrence } of advance.occurrences) {
+    if (occurrence.goalId !== stored.goalId)
+      throw new TypeError(
+        `Invalid schedule advance: occurrence ${occurrence.occurrenceId} must go to goal ${stored.goalId}`,
+      );
+    let inboxEntryId: string | undefined;
+    if (delivery !== undefined) {
+      inboxEntryId = entryId(delivery);
+      if (snapshot.entries.has(inboxEntryId) || queued.has(inboxEntryId)) duplicates++;
+      else {
+        queued.add(inboxEntryId);
+        enqueued++;
+        writes.push({
+          kind: 'entry',
+          entry: { ...delivery, id: inboxEntryId, disposition: 'pending', enqueuedAt: now },
+          created: true,
+        });
+      }
+    }
+    if (!snapshot.recorded.has(occurrence.occurrenceId))
+      writes.push({
+        kind: 'occurrence',
+        record: {
+          ...occurrence,
+          ...(inboxEntryId !== undefined ? { inboxEntryId } : {}),
+          recordedAt: now,
+        },
+      });
+  }
+  const { scanTo: _scanTo, ...rest } = stored;
+  const schedule: DurableSchedule = {
+    ...rest,
+    scheduleCursor: advance.toCursor,
+    ...(advance.scanTo !== undefined ? { scanTo: advance.scanTo } : {}),
+    updatedAt: now,
+  };
+  writes.unshift({ kind: 'schedule', schedule, created: false });
+  return { result: { status: 'advanced', schedule, enqueued, duplicates }, writes };
+}
+
+/** A validated occurrence listing. */
+export interface OccurrenceListPlan {
+  scope: string;
+  scheduleId: string | undefined;
+  limit: number;
+  /** The sort key of the previous page's last record. */
+  after: readonly [at: number, occurrenceId: string] | undefined;
+}
+
+export function planOccurrenceList(query: ScheduleOccurrenceQuery): OccurrenceListPlan {
+  const fields = checkQuery(query, 'occurrence listing');
+  const scope = optionalQueryString(fields.scope, 'Occurrence listing scope');
+  if (scope === undefined)
+    throw new TypeError('Occurrence listing scope must be a nonempty string');
+  return {
+    scope,
+    scheduleId: optionalQueryString(fields.scheduleId, 'Occurrence listing scheduleId'),
+    limit: checkLimit(fields.limit, 'Occurrence listing'),
+    after:
+      fields.cursor === undefined
+        ? undefined
+        : decodeCursor(fields.cursor, ['number', 'string'] as const, 'occurrence listing'),
+  };
+}
+
+/** By occurrence time, then occurrence id (code point order). */
+export function occurrencesOldestFirst(
+  left: Pick<ScheduleOccurrenceRecord, 'at' | 'occurrenceId'>,
+  right: Pick<ScheduleOccurrenceRecord, 'at' | 'occurrenceId'>,
+): number {
+  if (left.at !== right.at) return left.at - right.at;
+  return compareText(left.occurrenceId, right.occurrenceId);
+}
+
+/** The sort key an occurrence cursor carries. */
+export const occurrenceKey = (record: ScheduleOccurrenceRecord): [number, string] => [
+  record.at,
+  record.occurrenceId,
+];
+
+/** Whether `record` belongs on a listing (for a store that filters in process). */
+export function matchesOccurrenceList(
+  record: ScheduleOccurrenceRecord,
+  plan: OccurrenceListPlan,
+): boolean {
+  if (record.scope !== plan.scope) return false;
+  if (plan.scheduleId !== undefined && record.scheduleId !== plan.scheduleId) return false;
+  if (plan.after !== undefined)
+    return occurrencesOldestFirst(record, { at: plan.after[0], occurrenceId: plan.after[1] }) > 0;
   return true;
 }

@@ -27,6 +27,8 @@ import type {
   GoalRunIntentInput,
   GoalRuntimeState,
   GoalRuntimeStore,
+  ScheduleAdvance,
+  ScheduleOccurrenceRecord,
 } from '../../src/goal/runtime';
 import type { Sha256Digest } from '../../src/internal/digest';
 import type { Clock } from '../../src/types/deps';
@@ -149,6 +151,47 @@ export function scheduleInput(
     spec: { cron: '* * * * *' },
     ...patch,
   };
+}
+
+const MINUTE = 60_000;
+
+/** The occurrence of schedule `scheduleId` at `at`, delivered to `goal` or skipped. */
+export function occurrence(
+  goal: Pick<GoalRecord, 'goalId' | 'scope'>,
+  scheduleId: string,
+  at: number,
+  skipped?: ScheduleOccurrenceRecord['reason'],
+): ScheduleAdvance['occurrences'][number] {
+  const occurrenceId = `${scheduleId}@${at}`;
+  const base = { occurrenceId, scheduleId, scope: goal.scope, goalId: goal.goalId, at };
+  if (skipped) return { ...base, disposition: 'skipped', reason: skipped };
+  return {
+    ...base,
+    disposition: 'delivered',
+    delivery: {
+      scope: goal.scope,
+      goalId: goal.goalId,
+      namespace: `schedule:${scheduleId}`,
+      deliveryId: occurrenceId,
+      event: createGoalEvent({
+        source: { type: 'schedule', id: scheduleId },
+        scope: goal.scope,
+        goalId: goal.goalId,
+        key: occurrenceId,
+        at,
+        notBefore: at,
+      }),
+      digest: DIGEST_A,
+    },
+  };
+}
+
+/** A goal with a schedule `s1` created at `T0` (its cursor there). */
+async function goalWithSchedule(store: GoalRuntimeStore) {
+  const goal = runtimeGoal('g');
+  await store.save(goal);
+  await store.schedules.put(scheduleInput(goal, 's1'), { expectedRevision: 0, effectiveFrom: T0 });
+  return goal;
 }
 
 /** A goal with one queued delivery `d1` and a runtime state at revision 1. */
@@ -864,6 +907,271 @@ export function goalRuntimeStoreContracts(
               JSON.stringify(input),
             ).rejects.toThrow(TypeError);
           expect((await store.schedules.list()).schedules).toEqual([]);
+        }),
+      );
+    });
+
+    describe('schedule advance', () => {
+      /** The occurrence records of `s1` (the store's optional read, which ours all have). */
+      const recorded = async (store: GoalRuntimeStore) =>
+        (await store.schedules.occurrences!({ scope: 'tenant', scheduleId: 's1' })).occurrences;
+
+      it(
+        'moves the cursor, records the occurrences and queues the deliveries in one write',
+        withStore(async (store, time) => {
+          const goal = await goalWithSchedule(store);
+          await time.advance(3 * MINUTE + 5);
+          const now = T0 + 3 * MINUTE + 5;
+          const result = await store.schedules.advance({
+            scope: 'tenant',
+            scheduleId: 's1',
+            expectedRevision: 1,
+            fromCursor: T0,
+            toCursor: T0 + 3 * MINUTE,
+            occurrences: [
+              occurrence(goal, 's1', T0 + MINUTE),
+              occurrence(goal, 's1', T0 + 2 * MINUTE, 'catch-up-latest'),
+              occurrence(goal, 's1', T0 + 3 * MINUTE),
+            ],
+          });
+          expect(result).toMatchObject({
+            status: 'advanced',
+            enqueued: 2,
+            duplicates: 0,
+            schedule: { revision: 1, scheduleCursor: T0 + 3 * MINUTE, updatedAt: now },
+          });
+          expect((await store.schedules.get('tenant', 's1'))?.scheduleCursor).toBe(T0 + 3 * MINUTE);
+          const first = occurrence(goal, 's1', T0 + MINUTE);
+          const firstId = goalInboxKey('tenant', 'schedule:s1', `s1@${T0 + MINUTE}`);
+          expect(await recorded(store)).toEqual([
+            {
+              occurrenceId: `s1@${T0 + MINUTE}`,
+              scheduleId: 's1',
+              scope: 'tenant',
+              goalId: 'g',
+              at: T0 + MINUTE,
+              disposition: 'delivered',
+              inboxEntryId: firstId,
+              recordedAt: now,
+            },
+            {
+              occurrenceId: `s1@${T0 + 2 * MINUTE}`,
+              scheduleId: 's1',
+              scope: 'tenant',
+              goalId: 'g',
+              at: T0 + 2 * MINUTE,
+              disposition: 'skipped',
+              reason: 'catch-up-latest',
+              recordedAt: now,
+            },
+            expect.objectContaining({ occurrenceId: `s1@${T0 + 3 * MINUTE}` }),
+          ]);
+          expect(await store.inbox.get('tenant', firstId)).toEqual({
+            ...first.delivery,
+            id: firstId,
+            disposition: 'pending',
+            enqueuedAt: now,
+          });
+          expect(
+            (await store.inbox.list({ scope: 'tenant' })).entries.map((entry) => entry.deliveryId),
+          ).toEqual([`s1@${T0 + MINUTE}`, `s1@${T0 + 3 * MINUTE}`]);
+          expect(await store.schedules.occurrences!({ scope: 'other' })).toEqual({
+            occurrences: [],
+          });
+        }),
+      );
+
+      it(
+        'counts a delivery already queued as a duplicate, and keeps it as it was',
+        withStore(async (store, time) => {
+          const goal = await goalWithSchedule(store);
+          const early = occurrence(goal, 's1', T0 + MINUTE);
+          const { entry } = await store.inbox.enqueue(early.delivery!);
+          await time.advance(2 * MINUTE);
+          const result = await store.schedules.advance({
+            scope: 'tenant',
+            scheduleId: 's1',
+            expectedRevision: 1,
+            fromCursor: T0,
+            toCursor: T0 + 2 * MINUTE,
+            occurrences: [early, occurrence(goal, 's1', T0 + 2 * MINUTE)],
+          });
+          expect(result).toMatchObject({ status: 'advanced', enqueued: 1, duplicates: 1 });
+          expect(await store.inbox.get('tenant', entry.id)).toEqual(entry);
+          expect((await recorded(store))[0]?.inboxEntryId).toBe(entry.id);
+        }),
+      );
+
+      it(
+        'writes nothing when the revision, the cursor or the status moved',
+        withStore(async (store) => {
+          const goal = await goalWithSchedule(store);
+          const step = (patch: Partial<ScheduleAdvance>): ScheduleAdvance => ({
+            scope: 'tenant',
+            scheduleId: 's1',
+            expectedRevision: 1,
+            fromCursor: T0,
+            toCursor: T0 + MINUTE,
+            occurrences: [occurrence(goal, 's1', T0 + MINUTE)],
+            ...patch,
+          });
+          const stored = await store.schedules.get('tenant', 's1');
+          expect(await store.schedules.advance(step({ expectedRevision: 2 }))).toEqual({
+            status: 'conflict',
+            schedule: stored,
+          });
+          expect(
+            await store.schedules.advance(step({ fromCursor: T0 - MINUTE, occurrences: [] })),
+          ).toEqual({ status: 'conflict', schedule: stored });
+          expect(
+            await store.schedules.advance(step({ scheduleId: 'unknown', occurrences: [] })),
+          ).toEqual({ status: 'conflict' });
+          expect(await store.schedules.advance(step({ scope: 'other', occurrences: [] }))).toEqual({
+            status: 'conflict',
+          });
+          await store.schedules.pause('tenant', 's1', { expectedRevision: 1 });
+          expect(await store.schedules.advance(step({ expectedRevision: 2 }))).toMatchObject({
+            status: 'conflict',
+            schedule: { status: 'paused' },
+          });
+          await store.schedules.cancel('tenant', 's1', { expectedRevision: 2 });
+          expect(await store.schedules.advance(step({ expectedRevision: 3 }))).toMatchObject({
+            status: 'conflict',
+            schedule: { status: 'cancelled' },
+          });
+          expect((await store.schedules.get('tenant', 's1'))?.scheduleCursor).toBe(T0);
+          expect(await recorded(store)).toEqual([]);
+          expect((await store.inbox.list({ scope: 'tenant', dispositions: [] })).entries).toEqual(
+            [],
+          );
+          expect(
+            (await store.inbox.list({ scope: 'tenant', dispositions: ['pending', 'cancelled'] }))
+              .entries,
+          ).toEqual([]);
+        }),
+      );
+
+      it(
+        'lets one of two advances from the same cursor win, and never delivers twice',
+        withStore(async (store) => {
+          const goal = await goalWithSchedule(store);
+          const step: ScheduleAdvance = {
+            scope: 'tenant',
+            scheduleId: 's1',
+            expectedRevision: 1,
+            fromCursor: T0,
+            toCursor: T0 + MINUTE,
+            occurrences: [occurrence(goal, 's1', T0 + MINUTE)],
+          };
+          const results = await Promise.all([
+            store.schedules.advance(step),
+            store.schedules.advance(step),
+          ]);
+          expect(results.map((result) => result.status).sort()).toEqual(['advanced', 'conflict']);
+          expect((await store.inbox.list({ scope: 'tenant' })).entries).toHaveLength(1);
+          expect(await recorded(store)).toHaveLength(1);
+        }),
+      );
+
+      it(
+        'keeps an unfinished scan until a step completes it',
+        withStore(async (store) => {
+          await goalWithSchedule(store);
+          const first = await store.schedules.advance({
+            scope: 'tenant',
+            scheduleId: 's1',
+            expectedRevision: 1,
+            fromCursor: T0,
+            toCursor: T0 + 10 * MINUTE,
+            scanTo: T0 + 20 * MINUTE,
+            occurrences: [],
+          });
+          expect(first).toMatchObject({
+            status: 'advanced',
+            enqueued: 0,
+            schedule: { scheduleCursor: T0 + 10 * MINUTE, scanTo: T0 + 20 * MINUTE },
+          });
+          const second = await store.schedules.advance({
+            scope: 'tenant',
+            scheduleId: 's1',
+            expectedRevision: 1,
+            fromCursor: T0 + 10 * MINUTE,
+            toCursor: T0 + 20 * MINUTE,
+            occurrences: [],
+          });
+          expect(second.status).toBe('advanced');
+          expect((await store.schedules.get('tenant', 's1'))?.scanTo).toBeUndefined();
+          expect((await store.schedules.get('tenant', 's1'))?.scheduleCursor).toBe(
+            T0 + 20 * MINUTE,
+          );
+        }),
+      );
+
+      it(
+        'refuses a malformed step without writing',
+        withStore(async (store) => {
+          const goal = await goalWithSchedule(store);
+          const step = (patch: Partial<ScheduleAdvance>): ScheduleAdvance => ({
+            scope: 'tenant',
+            scheduleId: 's1',
+            expectedRevision: 1,
+            fromCursor: T0,
+            toCursor: T0 + 2 * MINUTE,
+            occurrences: [occurrence(goal, 's1', T0 + MINUTE)],
+            ...patch,
+          });
+          const { delivery: _delivery, ...undelivered } = occurrence(goal, 's1', T0 + MINUTE);
+          const other = runtimeGoal('h');
+          await store.save(other);
+          for (const bad of [
+            step({ toCursor: T0 - 1, occurrences: [] }),
+            step({ occurrences: [occurrence(goal, 's1', T0 + 3 * MINUTE)] }),
+            step({ occurrences: [occurrence(goal, 's1', T0)] }),
+            step({ occurrences: [undelivered] }),
+            step({ occurrences: [occurrence(goal, 's2', T0 + MINUTE)] }),
+            step({ occurrences: [occurrence(other, 's1', T0 + MINUTE)] }),
+            step({
+              occurrences: [
+                occurrence(goal, 's1', T0 + MINUTE),
+                occurrence(goal, 's1', T0 + MINUTE),
+              ],
+            }),
+          ])
+            await expect(
+              Promise.resolve().then(() => store.schedules.advance(bad)),
+              JSON.stringify(bad.occurrences.map((item) => item.occurrenceId)),
+            ).rejects.toThrow(TypeError);
+          expect((await store.schedules.get('tenant', 's1'))?.scheduleCursor).toBe(T0);
+          expect(await recorded(store)).toEqual([]);
+          expect((await store.inbox.list({ scope: 'tenant' })).entries).toEqual([]);
+        }),
+      );
+
+      it(
+        'lists occurrence records oldest first, page by page',
+        withStore(async (store) => {
+          const goal = await goalWithSchedule(store);
+          await store.schedules.advance({
+            scope: 'tenant',
+            scheduleId: 's1',
+            expectedRevision: 1,
+            fromCursor: T0,
+            toCursor: T0 + 3 * MINUTE,
+            occurrences: [1, 2, 3].map((n) => occurrence(goal, 's1', T0 + n * MINUTE, 'paused')),
+          });
+          const pages: number[][] = [];
+          let cursor: string | undefined;
+          do {
+            const page = await store.schedules.occurrences!({ scope: 'tenant', limit: 2, cursor });
+            pages.push(page.occurrences.map((record) => (record.at - T0) / MINUTE));
+            cursor = page.cursor;
+          } while (cursor);
+          expect(pages).toEqual([[1, 2], [3]]);
+          await expect(
+            Promise.resolve().then(() =>
+              store.schedules.occurrences!({ scope: 'tenant', cursor: 'nope' }),
+            ),
+          ).rejects.toThrow(TypeError);
         }),
       );
     });
