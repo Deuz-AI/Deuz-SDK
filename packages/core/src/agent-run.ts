@@ -441,10 +441,13 @@ export function createInMemoryAgentRunStore(
  * `AgentRunChatState`), and settle an extraction an interruption left pending
  * (or that failed). An extraction whose records are in the memory store
  * already, under its operation id, is recorded completed without another
- * memory LLM call; otherwise it runs now. Only for a run that ended or is
- * suspended: an active run settles these itself. The `chat` and `memory`
- * scopes must be the run's. Rejects when the run is unknown, still running, or
- * bound differently, and when a store write fails.
+ * memory LLM call; otherwise it runs now. Since 2.4 an extraction that saved
+ * its planned mutation count is completed only when all of it is confirmed:
+ * one that wrote part of it is recorded `'failed'` and reported in
+ * `warnings` (`memory-extraction-partial`), never run again. Only for a run
+ * that ended or is suspended: an active run settles these itself. The `chat`
+ * and `memory` scopes must be the run's. Rejects when the run is unknown,
+ * still running, or bound differently, and when a store write fails.
  *
  * Call it only when no executor drives the run. An extraction stays pending
  * from the terminal commit until its outcome is saved, also while the
@@ -527,10 +530,22 @@ export async function reconcileAgentRun(
     if (options.memory && extraction && envelope.transcript) {
       if (extraction.status !== 'completed') {
         const nativeMemory = await import('./internal/native-memory');
-        const wrote = await nativeMemory.operationWrote(options.memory, extraction.operationId);
-        if (wrote > 0)
-          envelope.memory!.extraction = { ...extraction, status: 'completed', mutations: wrote };
-        else {
+        // What the pass left is settled against what it planned (2.4, H5).
+        const settled = await nativeMemory.settleInterrupted(options.memory, extraction, runId);
+        if (settled) {
+          if (settled.warning) {
+            deps.logger.warn(settled.warning.message, {
+              warning: settled.warning.type,
+              setting: settled.warning.setting,
+              runId,
+            });
+            outcome.warnings = [settled.warning];
+          }
+          if (settled.extraction !== extraction) {
+            envelope.memory!.extraction = settled.extraction;
+            await save();
+          }
+        } else {
           lease?.assertHeld();
           try {
             const mutations = await nativeMemory.runExtraction(
@@ -540,17 +555,25 @@ export async function reconcileAgentRun(
               runId,
               deps.clock,
               deps.logger,
+              async (progress) => {
+                envelope.memory!.extraction = nativeMemory.progressed(extraction, progress);
+                await save();
+              },
             );
-            envelope.memory!.extraction = { ...extraction, status: 'completed', mutations };
+            envelope.memory!.extraction = {
+              ...envelope.memory!.extraction!,
+              status: 'completed',
+              mutations,
+            };
           } catch (error) {
             envelope.memory!.extraction = {
-              ...extraction,
+              ...envelope.memory!.extraction!,
               status: 'failed',
               error: errorData(error),
             };
           }
+          await save();
         }
-        await save();
       }
       outcome.memory = envelope.memory!.extraction!.status;
     }
@@ -686,8 +709,10 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
    * for the next save or `reconcileAgentRun`. The revision advances only when
    * the store took the write.
    */
-  async function saveBookkeeping(): Promise<void> {
-    if (!options.session || persistFailed) return;
+  async function saveBookkeeping(): Promise<boolean> {
+    // Whether the record is durable now (2.4): trivially so without a session.
+    if (!options.session) return true;
+    if (persistFailed) return false;
     const snapshot = structuredClone(envelope);
     snapshot.version = envelopeVersion(snapshot);
     snapshot.revision = (envelope.revision ?? 0) + 1;
@@ -699,11 +724,13 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
     try {
       await write;
       envelope.revision = snapshot.revision;
+      return true;
     } catch (error) {
       resolveDependencies(options.deps).logger.error('native run bookkeeping save failed', {
         runId: envelope.runId,
         error,
       });
+      return false;
     }
   }
 
@@ -758,18 +785,34 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
     }
     const extraction = envelope.memory?.extraction;
     if (extractNow && extraction && options.memory && envelope.transcript && nativeMemory) {
+      const native = nativeMemory;
       try {
-        const mutations = await nativeMemory.runExtraction(
+        const mutations = await native.runExtraction(
           options.memory,
-          nativeMemory.extractionTurns(envelope.transcript),
+          native.extractionTurns(envelope.transcript),
           extraction,
           envelope.runId,
           deps.clock,
           deps.logger,
+          // The plan is durable before the first memory write (2.4, H5), or
+          // nothing is written.
+          async (progress) => {
+            envelope.memory!.extraction = native.progressed(extraction, progress);
+            if (!(await saveBookkeeping()))
+              throw new Error('its progress could not be saved, so it wrote nothing more');
+          },
         );
-        envelope.memory!.extraction = { ...extraction, status: 'completed', mutations };
+        envelope.memory!.extraction = {
+          ...envelope.memory!.extraction!,
+          status: 'completed',
+          mutations,
+        };
       } catch (error) {
-        envelope.memory!.extraction = { ...extraction, status: 'failed', error: errorData(error) };
+        envelope.memory!.extraction = {
+          ...envelope.memory!.extraction!,
+          status: 'failed',
+          error: errorData(error),
+        };
         warnRecords(
           'memory',
           `The memory extraction of run ${envelope.runId} failed (${errorData(error).message}); the run's outcome stands.`,

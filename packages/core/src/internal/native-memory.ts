@@ -9,14 +9,18 @@
  * - extraction runs only for a completed run, under an operation id the
  *   checkpoint records as pending before anything is written, and every record
  *   it writes carries that id, so an interrupted pass can be told apart from
- *   one that never started (`reconcileAgentRun`).
+ *   one that never started (`reconcileAgentRun`);
+ * - the pass saves how many mutations it planned before its first memory
+ *   write (2.4, H5), so an interrupted pass that wrote only part of them is
+ *   told apart from one that finished.
  * Loaded on demand: a run without `memory` never pulls this module or the
  * memory pipeline in.
  */
 import type { Message } from '../types/message';
 import type { BudgetLedger, NativeExecutionContext } from '../types/execution';
 import type { Clock, Logger } from '../types/deps';
-import type { MemoryCallOptions, MemoryScope } from '../memory';
+import type { MemoryCallOptions, MemoryMutation, MemoryScope } from '../memory';
+import type { CallWarning } from '../types/methods';
 import type {
   AgentRunMemoryExtraction,
   AgentRunRecall,
@@ -182,9 +186,53 @@ export function extractionTurns(transcript: AgentRunTranscript): Message[] {
   return lastUser ? [lastUser, ...own] : own;
 }
 
+/** How far a pass has got (2.4, H5), saved before the writes it describes. */
+export interface ExtractionProgress {
+  /** Every mutation the pass planned. */
+  planned: number;
+  /** The deletions and invalidations applied so far (they leave no record to find). */
+  mutations?: number;
+}
+
+/** The extraction record of a pass under way (2.4): pending, with its progress. */
+export function progressed(
+  extraction: AgentRunMemoryExtraction,
+  progress: ExtractionProgress,
+): AgentRunMemoryExtraction {
+  return {
+    operationId: extraction.operationId,
+    status: 'pending',
+    infer: extraction.infer,
+    ...progress,
+  };
+}
+
+/**
+ * Stamp an upsert with the pass's ids. A new record has them already; an
+ * updated one keeps its own metadata otherwise, and with it the ids of the
+ * operation that wrote it before (2.4: the pass that changed a record is the
+ * one it names).
+ */
+function stamped(
+  mutation: MemoryMutation,
+  deuz: { runId: string; operationId: string },
+): MemoryMutation {
+  if (mutation.op !== 'upsert') return mutation;
+  return {
+    ...mutation,
+    record: { ...mutation.record, metadata: { ...mutation.record.metadata, deuz } },
+  };
+}
+
 /**
  * Run one extraction: every record it writes carries the run and operation
- * ids. `sweep: 'on-extract'` follows it, best-effort. Throws when the pass fails.
+ * ids. The pass is planned first and its size handed to `checkpoint` before
+ * the first memory write (2.4, H5); deletions and invalidations, which leave
+ * no record to find, are applied next and counted in a second checkpoint, and
+ * the records last. A plan that deletes a record it also writes keeps the
+ * store's own order (records, then deletions) in one apply.
+ * `sweep: 'on-extract'` follows it, best-effort. Throws when the pass fails;
+ * nothing is written when the first checkpoint throws.
  */
 export async function runExtraction(
   memory: MemoryCallOptions,
@@ -193,12 +241,30 @@ export async function runExtraction(
   runId: string,
   clock: Clock,
   logger: Logger,
+  checkpoint: (progress: ExtractionProgress) => Promise<void>,
 ): Promise<number> {
-  const { remember, sweepExpired } = await import('./memory-pipeline');
-  const mutations = await remember(turns, memory.scope, memory.seams, {
-    infer: extraction.infer,
-    metadata: { deuz: { runId, operationId: extraction.operationId } },
-  });
+  const { remember, applyMutations, sweepExpired } = await import('./memory-pipeline');
+  const deuz = { runId, operationId: extraction.operationId };
+  const plan = (
+    await remember(turns, memory.scope, memory.seams, {
+      infer: extraction.infer,
+      metadata: { deuz },
+      apply: false,
+    })
+  ).map((mutation) => stamped(mutation, deuz));
+  await checkpoint({ planned: plan.length });
+  const records = plan.filter(
+    (mutation): mutation is Extract<MemoryMutation, { op: 'upsert' }> => mutation.op === 'upsert',
+  );
+  const removals = plan.filter(
+    (mutation): mutation is Exclude<MemoryMutation, { op: 'upsert' }> => mutation.op !== 'upsert',
+  );
+  const written = new Set(records.map((mutation) => mutation.record.id));
+  if (records.length > 0 && removals.length > 0 && !removals.some(({ id }) => written.has(id))) {
+    await applyMutations(memory.seams.store, removals);
+    await checkpoint({ planned: plan.length, mutations: removals.length });
+    await applyMutations(memory.seams.store, records);
+  } else if (plan.length > 0) await applyMutations(memory.seams.store, plan);
   if (memory.sweep === 'on-extract') {
     try {
       await sweepExpired(memory.seams.store, memory.scope, clock);
@@ -206,7 +272,7 @@ export async function runExtraction(
       logger.error('memory sweep failed', { error });
     }
   }
-  return mutations.length;
+  return plan.length;
 }
 
 /**
@@ -222,4 +288,52 @@ export async function operationWrote(
     (record) =>
       (record.metadata?.deuz as { operationId?: unknown } | undefined)?.operationId === operationId,
   ).length;
+}
+
+const PARTIAL = 'memory-extraction-partial';
+
+function partialWarning(runId: string, confirmed: number, planned: number): CallWarning {
+  return {
+    type: PARTIAL,
+    setting: 'memory',
+    message: `The memory extraction of run ${runId} was interrupted: ${confirmed} of the ${planned} memory mutations it planned are in the store, and the rest were not written.`,
+  };
+}
+
+/**
+ * Settle a pass an interruption left, from its record and the store (2.4, H5).
+ * Confirmed are the records found under its operation id plus the deletions
+ * its record counts. Every planned mutation confirmed: completed. Only some:
+ * `'failed'` with a `memory-extraction-partial` warning, final (a later call
+ * reports it again and never runs the pass). None: `undefined`, the pass runs
+ * again. A record without a planned count (a 2.3 process wrote it) is
+ * completed when a record of its operation is found, as in 2.3. The returned
+ * record is the given one when nothing changed.
+ */
+export async function settleInterrupted(
+  memory: MemoryCallOptions,
+  extraction: AgentRunMemoryExtraction,
+  runId: string,
+): Promise<{ extraction: AgentRunMemoryExtraction; warning?: CallWarning } | undefined> {
+  const { planned } = extraction;
+  if (planned !== undefined && extraction.error?.code === PARTIAL)
+    return { extraction, warning: partialWarning(runId, extraction.mutations ?? 0, planned) };
+  const found = planned === 0 ? 0 : await operationWrote(memory, extraction.operationId);
+  const confirmed = (planned === undefined ? 0 : (extraction.mutations ?? 0)) + found;
+  const { error: _error, ...rest } = extraction;
+  if (planned === 0 || (planned !== undefined && confirmed >= planned))
+    return { extraction: { ...rest, status: 'completed', mutations: planned } };
+  if (confirmed === 0) return undefined;
+  if (planned === undefined)
+    return { extraction: { ...rest, status: 'completed', mutations: confirmed } };
+  const warning = partialWarning(runId, confirmed, planned);
+  return {
+    extraction: {
+      ...rest,
+      status: 'failed',
+      mutations: confirmed,
+      error: { name: 'MemoryExtractionPartialError', message: warning.message, code: PARTIAL },
+    },
+    warning,
+  };
 }
