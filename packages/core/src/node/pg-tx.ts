@@ -39,6 +39,8 @@ export interface PgPoolClientLike extends PgClientLike {
 /** A pool that lends one connection for a transaction: `pg.Pool`, `@neondatabase/serverless`'s `Pool`. */
 export interface PgPoolLike extends PgClientLike {
   connect(): Promise<PgPoolClientLike>;
+  /** Present on pools a store opened itself and ends on `close()`. */
+  end?(): Promise<void>;
 }
 
 /** True for a client that can lend a connection (`connect()`), false for a query()-only one. */

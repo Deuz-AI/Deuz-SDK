@@ -6,7 +6,7 @@ license: MIT
 
 # Building with @deuz-sdk/core
 
-A pure, web-first, multi-provider AI runtime. Zero runtime dependencies, ESM+CJS, Node >= 22. The root and web-safe subpaths run on Edge/Workers; Node adapters have separate entry points. 71 code subpaths (72 package export keys including `package.json`), 270 root exports, 29 provider ids across four wire surfaces. Everything a provider sends is normalized to one canonical `StreamPart` delta stream before anything else touches it.
+A pure, web-first, multi-provider AI runtime. Zero runtime dependencies, ESM+CJS, Node >= 22. The root and web-safe subpaths run on Edge/Workers; Node adapters have separate entry points. 80 code subpaths (81 package export keys including `package.json`), 270 root exports, 29 provider ids across four wire surfaces. Everything a provider sends is normalized to one canonical `StreamPart` delta stream before anything else touches it.
 
 ## Before you `npm install` anything else
 
@@ -275,4 +275,4 @@ Full prose for every topic is at **https://deuz-sdk.tech/docs** — each `/docs/
 
 Maintaining this skill: it is generated and verified from source by the scripts under `packages/core/tooling/skills/` in the Deuz-SDK repository. `generate-api-index.mjs` rebuilds the index; `verify-skill.mjs` resolves every name against the real export table and fails the moment the package version or the API contract moves, so a release cannot let this drift silently. `skills/deuz-sdk/` is the source; `sync-skill-copy.mjs --write` mirrors it into `.claude/skills/deuz-sdk/`. From the repository root: `npm run generate:skills -- --date YYYY-MM-DD`, `npm run sync:skills`, `npm run verify:skills`.
 
-> Verified against @deuz-sdk/core@2.3.0 · api-contract sha256:d0398bbef8c4 · 2026-10-12
+> Verified against @deuz-sdk/core@2.3.0 · api-contract sha256:d27a42f55029 · 2026-10-14

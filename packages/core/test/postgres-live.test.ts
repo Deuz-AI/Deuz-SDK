@@ -36,6 +36,7 @@ import { budgetStoreContracts } from './fixtures/budget-store-conformance';
 import { initialSnapshot, swarmStoreContracts } from './fixtures/swarm-store-conformance';
 import { SLOW_HOOK_TIMEOUT_MS, SLOW_TEST_TIMEOUT_MS } from './fixtures/timeouts';
 import { postgresUrl } from './fixtures/services';
+import { estimateClockSkew } from './fixtures/clock-skew';
 
 const url = postgresUrl();
 // A network round trip per statement, and real waits for database time.
@@ -50,6 +51,8 @@ let pool: pg.Pool | undefined;
 const poolErrors: unknown[] = [];
 /** Database clock minus host clock, so `now()` reads the stores' own time. */
 let skew = 0;
+/** How far `skew` can be off; added to the harnesses' time slack. */
+let skewError = 0;
 const now = (): number => Date.now() + skew;
 const wait = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
@@ -101,11 +104,13 @@ describe.skipIf(!url)('Postgres stores on a live server (REPEATABLE READ, pooled
       connection.query(REPEATABLE_READ).catch((error: unknown) => poolErrors.push(error));
     });
     pool.on('error', (error) => poolErrors.push(error));
-    const sent = Date.now();
-    const { rows } = await pool.query<{ at: number }>(
-      'SELECT extract(epoch from clock_timestamp())::float8 * 1000 AS at',
-    );
-    skew = Number(rows[0]!.at) - (sent + Date.now()) / 2;
+    // Best of several round trips: the first query also opens the connection.
+    ({ skew, error: skewError } = await estimateClockSkew(async () => {
+      const { rows } = await pool!.query<{ at: number }>(
+        'SELECT extract(epoch from clock_timestamp())::float8 * 1000 AS at',
+      );
+      return Number(rows[0]!.at);
+    }));
   });
 
   afterAll(async () => {
@@ -150,7 +155,7 @@ describe.skipIf(!url)('Postgres stores on a live server (REPEATABLE READ, pooled
     advance: wait,
     now,
     // `now` estimates the database clock across a network round trip.
-    slack: 25,
+    slack: 25 + skewError,
   }));
   scheduleClaimContracts('claim', async () => (await freshOps()).claims);
   scheduleClaimPruneContracts('claim retention', async () => ({
@@ -163,7 +168,7 @@ describe.skipIf(!url)('Postgres stores on a live server (REPEATABLE READ, pooled
     advance: wait,
     now,
     // `now` estimates the database clock across a network round trip.
-    slack: 25,
+    slack: 25 + skewError,
   }));
   swarmStoreContracts('swarm store', () => freshSwarmStore(), {
     spawn: true,

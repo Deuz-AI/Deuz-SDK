@@ -1,4 +1,4 @@
-<!-- verified: 2026-10-12 against @deuz-sdk/core@2.3.0 · api-contract sha256:d0398bbef8c4
+<!-- verified: 2026-10-14 against @deuz-sdk/core@2.3.0 · api-contract sha256:d27a42f55029
      sources: packages/core/src/{memory.ts, memory-markdown.ts, compaction.ts, chat-request.ts,
      inference/compaction.ts, inference/loop-shared.ts, internal/stable-prefix.ts, internal/native-memory.ts,
      types/config.ts, types/methods.ts, types/message.ts, node/store-sqlite.ts},

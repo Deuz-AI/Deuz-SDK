@@ -40,6 +40,8 @@ export default tseslint.config(
     ignores: [
       'src/mcp/stdio.ts',
       'src/node/**',
+      // 2.4: the Docker runner lazy-imports node:child_process; the subpath is Node-only.
+      'src/compute/docker/**',
       'src/rag-node.ts',
       'src/skills/node.ts',
       'src/memory-markdown.ts',

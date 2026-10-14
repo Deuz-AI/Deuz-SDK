@@ -1,3 +1,4 @@
+import type { CallAccounting } from './accounting';
 import type { CommonCallOptions } from './config';
 import type { Usage, FinishReason } from './usage';
 import type { StreamPart } from './stream';
@@ -335,6 +336,11 @@ export type EmbeddingTaskType =
 export interface EmbedOptions {
   model: EmbeddingModel;
   value: string;
+  /**
+   * Charge this embedding to a budget ledger (2.4). Without it the call is not accounted,
+   * exactly as in 2.3.
+   */
+  accounting?: CallAccounting;
   /** Matryoshka truncation (OpenAI `dimensions` / Gemini `outputDimensionality` / Voyage `output_dimension`). */
   dimensions?: number;
   taskType?: EmbeddingTaskType;

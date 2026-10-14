@@ -130,7 +130,7 @@ jobs:
     # and runs stores (2.3) against redis:7, and the Postgres stores' concurrent
     # legs (F23) against postgres:16. A test that needs a server reads
     # DEUZ_TEST_REDIS_URL or DEUZ_TEST_POSTGRES_URL and skips without it, so the
-    # `check` legs stay offline. Here DEUZ_TEST_REQUIRE_SERVICES=1 turns that
+    # `check` legs stay offline. Here DEUZ_TEST_REQUIRE_SERVICES=postgres,redis turns that
     # skip into a failure: a server that did not come up, or a URL that went
     # missing, cannot pass as green.
     name: Integration (Redis 7, Postgres 16)
@@ -154,7 +154,7 @@ jobs:
     env:
       DEUZ_TEST_REDIS_URL: redis://localhost:6379
       DEUZ_TEST_POSTGRES_URL: postgres://postgres:deuz@localhost:5432/deuz
-      DEUZ_TEST_REQUIRE_SERVICES: '1'
+      DEUZ_TEST_REQUIRE_SERVICES: postgres,redis
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
@@ -228,7 +228,7 @@ jobs:
   #         --health-retries 10
   #   env:
   #     DEUZ_TEST_POSTGRES_URL: postgres://postgres:deuz@localhost:5432/deuz
-  #     DEUZ_TEST_REQUIRE_SERVICES: '1'
+  #     DEUZ_TEST_REQUIRE_SERVICES: postgres
   #   steps:
   #     - uses: actions/checkout@v5
   #     - uses: actions/setup-node@v5

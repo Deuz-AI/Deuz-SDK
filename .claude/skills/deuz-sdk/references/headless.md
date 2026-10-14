@@ -1,4 +1,4 @@
-<!-- verified: 2026-10-12 against @deuz-sdk/core@2.3.0 · api-contract sha256:d0398bbef8c4
+<!-- verified: 2026-10-14 against @deuz-sdk/core@2.3.0 · api-contract sha256:d27a42f55029
      sources: packages/core/src/node/headless.ts, packages/core/src/headless/{report,doctor,instructions}.ts,
      packages/core/src/{model-profile,agent-run}.ts, examples/13-headless/{index.ts,README.md},
      docs/content/docs/modules/headless.mdx -->

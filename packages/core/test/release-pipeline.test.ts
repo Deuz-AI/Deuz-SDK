@@ -97,7 +97,8 @@ describe('ci.yml', () => {
   it('the integration job fails on a missing Postgres or Redis instead of skipping', () => {
     const job = ci.jobs.integration;
     expectBackends(job, ['postgres', 'redis']);
-    expect(env(job, 'DEUZ_TEST_REQUIRE_SERVICES')).toBe('1');
+    // `1` would also require Docker, which this job does not opt into.
+    expect(env(job, 'DEUZ_TEST_REQUIRE_SERVICES')).toBe('postgres,redis');
     expect(runs(job)).toContain('npm run test -w @deuz-sdk/core');
   });
 
@@ -122,7 +123,7 @@ describe('ci.yml', () => {
     expect(job?.['runs-on']).toBe('ubuntu-latest');
     expect(String(nodeVersion(job))).toBe('22');
     expectBackends(job, ['postgres']);
-    expect(env(job, 'DEUZ_TEST_REQUIRE_SERVICES')).toBe('1');
+    expect(env(job, 'DEUZ_TEST_REQUIRE_SERVICES')).toBe('postgres');
     expect(runs(job)).toContain('npm run test:rollback -w @deuz-sdk/core');
   });
 });

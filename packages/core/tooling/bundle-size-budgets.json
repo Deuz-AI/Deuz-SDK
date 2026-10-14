@@ -271,7 +271,11 @@
     "The last four measure the W0 contract STUBS (each factory throws NotImplementedError). They are",
     "meant to trip: raise each one deliberately, with its measurement, when its W1 lane lands the",
     "implementation. The Node-only 2.4 entries (versioned memory and goal runtime stores, compute/docker)",
-    "are not budgeted, like the other Node-only stores."
+    "are not budgeted, like the other Node-only stores.",
+    "",
+    "RAISED FOR 2.4 (W0E, H5: the extraction plan saves planned/mutations before it writes). Measured",
+    "13167 / 5418 on feat/2.4 and 14544 / 5910 with H5; native-memory lazy 13800 / 5700 -> 15000 / 6150",
+    "(edge, native-agent, native-swarm)."
   ],
   "bundles": {
     "core": {
@@ -346,8 +350,8 @@
         },
         "native-memory": {
           "entryPoint": "native-memory",
-          "maxRawBytes": 13800,
-          "maxGzipBytes": 5700
+          "maxRawBytes": 15000,
+          "maxGzipBytes": 6150
         },
         "native-fallback": {
           "entryPoint": "native-fallback",
@@ -411,8 +415,8 @@
         },
         "native-memory": {
           "entryPoint": "native-memory",
-          "maxRawBytes": 13800,
-          "maxGzipBytes": 5700
+          "maxRawBytes": 15000,
+          "maxGzipBytes": 6150
         },
         "native-fallback": {
           "entryPoint": "native-fallback",
@@ -462,8 +466,8 @@
         },
         "native-memory": {
           "entryPoint": "native-memory",
-          "maxRawBytes": 13800,
-          "maxGzipBytes": 5700
+          "maxRawBytes": 15000,
+          "maxGzipBytes": 6150
         },
         "native-fallback": {
           "entryPoint": "native-fallback",

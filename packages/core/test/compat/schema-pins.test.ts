@@ -52,7 +52,8 @@ import { createGoal, GOAL_EVENT_VERSION, GOAL_RECORD_VERSION } from '../../src/g
 import { DEUZ_STREAM_VERSION, DEUZ_STREAM_VERSIONS } from '../../src/ui';
 import { createMockModel } from '../../src/testing';
 import { createInMemoryMemoryStore } from '../../src/memory';
-import { liveRedisServer, liveRedisUrl, mockRedisServer } from '../fixtures/redis-harness';
+import { liveRedisServer, mockRedisServer } from '../fixtures/redis-harness';
+import { postgresUrl, redisUrl, requiredServices } from '../fixtures/services';
 
 const LAYOUT_FILE = join(
   dirname(fileURLToPath(import.meta.url)),
@@ -60,9 +61,11 @@ const LAYOUT_FILE = join(
   'schema-layout-2.3.0.json',
 );
 const RECORD = process.env.DEUZ_SCHEMA_PIN_RECORD === '1';
-const liveUrl = process.env.DEUZ_TEST_POSTGRES_URL || undefined;
+// The shared helpers throw at load when a required server's URL is missing.
+const liveUrl = postgresUrl();
+const liveRedisUrl = redisUrl();
 /** With DEUZ_TEST_REQUIRE_SERVICES=1 a missing live server fails instead of skipping. */
-const requireServices = process.env.DEUZ_TEST_REQUIRE_SERVICES === '1';
+const requireServices = requiredServices().size > 0;
 
 function missingService(name: string, variable: string): void {
   if (requireServices) {
