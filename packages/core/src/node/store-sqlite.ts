@@ -21,10 +21,18 @@
 import type { ChatRecord, ChatStore } from '../chat';
 import { serializeChatRecord, deserializeChatRecord } from '../chat';
 import { serializeCheckpoint, deserializeCheckpoint, CheckpointVersionError } from '../durable';
-import type { MemoryHit, MemoryKind, MemoryRecord, MemoryScope, MemoryStore } from '../memory';
+import type {
+  MemoryHit,
+  MemoryKind,
+  MemoryQuery,
+  MemoryRecord,
+  MemoryScope,
+  MemoryStore,
+} from '../memory';
 import type { AgentCheckpoint, SessionStore } from '../types/session';
 import type { RunRecord, RunStore } from '../types/runtime';
-import { cosineSimilarity, decodeVector, encodeVector, rankFuse } from '../internal/vector';
+import { decodeVector, encodeVector, rankByVector, rankFuse } from '../internal/vector';
+import { reportEmbeddingMismatch, withoutStaleVector } from '../internal/memory-vectors';
 import {
   createSqliteOpener,
   createSqliteStatementCache,
@@ -567,8 +575,14 @@ export function createSqliteStores(options: SqliteStoreOptions): SqliteStores {
    * A pure-SQL cosine would need a distance extension; a bounded prefetch
    * (`max(1000, topK * 50)`) keeps one round-trip and stays honest about being
    * an approximation on very large scopes.
+   *
+   * 2.4 (spec §2.2): only vectors comparable with the query's are ranked. A row
+   * without one, or with one of another length or `embeddingModelId`, is left
+   * out instead of scoring 0 (a hybrid query still finds it through the lexical
+   * list), and the mismatch is reported once through `onEmbeddingMismatch`.
    */
   const vectorSearch = async (
+    query: MemoryQuery,
     embedding: number[],
     where: { sql: string; params: SqlValue[] },
     topK: number,
@@ -579,17 +593,13 @@ export function createSqliteStores(options: SqliteStoreOptions): SqliteStores {
       `SELECT ${MEMORY_SELECT} FROM deuz_memory m WHERE ${where.sql} ORDER BY m.updated_at DESC, m.id ASC LIMIT ?`,
       [...where.params, Math.max(1000, topK * 50)],
     );
-    return rows
-      .map((row) => {
-        const record = hydrateMemory(row);
-        return {
-          record,
-          score: record.embedding ? cosineSimilarity(embedding, record.embedding) : 0,
-        };
-      })
-      .filter((hit) => keep(hit.record))
-      .sort((a, b) => b.score - a.score)
-      .slice(0, topK);
+    const ranking = rankByVector(
+      rows.map(hydrateMemory).filter(keep),
+      (record) => ({ vector: record.embedding, modelId: record.embeddingModelId }),
+      { vector: embedding, modelId: query.embeddingModelId },
+    );
+    reportEmbeddingMismatch({ ...query, embedding }, ranking.mismatched);
+    return ranking.ranked.slice(0, topK).map(({ item, score }) => ({ record: item, score }));
   };
 
   /**
@@ -704,14 +714,14 @@ export function createSqliteStores(options: SqliteStoreOptions): SqliteStores {
           .filter((hit) => keep(hit.record))
           .slice(0, topK);
       }
-      if (embedding && !text) return vectorSearch(embedding, where, topK, keep);
+      if (embedding && !text) return vectorSearch(query, embedding, where, topK, keep);
       if (text && !embedding) return lexicalSearch(text, where, topK, keep, scanFor(topK));
 
       // Hybrid: cosine and bm25 live on incomparable scales, so only their
       // RANKS are fused (RRF, k = 60) — the same merge `hybridRetrieve` uses.
       const window = Math.max(topK, 20);
       const [dense, lexical] = await Promise.all([
-        vectorSearch(embedding!, where, window, keep),
+        vectorSearch(query, embedding!, where, window, keep),
         lexicalSearch(text!, where, window, keep, scanFor(window)),
       ]);
       const byId = new Map<string, MemoryRecord>();
@@ -751,7 +761,7 @@ export function createSqliteStores(options: SqliteStoreOptions): SqliteStores {
       if (!existing) return;
       // Read-modify-write through the same upsert path: one statement, one
       // encoding of the record, no column-by-column UPDATE to keep in sync.
-      await memory.upsert([{ ...existing, ...patch, id }]);
+      await memory.upsert([{ ...withoutStaleVector(existing, patch), ...patch, id }]);
     },
 
     async findByHash(hashes, scope) {

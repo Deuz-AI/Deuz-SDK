@@ -5,7 +5,12 @@
  * reports the mismatch once (`embedding-mismatch`). `cosineSimilarity` itself
  * keeps its 2.3 behaviour: rag.ts and evolve rely on it.
  */
-import { describe, expect, it } from 'vitest';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import type { MemoryRecord } from '../src/memory';
+import { createMarkdownMemoryStore } from '../src/memory-markdown';
 import { cosineSimilarity, rankByVector, vectorExclusion } from '../src/internal/vector';
 
 describe('vectorExclusion', () => {
@@ -63,5 +68,82 @@ describe('rankByVector', () => {
   it('leaves cosineSimilarity as it was: 0 on a length mismatch', () => {
     expect(cosineSimilarity([1, 0, 0], [1, 0])).toBe(0);
     expect(cosineSimilarity([1, 0], [1, 0])).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The Markdown store (not part of the shared contract): the same rule, with
+// vectors in its sidecar file.
+// ---------------------------------------------------------------------------
+
+describe('createMarkdownMemoryStore (2.4 vector rule, H6)', () => {
+  let dir: string;
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'deuz-mem-vec-'));
+  });
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  const record = (id: string, text: string, extra: Partial<MemoryRecord> = {}): MemoryRecord => ({
+    id,
+    text,
+    hash: `h-${id}`,
+    kind: 'semantic',
+    scope: { userId: 'u1' },
+    createdAt: 1,
+    updatedAt: 1,
+    ...extra,
+  });
+
+  it('ranks only comparable vectors, finds the rest by text and reports a mismatch once', async () => {
+    const store = createMarkdownMemoryStore({ dir });
+    await store.upsert([
+      record('same', 'same model', { embedding: [1, 0, 0], embeddingModelId: 'm1' }),
+      record('other', 'the user lives in Istanbul', {
+        embedding: [1, 0, 0],
+        embeddingModelId: 'm2',
+      }),
+      record('novec', 'no vector at all'),
+    ]);
+    const notices: unknown[] = [];
+    const hits = await store.search({
+      scope: { userId: 'u1' },
+      embedding: [1, 0, 0],
+      embeddingModelId: 'm1',
+      onEmbeddingMismatch: (mismatch) => notices.push(mismatch),
+    });
+    expect(hits.map((hit) => hit.record.id)).toEqual(['same']);
+    expect(notices).toEqual([{ records: 1, dims: 3, modelId: 'm1' }]);
+
+    const withText = await store.search({
+      scope: { userId: 'u1' },
+      text: 'Istanbul',
+      embedding: [1, 0, 0],
+      embeddingModelId: 'm1',
+    });
+    expect(withText.map((hit) => hit.record.id).sort()).toEqual(['other', 'same']);
+  });
+
+  it('drops the sidecar vector when an update changes the text', async () => {
+    const store = createMarkdownMemoryStore({ dir });
+    await store.upsert([
+      record('moved', 'the user lives in Istanbul', {
+        embedding: [1, 0, 0],
+        embeddingModelId: 'm1',
+      }),
+      record('kept', 'the user drinks tea', { embedding: [0.9, 0.1, 0] }),
+    ]);
+    await store.update!('moved', { text: 'the user moved to Ankara' });
+    await store.update!('kept', { importance: 0.5 });
+
+    const byVector = await store.search({ scope: { userId: 'u1' }, embedding: [1, 0, 0] });
+    expect(byVector.map((hit) => hit.record.id)).toEqual(['kept']);
+    expect((await store.get('moved'))?.embeddingModelId).toBeUndefined();
+    const sidecar = JSON.parse(await readFile(join(dir, '.deuz-vectors.json'), 'utf-8')) as Record<
+      string,
+      unknown
+    >;
+    expect(Object.keys(sidecar)).toEqual(['kept']);
   });
 });

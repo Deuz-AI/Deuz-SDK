@@ -235,20 +235,131 @@ export function assertMemoryStoreContract(
       });
     });
 
-    it('search with an embedding still returns records that carry NO embedding', async () => {
+    it('a vector query never fills topK with a record that has NO embedding (2.4)', async () => {
       await withStore(async (store) => {
         await store.upsert([
           memoryRecord('vec', 'written after an embedder ran', SCOPE_A, { embedding: [1, 0, 0] }),
-          // Written by a pipeline with no embedder, or before one was wired up.
+          // Written by a pipeline with no embedder, or by memory_append.
           memoryRecord('novec', 'written with no embedder at all', SCOPE_A),
         ]);
 
+        // 2.3 returned 'novec' at score 0 to fill the page; 2.4 never does
+        // (spec §2.2). It stays findable by text, below.
         const hits = await store.search({ scope: SCOPE_A, embedding: [1, 0, 0], topK: 5 });
-        // A vector query RANKS by cosine; it does not RESTRICT the candidate set
-        // to rows that happen to have a vector. Dropping them makes the same
-        // query answer differently per backend and loses text-only memories.
-        expect(ids(hits)).toEqual(['vec', 'novec']);
-        expect(hits[1]!.score).toBe(0);
+        expect(ids(hits)).toEqual(['vec']);
+      });
+    });
+
+    it('a vector query still finds an embedding-less record by its text (2.4)', async () => {
+      await withStore(async (store) => {
+        await store.upsert([
+          memoryRecord('vec', 'unrelated fact', SCOPE_A, { embedding: [1, 0, 0] }),
+          memoryRecord('novec', 'the user lives in Istanbul', SCOPE_A),
+          memoryRecord('other', 'the user drinks coffee', SCOPE_A),
+        ]);
+
+        const hits = await store.search({
+          scope: SCOPE_A,
+          text: 'Istanbul',
+          embedding: [1, 0, 0],
+          topK: 5,
+        });
+        expect(ids(hits)).toContain('novec');
+        expect(ids(hits)).toContain('vec');
+        expect(ids(hits)).not.toContain('other');
+      });
+    });
+
+    it('a vector of another embedding model stays out of the vector ranking, reported once (2.4)', async () => {
+      await withStore(async (store) => {
+        await store.upsert([
+          memoryRecord('same', 'same model', SCOPE_A, {
+            embedding: [1, 0, 0],
+            embeddingModelId: 'model-1',
+          }),
+          memoryRecord('unpinned', 'no model recorded', SCOPE_A, { embedding: [0.6, 0.8, 0] }),
+          memoryRecord('other', 'the user lives in Istanbul', SCOPE_A, {
+            embedding: [1, 0, 0],
+            embeddingModelId: 'model-2',
+          }),
+          memoryRecord('other2', 'another model too', SCOPE_A, {
+            embedding: [0.9, 0.1, 0],
+            embeddingModelId: 'model-2',
+          }),
+        ]);
+        const notices: unknown[] = [];
+
+        const hits = await store.search({
+          scope: SCOPE_A,
+          embedding: [1, 0, 0],
+          embeddingModelId: 'model-1',
+          topK: 5,
+          onEmbeddingMismatch: (mismatch) => notices.push(mismatch),
+        });
+        expect(ids(hits)).toEqual(['same', 'unpinned']);
+        expect(notices).toEqual([{ records: 2, dims: 3, modelId: 'model-1' }]);
+
+        // Still found by text.
+        const byText = await store.search({
+          scope: SCOPE_A,
+          text: 'Istanbul',
+          embedding: [1, 0, 0],
+          embeddingModelId: 'model-1',
+          topK: 5,
+        });
+        expect(ids(byText)).toContain('other');
+      });
+    });
+
+    it('a query vector of another length ranks nothing by vector, reported once (2.4)', async () => {
+      await withStore(async (store) => {
+        await store.upsert([
+          memoryRecord('a', 'the user lives in Istanbul', SCOPE_A, { embedding: [1, 0, 0] }),
+          memoryRecord('b', 'the user drinks coffee', SCOPE_A, { embedding: [0, 1, 0] }),
+        ]);
+        const notices: unknown[] = [];
+
+        const none = await store.search({
+          scope: SCOPE_A,
+          embedding: [1, 0],
+          topK: 5,
+          onEmbeddingMismatch: (mismatch) => notices.push(mismatch),
+        });
+        expect(ids(none)).toEqual([]);
+        expect(notices).toEqual([{ records: 2, dims: 2 }]);
+
+        const byText = await store.search({
+          scope: SCOPE_A,
+          text: 'Istanbul',
+          embedding: [1, 0],
+          topK: 5,
+        });
+        expect(ids(byText)).toEqual(['a']);
+      });
+    });
+
+    it('update with a new text and no new embedding drops the stale vector (2.4, H6)', async (ctx) => {
+      await withStore(async (store) => {
+        if (!store.update) return ctx.skip();
+        await store.upsert([
+          memoryRecord('moved', 'the user lives in Istanbul', SCOPE_A, {
+            embedding: [1, 0, 0],
+            embeddingModelId: 'model-1',
+          }),
+          memoryRecord('kept', 'the user drinks coffee', SCOPE_A, {
+            embedding: [0.9, 0.1, 0],
+            embeddingModelId: 'model-1',
+          }),
+        ]);
+
+        await store.update('moved', { text: 'the user moved to Ankara', hash: 'hash-moved-2' });
+        await store.update('kept', { importance: 0.5 });
+
+        const byVector = await store.search({ scope: SCOPE_A, embedding: [1, 0, 0], topK: 5 });
+        expect(ids(byVector)).toEqual(['kept']);
+        const byText = await store.search({ scope: SCOPE_A, text: 'Ankara', topK: 5 });
+        expect(byText[0]?.record.id).toBe('moved');
+        expect((await store.get('moved'))?.embeddingModelId).toBeUndefined();
       });
     });
 

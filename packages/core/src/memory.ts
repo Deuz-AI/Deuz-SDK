@@ -22,7 +22,7 @@ import type { EmbeddingModel } from './types/model';
 import type { Embedder as RagEmbedder } from './rag';
 import { InvalidRequestError } from './errors';
 import { embedMany } from './inference/embed';
-import { cosineSimilarity } from './internal/vector';
+import { vectorHits, withoutStaleVector } from './internal/memory-vectors';
 
 // ===================================================================
 // Canonical record (superset of mem0 + Letta + Graphiti + Obsidian; the extra
@@ -82,6 +82,29 @@ export interface MemoryQuery {
   /** Bi-temporal point-in-time query. */
   asOf?: number;
   filter?: Record<string, unknown>;
+  /**
+   * The embedding model `embedding` came from (2.4): a stored vector pinned to
+   * another model (`MemoryRecord.embeddingModelId`) stays out of the vector
+   * ranking, as one of another length always does. `recall` fills it in from
+   * the embedder's answer; without it only the lengths are compared.
+   */
+  embeddingModelId?: string;
+  /**
+   * Called at most once per search (2.4) when stored vectors of another length
+   * or model were left out of the vector ranking. Those records are still
+   * found by text. `recall` turns it into one `embedding-mismatch` warning.
+   */
+  onEmbeddingMismatch?: (mismatch: MemoryEmbeddingMismatch) => void;
+}
+
+/** What a search left out of its vector ranking (2.4); see `MemoryQuery.onEmbeddingMismatch`. */
+export interface MemoryEmbeddingMismatch {
+  /** Records whose stored vector has another length or embedding model than the query's. */
+  records: number;
+  /** The query vector's length. */
+  dims: number;
+  /** The query vector's model, when the query named one. */
+  modelId?: string;
 }
 
 export interface MemoryHit {
@@ -1187,10 +1210,14 @@ export function createInMemoryMemoryStore(): MemoryStore {
       );
       let scored: MemoryHit[];
       if (query.embedding) {
-        scored = candidates.map((r) => ({
-          record: r,
-          score: r.embedding ? cosineSimilarity(query.embedding!, r.embedding) : 0,
-        }));
+        // 2.4: only comparable vectors are ranked; the rest are found by text or not at all.
+        const needle = query.text?.toLowerCase() ?? '';
+        scored = vectorHits(
+          candidates,
+          query,
+          (r) => r.embedding,
+          (r) => r.text.toLowerCase().includes(needle),
+        );
       } else if (query.text) {
         const q = query.text.toLowerCase();
         scored = candidates.map((r) => ({
@@ -1221,7 +1248,8 @@ export function createInMemoryMemoryStore(): MemoryStore {
     },
     async update(id, patch) {
       const r = records.get(id);
-      if (r) records.set(id, { ...r, ...patch });
+      // H6 (2.4): a new text without a new embedding leaves no stale vector behind.
+      if (r) records.set(id, { ...withoutStaleVector(r, patch), ...patch });
     },
     async findByHash(hashes, scope) {
       // Soft-deleted records are invisible here for the same reason they are in
