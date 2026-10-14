@@ -217,9 +217,6 @@ describe('2.4 Node stores on their entries', () => {
     expectStub('createPostgresConditionalChatStore', () =>
       storesPostgres.createPostgresConditionalChatStore(any),
     );
-    expectStub('createRedisDurableStreamStateStore', () =>
-      storesRedis.createRedisDurableStreamStateStore(any),
-    );
     expectStub('createSqliteAgentRunStoreV3', () => opsSqlite.createSqliteAgentRunStoreV3(any));
     expectStub('createPostgresAgentRunStoreV3', () =>
       opsPostgres.createPostgresAgentRunStoreV3(any),
@@ -236,6 +233,9 @@ describe('2.4 Node stores on their entries', () => {
     });
     expect(postgres.durable).toBe(true);
     await postgres.close();
+    const redis = storesRedis.createRedisDurableStreamStateStore({ url: 'redis://127.0.0.1:1' });
+    expect(redis.durable).toBe(true);
+    await redis.close();
   });
 
   it('keep the existing entry factories exported as before', () => {
