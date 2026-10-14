@@ -762,3 +762,7 @@ export function createRedisStores(options: RedisStoreOptions): RedisStores {
     close: connection.close,
   };
 }
+
+// 2.4 stores on this entry: their own modules and tables (W0 skeleton; W1 lanes
+// implement them in place, never in this file).
+export * from './stream-state-redis';

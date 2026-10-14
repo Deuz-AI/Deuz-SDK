@@ -380,3 +380,7 @@ export function createPostgresOpsStore(options: PostgresOpsStoreOptions): Postgr
 
   return { leases, agentRuns, claims };
 }
+
+// 2.4 stores on this entry: their own modules and tables (W0 skeleton; W1 lanes
+// implement them in place, never in this file).
+export * from './runs-v3-postgres';

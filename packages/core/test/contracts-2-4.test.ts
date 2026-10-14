@@ -17,6 +17,17 @@ import { createTokenEstimator } from '../src/internal/estimate-tokens';
 import * as goalRuntime from '../src/goal/runtime';
 import { agentRunLeaseKey } from '../src/ops';
 import * as learning from '../src/skills/learning';
+import * as docker from '../src/compute/docker';
+import * as storesSqlite from '../src/node/store-sqlite';
+import * as storesPostgres from '../src/node/store-postgres';
+import * as storesRedis from '../src/node/store-redis';
+import * as opsSqlite from '../src/node/ops-sqlite';
+import * as opsPostgres from '../src/node/ops-postgres';
+import * as vmemSqlite from '../src/node/vmem-sqlite';
+import * as vmemPostgres from '../src/node/vmem-postgres';
+import * as goalRuntimeSqlite from '../src/node/goal-runtime-sqlite';
+import * as goalRuntimePostgres from '../src/node/goal-runtime-postgres';
+import { createInMemoryAgentRunStoreV3 } from '../src/agent-run-v3-store';
 
 function expectStub(name: string, call: () => unknown): void {
   let thrown: unknown;
@@ -170,5 +181,80 @@ describe('/skills/learning skeleton', () => {
     const error = new learning.SkillLearningError('source_too_large', 'too large');
     expect(errors.isDeuzError(error)).toBe(true);
     expect(error.code).toBe('source_too_large');
+  });
+});
+
+describe('/compute/docker skeleton (Node-only)', () => {
+  it('publishes the sandbox, runner and operation stores as stubs', () => {
+    expectStub('createDockerSandbox', () => docker.createDockerSandbox(any));
+    expectStub('createDockerProcessRunner', () => docker.createDockerProcessRunner(any));
+    expectStub('createInMemoryProcessOperationStore', () =>
+      docker.createInMemoryProcessOperationStore(),
+    );
+    expectStub('createSqliteProcessOperationStore', () =>
+      docker.createSqliteProcessOperationStore(any),
+    );
+    expect(docker.OperationConflictError).toBe(errors.OperationConflictError);
+  });
+
+  it('pins the isolation and size defaults of spec §3.3', () => {
+    expect(docker.DEFAULT_DOCKER_SANDBOX).toMatchObject({
+      user: '10001:10001',
+      network: 'none',
+      cpus: 1,
+      memoryBytes: 536_870_912,
+      pids: 128,
+      maxStagingBytes: 268_435_456,
+      maxArtifactBytes: 67_108_864,
+      cancelGraceMs: 2_000,
+    });
+  });
+});
+
+describe('2.4 Node stores on their entries', () => {
+  it('reach the existing /stores and /ops entries through appended exports', () => {
+    expectStub('createSqliteConditionalChatStore', () =>
+      storesSqlite.createSqliteConditionalChatStore(any),
+    );
+    expectStub('createSqliteDurableStreamStateStore', () =>
+      storesSqlite.createSqliteDurableStreamStateStore(any),
+    );
+    expectStub('createPostgresConditionalChatStore', () =>
+      storesPostgres.createPostgresConditionalChatStore(any),
+    );
+    expectStub('createPostgresDurableStreamStateStore', () =>
+      storesPostgres.createPostgresDurableStreamStateStore(any),
+    );
+    expectStub('createRedisDurableStreamStateStore', () =>
+      storesRedis.createRedisDurableStreamStateStore(any),
+    );
+    expectStub('createSqliteAgentRunStoreV3', () => opsSqlite.createSqliteAgentRunStoreV3(any));
+    expectStub('createPostgresAgentRunStoreV3', () =>
+      opsPostgres.createPostgresAgentRunStoreV3(any),
+    );
+    expectStub('createInMemoryAgentRunStoreV3', () => createInMemoryAgentRunStoreV3());
+  });
+
+  it('keep the existing entry factories exported as before', () => {
+    expect(typeof storesSqlite.createSqliteStores).toBe('function');
+    expect(typeof storesPostgres.createPostgresStores).toBe('function');
+    expect(typeof storesRedis.createRedisStores).toBe('function');
+    expect(typeof opsSqlite.createSqliteOpsStore).toBe('function');
+    expect(typeof opsPostgres.createPostgresOpsStore).toBe('function');
+  });
+
+  it('publish the versioned memory and goal runtime stores on their own subpaths', () => {
+    expectStub('createSqliteVersionedMemoryStore', () =>
+      vmemSqlite.createSqliteVersionedMemoryStore(any),
+    );
+    expectStub('createPostgresVersionedMemoryStore', () =>
+      vmemPostgres.createPostgresVersionedMemoryStore(any),
+    );
+    expectStub('createSqliteGoalRuntimeStore', () =>
+      goalRuntimeSqlite.createSqliteGoalRuntimeStore(any),
+    );
+    expectStub('createPostgresGoalRuntimeStore', () =>
+      goalRuntimePostgres.createPostgresGoalRuntimeStore(any),
+    );
   });
 });
