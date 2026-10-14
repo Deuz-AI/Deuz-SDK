@@ -7,14 +7,8 @@
  * The legacy `@deuz-sdk/core/memory` seam is unchanged. Edge-safe; the SQLite
  * and PostgreSQL stores live at `/memory/versioned/sqlite` and `/postgres`.
  */
-import type { AgentToolSet } from '../../types/agent-run';
 import { notImplemented } from '../../internal/not-implemented';
-import type {
-  ImportLegacyMemoryOptions,
-  ImportLegacyMemoryResult,
-  MemorySession,
-  VersionedMemoryToolsOptions,
-} from './types';
+import type { ImportLegacyMemoryOptions, ImportLegacyMemoryResult } from './types';
 
 export type * from './types';
 export type {
@@ -34,20 +28,7 @@ export {
 export { defineAccountedMemoryLLM, isAccounted } from '../../internal/accounting';
 export { createInMemoryVersionedMemoryStore } from './store';
 export { createMemorySession } from './session';
-
-/**
- * The model's memory tools, bound to `session`'s scope (2.4): remember,
- * recall, revise and retract by default (never forget). Every write is
- * `'inferred'`, and a tool can never change a record's scope, origin or
- * source kinds; its operation id derives from the model step and tool call
- * id, so a replayed call never applies twice.
- */
-export function createVersionedMemoryTools(
-  _session: MemorySession,
-  _options?: VersionedMemoryToolsOptions,
-): AgentToolSet {
-  return notImplemented('createVersionedMemoryTools');
-}
+export { createVersionedMemoryTools } from './tools';
 
 /**
  * Imports a legacy `MemoryStore` scope into a versioned store (2.4): each
