@@ -12,12 +12,16 @@
  *
  * Edge-safe.
  */
-import { RevisionConflictError } from './errors';
+import { RevisionConflictError, UnsupportedStoreError } from './errors';
 import { isSha256Digest, type Sha256Digest } from './internal/digest';
 import { summarizeAgentRun } from './internal/agent-run-list';
 import { decodeSwarm, encodeSwarm } from './swarm/store';
 import type { AgentRunSummary } from './types/agent-run';
-import type { AgentRunEnvelopeV3, AgentRunMemoryIntentV3 } from './types/agent-run-v3';
+import type {
+  AgentRunEnvelopeV3,
+  AgentRunMemoryIntentV3,
+  AgentRunStoreV3,
+} from './types/agent-run-v3';
 
 const PHASES: readonly string[] = ['running', 'finalizing', 'terminal'];
 const INTENT_STATUSES: readonly AgentRunMemoryIntentV3['status'][] = [
@@ -197,4 +201,65 @@ export function agentRunV3BlobDigests(envelope: AgentRunEnvelopeV3): Sha256Diges
   const last = envelope.context?.compiler?.lastPackage;
   if (last) digests.add(last.digest);
   return [...digests];
+}
+
+/**
+ * Where a run store keeps its runs, when that decides what it may hold: the
+ * Redis ops store sets `'redis'` on its `agentRuns`. Registered with
+ * `Symbol.for`, so a second copy of the SDK in one process reads the same
+ * brand. Not enumerable, so it never reaches a spread or JSON.
+ */
+export const AGENT_RUN_STORE_BACKEND: unique symbol = Symbol.for(
+  '@deuz-sdk/core/AgentRunStoreBackend',
+);
+
+/** Brands `store` with the backend it runs on (idempotent) and returns it. */
+export function markAgentRunStoreBackend<S extends object>(store: S, backend: string): S {
+  Object.defineProperty(store, AGENT_RUN_STORE_BACKEND, {
+    value: backend,
+    enumerable: false,
+    configurable: true,
+    writable: false,
+  });
+  return store;
+}
+
+const STORE_V3_METHODS = [
+  'load',
+  'save',
+  'list',
+  'putBlob',
+  'getBlob',
+  'redactForgotten',
+  'prune',
+] as const;
+
+/**
+ * The configuration-time check of a `checkpointVersion: 3` session (spec
+ * §4.1), before anything is read or written: a Redis run store is refused
+ * with `UnsupportedStoreError` (2.4 has no Redis V3 store), any other store
+ * that is not an `AgentRunStoreV3` (a 2.3 `AgentRunStore`) with a TypeError.
+ */
+export function assertAgentRunStoreV3(store: unknown): asserts store is AgentRunStoreV3 {
+  const record =
+    store !== null && (typeof store === 'object' || typeof store === 'function')
+      ? (store as Record<string | symbol, unknown>)
+      : undefined;
+  if (record?.[AGENT_RUN_STORE_BACKEND] === 'redis')
+    throw new UnsupportedStoreError({
+      backend: 'redis',
+      feature: 'agent-run-v3',
+      message:
+        'checkpointVersion 3 cannot run on a Redis AgentRunStore: Redis has no V3 run store in 2.4. ' +
+        'Use createInMemoryAgentRunStoreV3, createSqliteAgentRunStoreV3 or createPostgresAgentRunStoreV3.',
+    });
+  if (
+    record?.checkpointVersion !== 3 ||
+    STORE_V3_METHODS.some((method) => typeof record[method] !== 'function')
+  )
+    throw new TypeError(
+      'checkpointVersion 3 needs an AgentRunStoreV3 (createInMemoryAgentRunStoreV3, ' +
+        'createSqliteAgentRunStoreV3 or createPostgresAgentRunStoreV3): a 2.3 AgentRunStore keeps ' +
+        'version 1 and 2 runs only.',
+    );
 }

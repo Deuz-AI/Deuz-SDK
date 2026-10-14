@@ -6,19 +6,25 @@
  */
 import { describe, expect, it } from 'vitest';
 import {
+  AGENT_RUN_STORE_BACKEND,
   assertAgentRunEnvelopeV3,
+  assertAgentRunStoreV3,
   assertEnvelopeRevisionV3,
+  markAgentRunStoreBackend,
   decodeAgentRunEnvelopeV3,
   encodeAgentRunEnvelopeV3,
   isAgentRunEnvelopeV3,
 } from '../src/agent-run-v3';
-import { reconcileAgentRun, resumeAgent } from '../src/agent-run';
-import { RevisionConflictError } from '../src/errors';
+import { createInMemoryAgentRunStore, reconcileAgentRun, resumeAgent } from '../src/agent-run';
+import { RevisionConflictError, UnsupportedStoreError } from '../src/errors';
+import { createRedisOpsStore } from '../src/node/ops-redis';
 import { attachConfig } from '../src/internal/config-symbol';
 import type { AgentRunEnvelope, AgentRunStore, AgentToolSet } from '../src/types/agent-run';
+import type { AgentRunStoreV3 } from '../src/types/agent-run-v3';
 import type { LanguageModel } from '../src/types/model';
 import { createWorkingMemoryFixture } from './fixtures/working-memory';
 import { contextPackage, envelopeV3 } from './fixtures/agent-run-v3';
+import { mockRedisServer } from './fixtures/redis-harness';
 
 describe('V3 envelope validation', () => {
   it('accepts a V3 envelope with context, working memory and memory intents', () => {
@@ -36,7 +42,7 @@ describe('V3 envelope validation', () => {
       },
       workingMemory: createWorkingMemoryFixture(),
       memoryIntents: [{ operationId: 'op-1', status: 'intended' }],
-      memory: { extraction: { status: 'partial', operationId: 'x', planned: 2 } as never },
+      memory: { extraction: { status: 'partial', operationId: 'x', planned: 2 } } as never,
     });
     expect(() => assertAgentRunEnvelopeV3(envelope)).not.toThrow();
     expect(isAgentRunEnvelopeV3(envelope)).toBe(true);
@@ -255,5 +261,66 @@ describe('a 2.3 reader and a V3 envelope', () => {
       reconcileAgentRun({ session: { store, runId: 'run-v3', scope: 'tenant' } }),
     ).rejects.toThrow(/version, identity, or scope mismatch/);
     expect(saves()).toBe(0);
+  });
+});
+
+/** A V3 store that is never called: the guard only reads its shape. */
+function shapeOfV3Store(): AgentRunStoreV3 {
+  const never = () => Promise.reject(new Error('not called'));
+  return {
+    checkpointVersion: 3,
+    load: never,
+    save: never,
+    list: never,
+    putBlob: never,
+    getBlob: never,
+    redactForgotten: never,
+    prune: never,
+  };
+}
+
+describe('which stores hold V3 runs', () => {
+  it('takes an AgentRunStoreV3', () => {
+    expect(() => assertAgentRunStoreV3(shapeOfV3Store())).not.toThrow();
+  });
+
+  it('refuses a 2.3 AgentRunStore, or a store missing a V3 method, with a TypeError', () => {
+    expect(() => assertAgentRunStoreV3(createInMemoryAgentRunStore())).toThrow(TypeError);
+    expect(() => assertAgentRunStoreV3(createInMemoryAgentRunStore())).toThrow(/AgentRunStoreV3/);
+    const partial = { ...shapeOfV3Store(), putBlob: undefined };
+    expect(() => assertAgentRunStoreV3(partial)).toThrow(TypeError);
+    for (const value of [undefined, null, 'store'])
+      expect(() => assertAgentRunStoreV3(value)).toThrow(TypeError);
+  });
+
+  it('refuses a Redis AgentRunStore with UnsupportedStoreError, a fatal configuration error', () => {
+    // The Redis ops store brands its run store (wiring in node/ops-redis.ts);
+    // marking it again here is idempotent.
+    const ops = createRedisOpsStore({ client: mockRedisServer().client });
+    const store = markAgentRunStoreBackend(ops.agentRuns, 'redis');
+    expect(store).toBe(ops.agentRuns);
+    let caught: unknown;
+    try {
+      assertAgentRunStoreV3(store);
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(UnsupportedStoreError);
+    expect(caught).toMatchObject({
+      code: 'unsupported_store',
+      backend: 'redis',
+      feature: 'agent-run-v3',
+      fatalExecution: true,
+    });
+    // Even a Redis store that claimed V3 is refused.
+    const claiming = markAgentRunStoreBackend(shapeOfV3Store(), 'redis');
+    expect(() => assertAgentRunStoreV3(claiming)).toThrow(UnsupportedStoreError);
+  });
+
+  it('keeps the backend brand out of the enumerable keys', () => {
+    const store = markAgentRunStoreBackend(shapeOfV3Store(), 'redis');
+    expect(Object.keys(store)).not.toContain(AGENT_RUN_STORE_BACKEND);
+    expect((store as unknown as Record<symbol, unknown>)[AGENT_RUN_STORE_BACKEND]).toBe('redis');
+    expect(AGENT_RUN_STORE_BACKEND).toBe(Symbol.for('@deuz-sdk/core/AgentRunStoreBackend'));
   });
 });
