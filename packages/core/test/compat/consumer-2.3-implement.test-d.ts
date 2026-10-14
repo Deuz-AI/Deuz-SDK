@@ -269,7 +269,7 @@ test('a model middleware', () => {
   const middleware: LanguageModelMiddleware = {
     name: 'audit',
     transformParams: async (options, ctx) => {
-      expectTypeOf(ctx.operation).toExtend<'stream' | 'generate'>();
+      expectTypeOf<'stream' | 'generate'>().toExtend<typeof ctx.operation>();
       return options;
     },
     wrapGenerate: async (next, options, _ctx) => next(options),

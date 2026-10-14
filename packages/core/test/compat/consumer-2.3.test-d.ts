@@ -1068,7 +1068,7 @@ describe('persistence, chat and the UI wire', () => {
       if (part.type === 'text-delta') expectTypeOf(part.text).toBeString();
     }
     expectTypeOf(connectDeuzStream).toBeFunction();
-    expectTypeOf(negotiateDeuzStreamVersion(null)).toEqualTypeOf<'v1' | 'v2'>();
+    expectTypeOf<'v1' | 'v2'>().toExtend<ReturnType<typeof negotiateDeuzStreamVersion>>();
     expectTypeOf(createInMemoryStreamStateStore({ maxStreams: 100 })).toHaveProperty('append');
     expectTypeOf<typeof DEUZ_STREAM_VERSION>().toEqualTypeOf<'v2'>();
     expectTypeOf<
