@@ -565,6 +565,17 @@ export interface CreateMemorySessionOptions {
   onForget?: MemoryForgetListener | readonly MemoryForgetListener[];
   /** Charges embeddings and LLM calls to this context's ledger (accounted or unaccounted). */
   execution?: NativeExecutionContext;
+  /**
+   * The memory LLM's model id, named on its ledger reservations so prices and
+   * `allowedModels` apply to it (2.4). Default `'memory-llm'`.
+   */
+  llmModelId?: string;
+  /**
+   * The embedder's model id for ledger reservations before any generation
+   * names one (2.4). Default: the active generation's model, else
+   * `'memory-embedder'`.
+   */
+  embedderModelId?: string;
   /** Clock, ids, logger, observer (`deuz.memory.op` spans). */
   deps?: Dependencies;
 }

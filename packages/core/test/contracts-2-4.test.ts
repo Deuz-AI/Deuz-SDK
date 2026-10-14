@@ -53,13 +53,12 @@ async function expectAsyncStub(name: string, call: () => Promise<unknown>): Prom
 const any = {} as never;
 
 describe('/memory/versioned skeleton', () => {
-  it('publishes the session, tools, in-memory store and import helper as stubs', async () => {
-    expectStub('createMemorySession', () => versioned.createMemorySession(any));
-    expectStub('createVersionedMemoryTools', () => versioned.createVersionedMemoryTools(any));
-    expectStub('createInMemoryVersionedMemoryStore', () =>
-      versioned.createInMemoryVersionedMemoryStore(),
-    );
-    await expectAsyncStub('importLegacyMemory', () => versioned.importLegacyMemory(any));
+  it('publishes the session, tools, in-memory store and import helper (implemented by L1a)', async () => {
+    const store = versioned.createInMemoryVersionedMemoryStore();
+    const session = versioned.createMemorySession({ store, scope: { userId: 'u' } });
+    expect(Object.keys(versioned.createVersionedMemoryTools(session))).toContain('memory_recall');
+    const error = await versioned.importLegacyMemory(any).catch((reason: unknown) => reason);
+    expect(error).not.toBeInstanceOf(NotImplementedError);
   });
 
   it('re-exports the shared conflict and mismatch errors', () => {
