@@ -738,3 +738,214 @@ describe('forget', () => {
     ).toBe('committed');
   });
 });
+
+describe('embedding generations', () => {
+  it('prepares a new generation aside and switches atomically once complete', async () => {
+    const { store } = setup();
+    await committed(
+      store,
+      await op('op-1', [
+        await embedded('b', 'bravo', [1, 0]),
+        await embedded('a', 'alpha', [0, 1]),
+        await create('c', 'charlie'),
+      ]),
+    );
+    await committed(store, await op('op-2', [await create('z', 'zulu')], { scope: OTHER }));
+    await committed(store, await op('op-3', [{ type: 'retract', id: 'c', expectedRevision: 1 }]));
+
+    const next = await store.embeddings.begin({ modelId: 'emb-2', dims: 3 });
+    expect(next).toMatchObject({ generation: 2, modelId: 'emb-2', dims: 3, status: 'pending' });
+    expect(await store.embeddings.begin({ modelId: 'emb-2', dims: 3 })).toEqual(next);
+    expect((await store.embeddings.active())!.generation).toBe(1);
+
+    const firstPage = await store.embeddings.pending(2, { limit: 2 });
+    expect(firstPage).toEqual([
+      { id: 'a', revision: 1, scope: USER, text: 'alpha', textDigest: await sha256Digest('alpha') },
+      { id: 'b', revision: 1, scope: USER, text: 'bravo', textDigest: await sha256Digest('bravo') },
+    ]);
+    const secondPage = await store.embeddings.pending(2, { limit: 10, after: 'b' });
+    expect(secondPage.map((item) => [item.id, item.revision, item.scope])).toEqual([
+      ['c', 2, USER],
+      ['z', 1, OTHER],
+    ]);
+
+    expect(
+      await store.embeddings.put(
+        2,
+        firstPage.map((item, index) => ({
+          id: item.id,
+          revision: item.revision,
+          textDigest: item.textDigest,
+          vector: [index, 1, 0],
+        })),
+      ),
+    ).toBe(2);
+    expect(await store.embeddings.activate(2)).toBe(false);
+    // Search keeps the old generation meanwhile.
+    const old = await store.search({
+      scope: USER,
+      embedding: { vector: [1, 0], modelId: 'emb-1' },
+    });
+    expect(old.map((hit) => hit.record.id)).toEqual(['b', 'a']);
+    await expect(
+      store.search({ scope: USER, embedding: { vector: [1, 0, 0], modelId: 'emb-2' } }),
+    ).rejects.toBeInstanceOf(EmbeddingMismatchError);
+
+    await store.embeddings.put(
+      2,
+      secondPage.map((item) => ({
+        id: item.id,
+        revision: item.revision,
+        textDigest: item.textDigest,
+        vector: [0, 0, 1],
+      })),
+    );
+    expect(await store.embeddings.pending(2, { limit: 10 })).toEqual([]);
+    expect(await store.embeddings.activate(2)).toBe(true);
+    expect(await store.embeddings.active()).toMatchObject({ generation: 2, status: 'active' });
+    expect(await store.embeddings.activate(2)).toBe(true);
+    const switched = await store.search({
+      scope: USER,
+      embedding: { vector: [0, 1, 0], modelId: 'emb-2' },
+      includeRetracted: true,
+    });
+    expect(switched.map((hit) => hit.record.id).sort()).toEqual(['a', 'b', 'c']);
+    expect(switched[0]!.record.embedding).toMatchObject({
+      generation: 2,
+      modelId: 'emb-2',
+      dims: 3,
+    });
+    await expect(
+      store.search({ scope: USER, embedding: { vector: [1, 0], modelId: 'emb-1' } }),
+    ).rejects.toBeInstanceOf(EmbeddingMismatchError);
+  });
+
+  it('skips a vector whose revision moved and lists the new revision instead', async () => {
+    const { store } = setup();
+    await committed(store, await op('op-1', [await embedded('a', 'alpha', [1, 0])]));
+    const { generation } = await store.embeddings.begin({ modelId: 'emb-2', dims: 2 });
+    const [item] = await store.embeddings.pending(generation, { limit: 10 });
+    await committed(
+      store,
+      await op('op-2', [
+        {
+          type: 'revise',
+          id: 'a',
+          expectedRevision: 1,
+          changes: { text: 'alpha two' },
+          embedding: {
+            vector: [1, 0],
+            modelId: 'emb-1',
+            textDigest: await sha256Digest('alpha two'),
+          },
+        },
+      ]),
+    );
+    const stale = [{ id: 'a', revision: 1, textDigest: item!.textDigest, vector: [0, 1] }];
+    expect(await store.embeddings.put(generation, stale)).toBe(0);
+    const wrongText = [{ id: 'a', revision: 2, textDigest: item!.textDigest, vector: [0, 1] }];
+    expect(await store.embeddings.put(generation, wrongText)).toBe(0);
+    expect(await store.embeddings.activate(generation)).toBe(false);
+    const [fresh] = await store.embeddings.pending(generation, { limit: 10 });
+    expect(fresh).toMatchObject({ id: 'a', revision: 2, text: 'alpha two' });
+    await expect(
+      store.embeddings.put(generation, [{ ...fresh!, vector: [0, 1, 0] }]),
+    ).rejects.toBeInstanceOf(EmbeddingMismatchError);
+    expect(await store.embeddings.put(generation, [{ ...fresh!, vector: [0, 1] }])).toBe(1);
+    // A metadata-only revise keeps the text, so its prepared vector carries over.
+    await committed(
+      store,
+      await op('op-3', [
+        { type: 'revise', id: 'a', expectedRevision: 2, changes: { importance: 1 } },
+      ]),
+    );
+    expect(await store.embeddings.pending(generation, { limit: 10 })).toEqual([]);
+    expect(await store.embeddings.activate(generation)).toBe(true);
+    expect((await store.get(USER, 'a'))!.embedding).toMatchObject({ generation, revision: 3 });
+  });
+
+  it('starts from nothing: begin, fill and activate a first generation', async () => {
+    const { store } = setup();
+    expect(await store.embeddings.active()).toBeUndefined();
+    await committed(store, await op('op-1', [await create('a', 'alpha')]));
+    const first = await store.embeddings.begin({ modelId: 'emb-1', dims: 2 });
+    expect(first).toMatchObject({ generation: 1, status: 'pending' });
+    // Another model replaces the pending generation.
+    const second = await store.embeddings.begin({ modelId: 'emb-9', dims: 2 });
+    expect(second.generation).toBe(2);
+    expect(await store.embeddings.pending(1, { limit: 10 })).toEqual([]);
+    expect(await store.embeddings.activate(1)).toBe(false);
+    const [item] = await store.embeddings.pending(2, { limit: 10 });
+    await store.embeddings.put(2, [{ ...item!, vector: [1, 1] }]);
+    expect(await store.embeddings.activate(2)).toBe(true);
+    expect(await store.embeddings.active()).toMatchObject({ generation: 2, modelId: 'emb-9' });
+  });
+});
+
+describe('retention', () => {
+  it('pruneHistory deletes past revisions of retracted or expired records only', async () => {
+    const { store, tick } = setup();
+    await committed(
+      store,
+      await op('op-1', [
+        await create('gone', 'v1'),
+        await create('live', 'v1'),
+        await create('ttl', 'v1', { expiresAt: 1_050 }),
+      ]),
+    );
+    tick(10);
+    const revise = (id: string, expectedRevision: number, text: string) => ({
+      type: 'revise' as const,
+      id,
+      expectedRevision,
+      changes: { text },
+    });
+    await committed(
+      store,
+      await op('op-2', [revise('gone', 1, 'v2'), revise('live', 1, 'v2'), revise('ttl', 1, 'v2')]),
+    );
+    tick(10);
+    await committed(
+      store,
+      await op('op-3', [{ type: 'retract', id: 'gone', expectedRevision: 2 }]),
+    );
+    tick(100);
+    expect(await store.pruneHistory({ olderThan: 1_015 })).toBe(3);
+    expect((await store.history(USER, 'gone')).map((record) => record.revision)).toEqual([3]);
+    expect((await store.history(USER, 'ttl')).map((record) => record.revision)).toEqual([2]);
+    expect((await store.history(USER, 'live')).map((record) => record.revision)).toEqual([1, 2]);
+    expect(await store.receipt('op-1')).toBeDefined();
+    expect(await store.pruneHistory({ olderThan: 5_000 })).toBe(0);
+  });
+
+  it('pruneHistory can be narrowed to one scope', async () => {
+    const { store, tick } = setup();
+    for (const scope of [USER, OTHER]) {
+      await committed(store, await op(`c-${scope.userId}`, [await create('r', 'v1')], { scope }));
+      await committed(
+        store,
+        await op(`x-${scope.userId}`, [{ type: 'retract', id: 'r', expectedRevision: 1 }], {
+          scope,
+        }),
+      );
+    }
+    tick(10);
+    expect(await store.pruneHistory({ olderThan: 2_000, scope: OTHER })).toBe(1);
+    expect(await store.history(USER, 'r')).toHaveLength(2);
+    expect(await store.history(OTHER, 'r')).toHaveLength(1);
+  });
+
+  it('pruneOperations deletes old receipts and warns that dedupe is lost for them', async () => {
+    const { store, tick, warnings } = setup();
+    const empty = await op('op-old', []);
+    await committed(store, empty);
+    tick(100);
+    await committed(store, await op('op-new', []));
+    expect(await store.pruneOperations({ olderThan: 1_050 })).toBe(1);
+    expect(await store.receipt('op-old')).toBeUndefined();
+    expect(await store.receipt('op-new')).toBeDefined();
+    expect(warnings.some((message) => /dedupe|applied again/i.test(message))).toBe(true);
+    // The pruned id is no longer protected: a redelivery is applied again.
+    expect((await store.commit(empty)).status).toBe('committed');
+  });
+});

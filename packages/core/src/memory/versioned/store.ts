@@ -6,7 +6,6 @@
  */
 import { EmbeddingMismatchError, OperationConflictError } from '../../errors';
 import { digestJson, isSha256Digest, type Sha256Digest } from '../../internal/digest';
-import { notImplemented } from '../../internal/not-implemented';
 import { resolveDependencies } from '../../internal/resolve-deps';
 import { cosineSimilarity, rankFuse } from '../../internal/vector';
 import type { Dependencies } from '../../types/deps';
@@ -29,6 +28,7 @@ import {
 } from './shared';
 import type {
   MemoryEmbeddingGeneration,
+  MemoryReembedItem,
   VersionedMemoryCommit,
   VersionedMemoryCommitResult,
   VersionedMemoryHit,
@@ -603,26 +603,193 @@ export function createInMemoryVersionedMemoryStore(options?: {
         const active = activeGeneration();
         return active ? copy(active) : undefined;
       },
-      async begin() {
-        return notImplemented('VersionedMemoryStore.embeddings.begin');
+      async begin(request) {
+        if (
+          request === null ||
+          typeof request !== 'object' ||
+          typeof request.modelId !== 'string' ||
+          request.modelId === '' ||
+          !Number.isSafeInteger(request.dims) ||
+          request.dims < 1
+        )
+          throw invalid('An embedding generation needs a modelId and a positive integer dims.');
+        return mutex.run(async () => {
+          const pending = generations.find((generation) => generation.status === 'pending');
+          if (pending && pending.modelId === request.modelId && pending.dims === request.dims)
+            return copy(pending);
+          // One generation is prepared at a time: another model replaces it.
+          if (pending) {
+            pending.status = 'retired';
+            vectors.delete(pending.generation);
+          }
+          const generation: MemoryEmbeddingGeneration = {
+            generation: generations.reduce((max, item) => Math.max(max, item.generation), 0) + 1,
+            modelId: request.modelId,
+            dims: request.dims,
+            status: 'pending',
+            createdAt: deps.clock.now(),
+          };
+          generations.push(generation);
+          return copy(generation);
+        });
       },
-      async pending() {
-        return notImplemented('VersionedMemoryStore.embeddings.pending');
+
+      async pending(generation, pendingOptions) {
+        const limit = pendingOptions?.limit;
+        if (!Number.isSafeInteger(limit) || limit < 1)
+          throw invalid('limit must be a positive integer.');
+        const after = pendingOptions.after;
+        const target = generations.find((item) => item.generation === generation);
+        if (!target || target.status === 'retired') return [];
+        const byKey = vectors.get(generation);
+        const items: { key: string; item: MemoryReembedItem }[] = [];
+        for (const [key, scopeRecords] of records)
+          for (const [id, history] of scopeRecords) {
+            if (after !== undefined && id <= after) continue;
+            const latest = history.at(-1)!;
+            if (byKey?.has(vectorKey(key, id, latest.record.revision))) continue;
+            items.push({
+              key,
+              item: {
+                id,
+                revision: latest.record.revision,
+                scope: copy(latest.record.scope),
+                text: latest.record.text,
+                textDigest: latest.textDigest,
+              },
+            });
+          }
+        return items
+          .sort((left, right) =>
+            left.item.id !== right.item.id
+              ? left.item.id < right.item.id
+                ? -1
+                : 1
+              : left.key < right.key
+                ? -1
+                : 1,
+          )
+          .slice(0, limit)
+          .map((entry) => entry.item);
       },
-      async put() {
-        return notImplemented('VersionedMemoryStore.embeddings.put');
+
+      async put(generation, items) {
+        if (!Array.isArray(items)) throw invalid('put needs an array of vectors.');
+        return mutex.run(async () => {
+          const target = generations.find((item) => item.generation === generation);
+          if (!target || target.status === 'retired') return 0;
+          for (const [index, item] of items.entries()) {
+            if (
+              item === null ||
+              typeof item !== 'object' ||
+              typeof item.id !== 'string' ||
+              !Number.isSafeInteger(item.revision) ||
+              !isSha256Digest(item.textDigest) ||
+              !Array.isArray(item.vector) ||
+              item.vector.some((value) => typeof value !== 'number' || !Number.isFinite(value))
+            )
+              throw invalid(
+                `Vector ${index} needs an id, a revision, a textDigest and finite numbers.`,
+              );
+            if (item.vector.length !== target.dims)
+              throw new EmbeddingMismatchError({
+                expected: { modelId: target.modelId, dims: target.dims, generation },
+                actual: { modelId: target.modelId, dims: item.vector.length },
+              });
+          }
+          let byKey = vectors.get(generation);
+          if (!byKey) vectors.set(generation, (byKey = new Map()));
+          let stored = 0;
+          for (const item of items) {
+            let matched = false;
+            for (const [key, scopeRecords] of records) {
+              const latest = scopeRecords.get(item.id)?.at(-1);
+              // Only the current revision of the same text: a moved record is embedded again.
+              if (
+                latest?.record.revision !== item.revision ||
+                latest.textDigest !== item.textDigest
+              )
+                continue;
+              byKey.set(vectorKey(key, item.id, item.revision), {
+                vector: [...item.vector],
+                textDigest: item.textDigest,
+              });
+              matched = true;
+            }
+            if (matched) stored++;
+          }
+          return stored;
+        });
       },
-      async activate() {
-        return notImplemented('VersionedMemoryStore.embeddings.activate');
+
+      async activate(generation) {
+        return mutex.run(async () => {
+          const target = generations.find((item) => item.generation === generation);
+          if (!target || target.status === 'retired') return false;
+          if (target.status === 'active') return true;
+          const byKey = vectors.get(generation);
+          for (const [key, scopeRecords] of records)
+            for (const [id, history] of scopeRecords)
+              if (!byKey?.has(vectorKey(key, id, history.at(-1)!.record.revision))) return false;
+          const previous = activeGeneration();
+          if (previous) {
+            previous.status = 'retired';
+            vectors.delete(previous.generation);
+          }
+          target.status = 'active';
+          return true;
+        });
       },
     },
 
-    async pruneHistory() {
-      return notImplemented('VersionedMemoryStore.pruneHistory');
+    async pruneHistory(pruneOptions) {
+      const olderThan = checkTime(pruneOptions?.olderThan, 'olderThan');
+      if (olderThan === undefined) throw invalid('pruneHistory needs olderThan.');
+      const only =
+        pruneOptions.scope === undefined ? undefined : scopeKey(checkScope(pruneOptions.scope));
+      return mutex.run(async () => {
+        const now = deps.clock.now();
+        let removed = 0;
+        for (const [key, scopeRecords] of records) {
+          if (only !== undefined && key !== only) continue;
+          for (const [id, history] of scopeRecords) {
+            const latest = history.at(-1)!.record;
+            const expired = latest.expiresAt !== undefined && latest.expiresAt <= now;
+            if (latest.status !== 'retracted' && !expired) continue;
+            const kept = history.filter(
+              (item, index) => index === history.length - 1 || item.record.recordedAt >= olderThan,
+            );
+            if (kept.length === history.length) continue;
+            for (const item of history) {
+              if (kept.includes(item)) continue;
+              for (const byKey of vectors.values())
+                byKey.delete(vectorKey(key, id, item.record.revision));
+            }
+            removed += history.length - kept.length;
+            scopeRecords.set(id, kept);
+          }
+        }
+        return removed;
+      });
     },
 
-    async pruneOperations() {
-      return notImplemented('VersionedMemoryStore.pruneOperations');
+    async pruneOperations(pruneOptions) {
+      const olderThan = checkTime(pruneOptions?.olderThan, 'olderThan');
+      if (olderThan === undefined) throw invalid('pruneOperations needs olderThan.');
+      return mutex.run(async () => {
+        let removed = 0;
+        for (const [operationId, receipt] of receipts)
+          if (receipt.committedAt < olderThan) {
+            receipts.delete(operationId);
+            removed++;
+          }
+        if (removed > 0)
+          deps.logger.warn(
+            `pruneOperations removed ${removed} versioned memory receipt(s): those operation ids lose their dedupe protection, and a redelivered operation with one of them is applied again.`,
+            { removed, olderThan },
+          );
+        return removed;
+      });
     },
 
     async close() {},
