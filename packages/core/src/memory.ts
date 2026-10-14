@@ -16,6 +16,8 @@ import type { Message } from './types/message';
 import type { Clock } from './types/deps';
 import type { Tool, ToolSet } from './types/tool';
 import type { CallWarning, EmbedManyOptions } from './types/methods';
+import type { AccountedMemoryEmbedder, AccountedMemoryLLMResult } from './types/accounting';
+import type { NativeExecutionContext } from './types/execution';
 import type { EmbeddingModel } from './types/model';
 // TYPE-ONLY on purpose: the bridge below adapts rag.ts's Embedder shape without
 // pulling a byte of `./rag` into the `./memory` bundle.
@@ -23,6 +25,14 @@ import type { Embedder as RagEmbedder } from './rag';
 import { InvalidRequestError } from './errors';
 import { embedMany } from './inference/embed';
 import { vectorHits, withoutStaleVector } from './internal/memory-vectors';
+
+export type {
+  AccountedMemoryEmbedder,
+  AccountedMemoryLLM,
+  AccountedMemoryLLMResult,
+} from './types/accounting';
+/** Mark a memory LLM that reports usage, and tell marked callbacks from unmarked ones (2.4). */
+export { defineAccountedMemoryLLM, isAccounted } from './internal/accounting';
 
 // ===================================================================
 // Canonical record (superset of mem0 + Letta + Graphiti + Obsidian; the extra
@@ -202,9 +212,30 @@ export interface MemoryScorer {
 
 export interface MemorySeams {
   store: MemoryStore;
-  /** Required only when a vector store's search needs an embedding and the query has none. */
-  embedder?: Embedder;
-  llm: MemoryLLM;
+  /**
+   * Required only when a vector store's search needs an embedding and the query has none.
+   * 2.4: an `AccountedMemoryEmbedder` (`accounted: true`, usage with the vectors) is accepted too.
+   */
+  embedder?: Embedder | AccountedMemoryEmbedder;
+  /**
+   * A plain `MemoryLLM`, or (2.4) an `AccountedMemoryLLM` that answers its
+   * text with the call's usage (`defineAccountedMemoryLLM`). One callable
+   * type rather than a union, so `MemorySeams['llm']` still types a plain
+   * callback, and a `vi.fn` of one, as in 2.3.
+   */
+  llm: {
+    (prompt: { system: string; user: string }): Promise<string | AccountedMemoryLLMResult>;
+    readonly accounted?: true;
+  };
+  /**
+   * Charge the memory LLM and embedder calls to this context's ledger (2.4).
+   * Each call is reserved first at a token estimate, so a budget can refuse
+   * it; an accounted callback then settles the usage it reports, and an
+   * unmarked one is counted as unaccounted (never free: its estimate stays
+   * held) with one `unaccounted-usage` warning. Without it nothing is
+   * charged, as in 2.3.
+   */
+  execution?: NativeExecutionContext;
   clock: Clock;
   generateId: () => string;
   /** Default: WebCrypto SHA-256 hex. */
@@ -651,6 +682,11 @@ export interface RememberOptions {
    * run and extraction that made it. An updated record's own metadata wins.
    */
   metadata?: Record<string, unknown>;
+  /**
+   * Where this pass's 2.4 warnings go (`embedding-mismatch`,
+   * `unaccounted-usage`). Default: one logger line per seams and warning.
+   */
+  onWarning?: (warning: CallWarning) => void;
 }
 
 /**
@@ -825,11 +861,13 @@ export async function remember(
   if (opts.customExtract) {
     facts = await opts.customExtract(messages);
   } else {
-    const text = await seams.llm(
+    const text = await askMemoryLLM(
+      seams,
       buildExtractionPrompt(messages, {
         customInstructions: opts.customInstructions,
         links: opts.links,
       }),
+      opts.onWarning,
     );
     facts = parseFacts(text);
   }
@@ -843,9 +881,11 @@ export async function remember(
   const embeddings = new Map<string, number[]>();
   let embeddingModelId: string | undefined;
   if (seams.embedder) {
-    const { vectors, model } = await seams.embedder.embed(
+    const { vectors, model } = await embedWith(
+      seams,
       facts.map((f) => f.text),
       'add',
+      opts.onWarning,
     );
     embeddingModelId = model;
     facts.forEach((f, i) => {
@@ -868,7 +908,7 @@ export async function remember(
         ? {
             embeddingModelId,
             onEmbeddingMismatch: (notice: MemoryEmbeddingMismatch) =>
-              warnEmbeddingMismatch(seams, notice),
+              warnEmbeddingMismatch(seams, notice, opts.onWarning),
           }
         : {}),
     });
@@ -878,10 +918,11 @@ export async function remember(
 
   // Decide ADD/UPDATE/DELETE/NOOP and reduce to mutations.
   const decisionPrompt = buildDecisionPrompt(existing, facts);
-  const decisionText = await seams.llm({
-    system: decisionPrompt.system,
-    user: decisionPrompt.user,
-  });
+  const decisionText = await askMemoryLLM(
+    seams,
+    { system: decisionPrompt.system, user: decisionPrompt.user },
+    opts.onWarning,
+  );
   const decided = parseDecision(decisionText, decisionPrompt.idMap);
   const events = await dedupeAddEvents(enrichAddEvents(decided, factByText), existing, {
     store: seams.store,
@@ -986,7 +1027,7 @@ async function resolveLink(
   return first && first.score > 0 ? first.record : null;
 }
 
-/** Logger lines already written, per seams object: "once per mismatch" without a run sink. */
+/** Logger lines already written, per seams object: "once per warning" without a run sink. */
 const loggedMismatches = new WeakMap<object, Set<string>>();
 
 /**
@@ -1012,7 +1053,20 @@ function warnEmbeddingMismatch(
   mismatch: MemoryEmbeddingMismatch,
   onWarning?: (warning: CallWarning) => void,
 ): void {
-  const warning = embeddingMismatchWarning(mismatch);
+  deliverWarning(seams, embeddingMismatchWarning(mismatch), onWarning, {
+    records: mismatch.records,
+    dims: mismatch.dims,
+    ...(mismatch.modelId !== undefined ? { modelId: mismatch.modelId } : {}),
+  });
+}
+
+/** A 2.4 memory warning: to `onWarning` when given, else one logger line per seams and text. */
+function deliverWarning(
+  seams: MemorySeams,
+  warning: CallWarning,
+  onWarning: ((warning: CallWarning) => void) | undefined,
+  fields: Record<string, unknown> = {},
+): void {
   if (onWarning) {
     onWarning(warning);
     return;
@@ -1022,11 +1076,65 @@ function warnEmbeddingMismatch(
   if (!seen) loggedMismatches.set(seams, (seen = new Set()));
   if (seen.has(warning.message)) return;
   seen.add(warning.message);
-  seams.logger.warn(warning.message, {
-    warning: warning.type,
-    records: mismatch.records,
-    dims: mismatch.dims,
-    ...(mismatch.modelId !== undefined ? { modelId: mismatch.modelId } : {}),
+  seams.logger.warn(warning.message, { warning: warning.type, ...fields });
+}
+
+/**
+ * One memory LLM call (2.4): a plain callback answers text, an accounted one
+ * `{ text, usage, modelId }`. With `seams.execution` the call is charged to
+ * its ledger first (`internal/memory-accounting.ts`, loaded only then).
+ */
+async function askMemoryLLM(
+  seams: MemorySeams,
+  prompt: { system: string; user: string },
+  onWarning?: (warning: CallWarning) => void,
+): Promise<string> {
+  const llm = seams.llm;
+  const execution = seams.execution;
+  let answer: string | AccountedMemoryLLMResult;
+  if (!execution) answer = await llm(prompt);
+  else {
+    const { chargeMemoryCall } = await import('./internal/memory-accounting');
+    answer = await chargeMemoryCall<string | AccountedMemoryLLMResult>({
+      execution,
+      requestId: `memory:${seams.generateId()}`,
+      kind: 'memory-llm',
+      callback: llm,
+      input: [prompt.system, prompt.user],
+      now: seams.clock.now(),
+      run: () => llm(prompt),
+      usageOf: (result) => (typeof result === 'string' ? undefined : result),
+      warn: (warning) => deliverWarning(seams, warning, onWarning),
+    });
+  }
+  return typeof answer === 'string' ? answer : answer.text;
+}
+
+/** One embedder call (2.4), charged like {@link askMemoryLLM} when `seams.execution` is set. */
+async function embedWith(
+  seams: MemorySeams,
+  texts: string[],
+  action: 'add' | 'search' | 'update',
+  onWarning?: (warning: CallWarning) => void,
+): Promise<{ vectors: number[][]; model: string }> {
+  const embedder = seams.embedder!;
+  const execution = seams.execution;
+  if (!execution) return embedder.embed(texts, action);
+  const { chargeMemoryCall } = await import('./internal/memory-accounting');
+  type Answer = Awaited<ReturnType<typeof embedder.embed>>;
+  return chargeMemoryCall<Answer>({
+    execution,
+    requestId: `memory:${seams.generateId()}`,
+    kind: 'memory-embedding',
+    callback: embedder,
+    input: texts,
+    now: seams.clock.now(),
+    run: () => embedder.embed(texts, action),
+    usageOf: (result) =>
+      'usage' in result && result.usage
+        ? { usage: result.usage, modelId: result.modelId }
+        : undefined,
+    warn: (warning) => deliverWarning(seams, warning, onWarning),
   });
 }
 
@@ -1063,7 +1171,7 @@ export async function recall(
   assertScope(query.scope);
   let q = query;
   if (q.text && !q.embedding && seams.embedder) {
-    const { vectors, model } = await seams.embedder.embed([q.text], 'search');
+    const { vectors, model } = await embedWith(seams, [q.text], 'search', opts.onWarning);
     // 2.4: the query names the embedder's model, so a store can leave records
     // embedded by another model out of the vector ranking.
     if (vectors[0])
