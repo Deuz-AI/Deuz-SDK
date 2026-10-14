@@ -17,6 +17,7 @@ import {
 } from '../src/node/sqlite-handle';
 import { createSqliteOpsStore } from '../src/node/ops-sqlite';
 import { createSqliteStores, type SqliteDatabaseLike } from '../src/node/store-sqlite';
+import { envelope } from './fixtures/agent-run-store-conformance';
 import { SLOW_TEST_TIMEOUT_MS } from './fixtures/timeouts';
 
 let DatabaseSync: (new (path: string) => SqliteDatabaseLike) | undefined;
@@ -119,6 +120,15 @@ describe.skipIf(!DatabaseSync)('sqliteTransaction', () => {
         throw failure;
       }),
     ).toThrow(failure);
+  });
+
+  it('lets the ops store report why a transaction failed when its ROLLBACK fails too', async () => {
+    const { db } = recording(memory(), /^ROLLBACK$/);
+    const ops = createSqliteOpsStore({ path: ':memory:', database: db });
+    await ops.agentRuns.save(envelope('r', undefined));
+    await expect(ops.agentRuns.save(envelope('r', 5))).rejects.toThrow(
+      'Agent run revision conflict for r: expected 1, got 5',
+    );
   });
 });
 
