@@ -156,6 +156,12 @@ export interface BudgetAggregate {
    * it, keeps failing closed.
    */
   readonly unpricedUsd?: number;
+  /**
+   * Folded attempts through callbacks that reported no usage (2.4), still
+   * counted in `BudgetTotals.unaccounted`. Omitted when zero; a 2.3 reader
+   * drops it and keeps the held estimates.
+   */
+  readonly unaccounted?: number;
 }
 
 /** What one `compact` call changed (2.2). */
