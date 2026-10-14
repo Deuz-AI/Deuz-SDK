@@ -375,21 +375,39 @@ describe('commit', () => {
     expect(await store.scopeRevision(USER)).toBe(0);
   });
 
-  it('keeps scopes apart: same id in two scopes, reads never cross', async () => {
+  it('keeps scopes apart: reads match the scope exactly, ids are unique store-wide', async () => {
     const { store } = setup();
     await committed(store, await op('op-1', [await create('r1', 'u1 fact')]));
-    await committed(store, await op('op-2', [await create('r1', 'u2 fact')], { scope: OTHER }));
+    await committed(store, await op('op-2', [await create('r2', 'u2 fact')], { scope: OTHER }));
     expect((await store.get(USER, 'r1'))!.text).toBe('u1 fact');
-    expect((await store.get(OTHER, 'r1'))!.text).toBe('u2 fact');
+    expect(await store.get(OTHER, 'r1')).toBeUndefined();
+    expect(await store.get(USER, 'r2')).toBeUndefined();
     expect(await store.get({ userId: 'u1', chatId: 'c1' }, 'r1')).toBeUndefined();
+    expect(await store.history(OTHER, 'r1')).toEqual([]);
     expect(await store.scopeRevision(USER)).toBe(1);
     expect(await store.scopeRevision(OTHER)).toBe(1);
-    expect(await store.history(OTHER, 'r1')).toHaveLength(1);
-    // Field order does not change the scope's identity.
+    // Another scope can neither take the id nor learn its revision.
     expect(
-      (await store.get({ chatId: 'c', userId: 'u3' }, 'x')) ===
-        (await store.get({ userId: 'u3', chatId: 'c' }, 'x')),
-    ).toBe(true);
+      await store.commit(await op('op-3', [await create('r1', 'x')], { scope: OTHER })),
+    ).toEqual({
+      status: 'conflict',
+      scopeRevision: 1,
+      conflicts: [{ id: 'r1', expectedRevision: 0 }],
+    });
+    expect(
+      await store.commit(
+        await op('op-4', [{ type: 'retract', id: 'r1', expectedRevision: 1 }], { scope: OTHER }),
+      ),
+    ).toMatchObject({ status: 'conflict', conflicts: [{ id: 'r1', expectedRevision: 1 }] });
+    expect((await store.get(USER, 'r1'))!.revision).toBe(1);
+    // Field order does not change the scope's identity.
+    await committed(
+      store,
+      await op('op-5', [await create('r3', 'chat fact')], { scope: { chatId: 'c', userId: 'u3' } }),
+    );
+    expect(await store.get({ userId: 'u3', chatId: 'c' }, 'r3')).toMatchObject({
+      text: 'chat fact',
+    });
   });
 });
 
@@ -731,10 +749,11 @@ describe('forget', () => {
       operationId: 'op-forget',
     });
     expect(await store.get(USER, 'r1')).toMatchObject({ text: 'mine' });
-    // Nothing existed there, so the id stays free in that scope.
+    expect(await store.history(USER, 'r1')).toHaveLength(1);
+    // Nothing was forgotten, so an unknown id stays free.
+    await store.forget(USER, 'never-written', 'op-forget-2');
     expect(
-      (await store.commit(await op('op-2', [await create('r1', 'theirs')], { scope: OTHER })))
-        .status,
+      (await store.commit(await op('op-2', [await create('never-written', 'now it is')]))).status,
     ).toBe('committed');
   });
 });
@@ -921,18 +940,25 @@ describe('retention', () => {
   it('pruneHistory can be narrowed to one scope', async () => {
     const { store, tick } = setup();
     for (const scope of [USER, OTHER]) {
-      await committed(store, await op(`c-${scope.userId}`, [await create('r', 'v1')], { scope }));
       await committed(
         store,
-        await op(`x-${scope.userId}`, [{ type: 'retract', id: 'r', expectedRevision: 1 }], {
-          scope,
-        }),
+        await op(`c-${scope.userId}`, [await create(`r-${scope.userId}`, 'v1')], { scope }),
+      );
+      await committed(
+        store,
+        await op(
+          `x-${scope.userId}`,
+          [{ type: 'retract', id: `r-${scope.userId}`, expectedRevision: 1 }],
+          {
+            scope,
+          },
+        ),
       );
     }
     tick(10);
     expect(await store.pruneHistory({ olderThan: 2_000, scope: OTHER })).toBe(1);
-    expect(await store.history(USER, 'r')).toHaveLength(2);
-    expect(await store.history(OTHER, 'r')).toHaveLength(1);
+    expect(await store.history(USER, 'r-u1')).toHaveLength(2);
+    expect(await store.history(OTHER, 'r-u2')).toHaveLength(1);
   });
 
   it('pruneOperations deletes old receipts and warns that dedupe is lost for them', async () => {

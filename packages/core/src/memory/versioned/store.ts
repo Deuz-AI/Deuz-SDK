@@ -98,8 +98,10 @@ export function createInMemoryVersionedMemoryStore(options?: {
   const mutex = new Mutex();
   /** scope key → record id → revisions, oldest first. */
   const records = new Map<string, Map<string, StoredRevision[]>>();
-  /** scope key → ids of forgotten records: never recreated. */
-  const forgotten = new Map<string, Set<string>>();
+  /** Record ids are unique store-wide: id → the scope key that owns it. */
+  const owners = new Map<string, string>();
+  /** Ids of forgotten records: never recreated, in any scope. */
+  const forgotten = new Set<string>();
   const scopeRevisions = new Map<string, number>();
   const receipts = new Map<string, VersionedMemoryReceipt>();
   const generations: MemoryEmbeddingGeneration[] = [];
@@ -280,8 +282,9 @@ export function createInMemoryVersionedMemoryStore(options?: {
           const write = await planCreate(mutation, operation, scope, now, what);
           if (seen.has(write.id)) throw invalid(`${what} touches record ${write.id} twice.`);
           seen.add(write.id);
+          // An id taken in another scope conflicts too, without telling its revision.
           const current = revisionsOf(key, write.id);
-          if (current || forgotten.get(key)?.has(write.id))
+          if (owners.has(write.id) || forgotten.has(write.id))
             conflicts.push({
               id: write.id,
               expectedRevision: 0,
@@ -368,6 +371,7 @@ export function createInMemoryVersionedMemoryStore(options?: {
         const history = scopeRecords.get(write.id) ?? [];
         history.push(write.next);
         scopeRecords.set(write.id, history);
+        owners.set(write.id, key);
         const revision = write.next.record.revision;
         if (write.carryFrom !== undefined) {
           for (const byKey of vectors.values()) {
@@ -573,11 +577,10 @@ export function createInMemoryVersionedMemoryStore(options?: {
         const revisions = history?.map((item) => item.record.revision) ?? [];
         if (history) {
           records.get(key)!.delete(id);
+          owners.delete(id);
+          forgotten.add(id);
           for (const byKey of vectors.values())
             for (const revision of revisions) byKey.delete(vectorKey(key, id, revision));
-          let ids = forgotten.get(key);
-          if (!ids) forgotten.set(key, (ids = new Set()));
-          ids.add(id);
           // Receipts hold no text; they stay so a redelivery replays, marked redacted.
           for (const receipt of receipts.values())
             if (scopeKey(receipt.scope) === key && receipt.entries.some((entry) => entry.id === id))
@@ -642,35 +645,21 @@ export function createInMemoryVersionedMemoryStore(options?: {
         const target = generations.find((item) => item.generation === generation);
         if (!target || target.status === 'retired') return [];
         const byKey = vectors.get(generation);
-        const items: { key: string; item: MemoryReembedItem }[] = [];
+        const items: MemoryReembedItem[] = [];
         for (const [key, scopeRecords] of records)
           for (const [id, history] of scopeRecords) {
             if (after !== undefined && id <= after) continue;
             const latest = history.at(-1)!;
             if (byKey?.has(vectorKey(key, id, latest.record.revision))) continue;
             items.push({
-              key,
-              item: {
-                id,
-                revision: latest.record.revision,
-                scope: copy(latest.record.scope),
-                text: latest.record.text,
-                textDigest: latest.textDigest,
-              },
+              id,
+              revision: latest.record.revision,
+              scope: copy(latest.record.scope),
+              text: latest.record.text,
+              textDigest: latest.textDigest,
             });
           }
-        return items
-          .sort((left, right) =>
-            left.item.id !== right.item.id
-              ? left.item.id < right.item.id
-                ? -1
-                : 1
-              : left.key < right.key
-                ? -1
-                : 1,
-          )
-          .slice(0, limit)
-          .map((entry) => entry.item);
+        return items.sort((left, right) => (left.id < right.id ? -1 : 1)).slice(0, limit);
       },
 
       async put(generation, items) {
@@ -701,22 +690,20 @@ export function createInMemoryVersionedMemoryStore(options?: {
           if (!byKey) vectors.set(generation, (byKey = new Map()));
           let stored = 0;
           for (const item of items) {
-            let matched = false;
-            for (const [key, scopeRecords] of records) {
-              const latest = scopeRecords.get(item.id)?.at(-1);
-              // Only the current revision of the same text: a moved record is embedded again.
-              if (
-                latest?.record.revision !== item.revision ||
-                latest.textDigest !== item.textDigest
-              )
-                continue;
-              byKey.set(vectorKey(key, item.id, item.revision), {
-                vector: [...item.vector],
-                textDigest: item.textDigest,
-              });
-              matched = true;
-            }
-            if (matched) stored++;
+            const key = owners.get(item.id);
+            const latest = key === undefined ? undefined : revisionsOf(key, item.id)?.at(-1);
+            // Only the current revision of the same text: a moved record is embedded again.
+            if (
+              key === undefined ||
+              latest?.record.revision !== item.revision ||
+              latest.textDigest !== item.textDigest
+            )
+              continue;
+            byKey.set(vectorKey(key, item.id, item.revision), {
+              vector: [...item.vector],
+              textDigest: item.textDigest,
+            });
+            stored++;
           }
           return stored;
         });
