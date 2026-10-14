@@ -89,3 +89,76 @@ export function rankFuse<T>(lists: RankFuseList<T>[], k = 60): Map<string, numbe
   }
   return scores;
 }
+
+/**
+ * Why a stored vector is left out of a vector ranking (2.4, spec §2.2): it
+ * has none (`'missing'`), it has another length than the query's (`'dims'`),
+ * or both sides name their embedding model and the names differ (`'model'`).
+ */
+export type VectorExclusion = 'missing' | 'dims' | 'model';
+
+/** A vector and the model that produced it, as a store holds it. */
+export interface ModelVector {
+  vector?: number[] | null;
+  modelId?: string | null;
+}
+
+/** `'unknown'` is what `memoryEmbedderFromRag` pins without a `modelId`: it names no model. */
+function namesModel(modelId: string | null | undefined): modelId is string {
+  return typeof modelId === 'string' && modelId !== '' && modelId !== 'unknown';
+}
+
+/**
+ * Whether `stored` may be compared with the query vector (2.4), and if not,
+ * why. `cosineSimilarity` answers 0 for a length mismatch, which used to let
+ * such a record into a ranking as a score-0 filler; the 2.4 legacy stores
+ * ask this first instead.
+ */
+export function vectorExclusion(
+  stored: ModelVector,
+  query: { vector: number[]; modelId?: string },
+): VectorExclusion | undefined {
+  const vector = stored.vector;
+  if (!vector || vector.length === 0) return 'missing';
+  if (vector.length !== query.vector.length) return 'dims';
+  if (namesModel(stored.modelId) && namesModel(query.modelId) && stored.modelId !== query.modelId)
+    return 'model';
+  return undefined;
+}
+
+/** What {@link rankByVector} made of a candidate list. */
+export interface VectorRanking<T> {
+  /** The comparable items with their cosine, best first; ties keep the input order. */
+  ranked: { item: T; score: number }[];
+  /** The items left out: no vector, or one of another length or model. Input order. */
+  excluded: T[];
+  /** How many of `excluded` carry a vector of another length or model. */
+  mismatched: number;
+}
+
+/**
+ * Cosine-ranks the candidates that may be compared with the query vector
+ * (2.4) and sets the others aside, so a store can look them up by text
+ * instead of filling its topK with them at score 0.
+ */
+export function rankByVector<T>(
+  items: readonly T[],
+  vectorOf: (item: T) => ModelVector,
+  query: { vector: number[]; modelId?: string },
+): VectorRanking<T> {
+  const ranked: { item: T; score: number }[] = [];
+  const excluded: T[] = [];
+  let mismatched = 0;
+  for (const item of items) {
+    const stored = vectorOf(item);
+    const exclusion = vectorExclusion(stored, query);
+    if (exclusion === undefined) {
+      ranked.push({ item, score: cosineSimilarity(query.vector, stored.vector!) });
+      continue;
+    }
+    excluded.push(item);
+    if (exclusion !== 'missing') mismatched++;
+  }
+  ranked.sort((a, b) => b.score - a.score);
+  return { ranked, excluded, mismatched };
+}

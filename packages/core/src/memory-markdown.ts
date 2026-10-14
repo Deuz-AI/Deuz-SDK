@@ -10,11 +10,10 @@
  * when a query embedding + stored vectors are available, otherwise falls back to
  * grep/full-text — so the SAME store works with or without an embedder.
  *
- * Reuses the pure helpers (`matchesScope` / `cosineSimilarity`) from
- * `@deuz-sdk/core/memory` so semantics match the in-memory reference store.
+ * Reuses the pure helpers (`matchesScope`, and the 2.4 vector rule in
+ * `internal/memory-vectors.ts`) so semantics match the in-memory reference store.
  */
 import {
-  cosineSimilarity,
   matchesScope,
   type MemoryHit,
   type MemoryKind,
@@ -22,6 +21,7 @@ import {
   type MemoryScope,
   type MemoryStore,
 } from './memory';
+import { dropsVector, vectorHits, withoutStaleVector } from './internal/memory-vectors';
 
 interface NodeFs {
   mkdir(path: string, opts: { recursive: true }): Promise<string | undefined>;
@@ -285,10 +285,14 @@ export function createMarkdownMemoryStore(opts: MarkdownMemoryStoreOptions): Mem
       );
       let scored: MemoryHit[];
       if (query.embedding && useVectors) {
-        scored = candidates.map((r) => {
-          const vec = r.embedding ?? vectors.get(r.id);
-          return { record: r, score: vec ? cosineSimilarity(query.embedding!, vec) : 0 };
-        });
+        // 2.4: only comparable vectors are ranked; the rest are found by text or not at all.
+        const needle = query.text?.toLowerCase() ?? '';
+        scored = vectorHits(
+          candidates,
+          query,
+          (r) => r.embedding ?? vectors.get(r.id),
+          (r) => r.text.toLowerCase().includes(needle),
+        );
       } else if (query.text) {
         const q = query.text.toLowerCase();
         scored = candidates
@@ -328,15 +332,18 @@ export function createMarkdownMemoryStore(opts: MarkdownMemoryStoreOptions): Mem
         const text = await io.fs.readFile(io.path.join(opts.dir, fileName(id)), 'utf-8');
         const rec = deserializeRecord(text);
         if (!rec) return;
-        const merged = { ...rec, ...patch } as MemoryRecord;
+        // H6 (2.4): a new text without a new embedding drops the sidecar vector.
+        const stale = dropsVector(rec, patch);
+        const merged = { ...withoutStaleVector(rec, patch), ...patch } as MemoryRecord;
         await io.fs.writeFile(
           io.path.join(opts.dir, fileName(id)),
           serializeRecord(merged),
           'utf-8',
         );
-        if (useVectors && patch.embedding) {
+        if (useVectors && (patch.embedding || stale)) {
           const vectors = await loadVectors(io);
-          vectors.set(id, patch.embedding);
+          if (patch.embedding) vectors.set(id, patch.embedding);
+          else vectors.delete(id);
           await saveVectors(io);
         }
       } catch {

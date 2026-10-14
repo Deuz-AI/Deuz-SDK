@@ -165,6 +165,30 @@ export function createFakePg(
         value === null || value === undefined || numeric(value) > numeric(param(params, m[2]!))
       );
     }
+    // 2.4 model filters: (embedding_model_id IS NULL OR embedding_model_id = ANY($4))
+    if ((m = /^\(([a-z_]+) IS NULL OR \1 = ANY\(\$(\d+)\)\)$/.exec(atom))) {
+      const value = row[m[1]!];
+      const list = param(params, m[2]!) as unknown[];
+      return value === null || value === undefined || list.some((v) => String(v) === String(value));
+    }
+    // (embedding IS NULL OR NOT (embedding_model_id = ANY($4)))
+    if ((m = /^\(([a-z_]+) IS NULL OR NOT \(([a-z_]+) = ANY\(\$(\d+)\)\)\)$/.exec(atom))) {
+      const empty = row[m[1]!];
+      if (empty === null || empty === undefined) return true;
+      const value = row[m[2]!];
+      const list = param(params, m[3]!) as unknown[];
+      return (
+        value !== null && value !== undefined && !list.some((v) => String(v) === String(value))
+      );
+    }
+    // NOT (embedding_model_id = ANY($4)): NULL stays NULL, which is not true.
+    if ((m = /^NOT \(([a-z_]+) = ANY\(\$(\d+)\)\)$/.exec(atom))) {
+      const value = row[m[1]!];
+      const list = param(params, m[2]!) as unknown[];
+      return (
+        value !== null && value !== undefined && !list.some((v) => String(v) === String(value))
+      );
+    }
     // COALESCE(valid_at, created_at) <= $3
     if ((m = /^COALESCE\(([a-z_]+), ([a-z_]+)\) <= \$(\d+)$/.exec(atom))) {
       const value = row[m[1]!] ?? row[m[2]!];
@@ -289,6 +313,7 @@ export function createFakePg(
     }
 
     let rows = [...table(rest.trim()).values()].filter((row) => matches(where, row, params));
+    if (list === 'COUNT(*)::int AS n') return [{ n: rows.length }];
     if (order) rows = sortRows(rows, order, params);
     if (limit !== undefined) {
       const n = limit.startsWith('$') ? numeric(param(params, limit.slice(1))) : Number(limit);
@@ -927,32 +952,34 @@ describe('memory search', () => {
     expect(hits[0]!.record.embedding).toBeUndefined();
   });
 
-  it('tops up a vector page with unembedded rows only when the index page cannot be final', async () => {
+  it('never tops a vector page up with unembedded rows (2.4); a text query finds them', async () => {
     const client = createFakePg({ vectorExtension: true });
     const stores = createPostgresStores({ client, dimensions: 3 });
     await stores.memory.upsert([
       record('near', 'a', { embedding: [1, 0, 0] }),
       record('orthogonal', 'b', { embedding: [0, 1, 0] }),
-      record('novec', 'c'),
+      record('novec', 'the user lives in Istanbul'),
     ]);
-    const topUps = (): number =>
-      client.calls.filter((c) => c.sql.includes('embedding IS NULL')).length;
 
-    // A FULL page whose worst score is >= 0 is already the answer: a score-0
-    // row can only TIE it, so the HNSW path stays at ONE round-trip.
-    client.calls.length = 0;
-    const full = await stores.memory.search({ scope: SCOPE, embedding: [1, 0, 0], topK: 2 });
-    expect(full.map((h) => h.record.id)).toEqual(['near', 'orthogonal']);
-    expect(topUps()).toBe(0);
-
-    // A SHORT page has to reach for the rows the vector index cannot answer for.
+    // 2.3 topped a short page up with score-0 rows; 2.4 returns only real matches,
+    // in ONE round-trip when the query carries no text.
     client.calls.length = 0;
     const short = await stores.memory.search({ scope: SCOPE, embedding: [1, 0, 0], topK: 5 });
-    expect(short.map((h) => h.record.id)).toEqual(['near', 'orthogonal', 'novec']);
-    expect(topUps()).toBe(1);
+    expect(short.map((h) => h.record.id)).toEqual(['near', 'orthogonal']);
+    expect(client.calls).toHaveLength(1);
+
+    const withText = await stores.memory.search({
+      scope: SCOPE,
+      embedding: [1, 0, 0],
+      text: 'Istanbul',
+      topK: 5,
+    });
+    expect(withText.map((h) => h.record.id)).toEqual(['near', 'novec', 'orthogonal']);
+    const { sql } = find(client, 'ILIKE');
+    expect(sql).toContain('embedding IS NULL');
   });
 
-  it('ranks an unembedded row ABOVE a negative cosine, as the reference store does', async () => {
+  it('keeps a negative cosine below the real matches and adds no unembedded filler (2.4)', async () => {
     const client = createFakePg({ vectorExtension: true });
     const stores = createPostgresStores({ client, dimensions: 3 });
     await stores.memory.upsert([
@@ -961,9 +988,31 @@ describe('memory search', () => {
       record('novec', 'c'),
     ]);
 
-    // A full page is NOT final when it ends below zero — score 0 beats -1.
     const hits = await stores.memory.search({ scope: SCOPE, embedding: [1, 0, 0], topK: 2 });
-    expect(hits.map((h) => h.record.id)).toEqual(['near', 'novec']);
+    expect(hits.map((h) => h.record.id)).toEqual(['near', 'opposite']);
+  });
+
+  it('filters out vectors pinned to another model in SQL, and counts them once (2.4)', async () => {
+    const client = createFakePg({ vectorExtension: true });
+    const stores = createPostgresStores({ client, dimensions: 3 });
+    await stores.memory.upsert([
+      record('same', 'a', { embedding: [1, 0, 0], embeddingModelId: 'model-1' }),
+      record('other', 'b', { embedding: [1, 0, 0], embeddingModelId: 'model-2' }),
+    ]);
+    const notices: unknown[] = [];
+    client.calls.length = 0;
+    const hits = await stores.memory.search({
+      scope: SCOPE,
+      embedding: [1, 0, 0],
+      embeddingModelId: 'model-1',
+      topK: 5,
+      onEmbeddingMismatch: (mismatch) => notices.push(mismatch),
+    });
+    expect(hits.map((h) => h.record.id)).toEqual(['same']);
+    expect(notices).toEqual([{ records: 1, dims: 3, modelId: 'model-1' }]);
+    const { sql, params } = find(client, '<=>');
+    expect(sql).toContain('(embedding_model_id IS NULL OR embedding_model_id = ANY($');
+    expect(params).toContainEqual(['model-1', 'unknown', '']);
   });
 
   it('escapes LIKE metacharacters in a text query', async () => {
@@ -1080,14 +1129,33 @@ describe('memory fast paths', () => {
     const stores = createPostgresStores({ client, dimensions: 3 });
     await stores.memory.upsert([record('m1', 'before', { embedding: [1, 0, 0] })]);
 
-    await stores.memory.update('m1', { text: 'after', updatedAt: T0 + 1 });
+    await stores.memory.update('m1', { importance: 0.5, updatedAt: T0 + 1 });
     const { sql } = find(client, 'UPDATE public.deuz_memory');
-    expect(sql).toBe('UPDATE public.deuz_memory SET text = $2, updated_at = $3 WHERE id = $1');
+    expect(sql).toBe(
+      'UPDATE public.deuz_memory SET importance = $2, updated_at = $3 WHERE id = $1',
+    );
 
     const row = client.rows('deuz_memory')[0]!;
-    expect(row['text']).toBe('after');
     expect(row['embedding']).toBe('[1,0,0]'); // untouched
     expect((await stores.memory.get('m1'))!.updatedAt).toBe(T0 + 1);
+  });
+
+  it('drops the stale vector when an update changes the text (2.4, H6)', async () => {
+    const client = createFakePg({ vectorExtension: true });
+    const stores = createPostgresStores({ client, dimensions: 3 });
+    await stores.memory.upsert([
+      record('m1', 'before', { embedding: [1, 0, 0], embeddingModelId: 'model-1' }),
+    ]);
+
+    await stores.memory.update('m1', { text: 'before', updatedAt: T0 + 1 });
+    expect(client.rows('deuz_memory')[0]!['embedding']).toBe('[1,0,0]'); // same text: kept
+
+    await stores.memory.update('m1', { text: 'after', updatedAt: T0 + 2 });
+    const row = client.rows('deuz_memory')[0]!;
+    expect(row['text']).toBe('after');
+    expect(row['embedding']).toBeNull();
+    expect(row['embedding_json']).toBeNull();
+    expect(row['embedding_model_id']).toBeNull();
   });
 });
 

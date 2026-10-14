@@ -244,13 +244,16 @@ describe('2.4 Node stores on their entries', () => {
     expect(typeof opsPostgres.createPostgresOpsStore).toBe('function');
   });
 
-  it('publish the versioned memory and goal runtime stores on their own subpaths', () => {
-    expectStub('createSqliteVersionedMemoryStore', () =>
-      vmemSqlite.createSqliteVersionedMemoryStore(any),
-    );
-    expectStub('createPostgresVersionedMemoryStore', () =>
-      vmemPostgres.createPostgresVersionedMemoryStore(any),
-    );
+  it('publish the versioned memory and goal runtime stores on their own subpaths', async () => {
+    // Implemented by L1b: they open lazily, so building one throws nothing.
+    const sqlite = vmemSqlite.createSqliteVersionedMemoryStore({ path: ':memory:' });
+    expect(await sqlite.scopeRevision({ userId: 'u' })).toBe(0);
+    await sqlite.close();
+    const postgres = vmemPostgres.createPostgresVersionedMemoryStore({
+      connectionString: 'postgres://unused',
+    });
+    expect(typeof postgres.commit).toBe('function');
+    await postgres.close();
     expectStub('createSqliteGoalRuntimeStore', () =>
       goalRuntimeSqlite.createSqliteGoalRuntimeStore(any),
     );

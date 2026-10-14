@@ -15,14 +15,24 @@
 import type { Message } from './types/message';
 import type { Clock } from './types/deps';
 import type { Tool, ToolSet } from './types/tool';
-import type { EmbedManyOptions } from './types/methods';
+import type { CallWarning, EmbedManyOptions } from './types/methods';
+import type { AccountedMemoryEmbedder, AccountedMemoryLLMResult } from './types/accounting';
+import type { NativeExecutionContext } from './types/execution';
 import type { EmbeddingModel } from './types/model';
 // TYPE-ONLY on purpose: the bridge below adapts rag.ts's Embedder shape without
 // pulling a byte of `./rag` into the `./memory` bundle.
 import type { Embedder as RagEmbedder } from './rag';
 import { InvalidRequestError } from './errors';
 import { embedMany } from './inference/embed';
-import { cosineSimilarity } from './internal/vector';
+import { vectorHits, withoutStaleVector } from './internal/memory-vectors';
+
+export type {
+  AccountedMemoryEmbedder,
+  AccountedMemoryLLM,
+  AccountedMemoryLLMResult,
+} from './types/accounting';
+/** Mark a memory LLM that reports usage, and tell marked callbacks from unmarked ones (2.4). */
+export { defineAccountedMemoryLLM, isAccounted } from './internal/accounting';
 
 // ===================================================================
 // Canonical record (superset of mem0 + Letta + Graphiti + Obsidian; the extra
@@ -82,6 +92,29 @@ export interface MemoryQuery {
   /** Bi-temporal point-in-time query. */
   asOf?: number;
   filter?: Record<string, unknown>;
+  /**
+   * The embedding model `embedding` came from (2.4): a stored vector pinned to
+   * another model (`MemoryRecord.embeddingModelId`) stays out of the vector
+   * ranking, as one of another length always does. `recall` fills it in from
+   * the embedder's answer; without it only the lengths are compared.
+   */
+  embeddingModelId?: string;
+  /**
+   * Called at most once per search (2.4) when stored vectors of another length
+   * or model were left out of the vector ranking. Those records are still
+   * found by text. `recall` turns it into one `embedding-mismatch` warning.
+   */
+  onEmbeddingMismatch?: (mismatch: MemoryEmbeddingMismatch) => void;
+}
+
+/** What a search left out of its vector ranking (2.4); see `MemoryQuery.onEmbeddingMismatch`. */
+export interface MemoryEmbeddingMismatch {
+  /** Records whose stored vector has another length or embedding model than the query's. */
+  records: number;
+  /** The query vector's length. */
+  dims: number;
+  /** The query vector's model, when the query named one. */
+  modelId?: string;
 }
 
 export interface MemoryHit {
@@ -179,9 +212,30 @@ export interface MemoryScorer {
 
 export interface MemorySeams {
   store: MemoryStore;
-  /** Required only when a vector store's search needs an embedding and the query has none. */
-  embedder?: Embedder;
-  llm: MemoryLLM;
+  /**
+   * Required only when a vector store's search needs an embedding and the query has none.
+   * 2.4: an `AccountedMemoryEmbedder` (`accounted: true`, usage with the vectors) is accepted too.
+   */
+  embedder?: Embedder | AccountedMemoryEmbedder;
+  /**
+   * A plain `MemoryLLM`, or (2.4) an `AccountedMemoryLLM` that answers its
+   * text with the call's usage (`defineAccountedMemoryLLM`). One callable
+   * type rather than a union, so `MemorySeams['llm']` still types a plain
+   * callback, and a `vi.fn` of one, as in 2.3.
+   */
+  llm: {
+    (prompt: { system: string; user: string }): Promise<string | AccountedMemoryLLMResult>;
+    readonly accounted?: true;
+  };
+  /**
+   * Charge the memory LLM and embedder calls to this context's ledger (2.4).
+   * Each call is reserved first at a token estimate, so a budget can refuse
+   * it; an accounted callback then settles the usage it reports, and an
+   * unmarked one is counted as unaccounted (never free: its estimate stays
+   * held) with one `unaccounted-usage` warning. Without it nothing is
+   * charged, as in 2.3.
+   */
+  execution?: NativeExecutionContext;
   clock: Clock;
   generateId: () => string;
   /** Default: WebCrypto SHA-256 hex. */
@@ -628,6 +682,11 @@ export interface RememberOptions {
    * run and extraction that made it. An updated record's own metadata wins.
    */
   metadata?: Record<string, unknown>;
+  /**
+   * Where this pass's 2.4 warnings go (`embedding-mismatch`,
+   * `unaccounted-usage`). Default: one logger line per seams and warning.
+   */
+  onWarning?: (warning: CallWarning) => void;
 }
 
 /**
@@ -802,11 +861,13 @@ export async function remember(
   if (opts.customExtract) {
     facts = await opts.customExtract(messages);
   } else {
-    const text = await seams.llm(
+    const text = await askMemoryLLM(
+      seams,
       buildExtractionPrompt(messages, {
         customInstructions: opts.customInstructions,
         links: opts.links,
       }),
+      opts.onWarning,
     );
     facts = parseFacts(text);
   }
@@ -820,9 +881,11 @@ export async function remember(
   const embeddings = new Map<string, number[]>();
   let embeddingModelId: string | undefined;
   if (seams.embedder) {
-    const { vectors, model } = await seams.embedder.embed(
+    const { vectors, model } = await embedWith(
+      seams,
       facts.map((f) => f.text),
       'add',
+      opts.onWarning,
     );
     embeddingModelId = model;
     facts.forEach((f, i) => {
@@ -834,11 +897,20 @@ export async function remember(
   const topK = opts.topK ?? 5;
   const existingById = new Map<string, MemoryRecord>();
   for (const fact of facts) {
+    const embedding = embeddings.get(fact.text);
     const hits = await seams.store.search({
       scope,
       text: fact.text,
-      embedding: embeddings.get(fact.text),
+      embedding,
       topK,
+      // 2.4: compare with the embedder's model; a mismatch is logged once.
+      ...(embedding && embeddingModelId !== undefined
+        ? {
+            embeddingModelId,
+            onEmbeddingMismatch: (notice: MemoryEmbeddingMismatch) =>
+              warnEmbeddingMismatch(seams, notice, opts.onWarning),
+          }
+        : {}),
     });
     for (const h of hits) existingById.set(h.record.id, h.record);
   }
@@ -846,10 +918,11 @@ export async function remember(
 
   // Decide ADD/UPDATE/DELETE/NOOP and reduce to mutations.
   const decisionPrompt = buildDecisionPrompt(existing, facts);
-  const decisionText = await seams.llm({
-    system: decisionPrompt.system,
-    user: decisionPrompt.user,
-  });
+  const decisionText = await askMemoryLLM(
+    seams,
+    { system: decisionPrompt.system, user: decisionPrompt.user },
+    opts.onWarning,
+  );
   const decided = parseDecision(decisionText, decisionPrompt.idMap);
   const events = await dedupeAddEvents(enrichAddEvents(decided, factByText), existing, {
     store: seams.store,
@@ -954,6 +1027,117 @@ async function resolveLink(
   return first && first.score > 0 ? first.record : null;
 }
 
+/** Logger lines already written, per seams object: "once per warning" without a run sink. */
+const loggedMismatches = new WeakMap<object, Set<string>>();
+
+/**
+ * The `embedding-mismatch` warning (2.4, spec §2.2). Its text names only the
+ * current embedder's model and size, never a count or content, so a run's
+ * warning sink, which deduplicates by text, keeps one per mismatch.
+ */
+function embeddingMismatchWarning(mismatch: MemoryEmbeddingMismatch): CallWarning {
+  const embedder =
+    mismatch.modelId !== undefined
+      ? `${mismatch.modelId}, ${mismatch.dims} dimensions`
+      : `${mismatch.dims} dimensions`;
+  return {
+    type: 'embedding-mismatch',
+    message:
+      `Memory recall left out records whose stored vector does not match the current embedder (${embedder}): ` +
+      'they are found by text only until they are embedded again.',
+  };
+}
+
+function warnEmbeddingMismatch(
+  seams: MemorySeams,
+  mismatch: MemoryEmbeddingMismatch,
+  onWarning?: (warning: CallWarning) => void,
+): void {
+  deliverWarning(seams, embeddingMismatchWarning(mismatch), onWarning, {
+    records: mismatch.records,
+    dims: mismatch.dims,
+    ...(mismatch.modelId !== undefined ? { modelId: mismatch.modelId } : {}),
+  });
+}
+
+/** A 2.4 memory warning: to `onWarning` when given, else one logger line per seams and text. */
+function deliverWarning(
+  seams: MemorySeams,
+  warning: CallWarning,
+  onWarning: ((warning: CallWarning) => void) | undefined,
+  fields: Record<string, unknown> = {},
+): void {
+  if (onWarning) {
+    onWarning(warning);
+    return;
+  }
+  if (!seams.logger) return;
+  let seen = loggedMismatches.get(seams);
+  if (!seen) loggedMismatches.set(seams, (seen = new Set()));
+  if (seen.has(warning.message)) return;
+  seen.add(warning.message);
+  seams.logger.warn(warning.message, { warning: warning.type, ...fields });
+}
+
+/**
+ * One memory LLM call (2.4): a plain callback answers text, an accounted one
+ * `{ text, usage, modelId }`. With `seams.execution` the call is charged to
+ * its ledger first (`internal/memory-accounting.ts`, loaded only then).
+ */
+async function askMemoryLLM(
+  seams: MemorySeams,
+  prompt: { system: string; user: string },
+  onWarning?: (warning: CallWarning) => void,
+): Promise<string> {
+  const llm = seams.llm;
+  const execution = seams.execution;
+  let answer: string | AccountedMemoryLLMResult;
+  if (!execution) answer = await llm(prompt);
+  else {
+    const { chargeMemoryCall } = await import('./internal/memory-accounting');
+    answer = await chargeMemoryCall<string | AccountedMemoryLLMResult>({
+      execution,
+      id: seams.generateId(),
+      kind: 'memory-llm',
+      callback: llm,
+      input: [prompt.system, prompt.user],
+      now: seams.clock.now(),
+      run: () => llm(prompt),
+      usageOf: (result) => (typeof result === 'string' ? undefined : result),
+      warn: (warning) => deliverWarning(seams, warning, onWarning),
+    });
+  }
+  return typeof answer === 'string' ? answer : answer.text;
+}
+
+/** One embedder call (2.4), charged like {@link askMemoryLLM} when `seams.execution` is set. */
+async function embedWith(
+  seams: MemorySeams,
+  texts: string[],
+  action: 'add' | 'search' | 'update',
+  onWarning?: (warning: CallWarning) => void,
+): Promise<{ vectors: number[][]; model: string }> {
+  const embedder = seams.embedder!;
+  const execution = seams.execution;
+  if (!execution) return embedder.embed(texts, action);
+  const { chargeMemoryCall } = await import('./internal/memory-accounting');
+  type Answer = Awaited<ReturnType<typeof embedder.embed>>;
+  return chargeMemoryCall<Answer>({
+    execution,
+    id: seams.generateId(),
+    kind: 'memory-embedding',
+    callback: embedder,
+    input: texts,
+    now: seams.clock.now(),
+    run: () => embedder.embed(texts, action),
+    usageOf: (result) =>
+      'usage' in result && result.usage
+        ? { usage: result.usage, modelId: result.modelId }
+        : undefined,
+    warn: (warning) => deliverWarning(seams, warning, onWarning),
+  });
+}
+
 /**
  * Retrieval glue: embed query (if text & embedder) → store.search →
  * drop-expired → optional rerank → optional link expansion.
@@ -971,15 +1155,45 @@ async function resolveLink(
 export async function recall(
   query: MemoryQuery,
   seams: MemorySeams,
-  opts: { scorer?: MemoryScorer; dropExpired?: boolean; expandLinks?: number } = {},
+  opts: {
+    scorer?: MemoryScorer;
+    dropExpired?: boolean;
+    expandLinks?: number;
+    /**
+     * Where an `embedding-mismatch` warning goes (2.4): records whose stored
+     * vector does not match the current embedder were left out of the vector
+     * ranking. A run passes its warning sink; without one the warning is
+     * logged once per seams and mismatch through `seams.logger`.
+     */
+    onWarning?: (warning: CallWarning) => void;
+  } = {},
 ): Promise<MemoryHit[]> {
   assertScope(query.scope);
   let q = query;
   if (q.text && !q.embedding && seams.embedder) {
-    const { vectors } = await seams.embedder.embed([q.text], 'search');
-    if (vectors[0]) q = { ...q, embedding: vectors[0] };
+    const { vectors, model } = await embedWith(seams, [q.text], 'search', opts.onWarning);
+    // 2.4: the query names the embedder's model, so a store can leave records
+    // embedded by another model out of the vector ranking.
+    if (vectors[0])
+      q = {
+        ...q,
+        embedding: vectors[0],
+        ...(q.embeddingModelId === undefined && model ? { embeddingModelId: model } : {}),
+      };
+  }
+  let mismatch: MemoryEmbeddingMismatch | undefined;
+  if (q.embedding) {
+    const own = q.onEmbeddingMismatch;
+    q = {
+      ...q,
+      onEmbeddingMismatch: (notice) => {
+        mismatch ??= notice;
+        own?.(notice);
+      },
+    };
   }
   let hits = await seams.store.search(q);
+  if (mismatch) warnEmbeddingMismatch(seams, mismatch, opts.onWarning);
 
   if (opts.dropExpired !== false) {
     const now = seams.clock.now();
@@ -1113,15 +1327,25 @@ export function createMemoryTools(opts: MemoryToolOptions): ToolSet {
     },
     execute: async (rawArgs) => {
       const args = rawArgs as { id: string; text: string };
-      const patch = {
+      // H6 (2.4): the stored vector describes the OLD text, so the update
+      // drops it (and its model id); the record is found by text until a
+      // re-embed gives it a vector of the new text. No embedding call here.
+      const patch: Partial<MemoryRecord> = {
         text: args.text,
         hash: await hashFn(args.text),
         updatedAt: seams.clock.now(),
+        embedding: undefined,
+        embeddingModelId: undefined,
       };
       if (seams.store.update) await seams.store.update(args.id, patch);
       else {
         const existing = await seams.store.get(args.id, scope);
-        if (existing) await seams.store.upsert([{ ...existing, ...patch }]);
+        if (existing) {
+          const { embedding: _embedding, embeddingModelId: _model, ...kept } = existing;
+          await seams.store.upsert([
+            { ...kept, text: patch.text!, hash: patch.hash!, updatedAt: patch.updatedAt! },
+          ]);
+        }
       }
       return { id: args.id };
     },
@@ -1187,10 +1411,14 @@ export function createInMemoryMemoryStore(): MemoryStore {
       );
       let scored: MemoryHit[];
       if (query.embedding) {
-        scored = candidates.map((r) => ({
-          record: r,
-          score: r.embedding ? cosineSimilarity(query.embedding!, r.embedding) : 0,
-        }));
+        // 2.4: only comparable vectors are ranked; the rest are found by text or not at all.
+        const needle = query.text?.toLowerCase() ?? '';
+        scored = vectorHits(
+          candidates,
+          query,
+          (r) => r.embedding,
+          (r) => r.text.toLowerCase().includes(needle),
+        );
       } else if (query.text) {
         const q = query.text.toLowerCase();
         scored = candidates.map((r) => ({
@@ -1221,7 +1449,8 @@ export function createInMemoryMemoryStore(): MemoryStore {
     },
     async update(id, patch) {
       const r = records.get(id);
-      if (r) records.set(id, { ...r, ...patch });
+      // H6 (2.4): a new text without a new embedding leaves no stale vector behind.
+      if (r) records.set(id, { ...withoutStaleVector(r, patch), ...patch });
     },
     async findByHash(hashes, scope) {
       // Soft-deleted records are invisible here for the same reason they are in
