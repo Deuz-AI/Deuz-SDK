@@ -13,7 +13,7 @@ import type { ChatRecord } from '../chat';
 import type { MemoryScope } from '../memory';
 import type { TranscriptSearchOptions } from '../types/chat-conditional';
 import type { Message } from '../types/message';
-import { InvalidRequestError } from '../errors';
+import { InvalidRequestError, RevisionConflictError } from '../errors';
 import { scopeWithin } from './native-scope';
 
 /** Hits a search returns when `limit` is not set. */
@@ -164,4 +164,23 @@ export function compareRanked(a: RankedMessage, b: RankedMessage): number {
 /** A raw score as a fraction of the best one, so the top hit scores 1. */
 export function normalizeScore(raw: number, best: number): number {
   return best > 0 ? raw / best : 1;
+}
+
+/** Throws unless `value` is a revision a conditional write can expect: an integer from 0. */
+export function assertExpectedRevision(method: string, value: number): void {
+  if (!Number.isInteger(value) || value < 0)
+    throw new InvalidRequestError({
+      message: `ConditionalChatStore.${method}: expectedRevision must be an integer from 0, got ${String(value)}.`,
+    });
+}
+
+/** What a write over a tombstone throws: the chat was deleted and stays so until pruned. */
+export function deletedChatError(chatId: string, revision: number, attempts?: number): Error {
+  return new RevisionConflictError({
+    subsystem: 'chat',
+    key: chatId,
+    actualRevision: revision,
+    ...(attempts !== undefined ? { attempts } : {}),
+    message: `Chat '${chatId}' was deleted (tombstone at revision ${revision}); a write cannot bring it back.`,
+  });
 }

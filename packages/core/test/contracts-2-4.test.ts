@@ -104,11 +104,10 @@ describe('/context skeleton', () => {
 });
 
 describe('/chat and /ui 2.4 additions', () => {
-  it('publishes the conditional chat store, transcript index and backfill as stubs', async () => {
-    expectStub('createInMemoryConditionalChatStore', () =>
-      chat.createInMemoryConditionalChatStore(),
-    );
-    // Implemented by L7a: the in-memory index and the backfill.
+  it('publishes the conditional chat store, transcript index and backfill', async () => {
+    // Implemented by L7a: the in-memory store, index and backfill.
+    const store = chat.createInMemoryConditionalChatStore();
+    expect(await store.readChat('c')).toEqual({ status: 'missing' });
     const index = chat.createInMemoryTranscriptIndex();
     await chat.indexChat(index, {
       chatId: 'c',

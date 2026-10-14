@@ -86,6 +86,23 @@ export interface ConditionalChatStore {
   pruneTombstones(before: number): Promise<number>;
 }
 
+/**
+ * The merge step of `updateConditionalChat` (2.4): given the chat as stored
+ * now (and which attempt this is, from 1), the record to write, or
+ * `undefined` to write nothing. It runs again on every conflict, against the
+ * newly stored chat, so it must not have side effects of its own.
+ */
+export type ConditionalChatMerge = (
+  current: ConditionalChatRead,
+  attempt: number,
+) => ChatRecord | undefined | Promise<ChatRecord | undefined>;
+
+/** Options of `updateConditionalChat`. */
+export interface UpdateConditionalChatOptions {
+  /** Read-merge-write attempts in all, the first included. Default 3. */
+  attempts?: number;
+}
+
 /** Options of `TranscriptIndex.search`. */
 export interface TranscriptSearchOptions {
   /** Hits at most. Default 10. */
