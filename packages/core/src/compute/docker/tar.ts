@@ -83,7 +83,6 @@ function paxRecord(key: string, value: string): string {
 
 /** Whether ustar's 100-byte name field holds `name` as it is (ASCII, short). */
 function fitsUstar(name: string): boolean {
-  // eslint-disable-next-line no-control-regex -- printable ASCII only
   return /^[\x20-\x7e]*$/.test(name) && name.length <= 100;
 }
 
@@ -119,7 +118,6 @@ export function tarArchive(entries: readonly TarEntryInput[]): Uint8Array {
       push(new Uint8Array(padding(pax.byteLength)));
     }
     // The ustar name is a fallback for readers without PAX: printable ASCII.
-    // eslint-disable-next-line no-control-regex -- printable ASCII only
     const fallback = name.replace(/[^\x20-\x7e]/g, '_').slice(-100);
     push(header(fallback, TYPE_FLAG[entry.type], size, entry));
     if (content) {
