@@ -16,9 +16,15 @@
  */
 import { describe, expect, it } from 'vitest';
 import { createGoal, createGoalEvent, transitionGoal } from '../../src/goal';
-import type { GoalRecord } from '../../src/goal';
-import { DEFAULT_GOAL_RUNTIME_POLICY } from '../../src/goal/runtime';
-import type { GoalRuntimeState, GoalRuntimeStore } from '../../src/goal/runtime';
+import type { GoalEvent, GoalRecord } from '../../src/goal';
+import { DEFAULT_GOAL_RUNTIME_POLICY, goalInboxKey } from '../../src/goal/runtime';
+import type {
+  GoalInboxEnqueue,
+  GoalInboxQuery,
+  GoalRuntimeState,
+  GoalRuntimeStore,
+} from '../../src/goal/runtime';
+import type { Sha256Digest } from '../../src/internal/digest';
 import type { Clock } from '../../src/types/deps';
 import { manualClock } from './manual-clock';
 
@@ -72,14 +78,41 @@ export function runtimeState(
 }
 
 /** An event for `goal`, keyed `key`. */
-export function goalEvent(goal: Pick<GoalRecord, 'goalId' | 'scope'>, key: string, at = T0) {
+export function goalEvent(
+  goal: Pick<GoalRecord, 'goalId' | 'scope'>,
+  key: string,
+  patch: Partial<Pick<GoalEvent, 'at' | 'notBefore' | 'expiresAt'>> = {},
+): GoalEvent {
   return createGoalEvent({
     source: { type: 'signal', id: 'hook' },
     scope: goal.scope,
     goalId: goal.goalId,
     key,
-    at,
+    at: T0,
+    ...patch,
   });
+}
+
+/** Two well-formed digests that differ. */
+export const DIGEST_A: Sha256Digest = `sha256:${'a'.repeat(64)}`;
+export const DIGEST_B: Sha256Digest = `sha256:${'b'.repeat(64)}`;
+
+/** A webhook delivery for `goal`. */
+export function delivery(
+  goal: Pick<GoalRecord, 'goalId' | 'scope'>,
+  deliveryId: string,
+  patch: Partial<GoalInboxEnqueue> = {},
+): GoalInboxEnqueue {
+  return {
+    scope: goal.scope,
+    goalId: goal.goalId,
+    namespace: 'webhook:github',
+    deliveryId,
+    event: goalEvent(goal, deliveryId),
+    payload: { body: `{"delivery":"${deliveryId}"}`, mediaType: 'application/json' },
+    digest: DIGEST_A,
+    ...patch,
+  };
 }
 
 export function goalRuntimeStoreContracts(
@@ -244,6 +277,157 @@ export function goalRuntimeStoreContracts(
               JSON.stringify(bad),
             ).rejects.toThrow(TypeError);
           expect(await store.runtime.get('tenant', 'g')).toBeUndefined();
+        }),
+      );
+    });
+
+    describe('inbox enqueue', () => {
+      it(
+        'queues a delivery once under its scope, namespace and delivery id',
+        withStore(async (store) => {
+          const goal = runtimeGoal('g');
+          await store.save(goal);
+          const result = await store.inbox.enqueue(delivery(goal, 'd1'));
+          const id = goalInboxKey('tenant', 'webhook:github', 'd1');
+          const expected = {
+            ...delivery(goal, 'd1'),
+            id,
+            disposition: 'pending',
+            enqueuedAt: T0,
+          };
+          expect(result).toEqual({ status: 'enqueued', entry: expected });
+          const loaded = await store.inbox.get('tenant', id);
+          expect(loaded).toEqual(expected);
+          loaded!.payload!.body = 'changed';
+          expect((await store.inbox.get('tenant', id))!.payload!.body).toBe('{"delivery":"d1"}');
+          expect(await store.inbox.get('other', id)).toBeUndefined();
+          expect(
+            await store.inbox.get('tenant', goalInboxKey('tenant', 'webhook:github', 'd2')),
+          ).toBeUndefined();
+        }),
+      );
+
+      it(
+        'answers a repeat with the same content as a duplicate, and one with other content as a conflict',
+        withStore(async (store, time) => {
+          const goal = runtimeGoal('g');
+          const other = runtimeGoal('h');
+          await store.save(goal);
+          await store.save(other);
+          const first = await store.inbox.enqueue(delivery(goal, 'd1'));
+          await time.advance(1_000);
+          const stored = first.entry;
+          // The same content: a duplicate, answered with the stored entry.
+          expect(await store.inbox.enqueue(delivery(goal, 'd1'))).toEqual({
+            status: 'duplicate',
+            entry: stored,
+          });
+          // Another payload digest, or another target goal: a conflict, nothing written.
+          expect(await store.inbox.enqueue(delivery(goal, 'd1', { digest: DIGEST_B }))).toEqual({
+            status: 'conflict',
+            entry: stored,
+          });
+          expect(await store.inbox.enqueue(delivery(other, 'd1'))).toEqual({
+            status: 'conflict',
+            entry: stored,
+          });
+          expect(await store.inbox.get('tenant', stored.id)).toEqual(stored);
+          // Another namespace or scope is another delivery.
+          const github = await store.inbox.enqueue(
+            delivery(goal, 'd1', { namespace: 'webhook:slack' }),
+          );
+          expect(github.status).toBe('enqueued');
+        }),
+      );
+
+      it(
+        'queues only for a goal of the same scope',
+        withStore(async (store) => {
+          const goal = runtimeGoal('g', 'tenant-a');
+          await store.save(goal);
+          const foreign = { ...delivery(goal, 'd1'), scope: 'tenant-b' };
+          foreign.event = { ...foreign.event, scope: 'tenant-b' };
+          await expect(store.inbox.enqueue(foreign)).rejects.toMatchObject({
+            code: 'scope_mismatch',
+          });
+          await expect(
+            store.inbox.enqueue(delivery(runtimeGoal('missing', 'tenant-a'), 'd1')),
+          ).rejects.toMatchObject({ code: 'scope_mismatch' });
+          expect(await store.inbox.list({ scope: 'tenant-b', dispositions: [] })).toEqual({
+            entries: [],
+          });
+          expect(
+            await store.inbox.get('tenant-b', goalInboxKey('tenant-b', 'webhook:github', 'd1')),
+          ).toBeUndefined();
+        }),
+      );
+
+      it(
+        'refuses a malformed delivery without writing',
+        withStore(async (store) => {
+          const goal = runtimeGoal('g');
+          await store.save(goal);
+          for (const bad of [
+            delivery(goal, 'd1', { deliveryId: '' }),
+            delivery(goal, 'd1', { namespace: '' }),
+            delivery(goal, 'd1', { digest: 'sha256:nope' as Sha256Digest }),
+            delivery(goal, 'd1', { event: goalEvent(runtimeGoal('h'), 'd1') }),
+            delivery(goal, 'd1', { payload: { body: 42 as unknown as string } }),
+          ])
+            await expect(
+              Promise.resolve().then(() => store.inbox.enqueue(bad)),
+              JSON.stringify(bad),
+            ).rejects.toThrow();
+          expect((await store.inbox.list({ scope: 'tenant' })).entries).toEqual([]);
+        }),
+      );
+    });
+
+    describe('inbox listing', () => {
+      it(
+        'lists pending entries oldest first, by goal, disposition and due time, page by page',
+        withStore(async (store, time) => {
+          const g = runtimeGoal('g');
+          const h = runtimeGoal('h');
+          await store.save(g);
+          await store.save(h);
+          await store.inbox.enqueue(delivery(g, 'b'));
+          await store.inbox.enqueue(delivery(g, 'a'));
+          await time.advance(10);
+          await store.inbox.enqueue(delivery(h, 'c'));
+          await time.advance(10);
+          await store.inbox.enqueue(
+            delivery(g, 'later', { event: goalEvent(g, 'later', { notBefore: T0 + 100 }) }),
+          );
+          const ids = async (query: GoalInboxQuery) =>
+            (await store.inbox.list(query)).entries.map((entry) => entry.deliveryId);
+          // Same time: by entry id.
+          expect(await ids({ scope: 'tenant' })).toEqual(['a', 'b', 'c', 'later']);
+          expect(await ids({ scope: 'tenant', goalId: 'g' })).toEqual(['a', 'b', 'later']);
+          expect(await ids({ scope: 'tenant', dueBy: T0 + 99 })).toEqual(['a', 'b', 'c']);
+          expect(await ids({ scope: 'tenant', dueBy: T0 + 100 })).toEqual(['a', 'b', 'c', 'later']);
+          expect(await ids({ scope: 'tenant', dispositions: ['applied'] })).toEqual([]);
+          expect(await ids({ scope: 'other' })).toEqual([]);
+          const pages: string[][] = [];
+          let cursor: string | undefined;
+          do {
+            const page = await store.inbox.list({ scope: 'tenant', limit: 3, cursor });
+            pages.push(page.entries.map((entry) => entry.deliveryId));
+            cursor = page.cursor;
+          } while (cursor);
+          expect(pages).toEqual([['a', 'b', 'c'], ['later']]);
+          for (const query of [
+            { scope: 'tenant', limit: 0 },
+            { scope: 'tenant', limit: 1001 },
+            { scope: 'tenant', cursor: 'nope' },
+            { scope: 'tenant', dispositions: ['lost'] },
+            { scope: '' },
+            {},
+          ])
+            await expect(
+              Promise.resolve().then(() => store.inbox.list(query as GoalInboxQuery)),
+              JSON.stringify(query),
+            ).rejects.toThrow(TypeError);
         }),
       );
     });

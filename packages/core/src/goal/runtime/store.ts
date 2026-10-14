@@ -8,16 +8,28 @@ import { notImplemented } from '../../internal/not-implemented';
 import { planGoalList, goalListCursor } from '../store';
 import type { GoalRecord } from '../types';
 import {
+  checkEnqueue,
   checkGoal,
   checkRuntimeState,
   goalsNewestFirst,
+  inboxKey,
+  inboxOldestFirst,
   jsonCopy,
+  matchesInboxList,
+  pageOf,
+  planEnqueue,
   planGoalSave,
+  planInboxList,
   planRuntimeSave,
   type GoalRuntimePlan,
   type GoalRuntimeWrite,
 } from './store-shared';
-import type { GoalRuntimePolicy, GoalRuntimeState, GoalRuntimeStore } from './store-types';
+import type {
+  GoalInboxEntry,
+  GoalRuntimePolicy,
+  GoalRuntimeState,
+  GoalRuntimeStore,
+} from './store-types';
 
 /** The supervisor's policy defaults (spec §3.1); copy `retryDelaysMs` before changing it. */
 export const DEFAULT_GOAL_RUNTIME_POLICY = {
@@ -57,23 +69,29 @@ export function createInMemoryGoalRuntimeStore(options?: {
   deps?: Dependencies;
 }): GoalRuntimeStore {
   const clock = options?.deps?.clock ?? HOST_CLOCK;
-  void clock;
   const goals = new Map<string, GoalRecord>();
   /** By goal ID, which is globally unique. */
   const runtimes = new Map<string, GoalRuntimeState>();
+  /** By entry ID, which holds the scope. */
+  const entries = new Map<string, GoalInboxEntry>();
 
   /** Applies a plan's writes; each one is already checked, so nothing here can fail half way. */
   const apply = (writes: readonly GoalRuntimeWrite[]): void => {
     for (const write of writes) {
       if (write.kind === 'goal') goals.set(write.record.goalId, write.record);
       else if (write.kind === 'runtime') runtimes.set(write.state.goalId, write.state);
+      else if (write.kind === 'entry') entries.set(write.entry.id, write.entry);
     }
   };
 
-  /** Runs a plan and applies its writes: in one synchronous step, so nothing interleaves. */
+  /**
+   * Applies a plan's writes and answers a copy of its result. Reading the
+   * snapshot, planning and applying happen in one synchronous step, so no
+   * other call interleaves: that is this store's transaction.
+   */
   const commit = <R>(plan: GoalRuntimePlan<R>): R => {
     apply(plan.writes);
-    return plan.result;
+    return jsonCopy(plan.result);
   };
 
   const inScope = <T extends { scope: string }>(value: T | undefined, scope: string) =>
@@ -124,7 +142,34 @@ export function createInMemoryGoalRuntimeStore(options?: {
         );
       },
     },
-    inbox: { enqueue: todo, apply: todo, get: todo, list: todo },
+    inbox: {
+      async enqueue(delivery) {
+        const next = checkEnqueue(delivery);
+        const id = goalInboxKey(next.scope, next.namespace, next.deliveryId);
+        return commit(
+          planEnqueue(
+            { entry: entries.get(id), goal: goals.get(next.goalId) },
+            next,
+            id,
+            clock.now(),
+          ),
+        );
+      },
+      apply: todo,
+      async get(scope, entryId) {
+        return inScope(entries.get(entryId), scope);
+      },
+      async list(query) {
+        const plan = planInboxList(query);
+        const rows = [...entries.values()]
+          .filter((entry) => matchesInboxList(entry, plan))
+          .sort(inboxOldestFirst);
+        const page = pageOf(rows, plan.limit, inboxKey);
+        return jsonCopy(
+          page.cursor ? { entries: page.rows, cursor: page.cursor } : { entries: page.rows },
+        );
+      },
+    },
     schedules: {
       put: todo,
       get: todo,
