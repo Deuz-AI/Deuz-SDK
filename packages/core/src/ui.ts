@@ -33,6 +33,13 @@ import type { StandardSchemaV1 } from './types/schema';
 import type { ToolApprovalRequest, ToolCallOutcome } from './types/tool';
 import type { DurableStreamOptions } from './types/stream-durable';
 import type { DurableJournal } from './internal/durable-journal';
+import {
+  capabilitiesHandshake,
+  DEUZ_CAPABILITIES_HEADER,
+  DEUZ_CAPABILITY,
+  type DeuzCapabilitiesOptions,
+  type DeuzCapabilitiesPart,
+} from './internal/capabilities';
 import type {
   AgentEvent,
   AgentPartialOutput,
@@ -274,7 +281,15 @@ export type DeuzUIPart =
    * explained nothing. It rides every wire version.
    */
   | { type: 'finish'; finishReason: FinishReason; usage: Usage; stopDetails?: StopDetails }
-  | { type: 'error'; message: string };
+  | { type: 'error'; message: string }
+  /**
+   * The capability handshake's first frame (2.4): what the server supports,
+   * as in its `x-deuz-capabilities` response header. Sent only to a client
+   * that listed what it understands in the same request header, never on
+   * wire v1, without an event id and never journaled, so a 2.3 client never
+   * sees one.
+   */
+  | DeuzCapabilitiesPart;
 
 // ===================================================================
 // Native agent frames (2.3) — the `data-agent` part of the wire
@@ -877,6 +892,15 @@ export interface ToDeuzStreamOptions {
    * only; `store`, if set too, must be the same object. Off by default.
    */
   durable?: DurableStreamOptions;
+  /**
+   * The capability handshake (2.4): pass the request. When it lists what the
+   * client understands in `x-deuz-capabilities` (a 2.4 client does), the
+   * response announces what it supports in the same response header and in a
+   * first `capabilities` frame (no event id, never journaled, not on wire
+   * v1): `durable-stream` when `durable` is set, plus `announce`. A request
+   * without the header changes nothing, byte for byte.
+   */
+  capabilities?: DeuzCapabilitiesOptions;
 }
 
 /**
@@ -946,6 +970,10 @@ function deuzSSEResponse(
     throw new Error(`${label}: \`streamId\` is required when \`store\` is set.`);
   }
   if (durable) assertDurableOptions(label, durable, options);
+  const handshake = capabilitiesHandshake(
+    options.capabilities,
+    durable ? [DEUZ_CAPABILITY.durableStream] : [],
+  );
 
   // The client can vanish mid-stream (refresh, tab close, network drop) — the
   // response body dies, but the STORE must keep recording: resumability exists
@@ -980,6 +1008,8 @@ function deuzSSEResponse(
           /* cancelled meanwhile */
         }
       };
+      // The handshake's frame comes first, outside the journal and its seqs.
+      if (handshake && version === 'v2') enqueue(`data: ${JSON.stringify(handshake.part)}\n\n`);
       // A store failure (2.4, H1/H2) is told to the client once, off-journal
       // and off-seq like a transient part; a v1 client gets no v2-only part.
       let warned = false;
@@ -1140,6 +1170,7 @@ function deuzSSEResponse(
       'content-type': 'text/event-stream; charset=utf-8',
       'cache-control': 'no-cache',
       'x-deuz-stream': version,
+      ...(handshake ? { [DEUZ_CAPABILITIES_HEADER]: handshake.header } : {}),
       ...options.headers,
     },
   });
@@ -1733,6 +1764,13 @@ export interface ResumeDeuzStreamOptions {
   idleTimeoutMs?: number;
   /** Timer seam for polling (deterministic tests). Default: global setTimeout. */
   clock?: TimerLike;
+  /**
+   * The capability handshake (2.4), as on `ToDeuzStreamOptions`: only when the
+   * request lists what the client understands, the response header and a
+   * first `capabilities` frame (wire v2), with `durable-stream` when `store`
+   * is a `DurableStreamStateStore`.
+   */
+  capabilities?: DeuzCapabilitiesOptions;
 }
 
 /**
@@ -1754,6 +1792,10 @@ export function resumeDeuzStreamResponse(
   const idleTimeoutMs = Math.max(0, options.idleTimeoutMs ?? 30_000);
   const timer = options.clock ?? defaultTimer;
   const fromSeq = parseSeq(options.lastEventId) ?? -1;
+  const handshake = capabilitiesHandshake(
+    options.capabilities,
+    (store as { durable?: unknown }).durable === true ? [DEUZ_CAPABILITY.durableStream] : [],
+  );
 
   let cancelled = false;
   const body = new ReadableStream<Uint8Array>({
@@ -1782,6 +1824,7 @@ export function resumeDeuzStreamResponse(
       const emitDone = (seq: number): void => {
         enqueue(`${version === 'v2' ? `id: ${seq}\n` : ''}data: [DONE]\n\n`);
       };
+      if (handshake && version === 'v2') enqueue(`data: ${JSON.stringify(handshake.part)}\n\n`);
 
       try {
         let cursor = fromSeq;
@@ -1849,6 +1892,7 @@ export function resumeDeuzStreamResponse(
       'content-type': 'text/event-stream; charset=utf-8',
       'cache-control': 'no-cache',
       'x-deuz-stream': version,
+      ...(handshake ? { [DEUZ_CAPABILITIES_HEADER]: handshake.header } : {}),
       ...options.headers,
     },
   });
@@ -2068,4 +2112,8 @@ export {
   formatDeuzCapabilities,
   parseDeuzCapabilities,
 } from './internal/capabilities';
-export type { DeuzCapabilitiesPart, DeuzCapability } from './internal/capabilities';
+export type {
+  DeuzCapabilitiesOptions,
+  DeuzCapabilitiesPart,
+  DeuzCapability,
+} from './internal/capabilities';
