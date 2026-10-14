@@ -44,7 +44,6 @@ export interface InMemoryConditionalChatStoreOptions {
   deps?: Dependencies;
 }
 
-
 type StoredChat =
   | { status: 'found'; record: ConditionalChatRecord }
   | { status: 'deleted'; tombstone: ChatTombstone };
