@@ -275,4 +275,4 @@ Full prose for every topic is at **https://deuz-sdk.tech/docs** — each `/docs/
 
 Maintaining this skill: it is generated and verified from source by the scripts under `packages/core/tooling/skills/` in the Deuz-SDK repository. `generate-api-index.mjs` rebuilds the index; `verify-skill.mjs` resolves every name against the real export table and fails the moment the package version or the API contract moves, so a release cannot let this drift silently. `skills/deuz-sdk/` is the source; `sync-skill-copy.mjs --write` mirrors it into `.claude/skills/deuz-sdk/`. From the repository root: `npm run generate:skills -- --date YYYY-MM-DD`, `npm run sync:skills`, `npm run verify:skills`.
 
-> Verified against @deuz-sdk/core@2.3.0 · api-contract sha256:d27a42f55029 · 2026-10-14
+> Verified against @deuz-sdk/core@2.3.0 · api-contract sha256:fb025f0c23e3 · 2026-10-15

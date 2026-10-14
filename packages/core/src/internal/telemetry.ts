@@ -63,6 +63,7 @@ export type TelemetrySubsystem = Extract<
  * `deuz.context.source.<source>.selected|excluded|tokens`.
  */
 export const DEUZ_ATTR = {
+  scheduleReason: 'deuz.schedule.reason',
   contextSelected: 'deuz.context.selected',
   contextExcluded: 'deuz.context.excluded',
   contextTokens: 'deuz.context.tokens',

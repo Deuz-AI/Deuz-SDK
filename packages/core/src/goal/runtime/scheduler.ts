@@ -482,7 +482,9 @@ export function createDurableScheduler(options: DurableSchedulerOptions): Durabl
         [DEUZ_ATTR.scheduleDisposition]: occurrence.disposition,
         [DEUZ_ATTR.scheduleCatchUp]: mode,
         [DEUZ_ATTR.goalId]: occurrence.goalId,
-        ...(occurrence.reason !== undefined ? { 'deuz.schedule.reason': occurrence.reason } : {}),
+        ...(occurrence.reason !== undefined
+          ? { [DEUZ_ATTR.scheduleReason]: occurrence.reason }
+          : {}),
       });
       return record;
     });

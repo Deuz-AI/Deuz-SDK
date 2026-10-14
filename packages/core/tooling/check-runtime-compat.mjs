@@ -116,8 +116,8 @@ const consumers = [
   },
   {
     name: 'chat-conditional',
-    source: `export { createInMemoryConditionalChatStore, createInMemoryTranscriptIndex, indexChat }
-      from '@deuz-sdk/core/chat';`,
+    source: `export { createInMemoryConditionalChatStore, createInMemoryTranscriptIndex, indexChat,
+      isConditionalChatStore, updateConditionalChat } from '@deuz-sdk/core/chat';`,
   },
   {
     name: 'ui-durable-stream',

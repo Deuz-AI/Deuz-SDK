@@ -204,6 +204,8 @@ jobs:
           cache: npm
       # Fails here, once, if the runner has no usable Docker daemon.
       - run: docker version
+      # The Docker runner tests run the pinned image and never pull it themselves.
+      - run: docker pull alpine@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
       - run: npm ci
       - run: npm run build -w @deuz-sdk/core
       - run: npm run test -w @deuz-sdk/core

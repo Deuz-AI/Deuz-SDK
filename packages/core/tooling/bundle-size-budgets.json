@@ -275,7 +275,48 @@
     "",
     "RAISED FOR 2.4 (W0E, H5: the extraction plan saves planned/mutations before it writes). Measured",
     "13167 / 5418 on feat/2.4 and 14544 / 5910 with H5; native-memory lazy 13800 / 5700 -> 15000 / 6150",
-    "(edge, native-agent, native-swarm)."
+    "(edge, native-agent, native-swarm).",
+    "",
+    "RAISED FOR 2.4 (W1a integration, pass 1): measured on feat/2.4 after the ten W1a lanes; +5% headroom (lazy totals +10%):",
+    "  core/native-request lazy: 4300 / 1950 -> 4800 / 2100 (measured 4544 / 1996)",
+    "  core/memory-pipeline lazy: 11350 / 4750 -> 14350 / 5850 (measured 13651 / 5524)",
+    "  edge: 178000 / 55100 -> 178000 / 57900 (measured 177707 / 55130)",
+    "  edge/memory-pipeline lazy: 11350 / 4750 -> 13150 / 5450 (measured 12498 / 5145)",
+    "  edge/sdk-v2 lazy: 13100 / 5300 -> 13100 / 5600 (measured 13099 / 5315)",
+    "  edge/native-chat lazy: 3300 / 1550 -> 3800 / 1750 (measured 3581 / 1644)",
+    "  edge/native-memory lazy: 15000 / 6150 -> 17300 / 6950 (measured 16439 / 6599)",
+    "  native-agent/memory-pipeline lazy: 11350 / 4750 -> 13100 / 5400 (measured 12470 / 5132)",
+    "  native-agent/sdk-v2 lazy: 13100 / 5300 -> 13100 / 5600 (measured 13071 / 5304)",
+    "  native-agent/native-chat lazy: 3300 / 1550 -> 3800 / 1750 (measured 3581 / 1645)",
+    "  native-agent/native-memory lazy: 15000 / 6150 -> 17250 / 6950 (measured 16411 / 6588)",
+    "  native-swarm/memory-pipeline lazy: 11350 / 4750 -> 13100 / 5400 (measured 12470 / 5133)",
+    "  native-swarm/sdk-v2 lazy: 13100 / 5300 -> 13100 / 5600 (measured 13071 / 5307)",
+    "  native-swarm/native-chat lazy: 3300 / 1550 -> 3800 / 1750 (measured 3581 / 1646)",
+    "  native-swarm/native-memory lazy: 15000 / 6150 -> 17250 / 6950 (measured 16411 / 6588)",
+    "  evolve/memory-pipeline lazy: 11350 / 4750 -> 12900 / 5350 (measured 12281 / 5051)",
+    "  ui: 18900 / 6700 -> 22850 / 8350 (measured 21756 / 7939)",
+    "  ui (lazy): - / - -> 15300 / 5600 (measured 13907 / 5064)",
+    "  mcp-server (lazy): 285000 / 91200 -> 320800 / 103100 (measured 291612 / 93720)",
+    "  goal: 24700 / 7800 -> 27300 / 8550 (measured 25967 / 8130)",
+    "  memory-versioned: 1250 / 660 -> 66500 / 21150 (measured 63295 / 20112)",
+    "  context: 2300 / 1150 -> 55100 / 19300 (measured 52456 / 18359)",
+    "  goal-runtime: 1400 / 770 -> 80500 / 25250 (measured 76622 / 24008)",
+    "",
+    "RAISED FOR 2.4 (W1a integration, pass 2): the new optional chunks (durable-journal, embed-accounting, memory-accounting, chat-projection-cas) sized from their first measurement, +5%:",
+    "  core/embed-accounting lazy: 1 / 1 -> 2650 / 1200 (measured 2497 / 1130)",
+    "  core/memory-accounting lazy: 1 / 1 -> 2750 / 1300 (measured 2602 / 1214)",
+    "  edge/chat-projection-cas lazy: 1 / 1 -> 1250 / 650 (measured 1153 / 606)",
+    "  edge/durable-journal lazy: 1 / 1 -> 5900 / 2350 (measured 5576 / 2193)",
+    "  edge/embed-accounting lazy: 1 / 1 -> 1300 / 750 (measured 1230 / 674)",
+    "  edge/memory-accounting lazy: 1 / 1 -> 1300 / 750 (measured 1232 / 694)",
+    "  native-agent/chat-projection-cas lazy: 1 / 1 -> 2300 / 1100 (measured 2151 / 1040)",
+    "  native-agent/embed-accounting lazy: 1 / 1 -> 1300 / 750 (measured 1230 / 675)",
+    "  native-agent/memory-accounting lazy: 1 / 1 -> 1300 / 750 (measured 1232 / 693)",
+    "  native-swarm/chat-projection-cas lazy: 1 / 1 -> 2300 / 1100 (measured 2151 / 1040)",
+    "  native-swarm/embed-accounting lazy: 1 / 1 -> 1300 / 750 (measured 1230 / 674)",
+    "  native-swarm/memory-accounting lazy: 1 / 1 -> 1300 / 750 (measured 1232 / 697)",
+    "  evolve/embed-accounting lazy: 1 / 1 -> 1300 / 750 (measured 1230 / 675)",
+    "  evolve/memory-accounting lazy: 1 / 1 -> 1300 / 750 (measured 1232 / 694)"
   ],
   "bundles": {
     "core": {
@@ -289,8 +330,8 @@
       "lazyFeatures": {
         "native-request": {
           "entryPoint": "native-request",
-          "maxRawBytes": 4300,
-          "maxGzipBytes": 1950
+          "maxRawBytes": 4800,
+          "maxGzipBytes": 2100
         },
         "usage-cost": {
           "entryPoint": "usage-cost",
@@ -299,13 +340,23 @@
         },
         "memory-pipeline": {
           "entryPoint": "memory-pipeline",
-          "maxRawBytes": 11350,
-          "maxGzipBytes": 4750
+          "maxRawBytes": 14350,
+          "maxGzipBytes": 5850
         },
         "sdk-v2": {
           "entryPoint": "sdk-v2",
           "maxRawBytes": 13100,
           "maxGzipBytes": 5300
+        },
+        "embed-accounting": {
+          "entryPoint": "embed-accounting",
+          "maxRawBytes": 2650,
+          "maxGzipBytes": 1200
+        },
+        "memory-accounting": {
+          "entryPoint": "memory-accounting",
+          "maxRawBytes": 2750,
+          "maxGzipBytes": 1300
         }
       }
     },
@@ -313,7 +364,7 @@
       "from": "@deuz-sdk/core/edge",
       "exports": ["streamChat", "generateText", "generateObject", "createApprovalSigner"],
       "maxRawBytes": 178000,
-      "maxGzipBytes": 55100,
+      "maxGzipBytes": 57900,
       "maxLazyRawBytes": 22500,
       "maxLazyGzipBytes": 8450,
       "legacyLazyEntryPoint": "resolve",
@@ -330,13 +381,13 @@
         },
         "memory-pipeline": {
           "entryPoint": "memory-pipeline",
-          "maxRawBytes": 11350,
-          "maxGzipBytes": 4750
+          "maxRawBytes": 13150,
+          "maxGzipBytes": 5450
         },
         "sdk-v2": {
           "entryPoint": "sdk-v2",
           "maxRawBytes": 13100,
-          "maxGzipBytes": 5300
+          "maxGzipBytes": 5600
         },
         "native-mcp": {
           "entryPoint": "native-mcp",
@@ -345,18 +396,38 @@
         },
         "native-chat": {
           "entryPoint": "native-chat",
-          "maxRawBytes": 3300,
-          "maxGzipBytes": 1550
+          "maxRawBytes": 3800,
+          "maxGzipBytes": 1750
         },
         "native-memory": {
           "entryPoint": "native-memory",
-          "maxRawBytes": 15000,
-          "maxGzipBytes": 6150
+          "maxRawBytes": 17300,
+          "maxGzipBytes": 6950
         },
         "native-fallback": {
           "entryPoint": "native-fallback",
           "maxRawBytes": 1000,
           "maxGzipBytes": 600
+        },
+        "chat-projection-cas": {
+          "entryPoint": "chat-projection-cas",
+          "maxRawBytes": 1250,
+          "maxGzipBytes": 650
+        },
+        "durable-journal": {
+          "entryPoint": "durable-journal",
+          "maxRawBytes": 5900,
+          "maxGzipBytes": 2350
+        },
+        "embed-accounting": {
+          "entryPoint": "embed-accounting",
+          "maxRawBytes": 1300,
+          "maxGzipBytes": 750
+        },
+        "memory-accounting": {
+          "entryPoint": "memory-accounting",
+          "maxRawBytes": 1300,
+          "maxGzipBytes": 750
         }
       }
     },
@@ -395,13 +466,13 @@
         },
         "memory-pipeline": {
           "entryPoint": "memory-pipeline",
-          "maxRawBytes": 11350,
-          "maxGzipBytes": 4750
+          "maxRawBytes": 13100,
+          "maxGzipBytes": 5400
         },
         "sdk-v2": {
           "entryPoint": "sdk-v2",
           "maxRawBytes": 13100,
-          "maxGzipBytes": 5300
+          "maxGzipBytes": 5600
         },
         "native-mcp": {
           "entryPoint": "native-mcp",
@@ -410,18 +481,33 @@
         },
         "native-chat": {
           "entryPoint": "native-chat",
-          "maxRawBytes": 3300,
-          "maxGzipBytes": 1550
+          "maxRawBytes": 3800,
+          "maxGzipBytes": 1750
         },
         "native-memory": {
           "entryPoint": "native-memory",
-          "maxRawBytes": 15000,
-          "maxGzipBytes": 6150
+          "maxRawBytes": 17250,
+          "maxGzipBytes": 6950
         },
         "native-fallback": {
           "entryPoint": "native-fallback",
           "maxRawBytes": 1000,
           "maxGzipBytes": 600
+        },
+        "chat-projection-cas": {
+          "entryPoint": "chat-projection-cas",
+          "maxRawBytes": 2300,
+          "maxGzipBytes": 1100
+        },
+        "embed-accounting": {
+          "entryPoint": "embed-accounting",
+          "maxRawBytes": 1300,
+          "maxGzipBytes": 750
+        },
+        "memory-accounting": {
+          "entryPoint": "memory-accounting",
+          "maxRawBytes": 1300,
+          "maxGzipBytes": 750
         }
       }
     },
@@ -446,13 +532,13 @@
         },
         "memory-pipeline": {
           "entryPoint": "memory-pipeline",
-          "maxRawBytes": 11350,
-          "maxGzipBytes": 4750
+          "maxRawBytes": 13100,
+          "maxGzipBytes": 5400
         },
         "sdk-v2": {
           "entryPoint": "sdk-v2",
           "maxRawBytes": 13100,
-          "maxGzipBytes": 5300
+          "maxGzipBytes": 5600
         },
         "native-mcp": {
           "entryPoint": "native-mcp",
@@ -461,18 +547,33 @@
         },
         "native-chat": {
           "entryPoint": "native-chat",
-          "maxRawBytes": 3300,
-          "maxGzipBytes": 1550
+          "maxRawBytes": 3800,
+          "maxGzipBytes": 1750
         },
         "native-memory": {
           "entryPoint": "native-memory",
-          "maxRawBytes": 15000,
-          "maxGzipBytes": 6150
+          "maxRawBytes": 17250,
+          "maxGzipBytes": 6950
         },
         "native-fallback": {
           "entryPoint": "native-fallback",
           "maxRawBytes": 1000,
           "maxGzipBytes": 600
+        },
+        "chat-projection-cas": {
+          "entryPoint": "chat-projection-cas",
+          "maxRawBytes": 2300,
+          "maxGzipBytes": 1100
+        },
+        "embed-accounting": {
+          "entryPoint": "embed-accounting",
+          "maxRawBytes": 1300,
+          "maxGzipBytes": 750
+        },
+        "memory-accounting": {
+          "entryPoint": "memory-accounting",
+          "maxRawBytes": 1300,
+          "maxGzipBytes": 750
         }
       }
     },
@@ -523,13 +624,23 @@
         },
         "memory-pipeline": {
           "entryPoint": "memory-pipeline",
-          "maxRawBytes": 11350,
-          "maxGzipBytes": 4750
+          "maxRawBytes": 12900,
+          "maxGzipBytes": 5350
         },
         "sdk-v2": {
           "entryPoint": "sdk-v2",
           "maxRawBytes": 13100,
           "maxGzipBytes": 5300
+        },
+        "embed-accounting": {
+          "entryPoint": "embed-accounting",
+          "maxRawBytes": 1300,
+          "maxGzipBytes": 750
+        },
+        "memory-accounting": {
+          "entryPoint": "memory-accounting",
+          "maxRawBytes": 1300,
+          "maxGzipBytes": 750
         }
       }
     },
@@ -549,8 +660,10 @@
         "toDeuzAgentStreamResponse",
         "agentStateFromParts"
       ],
-      "maxRawBytes": 18900,
-      "maxGzipBytes": 6700
+      "maxRawBytes": 22850,
+      "maxGzipBytes": 8350,
+      "maxLazyRawBytes": 15300,
+      "maxLazyGzipBytes": 5600
     },
     "otel": {
       "from": "@deuz-sdk/core/otel",
@@ -599,8 +712,8 @@
       "exports": ["createMcpServer"],
       "maxRawBytes": 17150,
       "maxGzipBytes": 6570,
-      "maxLazyRawBytes": 285000,
-      "maxLazyGzipBytes": 91200
+      "maxLazyRawBytes": 320800,
+      "maxLazyGzipBytes": 103100
     },
     "realtime": {
       "from": "@deuz-sdk/core/realtime",
@@ -634,8 +747,8 @@
         "createInMemoryGoalStore",
         "GoalError"
       ],
-      "maxRawBytes": 24700,
-      "maxGzipBytes": 7800
+      "maxRawBytes": 27300,
+      "maxGzipBytes": 8550
     },
     "batch": {
       "from": "@deuz-sdk/core/batch",
@@ -696,8 +809,8 @@
         "createInMemoryVersionedMemoryStore",
         "importLegacyMemory"
       ],
-      "maxRawBytes": 1250,
-      "maxGzipBytes": 660
+      "maxRawBytes": 66500,
+      "maxGzipBytes": 21150
     },
     "context": {
       "from": "@deuz-sdk/core/context",
@@ -709,8 +822,8 @@
         "workingMemoryTools",
         "createTokenEstimator"
       ],
-      "maxRawBytes": 2300,
-      "maxGzipBytes": 1150
+      "maxRawBytes": 55100,
+      "maxGzipBytes": 19300
     },
     "goal-runtime": {
       "from": "@deuz-sdk/core/goal/runtime",
@@ -721,8 +834,8 @@
         "createInMemoryGoalRuntimeStore",
         "verifyGoalAcceptance"
       ],
-      "maxRawBytes": 1400,
-      "maxGzipBytes": 770
+      "maxRawBytes": 80500,
+      "maxGzipBytes": 25250
     },
     "skills-learning": {
       "from": "@deuz-sdk/core/skills/learning",

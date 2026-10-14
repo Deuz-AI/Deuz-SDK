@@ -1,7 +1,7 @@
 <!-- GENERATED FILE — do not hand-edit.
      regenerate: node packages/core/tooling/skills/generate-api-index.mjs --date YYYY-MM-DD
      source: packages/core/{package.json exports, tsup.config.ts} + src walk (export * followed)
-     verified: 2026-10-14 against @deuz-sdk/core@2.3.0 · api-contract sha256:d27a42f55029 -->
+     verified: 2026-10-15 against @deuz-sdk/core@2.3.0 · api-contract sha256:fb025f0c23e3 -->
 
 # API index — every subpath, every export
 
@@ -103,9 +103,9 @@ Deterministic mock models, SSE fixtures, fetch mocks, eval runners and versioned
 
 A file-tree seam agents use as externalized memory, plus the tools that drive it.
 
-**Values** (3): createInMemoryWorkspace, createWorkspaceTools, normalizeWorkspacePath
+**Values** (4): createInMemoryWorkspace, createWorkspaceTools, digestWorkspace, normalizeWorkspacePath
 
-**Types** (3): Workspace, WorkspaceEntry, WorkspaceToolsOptions
+**Types** (4): DigestWorkspaceOptions, Workspace, WorkspaceEntry, WorkspaceToolsOptions
 
 ## `@deuz-sdk/core/workspace/node`
 
@@ -135,9 +135,9 @@ Node child-process sandbox for the compute tools.
 
 Preview (Node only): local Docker sandbox for the compute tools and a reconnectable process runner with its operation store.
 
-**Values** (6): createDockerProcessRunner, createDockerSandbox, createInMemoryProcessOperationStore, createSqliteProcessOperationStore, DEFAULT_DOCKER_SANDBOX, OperationConflictError
+**Values** (7): createDockerProcessRunner, createDockerSandbox, createInMemoryProcessOperationStore, createSqliteProcessOperationStore, DEFAULT_DOCKER_SANDBOX, DockerSandboxError, OperationConflictError
 
-**Types** (13): DockerLimits, DockerSandboxOptions, ProcessArtifact, ProcessOperationQuery, ProcessOperationRecord, ProcessOperationStore, ProcessOutput, ProcessReconcileReport, ProcessRunner, ProcessSession, ProcessStartRequest, ProcessState, SqliteProcessOperationStoreOptions
+**Types** (14): DockerErrorCode, DockerLimits, DockerSandboxOptions, ProcessArtifact, ProcessOperationQuery, ProcessOperationRecord, ProcessOperationStore, ProcessOutput, ProcessReconcileReport, ProcessRunner, ProcessSession, ProcessStartRequest, ProcessState, SqliteProcessOperationStoreOptions
 
 ## `@deuz-sdk/core/agent`
 
@@ -191,7 +191,7 @@ Leases for cross-process runs: the LeaseProvider contract, an in-memory provider
 
 Node-only SQLite leases, native agent run store, schedule claims and persistent budget store.
 
-**Values** (3): createSqliteAgentRunStoreV3, createSqliteBudgetStore, createSqliteOpsStore
+**Values** (5): createSqliteAgentRunStoreV3, createSqliteBudgetStore, createSqliteOpsStore, RUNS_V3_SCHEMA_NAME, RUNS_V3_SCHEMA_VERSION
 
 **Types** (5): SqliteAgentRunStoreV3Options, SqliteBudgetStore, SqliteBudgetStoreOptions, SqliteOpsStore, SqliteOpsStoreOptions
 
@@ -231,9 +231,9 @@ Node-only SQLite population store for evolve.
 
 Five-field UTC cron, a tick-driven scheduler with dedupe, and verified webhooks.
 
-**Values** (10): createInMemoryClaim, createScheduler, handleSignal, nextOccurrence, occurrencesBetween, parseCron, previousOccurrence, verifyGitHubWebhook, verifyHmacSignature, verifySlackRequest
+**Values** (14): assertTimeZone, createInMemoryClaim, createScheduler, handleSignal, nextOccurrence, nextZonedOccurrence, occurrencesBetween, parseCron, previousOccurrence, timeZoneOffset, verifyGitHubWebhook, verifyHmacSignature, verifySlackRequest, zonedOccurrencesBetween
 
-**Types** (18): CronSchedule, HandleSignalOptions, HmacAlgorithm, HmacSignatureOptions, ScheduleCatchUp, ScheduleClaim, ScheduleDefinition, ScheduleOccurrence, ScheduleOccurrenceResult, Scheduler, SchedulerOptions, ScheduleStartOptions, ScheduleTickResult, SignalDispatchInput, SignalRejection, SignalVerification, SignatureEncoding, SlackVerifyOptions
+**Types** (22): CronSchedule, HandleSignalOptions, HmacAlgorithm, HmacSignatureOptions, ScheduleCatchUp, ScheduleClaim, ScheduleDefinition, ScheduleOccurrence, ScheduleOccurrenceResult, Scheduler, SchedulerOptions, ScheduleStartOptions, ScheduleTickResult, SignalDispatchInput, SignalRejection, SignalVerification, SignatureEncoding, SlackVerifyOptions, ZonedCronOptions, ZonedDstGap, ZonedDstOverlap, ZonedOccurrence
 
 ## `@deuz-sdk/core/goal`
 
@@ -241,15 +241,15 @@ Goals, wakeups and events: versioned records, pure transitions, evidence-based a
 
 **Values** (17): assessGoal, createGoal, createGoalEvent, createInMemoryGoalStore, GOAL_EVENT_VERSION, GOAL_RECORD_VERSION, GOAL_SEEN_LIMIT, GoalError, goalEventFromOccurrence, goalEventFromSignal, goalWakeupEvent, goalWakeupKey, parseGoal, parseGoalEvent, serializeGoal, serializeGoalEvent, transitionGoal
 
-**Types** (34): CreateGoalInput, GoalAcceptance, GoalBudget, GoalCommand, GoalCriterion, GoalCriterionAcceptance, GoalCriterionInput, GoalCriterionResult, GoalCriterionResultInput, GoalDependency, GoalErrorCode, GoalEvent, GoalEventInput, GoalEventSource, GoalEventSourceType, GoalEventTarget, GoalEvidence, GoalEvidenceInput, GoalEvidenceSource, GoalListPage, GoalListQuery, GoalOutcome, GoalPayloadRef, GoalRecord, GoalSpend, GoalStatus, GoalStore, GoalTransition, GoalTransitionOptions, GoalTransitionReason, GoalVerdict, GoalWaiting, GoalWaitReason, GoalWaitRequest
+**Types** (35): CreateGoalInput, GoalAcceptance, GoalBudget, GoalCommand, GoalCriterion, GoalCriterionAcceptance, GoalCriterionInput, GoalCriterionResult, GoalCriterionResultInput, GoalDependency, GoalErrorCode, GoalEvent, GoalEventInput, GoalEventSource, GoalEventSourceType, GoalEventTarget, GoalEvidence, GoalEvidenceInput, GoalEvidenceSource, GoalListPage, GoalListQuery, GoalOutcome, GoalPayloadRef, GoalRecord, GoalSpend, GoalStatus, GoalStore, GoalTransition, GoalTransitionOptions, GoalTransitionReason, GoalVerdict, GoalVerifierRef, GoalWaiting, GoalWaitReason, GoalWaitRequest
 
 ## `@deuz-sdk/core/goal/runtime`
 
 Durable goals: a supervisor over the native executor, the goal runtime store, a time-zone aware durable scheduler, webhook delivery and verifyGoalAcceptance.
 
-**Values** (13): createDurableScheduler, createGoalSupervisor, createInMemoryGoalRuntimeStore, createNativeRunLauncher, createWebhookHandler, DEFAULT_DURABLE_SCHEDULER, DEFAULT_GOAL_RUNTIME_POLICY, DEFAULT_GOAL_SUPERVISOR, GoalError, goalInboxKey, goalLeaseKey, toNodeHandler, verifyGoalAcceptance
+**Values** (16): createDurableScheduler, createGoalSupervisor, createInMemoryGoalRuntimeStore, createNativeRunLauncher, createWebhookHandler, DEFAULT_DURABLE_SCHEDULER, DEFAULT_GOAL_RUNTIME_POLICY, DEFAULT_GOAL_SUPERVISOR, goalDeliveryDigest, goalDependencyEvents, GoalError, goalInboxKey, goalLeaseKey, settleGoalEvent, toNodeHandler, verifyGoalAcceptance
 
-**Types** (58): DurableSchedule, DurableScheduleChangeOptions, DurableScheduleEvent, DurableScheduleInput, DurableSchedulePage, DurableScheduleQuery, DurableScheduler, DurableSchedulerOptions, DurableSchedulerTickResult, FetchHandler, GoalAcceptanceVerification, GoalActiveRun, GoalArtifactResolver, GoalErrorCode, GoalInboxApplication, GoalInboxDisposition, GoalInboxEnqueue, GoalInboxEnqueueResult, GoalInboxEntry, GoalInboxPage, GoalInboxQuery, GoalLedgerWatermark, GoalResumeInput, GoalRunIntent, GoalRunIntentInput, GoalRunIntentPage, GoalRunIntentQuery, GoalRuntimeCommitResult, GoalRuntimePhase, GoalRuntimePolicy, GoalRuntimePruneOptions, GoalRuntimeState, GoalRuntimeStore, GoalSubmitInput, GoalSupervision, GoalSupervisor, GoalSupervisorEvent, GoalSupervisorOptions, GoalSupervisorTickResult, GoalVerifier, GoalWatermarkAdvance, NativeRunLauncherOptions, NodeIncomingMessageLike, NodeServerResponseLike, ResolvedGoalArtifact, RunLauncher, RunLaunchRequest, RunLaunchResult, ScheduleAdvance, ScheduleAdvanceResult, ScheduleDstGap, ScheduleDstOverlap, ScheduleOccurrenceRecord, ScheduleSpec, VerifyGoalAcceptanceInput, WebhookHandlerOptions, WebhookTarget, WebhookVerification
+**Types** (64): DurableSchedule, DurableScheduleChangeOptions, DurableScheduleEvent, DurableScheduleInput, DurableSchedulePage, DurableScheduleQuery, DurableScheduler, DurableSchedulerOptions, DurableSchedulerTickResult, FetchHandler, GoalAcceptanceVerification, GoalActiveRun, GoalArtifactResolver, GoalDeliveryContent, GoalDependencyEventsOptions, GoalErrorCode, GoalInboxApplication, GoalInboxDisposition, GoalInboxEnqueue, GoalInboxEnqueueResult, GoalInboxEntry, GoalInboxPage, GoalInboxQuery, GoalInboxSettlement, GoalLedgerWatermark, GoalResumeInput, GoalRunIntent, GoalRunIntentInput, GoalRunIntentPage, GoalRunIntentQuery, GoalRuntimeCommitResult, GoalRuntimePhase, GoalRuntimePolicy, GoalRuntimePruneOptions, GoalRuntimeState, GoalRuntimeStore, GoalSettledDisposition, GoalSubmitInput, GoalSupervision, GoalSupervisor, GoalSupervisorEvent, GoalSupervisorOptions, GoalSupervisorTickResult, GoalVerifier, GoalWatermarkAdvance, NativeRunLauncherOptions, NodeIncomingMessageLike, NodeServerResponseLike, ResolvedGoalArtifact, RunLauncher, RunLaunchRequest, RunLaunchResult, ScheduleAdvance, ScheduleAdvanceResult, ScheduleDstGap, ScheduleDstOverlap, ScheduleOccurrencePage, ScheduleOccurrenceQuery, ScheduleOccurrenceRecord, ScheduleSpec, VerifyGoalAcceptanceInput, WebhookHandlerOptions, WebhookTarget, WebhookVerification
 
 ## `@deuz-sdk/core/goal/runtime/sqlite`
 
@@ -415,9 +415,9 @@ Yunwu relay: one key and base URL for chat, image, video, embeddings and Midjour
 
 Long-term memory: extract, reconcile, apply — behind one swappable store seam.
 
-**Values** (22): applyEvents, applyMutations, assertScope, buildDecisionPrompt, buildExtractionPrompt, cosineSimilarity, createEmbedder, createInMemoryMemoryStore, createMemoryTools, defaultHashFn, defaultMemoryScorer, extractLinks, formatMemoriesForPrompt, isExpired, matchesScope, memoryEmbedderFromRag, parseDecision, parseFacts, planMemory, recall, remember, sweepExpired
+**Values** (24): applyEvents, applyMutations, assertScope, buildDecisionPrompt, buildExtractionPrompt, cosineSimilarity, createEmbedder, createInMemoryMemoryStore, createMemoryTools, defaultHashFn, defaultMemoryScorer, defineAccountedMemoryLLM, extractLinks, formatMemoriesForPrompt, isAccounted, isExpired, matchesScope, memoryEmbedderFromRag, parseDecision, parseFacts, planMemory, recall, remember, sweepExpired
 
-**Types** (20): ApplyContext, Embedder, HashFn, MemoryCallOptions, MemoryEvent, MemoryEventType, MemoryFact, MemoryHit, MemoryKind, MemoryLLM, MemoryMutation, MemoryQuery, MemoryRecord, MemoryScope, MemoryScorer, MemorySeams, MemoryStore, MemoryToolOptions, RememberOptions, WritePolicy
+**Types** (24): AccountedMemoryEmbedder, AccountedMemoryLLM, AccountedMemoryLLMResult, ApplyContext, Embedder, HashFn, MemoryCallOptions, MemoryEmbeddingMismatch, MemoryEvent, MemoryEventType, MemoryFact, MemoryHit, MemoryKind, MemoryLLM, MemoryMutation, MemoryQuery, MemoryRecord, MemoryScope, MemoryScorer, MemorySeams, MemoryStore, MemoryToolOptions, RememberOptions, WritePolicy
 
 ## `@deuz-sdk/core/memory/markdown`
 
@@ -455,17 +455,17 @@ Node-only Postgres versioned memory store: hybrid tsvector + vector search, pgve
 
 One token budget for memory, RAG, transcript and skills: compileContext, the context compiler, working memory and the token estimator.
 
-**Values** (13): applyWorkingMemoryPatch, compileContext, ContextBudgetExceededError, createContextCompiler, createMemoryContextSource, createRagContextSource, createSkillsContextSource, createTokenEstimator, createTranscriptContextSource, createWorkingMemory, DEFAULT_CONTEXT_BUDGET, DEFAULT_CONTEXT_REFRESH, workingMemoryTools
+**Values** (19): ANTHROPIC_TOOL_FRAMING_TOKENS, applyWorkingMemoryPatch, compileContext, ContextBudgetExceededError, contextPackageBlob, contextWarnings, createContextCompiler, createMemoryContextSource, createRagContextSource, createSkillsContextSource, createTokenEstimator, createTranscriptContextSource, createWorkingMemory, DEFAULT_CONTEXT_BUDGET, DEFAULT_CONTEXT_REFRESH, estimateRequestOverhead, estimateRequestTokens, estimateTextTokens, workingMemoryTools
 
-**Types** (53): ApplyWorkingMemoryPatchOptions, CompileContextInput, ContextBlobRef, ContextBlock, ContextBudget, ContextBudgetOptions, ContextCandidate, ContextCompiler, ContextCompilerState, ContextEntryReason, ContextEstimator, ContextLoopHooks, ContextManifest, ContextManifestEntry, ContextManifestSource, ContextPackage, ContextPlacedEntry, ContextPlacement, ContextProvenance, ContextRefreshOptions, ContextRefreshReason, ContextSource, ContextSourceKind, ContextSourceOptions, ContextSourceRequest, ContextSourceResult, ContextStepInput, CreateContextCompilerOptions, CreateWorkingMemoryInput, MemoryContextSourceOptions, RagContextSourceOptions, SkillsContextSourceOptions, TokenEstimator, TokenEstimatorOptions, TranscriptContextSourceOptions, WorkingMemoryAttempt, WorkingMemoryConstraint, WorkingMemoryDecision, WorkingMemoryGoal, WorkingMemoryHandle, WorkingMemoryHypothesis, WorkingMemoryItemBase, WorkingMemoryList, WorkingMemoryObservation, WorkingMemoryOperation, WorkingMemoryPatch, WorkingMemoryPatchResult, WorkingMemoryQuestion, WorkingMemoryRejection, WorkingMemorySnapshot, WorkingMemoryTasks, WorkingMemoryToolsOptions, WorkingMemoryWriter
+**Types** (56): ApplyWorkingMemoryPatchOptions, CompileContextInput, ContextBlobRef, ContextBlock, ContextBudget, ContextBudgetOptions, ContextCandidate, ContextCompiler, ContextCompilerState, ContextEntryReason, ContextEstimator, ContextLoopHooks, ContextManifest, ContextManifestEntry, ContextManifestSource, ContextPackage, ContextPackageBlob, ContextPlacedEntry, ContextPlacement, ContextProvenance, ContextRefreshOptions, ContextRefreshReason, ContextSource, ContextSourceKind, ContextSourceOptions, ContextSourceRequest, ContextSourceResult, ContextStepInput, ContextToolSchema, CreateContextCompilerOptions, CreateWorkingMemoryInput, MemoryContextSourceOptions, RagContextSourceOptions, RequestOverheadInput, SkillsContextSourceOptions, TokenEstimator, TokenEstimatorOptions, TranscriptContextSourceOptions, WorkingMemoryAttempt, WorkingMemoryConstraint, WorkingMemoryDecision, WorkingMemoryGoal, WorkingMemoryHandle, WorkingMemoryHypothesis, WorkingMemoryItemBase, WorkingMemoryList, WorkingMemoryObservation, WorkingMemoryOperation, WorkingMemoryPatch, WorkingMemoryPatchResult, WorkingMemoryQuestion, WorkingMemoryRejection, WorkingMemorySnapshot, WorkingMemoryTasks, WorkingMemoryToolsOptions, WorkingMemoryWriter
 
 ## `@deuz-sdk/core/rag`
 
 Edge-safe RAG: sniff, parse, chunk, embed, dense + BM25 hybrid retrieval, citations.
 
-**Values** (29): approxCountTokens, chunkBlocks, chunkFixed, chunkRecursive, citationsFromHits, COHERE_RERANK_DEFAULT_MODEL, cosineSimilarity, createBm25Index, createCohereReranker, createMemoryVectorStore, createParserRegistry, csvToText, DEFAULT_CHUNK_OPTIONS, DEFAULT_SEPARATORS, estimatePdfTokens, estimateTokens, hybridRetrieve, identityReranker, indexChunks, modelSupportsDocuments, parse, parseCsv, RagError, reciprocalRankFusion, retrieve, shouldSendWhole, sniffMime, tokenize, toNativeDocumentPart
+**Values** (30): approxCountTokens, chunkBlocks, chunkFixed, chunkRecursive, citationsFromHits, COHERE_RERANK_DEFAULT_MODEL, cosineSimilarity, countTokensWith, createBm25Index, createCohereReranker, createMemoryVectorStore, createParserRegistry, csvToText, DEFAULT_CHUNK_OPTIONS, DEFAULT_SEPARATORS, estimatePdfTokens, estimateTokens, hybridRetrieve, identityReranker, indexChunks, modelSupportsDocuments, parse, parseCsv, RagError, reciprocalRankFusion, retrieve, shouldSendWhole, sniffMime, tokenize, toNativeDocumentPart
 
-**Types** (27): Bm25Index, Bm25Options, Chunk, ChunkOptions, CitationOptions, CohereRerankerSettings, Container, CountTokens, DocBlock, DocBlockType, DocMime, DocumentParser, EmbeddedChunk, Embedder, HybridRetrieveDeps, HybridRetrieveOptions, ParsedDocument, ParserRegistry, RagErrorCode, Reranker, RetrieveDeps, RetrieveOptions, RrfOptions, ScoredChunk, SendWholeInput, SniffResult, VectorStore
+**Types** (29): Bm25Index, Bm25Options, Chunk, ChunkOptions, CitationOptions, CohereRerankerSettings, Container, CountTokens, DocBlock, DocBlockType, DocMime, DocumentParser, EmbeddedChunk, Embedder, EmbeddingAccountingOptions, HybridRetrieveDeps, HybridRetrieveOptions, ParsedDocument, ParserRegistry, RagErrorCode, Reranker, RetrieveDeps, RetrieveOptions, RrfOptions, ScoredChunk, SendWholeInput, SniffResult, VectorStore, WithAccountedEmbedder
 
 ## `@deuz-sdk/core/rag/node`
 
@@ -615,9 +615,9 @@ JSONL persistence for observation events (Node only).
 
 A curated re-export subset guaranteed to contain nothing Node-only.
 
-**Values** (88): agentRunLeaseKey, agentTool, anthropicWebSearch, applySearchReplace, applyUIPart, assistantMessageFromTurn, branchBeforeUserMessage, BreakerOpenError, buildMutationPrompt, canonicalFromUI, CheckpointNotFoundError, CheckpointVersionError, clientToolResultMessage, composeObservers, costExceeds, createAgent, createApprovalSigner, createAssistantTurn, createCallbackObserver, createClient, createInMemoryChatStore, createInMemoryClaim, createInMemoryLeaseProvider, createInMemoryPopulationStore, createInMemorySessionStore, createMemoryObserver, createOtelObserver, createOtelTracer, createScheduler, deserializeChatRecord, deserializeCheckpoint, DeuzError, dropTrailingAssistant, durationExceeds, evolve, evolveCandidateId, EvolveConflictError, EvolveLeaseError, EvolvePatchError, extractFullRewrite, filePart, filesToImageParts, filterObserver, findStaleAgentRuns, generateObject, generateText, getModelCapabilities, googleSearch, handleSignal, handoff, hasToolCall, imagePart, isDeuzError, maxOutputLength, maxToolResultLength, nextOccurrence, NoObjectGeneratedError, occurrencesBetween, openaiWebSearch, otelReady, parseCron, parseDeuzChatRequest, parseEvolveBlocks, parseSearchReplace, previousOccurrence, promptInjectionGuardrail, resolveDependencies, resolveModelProfile, resumeDeuzChatResponse, resumeEvolve, resumeFromCheckpoint, resumeStreamFromCheckpoint, sealAssistantTurn, serializeChatRecord, serializeCheckpoint, stepCountIs, streamChat, streamObject, summarizeRun, tool, totalTokensExceed, uiFromMessages, UnpricedModelError, userMessageFromInput, validateChatRequest, verifyGitHubWebhook, verifyHmacSignature, verifySlackRequest
+**Values** (92): agentRunLeaseKey, agentTool, anthropicWebSearch, applySearchReplace, applyUIPart, assertTimeZone, assistantMessageFromTurn, branchBeforeUserMessage, BreakerOpenError, buildMutationPrompt, canonicalFromUI, CheckpointNotFoundError, CheckpointVersionError, clientToolResultMessage, composeObservers, costExceeds, createAgent, createApprovalSigner, createAssistantTurn, createCallbackObserver, createClient, createInMemoryChatStore, createInMemoryClaim, createInMemoryLeaseProvider, createInMemoryPopulationStore, createInMemorySessionStore, createMemoryObserver, createOtelObserver, createOtelTracer, createScheduler, deserializeChatRecord, deserializeCheckpoint, DeuzError, dropTrailingAssistant, durationExceeds, evolve, evolveCandidateId, EvolveConflictError, EvolveLeaseError, EvolvePatchError, extractFullRewrite, filePart, filesToImageParts, filterObserver, findStaleAgentRuns, generateObject, generateText, getModelCapabilities, googleSearch, handleSignal, handoff, hasToolCall, imagePart, isDeuzError, maxOutputLength, maxToolResultLength, nextOccurrence, nextZonedOccurrence, NoObjectGeneratedError, occurrencesBetween, openaiWebSearch, otelReady, parseCron, parseDeuzChatRequest, parseEvolveBlocks, parseSearchReplace, previousOccurrence, promptInjectionGuardrail, resolveDependencies, resolveModelProfile, resumeDeuzChatResponse, resumeEvolve, resumeFromCheckpoint, resumeStreamFromCheckpoint, sealAssistantTurn, serializeChatRecord, serializeCheckpoint, stepCountIs, streamChat, streamObject, summarizeRun, timeZoneOffset, tool, totalTokensExceed, uiFromMessages, UnpricedModelError, userMessageFromInput, validateChatRequest, verifyGitHubWebhook, verifyHmacSignature, verifySlackRequest, zonedOccurrencesBetween
 
-**Types** (287): ActivityPart, AgentCallOptions, AgentCheckpoint, AgentDef, AgentObjectCallOptions, AgentToolDef, AnthropicThinkingType, ApprovalRequestedEvent, ApprovalResolvedEvent, ApprovalSigner, AssistantTurnState, BreakerState, BreakerStore, BudgetExceededPart, CallWarning, ChatHistory, ChatInput, ChatPersistOptions, ChatRecord, ChatStore, CheckpointFailedEvent, CheckpointLoadedEvent, CheckpointSavedEvent, CheckpointStatus, CitationPart, ClientConfig, Clock, CommonCallOptions, CompactionLayer, CompactionObserveEvent, CompactionOption, CompactionPart, CompactionPolicy, CompactionSkippedEvent, CostCalculatedEvent, CostPart, CreateApprovalSignerOptions, CronSchedule, DataPart, DeepPartial, Dependencies, DeuzAgent, DeuzChatRequest, DeuzClient, DeuzErrorJSON, DeuzOAuthProvider, DoneWhen, DoneWhenContext, DurableSessionOptions, EffortField, EffortLevel, EffortNoneMapping, Embed, EmbeddingModel, EmbeddingModelSurface, EmbeddingProvider, EmbeddingTaskType, EmbedMany, EmbedManyOptions, EmbedManyResult, EmbedOptions, EmbedResult, ErrorStreamPart, EvolveArtifacts, EvolveBanditState, EvolveBlock, EvolveCandidate, EvolveCandidateQuery, EvolveEvent, EvolveGenerationCommit, EvolveHandle, EvolveIslandOptions, EvolveIslandState, EvolveKey, EvolveLeaseOptions, EvolveMetrics, EvolveModel, EvolveMutationPrompt, EvolveNoveltyJudgeInput, EvolveNoveltyOptions, EvolveOptions, EvolvePatchErrorCode, EvolvePatchType, EvolvePopulationOptions, EvolvePromptContext, EvolvePromptProgram, EvolveRejection, EvolveRejectionKind, EvolveResult, EvolveRunRecord, EvolveSelection, EvolveStage, EvolveStageContext, EvolveStageOutput, EvolveStageResult, EvolveStatus, EvolveStopReason, FalseFinishPart, FindStaleAgentRunsOptions, FinishMeta, FinishReason, FinishStreamPart, GenerateObject, GenerateObjectOptions, GenerateObjectResult, GenerateText, GenerateTextOptions, GenerateTextResult, GuardrailBaseContext, GuardrailPart, Guardrails, HandleSignalOptions, HandoffAgentDef, HandoffOptions, HandoffPart, HmacAlgorithm, HmacSignatureOptions, ImagePart, InferSchemaOutput, InferToolInput, InferToolOutput, InputGuardrail, InputGuardrailContext, InputGuardrailResult, JSONSchema, KeyProvider, LanguageModel, Lease, LeaseProvider, LeaseRenewal, LeaseRenewOptions, LeaseSignal, Logger, McpClientLoopEntry, McpHttpLoopConfig, McpLoopEntry, McpOAuthOptions, McpStdioLoopConfig, MemoryObserver, Message, ModelCapabilities, ModelCompletedEvent, ModelFailedEvent, ModelFirstContentEvent, ModelId, ModelProfile, ModelProfileCache, ModelProfileClamp, ModelProfileEffort, ModelProfileLimits, ModelProfileSampling, ModelProfileThinking, ModelProfileUsage, ModelRetryEvent, ModelStartedEvent, ModelStatus, ModelSurface, ObservationCaptureOptions, ObservationLimits, ObservationOptions, ObservationRedactor, ObserveAttributes, ObserveAttributeValue, ObservedError, ObservedSubsystem, ObserveEvent, ObserveEventBase, ObservePrimitive, Observer, OperationCompletedEvent, OperationFailedEvent, OperationStartedEvent, OtelTracerOptions, OutputGuardrail, OutputGuardrailContext, OutputGuardrailResult, ParsedEvolveSource, Part, PlanTaskSnapshot, PlanUpdatePart, PopulationStore, PrepareStepResult, PriceProvider, PriceUsageOptions, ProfileCapability, ProfileSupport, Provider, ReasoningDeltaPart, ReasoningPart, RegistryMatch, ResolvedDependencies, ResumeDeuzChatOptions, ResumeEvolveOptions, ResumeOptions, Role, RunAbortedEvent, RunCompletedEvent, RunFailedEvent, RunStartedEvent, RunSummary, RunSuspendedEvent, ScheduleCatchUp, ScheduleClaim, ScheduleDefinition, ScheduleOccurrence, ScheduleOccurrenceResult, Scheduler, SchedulerOptions, ScheduleStartOptions, ScheduleTickResult, SearchReplaceBlock, ServiceTier, SessionStore, SignalDispatchInput, SignalRejection, SignalVerification, SignatureEncoding, SignedApprovalPayload, SlackVerifyOptions, SourcePart, Span, SpanOptions, StandardSchemaIssue, StandardSchemaProps, StandardSchemaResult, StandardSchemaV1, StepCompletedEvent, StepFinishPart, StepResult, StepStartedEvent, StepStartPart, StopCondition, StopDetails, StreamChat, StreamChatOptions, StreamChatResult, StreamObject, StreamObjectResult, StreamPart, SubAgentCompletedEvent, SubAgentFailedEvent, SubAgentPart, SubAgentStartedEvent, SubAgentSuspendedEvent, TextDeltaPart, TextPart, TokenStore, Tool, ToolApprovalRequest, ToolApprovalRequestPart, ToolApprovalResponse, ToolCall, ToolCallDeltaPart, ToolCallGuardrail, ToolCallGuardrailContext, ToolCallGuardrailResult, ToolCallOutcome, ToolCallPart, ToolChoice, ToolCompletedEvent, ToolDeniedEvent, ToolExecuteContext, ToolFailedEvent, ToolResult, ToolResultGuardrail, ToolResultGuardrailContext, ToolResultGuardrailResult, ToolResultPart, ToolResultStreamPart, ToolRunState, ToolSet, ToolStartedEvent, ToolStatePart, ToolUsePart, Tracer, UIMessage, UIMessagePart, UIToolCall, Usage, UsageMeta, ValidateChatOptions, ValidateChatResult, VerifyPart, VerifyStep, VerifyStepContext, VerifyStepResult, WarningPart
+**Types** (291): ActivityPart, AgentCallOptions, AgentCheckpoint, AgentDef, AgentObjectCallOptions, AgentToolDef, AnthropicThinkingType, ApprovalRequestedEvent, ApprovalResolvedEvent, ApprovalSigner, AssistantTurnState, BreakerState, BreakerStore, BudgetExceededPart, CallWarning, ChatHistory, ChatInput, ChatPersistOptions, ChatRecord, ChatStore, CheckpointFailedEvent, CheckpointLoadedEvent, CheckpointSavedEvent, CheckpointStatus, CitationPart, ClientConfig, Clock, CommonCallOptions, CompactionLayer, CompactionObserveEvent, CompactionOption, CompactionPart, CompactionPolicy, CompactionSkippedEvent, CostCalculatedEvent, CostPart, CreateApprovalSignerOptions, CronSchedule, DataPart, DeepPartial, Dependencies, DeuzAgent, DeuzChatRequest, DeuzClient, DeuzErrorJSON, DeuzOAuthProvider, DoneWhen, DoneWhenContext, DurableSessionOptions, EffortField, EffortLevel, EffortNoneMapping, Embed, EmbeddingModel, EmbeddingModelSurface, EmbeddingProvider, EmbeddingTaskType, EmbedMany, EmbedManyOptions, EmbedManyResult, EmbedOptions, EmbedResult, ErrorStreamPart, EvolveArtifacts, EvolveBanditState, EvolveBlock, EvolveCandidate, EvolveCandidateQuery, EvolveEvent, EvolveGenerationCommit, EvolveHandle, EvolveIslandOptions, EvolveIslandState, EvolveKey, EvolveLeaseOptions, EvolveMetrics, EvolveModel, EvolveMutationPrompt, EvolveNoveltyJudgeInput, EvolveNoveltyOptions, EvolveOptions, EvolvePatchErrorCode, EvolvePatchType, EvolvePopulationOptions, EvolvePromptContext, EvolvePromptProgram, EvolveRejection, EvolveRejectionKind, EvolveResult, EvolveRunRecord, EvolveSelection, EvolveStage, EvolveStageContext, EvolveStageOutput, EvolveStageResult, EvolveStatus, EvolveStopReason, FalseFinishPart, FindStaleAgentRunsOptions, FinishMeta, FinishReason, FinishStreamPart, GenerateObject, GenerateObjectOptions, GenerateObjectResult, GenerateText, GenerateTextOptions, GenerateTextResult, GuardrailBaseContext, GuardrailPart, Guardrails, HandleSignalOptions, HandoffAgentDef, HandoffOptions, HandoffPart, HmacAlgorithm, HmacSignatureOptions, ImagePart, InferSchemaOutput, InferToolInput, InferToolOutput, InputGuardrail, InputGuardrailContext, InputGuardrailResult, JSONSchema, KeyProvider, LanguageModel, Lease, LeaseProvider, LeaseRenewal, LeaseRenewOptions, LeaseSignal, Logger, McpClientLoopEntry, McpHttpLoopConfig, McpLoopEntry, McpOAuthOptions, McpStdioLoopConfig, MemoryObserver, Message, ModelCapabilities, ModelCompletedEvent, ModelFailedEvent, ModelFirstContentEvent, ModelId, ModelProfile, ModelProfileCache, ModelProfileClamp, ModelProfileEffort, ModelProfileLimits, ModelProfileSampling, ModelProfileThinking, ModelProfileUsage, ModelRetryEvent, ModelStartedEvent, ModelStatus, ModelSurface, ObservationCaptureOptions, ObservationLimits, ObservationOptions, ObservationRedactor, ObserveAttributes, ObserveAttributeValue, ObservedError, ObservedSubsystem, ObserveEvent, ObserveEventBase, ObservePrimitive, Observer, OperationCompletedEvent, OperationFailedEvent, OperationStartedEvent, OtelTracerOptions, OutputGuardrail, OutputGuardrailContext, OutputGuardrailResult, ParsedEvolveSource, Part, PlanTaskSnapshot, PlanUpdatePart, PopulationStore, PrepareStepResult, PriceProvider, PriceUsageOptions, ProfileCapability, ProfileSupport, Provider, ReasoningDeltaPart, ReasoningPart, RegistryMatch, ResolvedDependencies, ResumeDeuzChatOptions, ResumeEvolveOptions, ResumeOptions, Role, RunAbortedEvent, RunCompletedEvent, RunFailedEvent, RunStartedEvent, RunSummary, RunSuspendedEvent, ScheduleCatchUp, ScheduleClaim, ScheduleDefinition, ScheduleOccurrence, ScheduleOccurrenceResult, Scheduler, SchedulerOptions, ScheduleStartOptions, ScheduleTickResult, SearchReplaceBlock, ServiceTier, SessionStore, SignalDispatchInput, SignalRejection, SignalVerification, SignatureEncoding, SignedApprovalPayload, SlackVerifyOptions, SourcePart, Span, SpanOptions, StandardSchemaIssue, StandardSchemaProps, StandardSchemaResult, StandardSchemaV1, StepCompletedEvent, StepFinishPart, StepResult, StepStartedEvent, StepStartPart, StopCondition, StopDetails, StreamChat, StreamChatOptions, StreamChatResult, StreamObject, StreamObjectResult, StreamPart, SubAgentCompletedEvent, SubAgentFailedEvent, SubAgentPart, SubAgentStartedEvent, SubAgentSuspendedEvent, TextDeltaPart, TextPart, TokenStore, Tool, ToolApprovalRequest, ToolApprovalRequestPart, ToolApprovalResponse, ToolCall, ToolCallDeltaPart, ToolCallGuardrail, ToolCallGuardrailContext, ToolCallGuardrailResult, ToolCallOutcome, ToolCallPart, ToolChoice, ToolCompletedEvent, ToolDeniedEvent, ToolExecuteContext, ToolFailedEvent, ToolResult, ToolResultGuardrail, ToolResultGuardrailContext, ToolResultGuardrailResult, ToolResultPart, ToolResultStreamPart, ToolRunState, ToolSet, ToolStartedEvent, ToolStatePart, ToolUsePart, Tracer, UIMessage, UIMessagePart, UIToolCall, Usage, UsageMeta, ValidateChatOptions, ValidateChatResult, VerifyPart, VerifyStep, VerifyStepContext, VerifyStepResult, WarningPart, ZonedCronOptions, ZonedDstGap, ZonedDstOverlap, ZonedOccurrence
 
 ## `@deuz-sdk/core/ui`
 
@@ -625,7 +625,7 @@ The Deuz UI wire: SSE responses (native agent runs included), resumable streams,
 
 **Values** (20): agentStateFromParts, connectDeuzStream, createDeuzStream, createInMemoryDurableStreamStateStore, createInMemoryStreamStateStore, DEFAULT_DURABLE_STREAM_BATCH, DEUZ_CAPABILITIES, DEUZ_CAPABILITIES_HEADER, DEUZ_CAPABILITY, DEUZ_STREAM_VERSION, DEUZ_STREAM_VERSIONS, formatDeuzCapabilities, negotiateDeuzStreamVersion, parseDeuzCapabilities, readDeuzStream, resumeDeuzStreamResponse, toDeuzAgentStreamResponse, toDeuzObjectStreamResponse, toDeuzStreamResponse, toDeuzTextStreamResponse
 
-**Types** (30): ConnectDeuzStreamOptions, CreateDeuzStreamOptions, DeuzAgentClientCall, DeuzAgentFrame, DeuzAgentResultFrame, DeuzAgentState, DeuzAgentStatus, DeuzAgentUnknownEffect, DeuzCapabilitiesPart, DeuzCapability, DeuzStreamDoneRecord, DeuzStreamSource, DeuzStreamWriter, DeuzUIPart, DeuzWireVersion, DurableStreamBatch, DurableStreamBatchOptions, DurableStreamCommitResult, DurableStreamOpenResult, DurableStreamOptions, DurableStreamStateStore, InMemoryStreamStateStoreOptions, ReadDeuzStreamOptions, ResumeDeuzStreamOptions, StreamStateRecord, StreamStateStore, ToDeuzAgentStreamOptions, ToDeuzStreamOptions, ToDeuzTextStreamOptions, WriteDataOptions
+**Types** (31): ConnectDeuzStreamOptions, CreateDeuzStreamOptions, DeuzAgentClientCall, DeuzAgentFrame, DeuzAgentResultFrame, DeuzAgentState, DeuzAgentStatus, DeuzAgentUnknownEffect, DeuzCapabilitiesOptions, DeuzCapabilitiesPart, DeuzCapability, DeuzStreamDoneRecord, DeuzStreamSource, DeuzStreamWriter, DeuzUIPart, DeuzWireVersion, DurableStreamBatch, DurableStreamBatchOptions, DurableStreamCommitResult, DurableStreamOpenResult, DurableStreamOptions, DurableStreamStateStore, InMemoryStreamStateStoreOptions, ReadDeuzStreamOptions, ResumeDeuzStreamOptions, StreamStateRecord, StreamStateStore, ToDeuzAgentStreamOptions, ToDeuzStreamOptions, ToDeuzTextStreamOptions, WriteDataOptions
 
 ## `@deuz-sdk/core/react`
 
@@ -639,9 +639,9 @@ Legacy in-core React hooks, frozen at 2.2: no 2.3 verdict matching or resumed-tu
 
 The pure chat state engine plus validateChatRequest — the gate in front of client history.
 
-**Values** (20): applyUIPart, assistantMessageFromTurn, branchBeforeUserMessage, canonicalFromUI, clientToolResultMessage, createAssistantTurn, createInMemoryChatStore, createInMemoryConditionalChatStore, createInMemoryTranscriptIndex, deserializeChatRecord, dropTrailingAssistant, filesToImageParts, indexChat, parseDeuzChatRequest, RevisionConflictError, sealAssistantTurn, serializeChatRecord, uiFromMessages, userMessageFromInput, validateChatRequest
+**Values** (22): applyUIPart, assistantMessageFromTurn, branchBeforeUserMessage, canonicalFromUI, clientToolResultMessage, createAssistantTurn, createInMemoryChatStore, createInMemoryConditionalChatStore, createInMemoryTranscriptIndex, deserializeChatRecord, dropTrailingAssistant, filesToImageParts, indexChat, isConditionalChatStore, parseDeuzChatRequest, RevisionConflictError, sealAssistantTurn, serializeChatRecord, uiFromMessages, updateConditionalChat, userMessageFromInput, validateChatRequest
 
-**Types** (23): AssistantTurnState, ChatHistory, ChatInput, ChatPersistOptions, ChatRecord, ChatStore, ChatTombstone, ConditionalChatRead, ConditionalChatRecord, ConditionalChatStore, ConditionalChatWriteResult, DeuzChatRequest, InMemoryConditionalChatStoreOptions, MemoryScope, TranscriptHit, TranscriptIndex, TranscriptMessage, TranscriptSearchOptions, UIMessage, UIMessagePart, UIToolCall, ValidateChatOptions, ValidateChatResult
+**Types** (25): AssistantTurnState, ChatHistory, ChatInput, ChatPersistOptions, ChatRecord, ChatStore, ChatTombstone, ConditionalChatMerge, ConditionalChatRead, ConditionalChatRecord, ConditionalChatStore, ConditionalChatWriteResult, DeuzChatRequest, InMemoryConditionalChatStoreOptions, MemoryScope, TranscriptHit, TranscriptIndex, TranscriptMessage, TranscriptSearchOptions, UIMessage, UIMessagePart, UIToolCall, UpdateConditionalChatOptions, ValidateChatOptions, ValidateChatResult
 
 ## `@deuz-sdk/core/chat/node`
 
@@ -671,6 +671,7 @@ Reverse lookup for "which subpath do I import this from?". Root exports are omit
 - `agentStateFromParts` — `ui`
 - `allTasksSettled` — `autonomy`
 - `anthropic` — `anthropic`
+- `ANTHROPIC_TOOL_FRAMING_TOKENS` — `context`
 - `applyEvents` — `memory`
 - `applyMutations` — `memory`
 - `applySearchReplace` — `evolve`
@@ -678,6 +679,7 @@ Reverse lookup for "which subpath do I import this from?". Root exports are omit
 - `applyWorkingMemoryPatch` — `context`
 - `approxCountTokens` — `rag`
 - `assertScope` — `memory`
+- `assertTimeZone` — `schedule`
 - `assessGoal` — `goal`
 - `assistantMessageFromTurn` — `chat`
 - `azure` — `azure`, `providers`
@@ -709,8 +711,11 @@ Reverse lookup for "which subpath do I import this from?". Root exports are omit
 - `composeObservers` — `observe`
 - `connectDeuzStream` — `ui`
 - `ContextBudgetExceededError` — `context`
+- `contextPackageBlob` — `context`
+- `contextWarnings` — `context`
 - `cosineSimilarity` — `memory`, `rag`
 - `CostBadge` — `@deuz-sdk/react`
+- `countTokensWith` — `rag`
 - `createA2AAgentExecutor` — `a2a`
 - `createA2AClient` — `a2a`
 - `createA2AHandler` — `a2a`
@@ -894,7 +899,7 @@ Reverse lookup for "which subpath do I import this from?". Root exports are omit
 - `defaultHashFn` — `memory`
 - `defaultMemoryScorer` — `memory`
 - `defaultNodeParserRegistry` — `rag/node`
-- `defineAccountedMemoryLLM` — `memory/versioned`
+- `defineAccountedMemoryLLM` — `memory`, `memory/versioned`
 - `deleteGeminiCache` — `google/extras`
 - `deserializeChatRecord` — `chat`
 - `deserializeCheckpoint` — `durable`
@@ -904,6 +909,8 @@ Reverse lookup for "which subpath do I import this from?". Root exports are omit
 - `DEUZ_CAPABILITY` — `ui`
 - `DEUZ_STREAM_VERSION` — `ui`
 - `DEUZ_STREAM_VERSIONS` — `ui`
+- `digestWorkspace` — `workspace`
+- `DockerSandboxError` — `compute/docker`
 - `doctor` — `headless`
 - `docxParser` — `rag/node`
 - `downloadVideo` — `video`
@@ -913,6 +920,9 @@ Reverse lookup for "which subpath do I import this from?". Root exports are omit
 - `emitActivity` — `runtime`
 - `emitPlanUpdate` — `runtime`
 - `estimatePdfTokens` — `rag`
+- `estimateRequestOverhead` — `context`
+- `estimateRequestTokens` — `context`
+- `estimateTextTokens` — `context`
 - `estimateTokens` — `rag`
 - `evolve` — `evolve`
 - `evolveCandidateId` — `evolve`
@@ -943,6 +953,8 @@ Reverse lookup for "which subpath do I import this from?". Root exports are omit
 - `GOAL_EVENT_VERSION` — `goal`
 - `GOAL_RECORD_VERSION` — `goal`
 - `GOAL_SEEN_LIMIT` — `goal`
+- `goalDeliveryDigest` — `goal/runtime`
+- `goalDependencyEvents` — `goal/runtime`
 - `GoalError` — `goal`, `goal/runtime`
 - `goalEventFromOccurrence` — `goal`
 - `goalEventFromSignal` — `goal`
@@ -967,7 +979,8 @@ Reverse lookup for "which subpath do I import this from?". Root exports are omit
 - `inMemoryTokenStore` — `mcp`
 - `inspectRun` — `headless`
 - `intersectExecutionPolicies` — `agent`
-- `isAccounted` — `memory/versioned`
+- `isAccounted` — `memory`, `memory/versioned`
+- `isConditionalChatStore` — `chat`
 - `isExpired` — `memory`
 - `kimi` — `providers`
 - `lexicalMatcher` — `skills`
@@ -986,6 +999,7 @@ Reverse lookup for "which subpath do I import this from?". Root exports are omit
 - `negotiateDeuzStreamVersion` — `ui`
 - `nextOccurrence` — `schedule`
 - `nextPendingTask` — `autonomy`
+- `nextZonedOccurrence` — `schedule`
 - `nodeSkillSource` — `skills/node`
 - `normalizeResourcePath` — `skills`
 - `normalizeWorkspacePath` — `workspace`
@@ -1052,6 +1066,8 @@ Reverse lookup for "which subpath do I import this from?". Root exports are omit
 - `runEvalSuite` — `testing`
 - `runGradedEval` — `testing`
 - `runHeadless` — `headless`
+- `RUNS_V3_SCHEMA_NAME` — `ops/sqlite`
+- `RUNS_V3_SCHEMA_VERSION` — `ops/sqlite`
 - `sambanova` — `providers`
 - `scopeToolsToSkill` — `skills`
 - `sealAssistantTurn` — `chat`
@@ -1063,6 +1079,7 @@ Reverse lookup for "which subpath do I import this from?". Root exports are omit
 - `serializeTaskList` — `autonomy`
 - `serveMcpStdio` — `mcp/server/stdio`
 - `setTaskStatus` — `autonomy`
+- `settleGoalEvent` — `goal/runtime`
 - `shellTool` — `compute`
 - `shouldSendWhole` — `rag`
 - `SkillLearningError` — `skills/learning`
@@ -1082,6 +1099,7 @@ Reverse lookup for "which subpath do I import this from?". Root exports are omit
 - `SwarmLeaseError` — `swarm`
 - `sweepExpired` — `memory`
 - `taskListProgress` — `autonomy`
+- `timeZoneOffset` — `schedule`
 - `toDeuzAgentStreamResponse` — `ui`
 - `toDeuzObjectStreamResponse` — `ui`
 - `toDeuzStreamResponse` — `ui`
@@ -1095,6 +1113,7 @@ Reverse lookup for "which subpath do I import this from?". Root exports are omit
 - `transitionGoal` — `goal`
 - `uiFromMessages` — `chat`
 - `UnsupportedStoreError` — `agent`
+- `updateConditionalChat` — `chat`
 - `updateTask` — `autonomy`
 - `uploadFile` — `google/extras`
 - `useChat` — `react`, `@deuz-sdk/react`
@@ -1124,3 +1143,4 @@ Reverse lookup for "which subpath do I import this from?". Root exports are omit
 - `YUNWU_MIDJOURNEY_MODELS` — `yunwu`
 - `YUNWU_MODELS` — `yunwu`
 - `YUNWU_VIDEO_MODELS` — `yunwu`
+- `zonedOccurrencesBetween` — `schedule`

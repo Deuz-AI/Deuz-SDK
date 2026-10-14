@@ -328,16 +328,21 @@ export function scheduleStoreContracts(
     test('refuses an advance from another cursor, revision or an inactive schedule, writing nothing', async () => {
       const { store } = await setup();
       await store.schedules.put(scheduleInput('s'), { expectedRevision: 0, effectiveFrom: T0 });
-      const step = async (overrides: Partial<ScheduleAdvance>) =>
-        store.schedules.advance({
-          scope: 'tenant',
-          scheduleId: 's',
+      // The occurrences follow the overridden scope and schedule, so each request is
+      // well formed and only its cursor, revision, scope or schedule is wrong.
+      const step = async (overrides: Partial<ScheduleAdvance>) => {
+        const scope = overrides.scope ?? 'tenant';
+        const scheduleId = overrides.scheduleId ?? 's';
+        return store.schedules.advance({
+          scope,
+          scheduleId,
           expectedRevision: 1,
           fromCursor: T0,
           toCursor: T0 + 2 * MINUTE,
-          occurrences: [await delivered('s', T0 + MINUTE)],
+          occurrences: [await delivered(scheduleId, T0 + MINUTE, { scope })],
           ...overrides,
         });
+      };
       expect((await step({ fromCursor: T0 - 1 })).status).toBe('conflict');
       expect((await step({ expectedRevision: 2 })).status).toBe('conflict');
       expect((await step({ scope: 'other' })).status).toBe('conflict');
@@ -462,9 +467,12 @@ export function scheduleStoreContracts(
       await time.advance(MINUTE);
       const again = await store.inbox.enqueue({ ...delivery, payload: { body: 'retry body' } });
       expect(again).toEqual({ status: 'duplicate', entry: queued.entry });
+      // The same entry id addressed (event and all) to another goal.
       const other = await store.inbox.enqueue({
-        ...delivery,
-        goalId: 'goal-2',
+        ...(await occurrenceDelivery('hook', T0, { goalId: 'goal-2' })),
+        namespace: delivery.namespace,
+        deliveryId: delivery.deliveryId,
+        payload: delivery.payload,
         digest: await sha256Digest('another target'),
       });
       expect(other).toEqual({ status: 'conflict', entry: queued.entry });
@@ -473,8 +481,16 @@ export function scheduleStoreContracts(
       expect((await store.inbox.enqueue({ ...delivery, namespace: 'webhook:slack' })).status).toBe(
         'enqueued',
       );
+      const elsewhere = await occurrenceDelivery('hook', T0, { scope: 'other', goalId: 'goal-x' });
       expect(
-        (await store.inbox.enqueue({ ...delivery, scope: 'other', goalId: 'goal-x' })).status,
+        (
+          await store.inbox.enqueue({
+            ...elsewhere,
+            namespace: delivery.namespace,
+            deliveryId: delivery.deliveryId,
+            payload: delivery.payload,
+          })
+        ).status,
       ).toBe('enqueued');
     });
 

@@ -302,7 +302,7 @@ export interface MemoryForgetEvent {
 }
 
 /** Called after a forget committed; awaited in order. A failure never undoes the forget. */
-export type MemoryForgetListener = (event: MemoryForgetEvent) => void | Promise<void>;
+export type MemoryForgetListener = (event: MemoryForgetEvent) => void | Promise<unknown>;
 
 /** What `forget` did. */
 export interface MemoryForgetResult extends MemoryForgetEvent {

@@ -29,9 +29,15 @@ import {
 } from './fixtures/goal-runtime-store-conformance';
 import { goalStoreContracts } from './fixtures/goal-store-conformance';
 import { SLOW_TEST_TIMEOUT_MS } from './fixtures/timeouts';
+import { scheduleStoreContracts } from './fixtures/schedule-store-conformance';
 
 goalStoreContracts('sqlite goal runtime store (GoalStore)', () =>
   createSqliteGoalRuntimeStore({ path: ':memory:' }),
+);
+
+// L5's schedule/inbox contract on this store (wired at the W1a integration).
+scheduleStoreContracts('sqlite goal runtime store (schedule/inbox contract)', (deps) =>
+  createSqliteGoalRuntimeStore({ path: ':memory:', clock: deps.clock }),
 );
 
 goalRuntimeStoreContracts('sqlite goal runtime store', ({ clock }) => {

@@ -52,5 +52,12 @@ export type {
   ResolvedGoalArtifact,
   VerifyGoalAcceptanceInput,
 } from './verify-acceptance';
+export { goalDeliveryDigest, goalDependencyEvents, settleGoalEvent } from './delivery';
+export type {
+  GoalDeliveryContent,
+  GoalDependencyEventsOptions,
+  GoalInboxSettlement,
+  GoalSettledDisposition,
+} from './delivery';
 export { GoalError } from '../errors';
 export type { GoalErrorCode } from '../errors';

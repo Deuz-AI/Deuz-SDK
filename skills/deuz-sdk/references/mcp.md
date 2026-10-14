@@ -1,4 +1,4 @@
-<!-- verified: 2026-10-14 against @deuz-sdk/core@2.3.0 · api-contract sha256:d27a42f55029
+<!-- verified: 2026-10-15 against @deuz-sdk/core@2.3.0 · api-contract sha256:fb025f0c23e3
      sources: packages/core/src/mcp/index.ts, packages/core/src/mcp/shared.ts, packages/core/src/mcp/resolve.ts,
      packages/core/src/mcp/auth.ts, packages/core/src/mcp/stdio.ts, packages/core/src/mcp/sdk-line.ts,
      packages/core/src/mcp/sdk-v2.ts, packages/core/src/node/mcp.ts, packages/core/src/inference/loop-shared.ts,

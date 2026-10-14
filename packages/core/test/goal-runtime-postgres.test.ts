@@ -29,6 +29,7 @@ import { goalStoreContracts } from './fixtures/goal-store-conformance';
 import { pglitePool } from './fixtures/pg-pool';
 import { postgresUrl } from './fixtures/services';
 import { SLOW_HOOK_TIMEOUT_MS, SLOW_TEST_TIMEOUT_MS } from './fixtures/timeouts';
+import { scheduleStoreContracts } from './fixtures/schedule-store-conformance';
 
 /** A pool whose connections throw on statements starting with `prefix` while `fail.on` is set. */
 function failingPool(inner: PgPoolLike, prefix: string): PgPoolLike & { fail: { on: boolean } } {
@@ -66,6 +67,17 @@ afterAll(() => lite.close());
 
 goalStoreContracts('postgres goal runtime store (GoalStore, PGlite)', async () =>
   createPostgresGoalRuntimeStore({ pool: litePool, schema: await liteSchema() }),
+);
+
+// L5's schedule/inbox contract on this store (wired at the W1a integration).
+scheduleStoreContracts(
+  'postgres goal runtime store (schedule/inbox contract, PGlite)',
+  async (deps) =>
+    createPostgresGoalRuntimeStore({
+      pool: litePool,
+      schema: await liteSchema(),
+      clock: deps.clock,
+    }),
 );
 
 goalRuntimeStoreContracts(
@@ -196,6 +208,13 @@ describe.skipIf(!url)('createPostgresGoalRuntimeStore (live server)', () => {
 
   goalStoreContracts('postgres goal runtime store (GoalStore, live)', async () =>
     createPostgresGoalRuntimeStore({ pool, schema: await freshSchema() }),
+  );
+
+  scheduleStoreContracts(
+    'postgres goal runtime store (schedule/inbox contract, live)',
+    async (deps) =>
+      createPostgresGoalRuntimeStore({ pool, schema: await freshSchema(), clock: deps.clock }),
+    { timeout: SLOW_TEST_TIMEOUT_MS },
   );
 
   goalRuntimeStoreContracts(

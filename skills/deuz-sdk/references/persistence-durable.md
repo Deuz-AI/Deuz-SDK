@@ -1,4 +1,4 @@
-<!-- verified: 2026-10-14 against @deuz-sdk/core@2.3.0 · api-contract sha256:d27a42f55029
+<!-- verified: 2026-10-15 against @deuz-sdk/core@2.3.0 · api-contract sha256:fb025f0c23e3
      sources: docs/content/docs/modules/stores.mdx, docs/content/docs/modules/chat-persistence.mdx,
      docs/content/docs/agents/durable-runtime.mdx, docs/content/docs/agents/unbreakable-chatbot.mdx,
      docs/content/docs/reference/whats-new-2-0.mdx, packages/core/src/durable.ts,

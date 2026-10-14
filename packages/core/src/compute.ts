@@ -36,6 +36,8 @@ function toToolResult(result: CodeExecutionResult, maxOutputChars: number | unde
     stderr: capText(result.stderr, maxOutputChars),
     exitCode: result.exitCode,
     ...(result.timedOut ? { timedOut: true } : {}),
+    // 2.4: which stream the sandbox cut at its byte limit; absent keeps 2.3 bytes.
+    ...(result.truncated ? { truncated: result.truncated } : {}),
     ...(result.durationMs !== undefined ? { durationMs: result.durationMs } : {}),
     // Only artifact METADATA goes to the model — never raw bytes in context.
     ...(result.artifacts && result.artifacts.length > 0

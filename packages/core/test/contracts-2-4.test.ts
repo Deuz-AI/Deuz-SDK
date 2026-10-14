@@ -71,16 +71,19 @@ describe('/memory/versioned skeleton', () => {
 });
 
 describe('/context skeleton', () => {
-  it('publishes the compiler, working memory and source adapters as stubs', () => {
-    expectStub('compileContext', () => context.compileContext(any));
-    expectStub('createContextCompiler', () => context.createContextCompiler(any));
-    expectStub('createWorkingMemory', () => context.createWorkingMemory(any));
-    expectStub('applyWorkingMemoryPatch', () => context.applyWorkingMemoryPatch(any, any, any));
-    expectStub('workingMemoryTools', () => context.workingMemoryTools(any));
-    expectStub('createMemoryContextSource', () => context.createMemoryContextSource(any));
-    expectStub('createRagContextSource', () => context.createRagContextSource(any));
-    expectStub('createTranscriptContextSource', () => context.createTranscriptContextSource(any));
-    expectStub('createSkillsContextSource', () => context.createSkillsContextSource(any));
+  it('publishes the compiler, working memory and source adapters (implemented by L2 and L3a)', () => {
+    for (const name of [
+      'compileContext',
+      'createContextCompiler',
+      'createWorkingMemory',
+      'applyWorkingMemoryPatch',
+      'workingMemoryTools',
+      'createMemoryContextSource',
+      'createRagContextSource',
+      'createTranscriptContextSource',
+      'createSkillsContextSource',
+    ] as const)
+      expect(typeof context[name]).toBe('function');
   });
 
   it('makes the one token estimator public, unchanged', () => {
@@ -127,15 +130,18 @@ describe('/chat and /ui 2.4 additions', () => {
 });
 
 describe('/goal/runtime skeleton', () => {
-  it('publishes the supervisor, scheduler, webhook, store and acceptance entry points as stubs', async () => {
+  it('publishes the supervisor (a stub until L4b), scheduler, webhook, store and acceptance', async () => {
     expectStub('createGoalSupervisor', () => goalRuntime.createGoalSupervisor(any));
     expectStub('createNativeRunLauncher', () => goalRuntime.createNativeRunLauncher(any));
-    expectStub('createDurableScheduler', () => goalRuntime.createDurableScheduler(any));
-    expectStub('createWebhookHandler', () => goalRuntime.createWebhookHandler(any));
-    expectStub('toNodeHandler', () => goalRuntime.toNodeHandler(any));
-    // Implemented by L4a.
+    // Implemented by L5, L4a and L4c.
+    for (const name of [
+      'createDurableScheduler',
+      'createWebhookHandler',
+      'toNodeHandler',
+      'verifyGoalAcceptance',
+    ] as const)
+      expect(typeof goalRuntime[name]).toBe('function');
     expect(await goalRuntime.createInMemoryGoalRuntimeStore().load('g')).toBeUndefined();
-    await expectAsyncStub('verifyGoalAcceptance', () => goalRuntime.verifyGoalAcceptance(any));
   });
 
   it('keys an inbox entry by scope, namespace and delivery id, on every store alike', () => {
@@ -225,11 +231,10 @@ describe('2.4 Node stores on their entries', () => {
       storesPostgres.createPostgresConditionalChatStore({ connectionString: 'postgres://unused' })
         .conditional,
     ).toBe(true);
-    expectStub('createSqliteAgentRunStoreV3', () => opsSqlite.createSqliteAgentRunStoreV3(any));
-    expectStub('createPostgresAgentRunStoreV3', () =>
-      opsPostgres.createPostgresAgentRunStoreV3(any),
-    );
-    expectStub('createInMemoryAgentRunStoreV3', () => createInMemoryAgentRunStoreV3());
+    // Implemented by L3a.
+    expect(typeof opsSqlite.createSqliteAgentRunStoreV3).toBe('function');
+    expect(typeof opsPostgres.createPostgresAgentRunStoreV3).toBe('function');
+    expect(typeof createInMemoryAgentRunStoreV3().save).toBe('function');
   });
 
   it('reach the durable stream state stores (implemented by L7b) through the /stores entries', async () => {
