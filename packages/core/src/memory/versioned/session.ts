@@ -12,7 +12,6 @@ import {
   RevisionConflictError,
 } from '../../errors';
 import { digestJson, type Sha256Digest } from '../../internal/digest';
-import { notImplemented } from '../../internal/not-implemented';
 import { resolveDependencies } from '../../internal/resolve-deps';
 import { DEUZ_ATTR, DEUZ_SPAN, observeSpan } from '../../internal/telemetry';
 import type { Embedder, MemoryKind, MemoryLLM } from '../../memory';
@@ -47,6 +46,9 @@ import type {
   MemoryLink,
   MemoryOperationResult,
   MemoryOrigin,
+  MemoryReembedItem,
+  MemoryReembedOptions,
+  MemoryReembedResult,
   MemoryRememberInput,
   MemorySession,
   MemorySourceRef,
@@ -57,6 +59,9 @@ import type {
   VersionedMemoryRecord,
   VersionedMemoryRevision,
 } from './types';
+
+/** Passes over the pending records before a re-embed call gives up for now (resumable). */
+const REEMBED_PASSES = 3;
 
 /** A fact to write, with the sources it rests on. */
 export interface SessionFact {
@@ -207,7 +212,7 @@ export function createMemorySession(options: CreateMemorySessionOptions): Memory
     throw invalid('maxConflictRetries must be a positive integer.');
   const deps = resolveDependencies(options.deps);
   const llm: MemoryLLM | AccountedMemoryLLM | undefined = options.llm;
-  const embedder: Embedder | AccountedMemoryEmbedder | undefined = options.embedder;
+  let embedder: Embedder | AccountedMemoryEmbedder | undefined = options.embedder;
   const listeners: readonly MemoryForgetListener[] =
     options.onForget === undefined
       ? []
@@ -803,8 +808,95 @@ export function createMemorySession(options: CreateMemorySessionOptions): Memory
       return store.history(scope, id);
     },
 
-    async reembed() {
-      return notImplemented('MemorySession.reembed');
+    async reembed(reembedOptions: MemoryReembedOptions) {
+      if (reembedOptions === null || typeof reembedOptions !== 'object')
+        throw invalid('reembed needs options.');
+      const next = reembedOptions.embedder;
+      if (next === null || typeof next !== 'object' || typeof next.embed !== 'function')
+        throw invalid('reembed needs an embedder.');
+      const { modelId, dims, signal } = reembedOptions;
+      if (typeof modelId !== 'string' || modelId === '') throw invalid('reembed needs a modelId.');
+      if (!Number.isSafeInteger(dims) || dims < 1)
+        throw invalid('reembed dims must be a positive integer.');
+      const batchSize = reembedOptions.batchSize ?? 64;
+      const concurrency = reembedOptions.concurrency ?? 1;
+      if (!Number.isSafeInteger(batchSize) || batchSize < 1)
+        throw invalid('reembed batchSize must be a positive integer.');
+      if (!Number.isSafeInteger(concurrency) || concurrency < 1)
+        throw invalid('reembed concurrency must be a positive integer.');
+      return observeSpan(
+        deps,
+        DEUZ_SPAN.memoryOp,
+        { [DEUZ_ATTR.memoryOperation]: 'reembed' },
+        async (annotate): Promise<MemoryReembedResult> => {
+          annotate({ [DEUZ_ATTR.memoryOperation]: 'reembed' });
+          throwIfAborted(signal);
+          const { generation } = await store.embeddings.begin({ modelId, dims });
+          annotate({ [DEUZ_ATTR.memoryEmbeddingGeneration]: generation });
+          let embedded = 0;
+          let skipped = 0;
+          const result = (activated: boolean): MemoryReembedResult => {
+            annotate({ [DEUZ_ATTR.memoryRecordCount]: embedded });
+            if (activated) embedder = next;
+            return { generation, embedded, skipped, activated };
+          };
+
+          /** Embeds one batch of the new generation and stores what is still current. */
+          const fill = async (items: MemoryReembedItem[]): Promise<void> => {
+            const out = await charging.embed(
+              next,
+              items.map((item) => item.text),
+              'add',
+              modelId,
+            );
+            for (const vector of out.vectors)
+              if (out.model !== modelId || !Array.isArray(vector) || vector.length !== dims)
+                throw new EmbeddingMismatchError({
+                  expected: { modelId, dims, generation },
+                  actual: { modelId: out.model, dims: Array.isArray(vector) ? vector.length : 0 },
+                });
+            const stored = await store.embeddings.put(
+              generation,
+              items.map((item, index) => ({
+                id: item.id,
+                revision: item.revision,
+                textDigest: item.textDigest,
+                vector: out.vectors[index]!,
+              })),
+            );
+            embedded += stored;
+            // A record whose revision moved meanwhile is embedded again from its new text.
+            skipped += items.length - stored;
+          };
+
+          for (let pass = 0; pass < REEMBED_PASSES; pass++) {
+            let after: string | undefined;
+            let exhausted = false;
+            while (!exhausted) {
+              throwIfAborted(signal);
+              const batches: MemoryReembedItem[][] = [];
+              while (batches.length < concurrency) {
+                const items = await store.embeddings.pending(generation, {
+                  limit: batchSize,
+                  ...(after !== undefined ? { after } : {}),
+                });
+                if (items.length > 0) {
+                  batches.push(items);
+                  after = items.at(-1)!.id;
+                }
+                if (items.length < batchSize) {
+                  exhausted = true;
+                  break;
+                }
+              }
+              await Promise.all(batches.map(fill));
+            }
+            if (await store.embeddings.activate(generation)) return result(true);
+            // Records changed behind the cursor: another pass from the start embeds them.
+          }
+          return result(false);
+        },
+      );
     },
   };
   sessionInternals.set(session, internals);
