@@ -19,6 +19,8 @@ import { createGoal, createGoalEvent, transitionGoal } from '../../src/goal';
 import type { GoalEvent, GoalRecord } from '../../src/goal';
 import { DEFAULT_GOAL_RUNTIME_POLICY, goalInboxKey } from '../../src/goal/runtime';
 import type {
+  DurableScheduleInput,
+  DurableScheduleQuery,
   GoalInboxApplication,
   GoalInboxEnqueue,
   GoalInboxQuery,
@@ -130,6 +132,21 @@ export function runIntent(
     kind: 'start',
     runId: `run-${intentId}`,
     attempt: 1,
+    ...patch,
+  };
+}
+
+/** A schedule for `goal`, every minute in UTC unless patched. */
+export function scheduleInput(
+  goal: Pick<GoalRecord, 'goalId' | 'scope'>,
+  scheduleId: string,
+  patch: Partial<DurableScheduleInput> = {},
+): DurableScheduleInput {
+  return {
+    scheduleId,
+    scope: goal.scope,
+    goalId: goal.goalId,
+    spec: { cron: '* * * * *' },
     ...patch,
   };
 }
@@ -589,6 +606,264 @@ export function goalRuntimeStoreContracts(
             ),
           ).rejects.toThrow(TypeError);
           expect((await store.inbox.get('tenant', entry.id))?.disposition).toBe('pending');
+        }),
+      );
+    });
+
+    describe('schedules', () => {
+      it(
+        'creates a schedule at revision 1 with its cursor at the effective instant',
+        withStore(async (store, time) => {
+          const goal = runtimeGoal('g');
+          await store.save(goal);
+          await time.advance(7);
+          const input = scheduleInput(goal, 's1', {
+            spec: { cron: '30 2 * * *', timezone: 'America/New_York', dstGap: 'skip' },
+            event: { correlationId: 'nightly', expiresAfterMs: 60_000 },
+          });
+          const created = await store.schedules.put(input, {
+            expectedRevision: 0,
+            effectiveFrom: T0 + 5,
+          });
+          const expected = {
+            ...input,
+            status: 'active',
+            revision: 1,
+            effectiveFrom: T0 + 5,
+            scheduleCursor: T0 + 5,
+            createdAt: T0 + 7,
+            updatedAt: T0 + 7,
+          };
+          expect(created).toEqual({ status: 'committed', schedule: expected });
+          expect(await store.schedules.get('tenant', 's1')).toEqual(expected);
+          expect(await store.schedules.get('other', 's1')).toBeUndefined();
+          // A second create of the same id conflicts.
+          expect(
+            await store.schedules.put(input, { expectedRevision: 0, effectiveFrom: T0 + 9 }),
+          ).toEqual({ status: 'conflict' });
+        }),
+      );
+
+      it(
+        'changes a schedule at its revision: a new revision and boundary, the cursor kept',
+        withStore(async (store, time) => {
+          const goal = runtimeGoal('g');
+          await store.save(goal);
+          await store.schedules.put(scheduleInput(goal, 's1'), {
+            expectedRevision: 0,
+            effectiveFrom: T0,
+          });
+          await time.advance(1_000);
+          const changed = await store.schedules.put(
+            scheduleInput(goal, 's1', { spec: { cron: '0 * * * *' } }),
+            { expectedRevision: 1, effectiveFrom: T0 + 1_000 },
+          );
+          expect(changed).toEqual({
+            status: 'committed',
+            schedule: {
+              ...scheduleInput(goal, 's1', { spec: { cron: '0 * * * *' } }),
+              status: 'active',
+              revision: 2,
+              effectiveFrom: T0 + 1_000,
+              scheduleCursor: T0,
+              createdAt: T0,
+              updatedAt: T0 + 1_000,
+            },
+          });
+          expect(
+            await store.schedules.put(scheduleInput(goal, 's1'), {
+              expectedRevision: 1,
+              effectiveFrom: T0 + 2_000,
+            }),
+          ).toEqual({ status: 'conflict' });
+          expect(
+            await store.schedules.put(scheduleInput(goal, 'unknown'), {
+              expectedRevision: 1,
+              effectiveFrom: T0,
+            }),
+          ).toEqual({ status: 'conflict' });
+          expect((await store.schedules.get('tenant', 's1'))?.spec.cron).toBe('0 * * * *');
+        }),
+      );
+
+      it(
+        'targets only an existing goal of its own scope',
+        withStore(async (store) => {
+          await store.save(runtimeGoal('g', 'tenant-a'));
+          for (const input of [
+            scheduleInput({ goalId: 'g', scope: 'tenant-b' }, 's1'),
+            scheduleInput({ goalId: 'missing', scope: 'tenant-a' }, 's1'),
+          ])
+            await expect(
+              store.schedules.put(input, { expectedRevision: 0, effectiveFrom: T0 }),
+            ).rejects.toMatchObject({ code: 'scope_mismatch' });
+          expect((await store.schedules.list()).schedules).toEqual([]);
+        }),
+      );
+
+      it(
+        'pauses an active schedule and resumes a paused one from a new boundary',
+        withStore(async (store, time) => {
+          const goal = runtimeGoal('g');
+          await store.save(goal);
+          await store.schedules.put(scheduleInput(goal, 's1'), {
+            expectedRevision: 0,
+            effectiveFrom: T0,
+          });
+          await time.advance(10);
+          const paused = await store.schedules.pause('tenant', 's1', { expectedRevision: 1 });
+          expect(paused).toMatchObject({
+            status: 'committed',
+            schedule: { status: 'paused', revision: 2, scheduleCursor: T0, updatedAt: T0 + 10 },
+          });
+          expect(await store.schedules.pause('tenant', 's1', { expectedRevision: 2 })).toEqual({
+            status: 'conflict',
+          });
+          expect(
+            await store.schedules.resume('tenant', 's1', {
+              expectedRevision: 1,
+              effectiveFrom: T0 + 20,
+            }),
+          ).toEqual({ status: 'conflict' });
+          expect(
+            await store.schedules.resume('other', 's1', {
+              expectedRevision: 2,
+              effectiveFrom: T0 + 20,
+            }),
+          ).toEqual({ status: 'conflict' });
+          const resumed = await store.schedules.resume('tenant', 's1', {
+            expectedRevision: 2,
+            effectiveFrom: T0 + 20,
+          });
+          expect(resumed).toMatchObject({
+            status: 'committed',
+            schedule: { status: 'active', revision: 3, effectiveFrom: T0 + 20, scheduleCursor: T0 },
+          });
+          expect(
+            await store.schedules.resume('tenant', 's1', {
+              expectedRevision: 3,
+              effectiveFrom: T0 + 30,
+            }),
+          ).toEqual({ status: 'conflict' });
+        }),
+      );
+
+      it(
+        'cancels a schedule for good and disposes its pending deliveries',
+        withStore(async (store, time) => {
+          const goal = runtimeGoal('g');
+          await store.save(goal);
+          await store.schedules.put(scheduleInput(goal, 's1'), {
+            expectedRevision: 0,
+            effectiveFrom: T0,
+          });
+          const fromSchedule = (deliveryId: string) =>
+            delivery(goal, deliveryId, { namespace: 'schedule:s1' });
+          const { entry: pending } = await store.inbox.enqueue(fromSchedule('s1@1'));
+          const { entry: settled } = await store.inbox.enqueue(fromSchedule('s1@2'));
+          const { entry: webhook } = await store.inbox.enqueue(delivery(goal, 'w1'));
+          await store.inbox.apply({
+            scope: 'tenant',
+            goalId: 'g',
+            entryId: settled.id,
+            disposition: 'applied',
+          });
+          await time.advance(50);
+          expect(await store.schedules.cancel('tenant', 's1', { expectedRevision: 2 })).toEqual({
+            status: 'conflict',
+          });
+          const cancelled = await store.schedules.cancel('tenant', 's1', { expectedRevision: 1 });
+          expect(cancelled).toMatchObject({
+            status: 'committed',
+            schedule: { status: 'cancelled', revision: 2 },
+          });
+          expect(await store.inbox.get('tenant', pending.id)).toEqual({
+            ...pending,
+            disposition: 'cancelled',
+            settledAt: T0 + 50,
+          });
+          expect((await store.inbox.get('tenant', settled.id))?.disposition).toBe('applied');
+          expect((await store.inbox.get('tenant', webhook.id))?.disposition).toBe('pending');
+          // A cancelled schedule takes no further change.
+          const options = { expectedRevision: 2, effectiveFrom: T0 + 60 };
+          expect(await store.schedules.put(scheduleInput(goal, 's1'), options)).toEqual({
+            status: 'conflict',
+          });
+          expect(await store.schedules.pause('tenant', 's1', options)).toEqual({
+            status: 'conflict',
+          });
+          expect(await store.schedules.resume('tenant', 's1', options)).toEqual({
+            status: 'conflict',
+          });
+          expect(await store.schedules.cancel('tenant', 's1', options)).toEqual({
+            status: 'conflict',
+          });
+        }),
+      );
+
+      it(
+        'lists schedules by id, by scope, goal and status, page by page',
+        withStore(async (store) => {
+          const g = runtimeGoal('g');
+          const h = runtimeGoal('h');
+          const x = runtimeGoal('x', 'other');
+          for (const goal of [g, h, x]) await store.save(goal);
+          const create = (input: DurableScheduleInput) =>
+            store.schedules.put(input, { expectedRevision: 0, effectiveFrom: T0 });
+          await create(scheduleInput(g, 'c'));
+          await create(scheduleInput(h, 'a'));
+          await create(scheduleInput(g, 'b'));
+          await create(scheduleInput(x, 'a'));
+          await store.schedules.pause('tenant', 'b', { expectedRevision: 1 });
+          const ids = async (query?: DurableScheduleQuery) =>
+            (await store.schedules.list(query)).schedules.map((s) => `${s.scope}/${s.scheduleId}`);
+          expect(await ids()).toEqual(['other/a', 'tenant/a', 'tenant/b', 'tenant/c']);
+          expect(await ids({ scope: 'tenant' })).toEqual(['tenant/a', 'tenant/b', 'tenant/c']);
+          expect(await ids({ goalId: 'g' })).toEqual(['tenant/b', 'tenant/c']);
+          expect(await ids({ statuses: ['paused'] })).toEqual(['tenant/b']);
+          expect(await ids({ statuses: [] })).toEqual([]);
+          const pages: string[][] = [];
+          let cursor: string | undefined;
+          do {
+            const page = await store.schedules.list({ limit: 3, cursor });
+            pages.push(page.schedules.map((s) => `${s.scope}/${s.scheduleId}`));
+            cursor = page.cursor;
+          } while (cursor);
+          expect(pages).toEqual([['other/a', 'tenant/a', 'tenant/b'], ['tenant/c']]);
+          for (const query of [{ limit: 0 }, { cursor: 'nope' }, { statuses: ['done'] }])
+            await expect(
+              Promise.resolve().then(() => store.schedules.list(query as DurableScheduleQuery)),
+              JSON.stringify(query),
+            ).rejects.toThrow(TypeError);
+        }),
+      );
+
+      it(
+        'refuses a malformed schedule without writing',
+        withStore(async (store) => {
+          const goal = runtimeGoal('g');
+          await store.save(goal);
+          const options = { expectedRevision: 0, effectiveFrom: T0 };
+          for (const [input, opts] of [
+            [scheduleInput(goal, 's1', { spec: { cron: '' } }), options],
+            [
+              scheduleInput(goal, 's1', { spec: { cron: '* * * * *', dstGap: 'never' as never } }),
+              options,
+            ],
+            [
+              scheduleInput(goal, 's1', { spec: { cron: '* * * * *', catchUp: 'some' as never } }),
+              options,
+            ],
+            [scheduleInput(goal, ''), options],
+            [scheduleInput(goal, 's1', { event: { expiresAfterMs: -1 } }), options],
+            [scheduleInput(goal, 's1'), { expectedRevision: -1, effectiveFrom: T0 }],
+            [scheduleInput(goal, 's1'), { expectedRevision: 0, effectiveFrom: Number.NaN }],
+          ] as const)
+            await expect(
+              Promise.resolve().then(() => store.schedules.put(input, opts)),
+              JSON.stringify(input),
+            ).rejects.toThrow(TypeError);
+          expect((await store.schedules.list()).schedules).toEqual([]);
         }),
       );
     });

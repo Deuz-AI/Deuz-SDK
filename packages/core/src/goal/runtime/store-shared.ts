@@ -16,6 +16,9 @@ import { GoalError } from '../errors';
 import { checkGoalEvent, readGoal } from '../validate';
 import type { GoalRecord } from '../types';
 import type {
+  DurableSchedule,
+  DurableScheduleInput,
+  DurableScheduleQuery,
   GoalInboxApplication,
   GoalInboxDisposition,
   GoalInboxEnqueue,
@@ -27,6 +30,7 @@ import type {
   GoalRuntimeCommitResult,
   GoalRuntimePhase,
   GoalRuntimeState,
+  ScheduleOccurrenceRecord,
 } from './store-types';
 
 /**
@@ -59,7 +63,9 @@ export type GoalRuntimeWrite =
   | { kind: 'goal'; record: GoalRecord; created: boolean }
   | { kind: 'runtime'; state: GoalRuntimeState; created: boolean }
   | { kind: 'entry'; entry: GoalInboxEntry; created: boolean }
-  | { kind: 'intent'; intent: GoalRunIntent; created: boolean };
+  | { kind: 'intent'; intent: GoalRunIntent; created: boolean }
+  | { kind: 'schedule'; schedule: DurableSchedule; created: boolean }
+  | { kind: 'occurrence'; record: ScheduleOccurrenceRecord };
 
 /** A planner's answer: the result, and the writes that commit it (none when refused). */
 export interface GoalRuntimePlan<R> {
@@ -682,4 +688,256 @@ export function planIntentRecord(
     return refused('scope-mismatch');
   if (snapshot.intent !== undefined) return refused('intent-exists');
   return committed([{ kind: 'intent', intent: newIntent(input, now), created: true }]);
+}
+
+// ===================================================================
+// Schedules
+// ===================================================================
+
+export const SCHEDULE_STATUSES: readonly DurableSchedule['status'][] = [
+  'active',
+  'paused',
+  'cancelled',
+];
+
+/** The namespace a schedule's deliveries use: `schedule:<scheduleId>`. */
+export function scheduleNamespace(scheduleId: string): string {
+  return `schedule:${scheduleId}`;
+}
+
+/** A checked schedule as the host defines it, as a JSON copy. Throws a TypeError. */
+export function checkScheduleInput(value: unknown): DurableScheduleInput {
+  const check = new RuntimeChecker('durable schedule');
+  const input = check.object(value, 'schedule');
+  check.string(input.scheduleId, 'scheduleId');
+  check.string(input.scope, 'scope');
+  check.string(input.goalId, 'goalId');
+  const spec = check.object(input.spec, 'spec');
+  check.string(spec.cron, 'spec.cron');
+  if (spec.timezone !== undefined) check.string(spec.timezone, 'spec.timezone');
+  if (spec.dstGap !== undefined) check.oneOf(spec.dstGap, ['shift', 'skip'], 'spec.dstGap');
+  if (spec.dstOverlap !== undefined)
+    check.oneOf(spec.dstOverlap, ['first', 'both'], 'spec.dstOverlap');
+  if (spec.catchUp !== undefined)
+    check.oneOf(spec.catchUp, ['latest', 'all', 'none'], 'spec.catchUp');
+  if (input.event !== undefined) {
+    const event = check.object(input.event, 'event');
+    check.optionalString(event.correlationId, 'event.correlationId');
+    if (event.expiresAfterMs !== undefined)
+      check.amount(event.expiresAfterMs, 'event.expiresAfterMs');
+  }
+  check.json(input, '');
+  return jsonCopy(input as unknown as DurableScheduleInput);
+}
+
+/** Checks the options of a schedule change. Throws a TypeError. */
+export function checkScheduleOptions(
+  value: unknown,
+  boundary: boolean,
+): { expectedRevision: number; effectiveFrom: number } {
+  const check = new RuntimeChecker('schedule change');
+  const options = check.object(value, 'options');
+  const expectedRevision = check.count(options.expectedRevision, 'expectedRevision');
+  const effectiveFrom = boundary ? check.time(options.effectiveFrom, 'effectiveFrom') : 0;
+  return { expectedRevision, effectiveFrom };
+}
+
+/** What a schedule change answers. */
+export type ScheduleChangeResult =
+  | { status: 'committed'; schedule: DurableSchedule }
+  | { status: 'conflict' };
+
+const SCHEDULE_CONFLICT: GoalRuntimePlan<ScheduleChangeResult> = {
+  result: { status: 'conflict' },
+  writes: [],
+};
+
+function scheduleCommitted(
+  schedule: DurableSchedule,
+  created: boolean,
+  more: GoalRuntimeWrite[] = [],
+): GoalRuntimePlan<ScheduleChangeResult> {
+  return {
+    result: { status: 'committed', schedule },
+    writes: [{ kind: 'schedule', schedule, created }, ...more],
+  };
+}
+
+/**
+ * `schedules.put`: a create at `expectedRevision` 0 (its cursor at
+ * `effectiveFrom`), or a change of a schedule that is not cancelled at its
+ * stored revision (a new revision and boundary; the cursor stays, only
+ * `advance` moves it). The target goal must be stored in the schedule's scope.
+ */
+export function planSchedulePut(
+  snapshot: { schedule: DurableSchedule | undefined; goal: StoredGoal | undefined },
+  input: DurableScheduleInput,
+  options: { expectedRevision: number; effectiveFrom: number },
+  now: number,
+): GoalRuntimePlan<ScheduleChangeResult> {
+  if (snapshot.goal === undefined || snapshot.goal.scope !== input.scope)
+    throw new GoalError(
+      'scope_mismatch',
+      `No goal ${input.goalId} in scope ${input.scope} for schedule ${input.scheduleId}`,
+    );
+  const stored = snapshot.schedule;
+  if (options.expectedRevision === 0) {
+    if (stored !== undefined) return SCHEDULE_CONFLICT;
+    return scheduleCommitted(
+      {
+        ...input,
+        status: 'active',
+        revision: 1,
+        effectiveFrom: options.effectiveFrom,
+        scheduleCursor: options.effectiveFrom,
+        createdAt: now,
+        updatedAt: now,
+      },
+      true,
+    );
+  }
+  if (!changeable(stored, options.expectedRevision)) return SCHEDULE_CONFLICT;
+  const { event: _event, ...kept } = stored;
+  return scheduleCommitted(
+    {
+      ...kept,
+      ...input,
+      revision: stored.revision + 1,
+      effectiveFrom: options.effectiveFrom,
+      updatedAt: now,
+    },
+    false,
+  );
+}
+
+/** A stored schedule at `expectedRevision` that is not cancelled. */
+function changeable(
+  stored: DurableSchedule | undefined,
+  expectedRevision: number,
+): stored is DurableSchedule {
+  return (
+    stored !== undefined && stored.revision === expectedRevision && stored.status !== 'cancelled'
+  );
+}
+
+/** `schedules.pause`: an active schedule at its revision stops scanning. */
+export function planSchedulePause(
+  stored: DurableSchedule | undefined,
+  options: { expectedRevision: number },
+  now: number,
+): GoalRuntimePlan<ScheduleChangeResult> {
+  if (!changeable(stored, options.expectedRevision) || stored.status !== 'active')
+    return SCHEDULE_CONFLICT;
+  return scheduleCommitted(
+    { ...stored, status: 'paused', revision: stored.revision + 1, updatedAt: now },
+    false,
+  );
+}
+
+/** `schedules.resume`: a paused schedule at its revision is active again from `effectiveFrom`. */
+export function planScheduleResume(
+  stored: DurableSchedule | undefined,
+  options: { expectedRevision: number; effectiveFrom: number },
+  now: number,
+): GoalRuntimePlan<ScheduleChangeResult> {
+  if (!changeable(stored, options.expectedRevision) || stored.status !== 'paused')
+    return SCHEDULE_CONFLICT;
+  return scheduleCommitted(
+    {
+      ...stored,
+      status: 'active',
+      revision: stored.revision + 1,
+      effectiveFrom: options.effectiveFrom,
+      updatedAt: now,
+    },
+    false,
+  );
+}
+
+/**
+ * `schedules.cancel`: the schedule ends at its revision, and `pending` (its
+ * still-pending deliveries, read by the store) are disposed as `'cancelled'`.
+ */
+export function planScheduleCancel(
+  snapshot: { schedule: DurableSchedule | undefined; pending: readonly GoalInboxEntry[] },
+  options: { expectedRevision: number },
+  now: number,
+): GoalRuntimePlan<ScheduleChangeResult> {
+  const stored = snapshot.schedule;
+  if (!changeable(stored, options.expectedRevision)) return SCHEDULE_CONFLICT;
+  return scheduleCommitted(
+    { ...stored, status: 'cancelled', revision: stored.revision + 1, updatedAt: now },
+    false,
+    snapshot.pending
+      .filter((entry) => entry.disposition === 'pending')
+      .map((entry) => ({
+        kind: 'entry' as const,
+        entry: { ...entry, disposition: 'cancelled' as const, settledAt: now },
+        created: false,
+      })),
+  );
+}
+
+/**
+ * Whether `entry` is a still-pending delivery of the schedule: in its scope,
+ * under its namespace or named by one of its occurrence records.
+ */
+export function isPendingDeliveryOf(
+  entry: GoalInboxEntry,
+  schedule: Pick<DurableSchedule, 'scope' | 'scheduleId'>,
+  occurrenceEntryIds: ReadonlySet<string>,
+): boolean {
+  return (
+    entry.scope === schedule.scope &&
+    entry.disposition === 'pending' &&
+    (entry.namespace === scheduleNamespace(schedule.scheduleId) || occurrenceEntryIds.has(entry.id))
+  );
+}
+
+/** A validated schedule listing. */
+export interface ScheduleListPlan {
+  scope: string | undefined;
+  goalId: string | undefined;
+  statuses: readonly DurableSchedule['status'][] | undefined;
+  limit: number;
+  /** The sort key of the previous page's last schedule. */
+  after: readonly [scheduleId: string, scope: string] | undefined;
+}
+
+export function planScheduleList(query: DurableScheduleQuery | undefined): ScheduleListPlan {
+  const fields = checkQuery(query, 'schedule listing');
+  return {
+    scope: optionalQueryString(fields.scope, 'Schedule listing scope'),
+    goalId: optionalQueryString(fields.goalId, 'Schedule listing goalId'),
+    statuses: checkStatuses(fields.statuses, SCHEDULE_STATUSES, 'Schedule listing statuses'),
+    limit: checkLimit(fields.limit, 'Schedule listing'),
+    after:
+      fields.cursor === undefined
+        ? undefined
+        : decodeCursor(fields.cursor, ['string', 'string'] as const, 'schedule listing'),
+  };
+}
+
+/** By schedule id, then scope (code point order). */
+export function schedulesById(
+  left: Pick<DurableSchedule, 'scheduleId' | 'scope'>,
+  right: Pick<DurableSchedule, 'scheduleId' | 'scope'>,
+): number {
+  return compareText(left.scheduleId, right.scheduleId) || compareText(left.scope, right.scope);
+}
+
+/** The sort key a schedule cursor carries. */
+export const scheduleKey = (schedule: DurableSchedule): [string, string] => [
+  schedule.scheduleId,
+  schedule.scope,
+];
+
+/** Whether `schedule` belongs on a listing (for a store that filters in process). */
+export function matchesScheduleList(schedule: DurableSchedule, plan: ScheduleListPlan): boolean {
+  if (plan.scope !== undefined && schedule.scope !== plan.scope) return false;
+  if (plan.goalId !== undefined && schedule.goalId !== plan.goalId) return false;
+  if (plan.statuses !== undefined && !plan.statuses.includes(schedule.status)) return false;
+  if (plan.after !== undefined)
+    return schedulesById(schedule, { scheduleId: plan.after[0], scope: plan.after[1] }) > 0;
+  return true;
 }

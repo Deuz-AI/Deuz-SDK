@@ -3,7 +3,8 @@
  * so the SQLite and PostgreSQL stores key and default exactly like this one.
  * Edge-safe.
  */
-import type { Clock, Dependencies } from '../../types/deps';
+import type { Dependencies } from '../../types/deps';
+import { resolveDependencies } from '../../internal/resolve-deps';
 import { notImplemented } from '../../internal/not-implemented';
 import { planGoalList, goalListCursor } from '../store';
 import type { GoalRecord } from '../types';
@@ -13,11 +14,15 @@ import {
   checkGoal,
   checkIntentInput,
   checkRuntimeState,
+  checkScheduleInput,
+  checkScheduleOptions,
   goalsNewestFirst,
   inboxKey,
   inboxOldestFirst,
+  isPendingDeliveryOf,
   jsonCopy,
   matchesInboxList,
+  matchesScheduleList,
   pageOf,
   planApply,
   planEnqueue,
@@ -25,15 +30,24 @@ import {
   planInboxList,
   planIntentRecord,
   planRuntimeSave,
+  planScheduleCancel,
+  planScheduleList,
+  planSchedulePause,
+  planSchedulePut,
+  planScheduleResume,
+  scheduleKey,
+  schedulesById,
   type GoalRuntimePlan,
   type GoalRuntimeWrite,
 } from './store-shared';
 import type {
+  DurableSchedule,
   GoalInboxEntry,
   GoalRunIntent,
   GoalRuntimePolicy,
   GoalRuntimeState,
   GoalRuntimeStore,
+  ScheduleOccurrenceRecord,
 } from './store-types';
 
 /** The supervisor's policy defaults (spec §3.1); copy `retryDelaysMs` before changing it. */
@@ -62,8 +76,6 @@ export function goalInboxKey(scope: string, namespace: string, deliveryId: strin
   return `inbox:${JSON.stringify([scope, namespace, deliveryId])}`;
 }
 
-const HOST_CLOCK: Pick<Clock, 'now'> = { now: () => Date.now() };
-
 /**
  * The in-memory `GoalRuntimeStore` (2.4): the reference for tests and one
  * process. Copies in and out; every multi-part write is applied whole or not
@@ -73,7 +85,7 @@ const HOST_CLOCK: Pick<Clock, 'now'> = { now: () => Date.now() };
 export function createInMemoryGoalRuntimeStore(options?: {
   deps?: Dependencies;
 }): GoalRuntimeStore {
-  const clock = options?.deps?.clock ?? HOST_CLOCK;
+  const { clock } = resolveDependencies(options?.deps);
   const goals = new Map<string, GoalRecord>();
   /** By goal ID, which is globally unique. */
   const runtimes = new Map<string, GoalRuntimeState>();
@@ -81,6 +93,10 @@ export function createInMemoryGoalRuntimeStore(options?: {
   const entries = new Map<string, GoalInboxEntry>();
   /** By `[scope, intentId]`. */
   const intents = new Map<string, GoalRunIntent>();
+  /** By `[scope, scheduleId]`. */
+  const schedules = new Map<string, DurableSchedule>();
+  /** By `[scope, occurrenceId]`. */
+  const occurrences = new Map<string, ScheduleOccurrenceRecord>();
   const scoped = (scope: string, id: string): string => JSON.stringify([scope, id]);
 
   /** Applies a plan's writes; each one is already checked, so nothing here can fail half way. */
@@ -91,6 +107,9 @@ export function createInMemoryGoalRuntimeStore(options?: {
       else if (write.kind === 'entry') entries.set(write.entry.id, write.entry);
       else if (write.kind === 'intent')
         intents.set(scoped(write.intent.scope, write.intent.intentId), write.intent);
+      else if (write.kind === 'schedule')
+        schedules.set(scoped(write.schedule.scope, write.schedule.scheduleId), write.schedule);
+      else occurrences.set(scoped(write.record.scope, write.record.occurrenceId), write.record);
     }
   };
 
@@ -197,12 +216,58 @@ export function createInMemoryGoalRuntimeStore(options?: {
       },
     },
     schedules: {
-      put: todo,
-      get: todo,
-      list: todo,
-      pause: todo,
-      resume: todo,
-      cancel: todo,
+      async put(schedule, putOptions) {
+        const input = checkScheduleInput(schedule);
+        const change = checkScheduleOptions(putOptions, true);
+        return commit(
+          planSchedulePut(
+            {
+              schedule: schedules.get(scoped(input.scope, input.scheduleId)),
+              goal: goals.get(input.goalId),
+            },
+            input,
+            change,
+            clock.now(),
+          ),
+        );
+      },
+      async get(scope, scheduleId) {
+        return inScope(schedules.get(scoped(scope, scheduleId)), scope);
+      },
+      async list(query) {
+        const plan = planScheduleList(query);
+        const rows = [...schedules.values()]
+          .filter((schedule) => matchesScheduleList(schedule, plan))
+          .sort(schedulesById);
+        const page = pageOf(rows, plan.limit, scheduleKey);
+        return jsonCopy(
+          page.cursor ? { schedules: page.rows, cursor: page.cursor } : { schedules: page.rows },
+        );
+      },
+      async pause(scope, scheduleId, pauseOptions) {
+        const change = checkScheduleOptions(pauseOptions, false);
+        return commit(
+          planSchedulePause(schedules.get(scoped(scope, scheduleId)), change, clock.now()),
+        );
+      },
+      async resume(scope, scheduleId, resumeOptions) {
+        const change = checkScheduleOptions(resumeOptions, true);
+        return commit(
+          planScheduleResume(schedules.get(scoped(scope, scheduleId)), change, clock.now()),
+        );
+      },
+      async cancel(scope, scheduleId, cancelOptions) {
+        const change = checkScheduleOptions(cancelOptions, false);
+        const schedule = schedules.get(scoped(scope, scheduleId));
+        const named = new Set<string>();
+        for (const record of occurrences.values())
+          if (record.scope === scope && record.scheduleId === scheduleId && record.inboxEntryId)
+            named.add(record.inboxEntryId);
+        const pending = [...entries.values()].filter((entry) =>
+          isPendingDeliveryOf(entry, { scope, scheduleId }, named),
+        );
+        return commit(planScheduleCancel({ schedule, pending }, change, clock.now()));
+      },
       advance: todo,
     },
     intents: {
