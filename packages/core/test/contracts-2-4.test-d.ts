@@ -44,6 +44,7 @@ import type {
   AgentRunMemoryExtractionV3,
   AgentStreamV3,
 } from '../src/types/agent-run-v3';
+import type { SkillProposal } from '../src/skills/learning';
 
 describe('2.4 stores plug into their 2.3 seams', () => {
   it('a conditional chat store is a ChatStore', () => {
@@ -183,5 +184,12 @@ describe('V3 runs', () => {
 
   it('streams a V3 run as an AgentStream, so the UI bridge takes it unchanged', () => {
     expectTypeOf<AgentStreamV3>().toMatchTypeOf<AgentStream>();
+  });
+});
+
+describe('skill proposals', () => {
+  it('are always proposed and never evaluated', () => {
+    expectTypeOf<SkillProposal['status']>().toEqualTypeOf<'proposed'>();
+    expectTypeOf<SkillProposal['evaluation']>().toEqualTypeOf<'not-evaluated'>();
   });
 });

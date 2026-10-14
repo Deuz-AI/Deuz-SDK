@@ -16,6 +16,7 @@ import * as ui from '../src/ui';
 import { createTokenEstimator } from '../src/internal/estimate-tokens';
 import * as goalRuntime from '../src/goal/runtime';
 import { agentRunLeaseKey } from '../src/ops';
+import * as learning from '../src/skills/learning';
 
 function expectStub(name: string, call: () => unknown): void {
   let thrown: unknown;
@@ -160,5 +161,14 @@ describe('/goal/runtime skeleton', () => {
       pollMs: 1_000,
     });
     expect(goalRuntime.GoalError).toBe(GoalError);
+  });
+});
+
+describe('/skills/learning skeleton', () => {
+  it('publishes proposeSkillFromRun as a stub and a typed refusal', async () => {
+    await expectAsyncStub('proposeSkillFromRun', () => learning.proposeSkillFromRun(any));
+    const error = new learning.SkillLearningError('source_too_large', 'too large');
+    expect(errors.isDeuzError(error)).toBe(true);
+    expect(error.code).toBe('source_too_large');
   });
 });
