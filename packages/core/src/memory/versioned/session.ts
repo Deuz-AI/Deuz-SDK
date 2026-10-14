@@ -18,7 +18,13 @@ import { DEUZ_ATTR, DEUZ_SPAN, observeSpan } from '../../internal/telemetry';
 import type { Embedder, MemoryKind, MemoryLLM } from '../../memory';
 import type { AccountedMemoryEmbedder, AccountedMemoryLLM } from '../../types/accounting';
 import { createMemoryCharging } from './accounting';
-import { buildReconcilePrompt, parseReconcileDecisions } from './prompts';
+import {
+  buildExtractionPrompt,
+  buildReconcilePrompt,
+  parseExtractedFacts,
+  parseReconcileDecisions,
+} from './prompts';
+import { readExtractionSources } from './policy';
 import {
   checkImportance,
   checkLinks,
@@ -35,6 +41,7 @@ import {
 } from './shared';
 import type {
   CreateMemorySessionOptions,
+  MemoryExtractionInput,
   MemoryForgetListener,
   MemoryForgetResult,
   MemoryLink,
@@ -595,8 +602,91 @@ export function createMemorySession(options: CreateMemorySessionOptions): Memory
       );
     },
 
-    async extract() {
-      return notImplemented('MemorySession.extract');
+    async extract(input: MemoryExtractionInput, writeOptions) {
+      if (input === null || typeof input !== 'object') throw invalid('extract needs an input.');
+      if (input.kind !== undefined && !isMemoryKind(input.kind))
+        throw invalid('extract has an unknown kind.');
+      if (
+        input.supersede !== undefined &&
+        input.supersede !== 'reconcile' &&
+        input.supersede !== 'add'
+      )
+        throw invalid("supersede must be 'reconcile' or 'add'.");
+      if (input.instructions !== undefined && typeof input.instructions !== 'string')
+        throw invalid('extract instructions must be a string.');
+      const topK = input.topK ?? 5;
+      if (!Number.isSafeInteger(topK) || topK < 1)
+        throw invalid('extract topK must be a positive integer.');
+      const ttlMs = checkTtl(input.ttlMs, 'extract');
+      const links = checkLinks(input.links, 'extract');
+      const infer = input.infer !== false;
+      if (infer && !llm)
+        throw invalid(
+          'extract infers facts with a memory LLM (options.llm), or pass infer: false.',
+        );
+      const mode = input.supersede ?? defaultMode;
+      if (mode === 'reconcile' && !llm)
+        throw invalid("supersede: 'reconcile' needs a memory LLM (options.llm).");
+      const read = await readExtractionSources(input.messages, options.extraction, scope);
+      const operationId = writeOptions?.operationId ?? deps.generateId();
+      const requestDigest = await digestJson({
+        type: 'extract',
+        scope,
+        sources: read.map((source) => source.ref),
+        kind: input.kind,
+        ttlMs,
+        links,
+        topK,
+        supersede: mode,
+        instructions: input.instructions,
+        infer,
+      });
+
+      let facts: SessionFact[] | undefined;
+      const extractFacts = async (): Promise<SessionFact[]> => {
+        if (read.length === 0) return [];
+        if (!infer) return read.map((source) => ({ text: source.text, sources: [source.ref] }));
+        const answer = await charging.complete(
+          llm!,
+          buildExtractionPrompt(
+            read.map((source) => ({ tag: source.tag, label: source.label, text: source.text })),
+            input.instructions,
+          ),
+        );
+        const byTag = new Map(read.map((source) => [source.tag, source.ref]));
+        return parseExtractedFacts(answer).map((fact) => {
+          const cited = [...new Set(fact.sources)]
+            .map((tag) => byTag.get(tag))
+            .filter((ref): ref is MemorySourceRef => ref !== undefined);
+          return {
+            text: fact.text,
+            ...(fact.kind !== undefined ? { kind: fact.kind } : {}),
+            ...(fact.importance !== undefined ? { importance: fact.importance } : {}),
+            // A fact that cites nothing it was shown rests on everything it read.
+            sources: cited.length > 0 ? cited : read.map((source) => source.ref),
+          };
+        });
+      };
+      return runOperation({
+        name: 'extract',
+        operationId,
+        requestDigest,
+        actor: 'extraction',
+        retry: true,
+        ...(writeOptions?.signal !== undefined ? { signal: writeOptions.signal } : {}),
+        plan: async () => {
+          // One extraction call, however many times reconciliation re-plans.
+          facts ??= await extractFacts();
+          return planFacts(facts, {
+            origin: 'inferred',
+            mode,
+            topK,
+            ...(input.kind !== undefined ? { kind: input.kind } : {}),
+            ...(ttlMs !== undefined ? { ttlMs } : {}),
+            ...(links !== undefined ? { links } : {}),
+          });
+        },
+      });
     },
 
     async recall(input = {}) {
