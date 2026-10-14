@@ -81,8 +81,10 @@ export interface GoalRuntimeDialect {
   table(name: TableName): string;
   /** The type of compared text columns: byte-ordered. */
   text: string;
-  /** The type of epoch ms, revisions and flags. */
+  /** The type of revisions and flags. */
   integer: string;
+  /** The type of epoch ms: any finite JavaScript number, kept exactly. */
+  time: string;
   /** The placeholder of the n-th parameter, 1-based. */
   placeholder(n: number): string;
   /** What a snapshot read appends for the rows its transaction may write: a row lock or nothing. */
@@ -127,22 +129,23 @@ export function goalRuntimeSchema(d: GoalRuntimeDialect): string[] {
   const t = d.table;
   const T = d.text;
   const I = d.integer;
+  const N = d.time;
   return [
-    `CREATE TABLE IF NOT EXISTS ${t('goals')} (goal_id ${T} PRIMARY KEY, scope ${T} NOT NULL, revision ${I} NOT NULL, status ${T} NOT NULL, updated_at ${I} NOT NULL, record TEXT NOT NULL)`,
+    `CREATE TABLE IF NOT EXISTS ${t('goals')} (goal_id ${T} PRIMARY KEY, scope ${T} NOT NULL, revision ${I} NOT NULL, status ${T} NOT NULL, updated_at ${N} NOT NULL, record TEXT NOT NULL)`,
     `CREATE INDEX IF NOT EXISTS deuz_goal_runtime_goals_updated_idx ON ${t('goals')} (updated_at, goal_id)`,
     `CREATE INDEX IF NOT EXISTS deuz_goal_runtime_goals_scope_idx ON ${t('goals')} (scope, updated_at, goal_id)`,
     `CREATE TABLE IF NOT EXISTS ${t('states')} (goal_id ${T} PRIMARY KEY, scope ${T} NOT NULL, revision ${I} NOT NULL, state TEXT NOT NULL)`,
-    `CREATE TABLE IF NOT EXISTS ${t('inbox')} (id ${T} PRIMARY KEY, scope ${T} NOT NULL, goal_id ${T} NOT NULL, namespace ${T} NOT NULL, disposition ${T} NOT NULL, not_before ${I}, enqueued_at ${I} NOT NULL, settled_at ${I}, payload_body TEXT, payload_media_type TEXT, payload_pruned ${I} NOT NULL DEFAULT 0, entry TEXT NOT NULL)`,
+    `CREATE TABLE IF NOT EXISTS ${t('inbox')} (id ${T} PRIMARY KEY, scope ${T} NOT NULL, goal_id ${T} NOT NULL, namespace ${T} NOT NULL, disposition ${T} NOT NULL, not_before ${N}, enqueued_at ${N} NOT NULL, settled_at ${N}, payload_body TEXT, payload_media_type TEXT, payload_pruned ${I} NOT NULL DEFAULT 0, entry TEXT NOT NULL)`,
     `CREATE INDEX IF NOT EXISTS deuz_goal_runtime_inbox_list_idx ON ${t('inbox')} (scope, disposition, enqueued_at, id)`,
     `CREATE INDEX IF NOT EXISTS deuz_goal_runtime_inbox_namespace_idx ON ${t('inbox')} (scope, namespace, disposition)`,
     `CREATE INDEX IF NOT EXISTS deuz_goal_runtime_inbox_settled_idx ON ${t('inbox')} (settled_at)`,
     `CREATE TABLE IF NOT EXISTS ${t('schedules')} (scope ${T} NOT NULL, schedule_id ${T} NOT NULL, goal_id ${T} NOT NULL, status ${T} NOT NULL, schedule TEXT NOT NULL, PRIMARY KEY (scope, schedule_id))`,
     `CREATE INDEX IF NOT EXISTS deuz_goal_runtime_schedules_list_idx ON ${t('schedules')} (schedule_id, scope)`,
-    `CREATE TABLE IF NOT EXISTS ${t('occurrences')} (scope ${T} NOT NULL, occurrence_id ${T} NOT NULL, schedule_id ${T} NOT NULL, at ${I} NOT NULL, inbox_entry_id ${T}, recorded_at ${I} NOT NULL, record TEXT NOT NULL, PRIMARY KEY (scope, occurrence_id))`,
+    `CREATE TABLE IF NOT EXISTS ${t('occurrences')} (scope ${T} NOT NULL, occurrence_id ${T} NOT NULL, schedule_id ${T} NOT NULL, at ${N} NOT NULL, inbox_entry_id ${T}, recorded_at ${N} NOT NULL, record TEXT NOT NULL, PRIMARY KEY (scope, occurrence_id))`,
     `CREATE INDEX IF NOT EXISTS deuz_goal_runtime_occurrences_list_idx ON ${t('occurrences')} (scope, at, occurrence_id)`,
     `CREATE INDEX IF NOT EXISTS deuz_goal_runtime_occurrences_schedule_idx ON ${t('occurrences')} (scope, schedule_id)`,
     `CREATE INDEX IF NOT EXISTS deuz_goal_runtime_occurrences_recorded_idx ON ${t('occurrences')} (recorded_at)`,
-    `CREATE TABLE IF NOT EXISTS ${t('intents')} (scope ${T} NOT NULL, intent_id ${T} NOT NULL, goal_id ${T} NOT NULL, status ${T} NOT NULL, recorded_at ${I} NOT NULL, updated_at ${I} NOT NULL, intent TEXT NOT NULL, PRIMARY KEY (scope, intent_id))`,
+    `CREATE TABLE IF NOT EXISTS ${t('intents')} (scope ${T} NOT NULL, intent_id ${T} NOT NULL, goal_id ${T} NOT NULL, status ${T} NOT NULL, recorded_at ${N} NOT NULL, updated_at ${N} NOT NULL, intent TEXT NOT NULL, PRIMARY KEY (scope, intent_id))`,
     `CREATE INDEX IF NOT EXISTS deuz_goal_runtime_intents_list_idx ON ${t('intents')} (status, recorded_at, scope, intent_id)`,
     `CREATE TABLE IF NOT EXISTS ${t('watermarks')} (scope ${T} NOT NULL, goal_id ${T} NOT NULL, run_id ${T} NOT NULL, revision ${I} NOT NULL, watermark TEXT NOT NULL, PRIMARY KEY (scope, goal_id, run_id))`,
   ];

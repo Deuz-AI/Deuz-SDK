@@ -81,6 +81,8 @@ const SQL = goalRuntimeSql({
   table: (name) => `deuz_goal_runtime_${name}`,
   text: 'TEXT',
   integer: 'INTEGER',
+  // INTEGER affinity keeps a fractional time as a REAL, exactly.
+  time: 'INTEGER',
   placeholder: () => '?',
   lock: '',
 });
