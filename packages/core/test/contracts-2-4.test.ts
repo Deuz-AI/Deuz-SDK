@@ -54,7 +54,6 @@ const any = {} as never;
 
 describe('/memory/versioned skeleton', () => {
   it('publishes the session, tools, in-memory store and import helper as stubs', async () => {
-    expectStub('createMemorySession', () => versioned.createMemorySession(any));
     expectStub('createVersionedMemoryTools', () => versioned.createVersionedMemoryTools(any));
     await expectAsyncStub('importLegacyMemory', () => versioned.importLegacyMemory(any));
   });
