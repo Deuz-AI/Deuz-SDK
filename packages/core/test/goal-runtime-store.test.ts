@@ -6,9 +6,13 @@
 import { describe, expect, it } from 'vitest';
 import { createInMemoryGoalStore, transitionGoal } from '../src/goal';
 import { createInMemoryGoalRuntimeStore } from '../src/goal/runtime';
+import { goalRuntimeStoreContracts } from './fixtures/goal-runtime-store-conformance';
 import { goalRecord, goalStoreContracts } from './fixtures/goal-store-conformance';
 
 goalStoreContracts('memory goal runtime store (GoalStore)', () => createInMemoryGoalRuntimeStore());
+goalRuntimeStoreContracts('memory goal runtime store', ({ clock }) => ({
+  store: createInMemoryGoalRuntimeStore({ deps: { clock } }),
+}));
 
 const T0 = Date.parse('2026-10-10T10:00:00Z');
 

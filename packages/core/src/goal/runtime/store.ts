@@ -7,8 +7,17 @@ import type { Clock, Dependencies } from '../../types/deps';
 import { notImplemented } from '../../internal/not-implemented';
 import { planGoalList, goalListCursor } from '../store';
 import type { GoalRecord } from '../types';
-import { checkGoal, goalsNewestFirst, planGoalSave, type GoalRuntimeWrite } from './store-shared';
-import type { GoalRuntimePolicy, GoalRuntimeStore } from './store-types';
+import {
+  checkGoal,
+  checkRuntimeState,
+  goalsNewestFirst,
+  jsonCopy,
+  planGoalSave,
+  planRuntimeSave,
+  type GoalRuntimePlan,
+  type GoalRuntimeWrite,
+} from './store-shared';
+import type { GoalRuntimePolicy, GoalRuntimeState, GoalRuntimeStore } from './store-types';
 
 /** The supervisor's policy defaults (spec §3.1); copy `retryDelaysMs` before changing it. */
 export const DEFAULT_GOAL_RUNTIME_POLICY = {
@@ -50,13 +59,25 @@ export function createInMemoryGoalRuntimeStore(options?: {
   const clock = options?.deps?.clock ?? HOST_CLOCK;
   void clock;
   const goals = new Map<string, GoalRecord>();
+  /** By goal ID, which is globally unique. */
+  const runtimes = new Map<string, GoalRuntimeState>();
 
   /** Applies a plan's writes; each one is already checked, so nothing here can fail half way. */
   const apply = (writes: readonly GoalRuntimeWrite[]): void => {
     for (const write of writes) {
       if (write.kind === 'goal') goals.set(write.record.goalId, write.record);
+      else if (write.kind === 'runtime') runtimes.set(write.state.goalId, write.state);
     }
   };
+
+  /** Runs a plan and applies its writes: in one synchronous step, so nothing interleaves. */
+  const commit = <R>(plan: GoalRuntimePlan<R>): R => {
+    apply(plan.writes);
+    return plan.result;
+  };
+
+  const inScope = <T extends { scope: string }>(value: T | undefined, scope: string) =>
+    value !== undefined && value.scope === scope ? jsonCopy(value) : undefined;
 
   const todo = (): never => notImplemented('createInMemoryGoalRuntimeStore');
 
@@ -87,7 +108,22 @@ export function createInMemoryGoalRuntimeStore(options?: {
         ? { goals: page, cursor: goalListCursor(last) }
         : { goals: page };
     },
-    runtime: { get: todo, save: todo },
+    runtime: {
+      async get(scope, goalId) {
+        return inScope(runtimes.get(goalId), scope);
+      },
+      async save(state, goal) {
+        const next = checkRuntimeState(state);
+        const nextGoal = goal === undefined ? undefined : checkGoal(goal);
+        return commit(
+          planRuntimeSave(
+            { goal: goals.get(next.goalId), runtime: runtimes.get(next.goalId) },
+            next,
+            nextGoal,
+          ),
+        );
+      },
+    },
     inbox: { enqueue: todo, apply: todo, get: todo, list: todo },
     schedules: {
       put: todo,
