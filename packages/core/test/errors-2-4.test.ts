@@ -10,6 +10,7 @@ import { describe, expect, it } from 'vitest';
 import {
   ContextBudgetExceededError,
   DeuzError,
+  EmbeddingMismatchError,
   OperationConflictError,
   RevisionConflictError,
   UnsupportedStoreError,
@@ -92,6 +93,25 @@ describe('OperationConflictError', () => {
       operationId: 'op-7',
       storedDigest: `sha256:${'a'.repeat(64)}`,
       requestDigest: `sha256:${'b'.repeat(64)}`,
+    });
+  });
+});
+
+describe('EmbeddingMismatchError', () => {
+  it('names both embedding models and sizes instead of scoring zero', () => {
+    const error = new EmbeddingMismatchError({
+      expected: { modelId: 'text-embedding-3-small', dims: 1536, generation: 2 },
+      actual: { modelId: 'voyage-3', dims: 1024 },
+    });
+    expect(isDeuzError(error)).toBe(true);
+    expect(error.code).toBe('embedding_mismatch');
+    expect(error.message).toMatch(/voyage-3/);
+    expect(error.toJSON().details).toEqual({
+      expectedModelId: 'text-embedding-3-small',
+      expectedDims: 1536,
+      expectedGeneration: 2,
+      actualModelId: 'voyage-3',
+      actualDims: 1024,
     });
   });
 });

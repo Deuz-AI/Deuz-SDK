@@ -520,6 +520,49 @@ export class OperationConflictError extends DeuzError {
   }
 }
 
+/**
+ * A vector from another embedding model or of another size than the store's
+ * active embedding generation (2.4). Versioned memory never scores such a
+ * vector as zero: the query or write is refused. Re-embed the records
+ * (`MemorySession.reembed`) or embed with the generation's model.
+ */
+export class EmbeddingMismatchError extends DeuzError {
+  readonly code = 'embedding_mismatch';
+  readonly expected: {
+    readonly modelId: string;
+    readonly dims: number;
+    readonly generation?: number;
+  };
+  readonly actual: { readonly modelId: string; readonly dims: number };
+  constructor(options: {
+    expected: { modelId: string; dims: number; generation?: number };
+    actual: { modelId: string; dims: number };
+    message?: string;
+  }) {
+    super(
+      options.message ??
+        `Embedding mismatch: the store expects ${options.expected.modelId} (${options.expected.dims} dimensions), got ${options.actual.modelId} (${options.actual.dims}).`,
+    );
+    this.expected = { ...options.expected };
+    this.actual = { ...options.actual };
+  }
+
+  override toJSON(): DeuzErrorJSON {
+    return {
+      ...super.toJSON(),
+      details: {
+        expectedModelId: this.expected.modelId,
+        expectedDims: this.expected.dims,
+        ...(this.expected.generation !== undefined
+          ? { expectedGeneration: this.expected.generation }
+          : {}),
+        actualModelId: this.actual.modelId,
+        actualDims: this.actual.dims,
+      },
+    };
+  }
+}
+
 /** The 2.4 features a store backend may not carry. */
 export type StoreFeature =
   | 'agent-run-v3'
