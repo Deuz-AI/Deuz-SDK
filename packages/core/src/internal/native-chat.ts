@@ -22,7 +22,8 @@
  * A `ConditionalChatStore` (2.4) is written with compare-and-set instead of
  * the load-then-save: the projection is decided against the revision it read
  * and written at that revision, decided again on a conflict (three attempts),
- * and never written over a deletion tombstone.
+ * and never written over a deletion tombstone (`chat-projection-cas.ts`,
+ * loaded only for such a store).
  */
 import type { Message } from '../types/message';
 import type { Clock } from '../types/deps';
@@ -34,7 +35,6 @@ import type {
   AgentToolReceipt,
 } from '../types/agent-run';
 import type { ConditionalChatStore } from '../types/chat-conditional';
-import { isConditionalChatStore, updateConditionalChat } from '../chat-conditional';
 import { scopeKey } from './native-scope';
 
 /**
@@ -122,13 +122,14 @@ export function replaceLastTurn(
   transcript.synced = syncPoint(canonical);
 }
 
-interface Projection {
+/** What a projection writes and records (its type is shared with `chat-projection-cas.ts`). */
+export interface Projection {
   messageIds: string[];
   turns: string[];
   invocations: AgentRunChatInvocation[];
 }
 
-function project(
+export function project(
   runId: string,
   transcript: AgentRunTranscript,
   previous: AgentRunChatState | undefined,
@@ -194,18 +195,30 @@ function project(
   return { messageIds, turns, invocations };
 }
 
-function errorOf(error: unknown): { name: string; message: string } {
+export function errorOf(error: unknown): { name: string; message: string } {
   return error instanceof Error
     ? { name: error.name, message: error.message }
     : { name: 'Error', message: String(error) };
 }
 
 /** `prefix` is the first `prefix.length` messages of `messages`. */
-function isPrefix(prefix: readonly Message[], messages: readonly Message[]): boolean {
+export function isPrefix(prefix: readonly Message[], messages: readonly Message[]): boolean {
   if (prefix.length > messages.length) return false;
   for (let index = 0; index < prefix.length; index++)
     if (fingerprint(prefix[index]) !== fingerprint(messages[index])) return false;
   return true;
+}
+
+/** `isConditionalChatStore` (from `/chat`) without loading the conditional chat module. */
+function isConditional(
+  store: ChatPersistOptions['store'],
+): store is ConditionalChatStore & ChatPersistOptions['store'] {
+  const candidate = store as Partial<ConditionalChatStore>;
+  return (
+    candidate.conditional === true &&
+    typeof candidate.readChat === 'function' &&
+    typeof candidate.writeChat === 'function'
+  );
 }
 
 /**
@@ -233,8 +246,11 @@ export async function saveProjection(
   clock: Clock,
   repair: boolean,
 ): Promise<AgentRunChatState> {
-  if (isConditionalChatStore(chat.store))
+  if (isConditional(chat.store)) {
+    // Loaded only for a conditional store: a run on any other store never pays for it.
+    const { saveConditionalProjection } = await import('./chat-projection-cas');
     return saveConditionalProjection(
+      { project, isPrefix, errorOf, fingerprint },
       chat,
       chat.store,
       runId,
@@ -244,6 +260,7 @@ export async function saveProjection(
       clock,
       repair,
     );
+  }
   const behind = {
     chatId: chat.chatId,
     cursor: previous?.cursor ?? 0,
@@ -294,86 +311,6 @@ export async function saveProjection(
     }
   }
   return { chatId: chat.chatId, cursor: messages.length, ...projection, status: 'saved' };
-}
-
-/**
- * `saveProjection` on a `ConditionalChatStore` (2.4): the same decisions
- * (scope check, a chat that moved ahead, a repair that finds the chat moved
- * on), taken against the revision read and written at that revision with
- * `writeChat`. A conflict means another writer got in between: the chat is
- * read and the projection decided again, three attempts in all, after which
- * the write counts as failed (`RevisionConflictError`) and a later repair
- * takes it up. A deletion tombstone is final: the projection is `'superseded'`,
- * from a repair and from a leg still running alike, and nothing is written.
- */
-async function saveConditionalProjection(
-  chat: ChatPersistOptions,
-  store: ConditionalChatStore,
-  runId: string,
-  transcript: AgentRunTranscript,
-  previous: AgentRunChatState | undefined,
-  receipts: readonly AgentToolReceipt[],
-  clock: Clock,
-  repair: boolean,
-): Promise<AgentRunChatState> {
-  const behind = {
-    chatId: chat.chatId,
-    cursor: previous?.cursor ?? 0,
-    messageIds: previous?.messageIds ?? [],
-    turns: previous?.turns ?? [],
-    invocations: previous?.invocations ?? [],
-  };
-  const found = previous?.found !== undefined ? { found: previous.found } : {};
-  const messages = transcript.messages;
-  // What the last decision settled on, and the record the last read found.
-  let settled: AgentRunChatState | undefined;
-  let projection: Projection | undefined;
-  let seen: { found?: string } | undefined;
-  try {
-    await updateConditionalChat(store, chat.chatId, (current) => {
-      settled = undefined;
-      const stored = current.status === 'found' ? current.record : undefined;
-      seen = stored ? { found: fingerprint(stored)! } : {};
-      if (current.status === 'deleted') {
-        settled = { ...behind, status: 'superseded' };
-        return undefined;
-      }
-      if (
-        stored &&
-        (stored.chatId !== chat.chatId || scopeKey(stored.scope) !== scopeKey(chat.scope))
-      ) {
-        settled = { ...behind, ...found, status: 'scope-mismatch' };
-        return undefined;
-      }
-      projection = project(runId, transcript, previous, stored, receipts);
-      const ahead =
-        stored !== undefined &&
-        stored.messages.length > messages.length &&
-        isPrefix(messages, stored.messages);
-      const moved = stored
-        ? !ahead && !isPrefix(stored.messages, messages) && fingerprint(stored) !== previous?.found
-        : previous?.found !== undefined;
-      if (repair && moved) {
-        settled = { ...behind, status: 'superseded' };
-        return undefined;
-      }
-      if (ahead) return undefined;
-      return {
-        chatId: chat.chatId,
-        scope: chat.scope,
-        messages: structuredClone(messages),
-        messageIds: projection.messageIds,
-        ...(chat.parentId ? { parentId: chat.parentId } : {}),
-        updatedAt: clock.now(),
-      };
-    });
-  } catch (error) {
-    // A read that failed before any succeeded keeps what the last failure found.
-    return { ...behind, ...(seen ?? found), status: 'failed', error: errorOf(error) };
-  }
-  return (
-    settled ?? { chatId: chat.chatId, cursor: messages.length, ...projection!, status: 'saved' }
-  );
 }
 
 /**
