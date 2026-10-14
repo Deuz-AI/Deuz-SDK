@@ -35,6 +35,7 @@ interface StoredRun {
   /** The encoded envelope: what a durable store keeps, so copies go in and out. */
   payload: string;
   summary: AgentRunSummary;
+  /** Every package blob the run has pointed to. */
   blobs: readonly Sha256Digest[];
 }
 
@@ -82,7 +83,8 @@ export function createInMemoryAgentRunStoreV3(
       runs.set(envelope.runId, {
         payload,
         summary: summarizeAgentRunEnvelopeV3(envelope, clock.now()),
-        blobs: agentRunV3BlobDigests(envelope),
+        // Every blob the run ever pointed to, as the SQL stores' refs keep them.
+        blobs: [...new Set([...(stored?.blobs ?? []), ...agentRunV3BlobDigests(envelope)])],
       });
     },
     async list(query) {
@@ -126,7 +128,14 @@ export function createInMemoryAgentRunStoreV3(
     async redactForgotten(event) {
       assertForgetEvent(event);
       const added = forgetTombstones(event);
-      tombstones.push(...added);
+      for (const tombstone of added)
+        if (
+          !tombstones.some(
+            (known) =>
+              known.recordId === tombstone.recordId && known.revision === tombstone.revision,
+          )
+        )
+          tombstones.push(tombstone);
       let redacted = 0;
       for (const stored of blobs.values())
         if (stored.content !== undefined && forgotten(stored.records, added)) {

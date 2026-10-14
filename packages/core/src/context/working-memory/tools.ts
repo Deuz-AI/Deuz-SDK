@@ -50,7 +50,7 @@ const LISTS = Object.values(KINDS);
 
 const REFUSALS: Record<WorkingMemoryRejection, string> = {
   forbidden:
-    'forbidden: you can only change items you wrote; the goal, constraints and task list are the host’s',
+    'forbidden: you can only change items you wrote; the goal, constraints and task list belong to the host',
   'unknown-id': 'there is no item with that id (read the working memory for the current ids)',
   'duplicate-id': 'an item with that id already exists',
   invalid: 'the change is malformed',
@@ -202,6 +202,10 @@ export function createWorkingMemoryTools(options: WorkingMemoryToolsOptions): Ag
     ]);
     for (let attempt = 1; attempt <= WRITE_ATTEMPTS; attempt++) {
       const before = memory.current();
+      // The ids there were, read before the write in case a handle updates in place.
+      const known = new Map(
+        LISTS.map((list) => [list, new Set(before[list].map((item) => item.id))] as const),
+      );
       const result = await memory.apply({
         operationId,
         expectedRevision: before.revision,
@@ -215,7 +219,7 @@ export function createWorkingMemoryTools(options: WorkingMemoryToolsOptions): Ag
         refuse(
           `Working memory refused change ${result.operation + 1}: ${REFUSALS[result.reason]}.`,
         );
-      return { before, after: result.snapshot };
+      return { known, after: result.snapshot };
     }
     return refuse('The working memory changed while writing; read it again and retry.');
   };
@@ -309,10 +313,13 @@ export function createWorkingMemoryTools(options: WorkingMemoryToolsOptions): Ag
       if ('status' in written) return written;
       // The ids the patch gave, in the order of the items.
       const fresh = new Map(
-        LISTS.map((list) => {
-          const known = new Set(written.before[list].map((item) => item.id));
-          return [list, written.after[list].filter((item) => !known.has(item.id))] as const;
-        }),
+        LISTS.map(
+          (list) =>
+            [
+              list,
+              written.after[list].filter((item) => !written.known.get(list)!.has(item.id)),
+            ] as const,
+        ),
       );
       return {
         status: 'applied' as const,
