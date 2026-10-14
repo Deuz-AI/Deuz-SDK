@@ -113,10 +113,8 @@ describe('/chat and /ui 2.4 additions', () => {
     expect(chat.RevisionConflictError).toBe(errors.RevisionConflictError);
   });
 
-  it('publishes the durable stream store stub, its batch defaults and the capability handshake', () => {
-    expectStub('createInMemoryDurableStreamStateStore', () =>
-      ui.createInMemoryDurableStreamStateStore(),
-    );
+  it('publishes the durable stream store (implemented by L7b), its batch defaults and the capability handshake', () => {
+    expect(ui.createInMemoryDurableStreamStateStore().durable).toBe(true);
     expect(ui.DEFAULT_DURABLE_STREAM_BATCH).toEqual({ maxDelayMs: 20, maxBytes: 16_384 });
     expect(ui.DEUZ_CAPABILITIES_HEADER).toBe('x-deuz-capabilities');
     expect(typeof ui.parseDeuzCapabilities).toBe('function');
