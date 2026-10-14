@@ -5,7 +5,7 @@
  * all-or-nothing and two writers never interleave. State is copied in and out.
  */
 import { EmbeddingMismatchError, OperationConflictError } from '../../errors';
-import { isSha256Digest, type Sha256Digest } from '../../internal/digest';
+import { digestJson, isSha256Digest, type Sha256Digest } from '../../internal/digest';
 import { notImplemented } from '../../internal/not-implemented';
 import { resolveDependencies } from '../../internal/resolve-deps';
 import { cosineSimilarity, rankFuse } from '../../internal/vector';
@@ -447,10 +447,13 @@ export function createInMemoryVersionedMemoryStore(options?: {
 
       const candidates: StoredRevision[] = [];
       for (const history of records.get(key)?.values() ?? []) {
-        const stored =
-          asOf === undefined
-            ? history.at(-1)
-            : history.findLast((item) => item.record.recordedAt <= asOf);
+        let stored = history.at(-1);
+        if (asOf !== undefined)
+          for (let index = history.length - 1; index >= 0; index--) {
+            stored = history[index];
+            if (stored!.record.recordedAt <= asOf) break;
+            stored = undefined;
+          }
         if (!stored) continue;
         const record = stored.record;
         if (record.status === 'retracted' && !query.includeRetracted) continue;
@@ -547,8 +550,52 @@ export function createInMemoryVersionedMemoryStore(options?: {
       return scopeRevisions.get(scopeKey(checkScope(scope))) ?? 0;
     },
 
-    async forget() {
-      return notImplemented('VersionedMemoryStore.forget');
+    async forget(scope, id, operationId) {
+      const checked = checkScope(scope);
+      if (typeof id !== 'string' || id === '') throw invalid('forget needs a record id.');
+      if (typeof operationId !== 'string' || operationId === '')
+        throw invalid('forget needs an operationId.');
+      const key = scopeKey(checked);
+      const requestDigest = await digestJson({ type: 'forget', scope: checked, id });
+      return mutex.run(async () => {
+        const stored = receipts.get(operationId);
+        if (stored) {
+          if (stored.requestDigest === requestDigest)
+            return { scope: copy(checked), recordId: id, revisions: [], operationId };
+          throw new OperationConflictError({
+            subsystem: 'memory',
+            operationId,
+            storedDigest: stored.requestDigest,
+            requestDigest,
+          });
+        }
+        const history = revisionsOf(key, id);
+        const revisions = history?.map((item) => item.record.revision) ?? [];
+        if (history) {
+          records.get(key)!.delete(id);
+          for (const byKey of vectors.values())
+            for (const revision of revisions) byKey.delete(vectorKey(key, id, revision));
+          let ids = forgotten.get(key);
+          if (!ids) forgotten.set(key, (ids = new Set()));
+          ids.add(id);
+          // Receipts hold no text; they stay so a redelivery replays, marked redacted.
+          for (const receipt of receipts.values())
+            if (scopeKey(receipt.scope) === key && receipt.entries.some((entry) => entry.id === id))
+              receipt.redacted = true;
+        }
+        const scopeRevision = (scopeRevisions.get(key) ?? 0) + 1;
+        scopeRevisions.set(key, scopeRevision);
+        receipts.set(operationId, {
+          operationId,
+          scope: checked,
+          actor: 'host',
+          requestDigest,
+          scopeRevision,
+          entries: [],
+          committedAt: deps.clock.now(),
+        });
+        return { scope: copy(checked), recordId: id, revisions, operationId };
+      });
     },
 
     embeddings: {

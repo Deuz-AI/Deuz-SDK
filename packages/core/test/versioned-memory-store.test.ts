@@ -631,3 +631,110 @@ describe('search', () => {
     expect(hits.map((hit) => hit.record.id)).toEqual(['r2', 'r1']);
   });
 });
+
+describe('forget', () => {
+  it('deletes every revision and vector and keeps content-free receipts', async () => {
+    const { store, now } = setup();
+    await committed(store, await op('op-1', [await embedded('r1', 'secret', [1, 0])]));
+    await committed(
+      store,
+      await op('op-2', [{ type: 'retract', id: 'r1', expectedRevision: 1, reason: 'stale' }]),
+    );
+    await committed(store, await op('op-3', [await embedded('r2', 'kept', [0, 1])]));
+    const event = await store.forget(USER, 'r1', 'op-forget');
+    expect(event).toEqual({
+      scope: USER,
+      recordId: 'r1',
+      revisions: [1, 2],
+      operationId: 'op-forget',
+    });
+    expect(await store.get(USER, 'r1', { includeRetracted: true })).toBeUndefined();
+    expect(await store.get(USER, 'r1', { revision: 1, includeRetracted: true })).toBeUndefined();
+    expect(await store.history(USER, 'r1')).toEqual([]);
+    const searches = await Promise.all([
+      store.search({ scope: USER, text: 'secret', includeRetracted: true, includeExpired: true }),
+      store.search({ scope: USER, text: 'secret', includeRetracted: true, recordedAsOf: now }),
+      store.search({
+        scope: USER,
+        embedding: { vector: [1, 0], modelId: 'emb-1' },
+        includeRetracted: true,
+      }),
+    ]);
+    for (const hits of searches) expect(hits.map((hit) => hit.record.id)).not.toContain('r1');
+    // The receipts that wrote it stay, content-free, so a redelivery replays.
+    expect(await store.receipt('op-1')).toMatchObject({
+      operationId: 'op-1',
+      redacted: true,
+      entries: [{ type: 'create', id: 'r1', revision: 1 }],
+    });
+    expect(await store.receipt('op-2')).toMatchObject({ redacted: true });
+    expect((await store.receipt('op-3'))!.redacted).toBeUndefined();
+    expect(JSON.stringify(await store.receipt('op-1'))).not.toContain('secret');
+    // The forget is an operation with its own content-free receipt.
+    expect(await store.receipt('op-forget')).toMatchObject({
+      operationId: 'op-forget',
+      actor: 'host',
+      entries: [],
+      scopeRevision: 4,
+    });
+    expect(await store.scopeRevision(USER)).toBe(4);
+    expect(await store.get(USER, 'r2')).toMatchObject({ text: 'kept' });
+  });
+
+  it('a redelivered operation cannot bring a forgotten record back', async () => {
+    const { store } = setup();
+    const write = await op('op-1', [await create('r1', 'secret')]);
+    await committed(store, write);
+    await store.forget(USER, 'r1', 'op-forget');
+    expect(await store.commit(write)).toMatchObject({ status: 'replayed' });
+    expect(await store.get(USER, 'r1')).toBeUndefined();
+    // Even under a new operation id the id is never recreated, and nothing revises it.
+    expect(await store.commit(await op('op-2', [await create('r1', 'secret again')]))).toEqual({
+      status: 'conflict',
+      scopeRevision: 2,
+      conflicts: [{ id: 'r1', expectedRevision: 0 }],
+    });
+    expect(
+      await store.commit(
+        await op('op-3', [
+          { type: 'revise', id: 'r1', expectedRevision: 1, changes: { text: 'x' } },
+        ]),
+      ),
+    ).toMatchObject({ status: 'conflict', conflicts: [{ id: 'r1', expectedRevision: 1 }] });
+    expect(await store.history(USER, 'r1')).toEqual([]);
+  });
+
+  it('replays a repeated forget and refuses its id for another record', async () => {
+    const { store } = setup();
+    await committed(store, await op('op-1', [await create('r1', 'a'), await create('r2', 'b')]));
+    await store.forget(USER, 'r1', 'op-forget');
+    expect(await store.forget(USER, 'r1', 'op-forget')).toEqual({
+      scope: USER,
+      recordId: 'r1',
+      revisions: [],
+      operationId: 'op-forget',
+    });
+    expect(await store.scopeRevision(USER)).toBe(2);
+    await expect(store.forget(USER, 'r2', 'op-forget')).rejects.toBeInstanceOf(
+      OperationConflictError,
+    );
+    expect(await store.get(USER, 'r2')).toMatchObject({ text: 'b' });
+  });
+
+  it('forgets nothing for an unknown record or another scope', async () => {
+    const { store } = setup();
+    await committed(store, await op('op-1', [await create('r1', 'mine')]));
+    expect(await store.forget(OTHER, 'r1', 'op-forget')).toEqual({
+      scope: OTHER,
+      recordId: 'r1',
+      revisions: [],
+      operationId: 'op-forget',
+    });
+    expect(await store.get(USER, 'r1')).toMatchObject({ text: 'mine' });
+    // Nothing existed there, so the id stays free in that scope.
+    expect(
+      (await store.commit(await op('op-2', [await create('r1', 'theirs')], { scope: OTHER })))
+        .status,
+    ).toBe('committed');
+  });
+});
