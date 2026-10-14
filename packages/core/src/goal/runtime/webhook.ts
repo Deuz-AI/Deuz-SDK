@@ -15,7 +15,6 @@ import {
 import type { SignalVerification, HmacAlgorithm, SignatureEncoding } from '../../schedule/signal';
 import type { Dependencies } from '../../types/deps';
 import { sha256Digest } from '../../internal/digest';
-import { notImplemented } from '../../internal/not-implemented';
 import { resolveDependencies } from '../../internal/resolve-deps';
 import { createGoalEvent } from '../events';
 import type { GoalEventInput } from '../events';
@@ -84,7 +83,6 @@ export interface WebhookHandlerOptions {
 /** The default body cap of a webhook handler. */
 const DEFAULT_MAX_BODY_BYTES = 1_048_576;
 const VERIFICATION_KINDS = ['hmac', 'github', 'slack', 'custom'] as const;
-const decoder = new TextDecoder();
 const encoder = new TextEncoder();
 
 function reply(status: number, body: Record<string, unknown>, headers?: Record<string, string>) {
@@ -317,15 +315,73 @@ export interface NodeServerResponseLike {
   end(body?: string | Uint8Array): unknown;
 }
 
+/** The body of an incoming message as a stream: read as the handler reads, stopped when it stops. */
+function bodyStream(source: AsyncIterable<Uint8Array | string>): ReadableStream<Uint8Array> {
+  let iterator: AsyncIterator<Uint8Array | string> | undefined;
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      iterator ??= source[Symbol.asyncIterator]();
+      const { done, value } = await iterator.next();
+      if (done) controller.close();
+      else controller.enqueue(typeof value === 'string' ? encoder.encode(value) : value);
+    },
+    async cancel() {
+      await iterator?.return?.();
+    },
+  });
+}
+
+function requestOf(message: NodeIncomingMessageLike, origin: string | undefined): Request {
+  const headers = new Headers();
+  for (const [name, value] of Object.entries(message.headers)) {
+    if (value === undefined) continue;
+    if (Array.isArray(value)) for (const item of value) headers.append(name, item);
+    else headers.set(name, value);
+  }
+  const url = new URL(message.url ?? '/', origin ?? `http://${headers.get('host') ?? 'localhost'}`);
+  const method = (message.method ?? 'GET').toUpperCase();
+  const init: RequestInit & { duplex?: 'half' } = { method, headers };
+  if (method !== 'GET' && method !== 'HEAD') {
+    init.body = bodyStream(message);
+    // Node's fetch needs this for a streamed request body.
+    init.duplex = 'half';
+  }
+  return new Request(url, init);
+}
+
 /**
  * Serves a Fetch handler from Node's `http` server, Express or similar (2.4):
  * builds a `Request` from the incoming message (`origin` resolves its URL)
  * and writes the `Response` back. Imports nothing from `node:http`.
+ *
+ * Without `origin` the URL is `http://` plus the `Host` header. The body is
+ * streamed to the handler as it reads it (a webhook handler stops reading
+ * past `maxBodyBytes`), never buffered first. A handler that throws answers
+ * `500`.
  */
 export function toNodeHandler(
-  _handler: FetchHandler,
-  _options?: { origin?: string },
+  handler: FetchHandler,
+  options?: { origin?: string },
 ): (request: NodeIncomingMessageLike, response: NodeServerResponseLike) => Promise<void> {
-  void decoder;
-  return notImplemented('toNodeHandler');
+  if (typeof handler !== 'function') throw new TypeError('toNodeHandler needs a Fetch handler');
+  const origin = options?.origin;
+  if (origin !== undefined)
+    try {
+      new URL(origin);
+    } catch {
+      throw new TypeError(`origin must be an absolute URL, not ${JSON.stringify(origin)}`);
+    }
+  return async (message, response) => {
+    let answer: Response;
+    try {
+      answer = await handler(requestOf(message, origin));
+    } catch {
+      answer = refuse(500, 'handler-error');
+    }
+    response.statusCode = answer.status;
+    answer.headers.forEach((value, name) => {
+      response.setHeader(name, value);
+    });
+    response.end(new Uint8Array(await answer.arrayBuffer()));
+  };
 }

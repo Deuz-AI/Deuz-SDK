@@ -11,8 +11,12 @@ import { describe, expect, it } from 'vitest';
 import { createGoal } from '../src/goal';
 import { goalInboxKey } from '../src/goal/runtime/store';
 import type { GoalRuntimeStore } from '../src/goal/runtime/store-types';
-import { createWebhookHandler } from '../src/goal/runtime/webhook';
-import type { WebhookHandlerOptions } from '../src/goal/runtime/webhook';
+import { createWebhookHandler, toNodeHandler } from '../src/goal/runtime/webhook';
+import type {
+  NodeIncomingMessageLike,
+  NodeServerResponseLike,
+  WebhookHandlerOptions,
+} from '../src/goal/runtime/webhook';
 import {
   SimulatedCrash,
   createScheduleStoreDouble,
@@ -374,5 +378,164 @@ describe('createWebhookHandler', () => {
     expect(() =>
       createWebhookHandler({ ...base, target: { scope: '', goalId: 'goal-1' } }),
     ).toThrow(TypeError);
+  });
+});
+
+describe('toNodeHandler', () => {
+  /** An `IncomingMessage` look-alike: method, url, headers and body chunks. */
+  function incoming(
+    chunks: (string | Uint8Array)[],
+    fields: Partial<Omit<NodeIncomingMessageLike, typeof Symbol.asyncIterator>> = {},
+  ): NodeIncomingMessageLike & { read: number } {
+    const message = {
+      method: 'POST',
+      url: '/hooks/github?attempt=2',
+      headers: { host: 'api.example.com' },
+      ...fields,
+      read: 0,
+      async *[Symbol.asyncIterator]() {
+        for (const chunk of chunks) {
+          message.read += 1;
+          yield chunk;
+        }
+      },
+    };
+    return message;
+  }
+
+  function outgoing() {
+    const written = {
+      statusCode: 0,
+      headers: {} as Record<string, string>,
+      body: undefined as string | undefined,
+      ended: 0,
+    };
+    const response: NodeServerResponseLike = {
+      get statusCode() {
+        return written.statusCode;
+      },
+      set statusCode(value: number) {
+        written.statusCode = value;
+      },
+      setHeader(name, value) {
+        written.headers[name.toLowerCase()] = value;
+      },
+      end(chunk) {
+        written.ended += 1;
+        written.body =
+          chunk === undefined
+            ? ''
+            : typeof chunk === 'string'
+              ? chunk
+              : new TextDecoder().decode(chunk);
+      },
+    };
+    return { response, written };
+  }
+
+  it('builds the Request from the message and writes the Response back', async () => {
+    let seen: Request | undefined;
+    let seenBody = '';
+    const node = toNodeHandler(async (request) => {
+      seen = request;
+      seenBody = await request.text();
+      return new Response('{"ok":true}', {
+        status: 202,
+        headers: { 'content-type': 'application/json', 'x-trace': 't-1' },
+      });
+    });
+    const { response, written } = outgoing();
+    await node(
+      incoming(['{"a":', new TextEncoder().encode('1}')], {
+        headers: {
+          host: 'api.example.com',
+          'content-type': 'application/json',
+          'x-multi': ['one', 'two'],
+          'x-absent': undefined,
+        },
+      }),
+      response,
+    );
+    expect(seen?.method).toBe('POST');
+    expect(seen?.url).toBe('http://api.example.com/hooks/github?attempt=2');
+    expect(seen?.headers.get('content-type')).toBe('application/json');
+    expect(seen?.headers.get('x-multi')).toBe('one, two');
+    expect(seen?.headers.has('x-absent')).toBe(false);
+    expect(seenBody).toBe('{"a":1}');
+    expect(written).toEqual({
+      statusCode: 202,
+      headers: { 'content-type': 'application/json', 'x-trace': 't-1' },
+      body: '{"ok":true}',
+      ended: 1,
+    });
+  });
+
+  it('resolves the URL against origin, and sends no body with GET', async () => {
+    let seen: Request | undefined;
+    const node = toNodeHandler(
+      async (request) => {
+        seen = request;
+        return new Response(null, { status: 405 });
+      },
+      { origin: 'https://hooks.example.com' },
+    );
+    const { response, written } = outgoing();
+    const message = incoming(['ignored'], { method: 'get', url: '/x' });
+    await node(message, response);
+    expect(seen?.url).toBe('https://hooks.example.com/x');
+    expect(seen?.method).toBe('GET');
+    expect(seen?.body).toBeNull();
+    expect(message.read).toBe(0);
+    expect(written).toMatchObject({ statusCode: 405, body: '', ended: 1 });
+    expect(() => toNodeHandler(async () => new Response(), { origin: 'not a url' })).toThrow(
+      TypeError,
+    );
+  });
+
+  it('streams the body, so an oversized one stops being read', async () => {
+    const { handler } = await setup({ maxBodyBytes: 10 });
+    const node = toNodeHandler(handler);
+    const { response, written } = outgoing();
+    const message = incoming(['0123456789', 'abcdef', 'more', 'and more']);
+    await node(message, response);
+    expect(written.statusCode).toBe(413);
+    expect(message.read).toBeLessThan(4);
+  });
+
+  it('answers 500 when the handler throws', async () => {
+    const node = toNodeHandler(async () => {
+      throw new Error('boom');
+    });
+    const { response, written } = outgoing();
+    await node(incoming(['{}']), response);
+    expect(written.statusCode).toBe(500);
+    expect(JSON.parse(written.body ?? '')).toEqual({ ok: false, reason: 'handler-error' });
+  });
+
+  it('serves a webhook from a real node:http server', async () => {
+    const { createServer } = await import('node:http');
+    const { store, handler } = await setup();
+    const server = createServer(toNodeHandler(handler));
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    try {
+      const { port } = server.address() as { port: number };
+      const signed = github();
+      const response = await fetch(`http://127.0.0.1:${port}/hooks/github`, {
+        method: 'POST',
+        headers: signed.headers,
+        body,
+      });
+      expect(response.status).toBe(202);
+      expect(await response.json()).toEqual({ ok: true, deliveryId: 'd-1' });
+      expect(await inbox(store)).toHaveLength(1);
+      const again = await fetch(`http://127.0.0.1:${port}/hooks/github`, {
+        method: 'POST',
+        headers: signed.headers,
+        body,
+      });
+      expect(again.status).toBe(200);
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
   });
 });
