@@ -6,7 +6,7 @@
  * same request and conflicts with another; forget keeps content-free receipts.
  */
 import { describe, expect, it } from 'vitest';
-import { InvalidRequestError, OperationConflictError } from '../src/errors';
+import { EmbeddingMismatchError, InvalidRequestError, OperationConflictError } from '../src/errors';
 import { digestJson, sha256Digest } from '../src/internal/digest';
 import { createInMemoryVersionedMemoryStore } from '../src/memory/versioned';
 import type {
@@ -390,5 +390,244 @@ describe('commit', () => {
       (await store.get({ chatId: 'c', userId: 'u3' }, 'x')) ===
         (await store.get({ userId: 'u3', chatId: 'c' }, 'x')),
     ).toBe(true);
+  });
+});
+
+async function embedded(
+  id: string,
+  text: string,
+  vector: number[],
+  modelId = 'emb-1',
+  extra: Partial<Extract<VersionedMemoryMutation, { type: 'create' }>['record']> = {},
+): Promise<VersionedMemoryMutation> {
+  return {
+    ...(await create(id, text, extra)),
+    embedding: { vector, modelId, textDigest: await sha256Digest(text) },
+  } as VersionedMemoryMutation;
+}
+
+describe('search', () => {
+  it('matches text within the scope, best first, and drops non-matching records', async () => {
+    const { store } = setup();
+    await committed(
+      store,
+      await op('op-1', [
+        await create('r1', 'likes green tea'),
+        await create('r2', 'drives a red car'),
+        await create('r3', 'a tea ceremony expert who likes cake'),
+      ]),
+    );
+    await committed(store, await op('op-2', [await create('r9', 'likes tea')], { scope: OTHER }));
+    const hits = await store.search({ scope: USER, text: 'likes tea' });
+    expect(hits.map((hit) => [hit.record.id, hit.match])).toEqual([
+      ['r1', 'lexical'],
+      ['r3', 'lexical'],
+    ]);
+    expect(hits[0]!.score).toBeGreaterThanOrEqual(hits[1]!.score);
+  });
+
+  it('ranks by cosine over the active generation; records without a vector stay out', async () => {
+    const { store } = setup();
+    await committed(
+      store,
+      await op('op-1', [
+        await embedded('r1', 'north', [1, 0, 0]),
+        await embedded('r2', 'north-east', [0.7, 0.7, 0]),
+        await create('r3', 'no vector'),
+      ]),
+    );
+    expect(await store.embeddings.active()).toMatchObject({
+      generation: 1,
+      modelId: 'emb-1',
+      dims: 3,
+      status: 'active',
+    });
+    const hits = await store.search({
+      scope: USER,
+      embedding: { vector: [1, 0.1, 0], modelId: 'emb-1' },
+    });
+    expect(hits.map((hit) => [hit.record.id, hit.match])).toEqual([
+      ['r1', 'vector'],
+      ['r2', 'vector'],
+    ]);
+    expect(hits[0]!.record.embedding).toMatchObject({
+      generation: 1,
+      modelId: 'emb-1',
+      dims: 3,
+      revision: 1,
+      textDigest: await sha256Digest('north'),
+    });
+  });
+
+  it('fuses text and vector ranks (RRF) and labels the hits', async () => {
+    const { store } = setup();
+    await committed(
+      store,
+      await op('op-1', [
+        await embedded('r1', 'green tea', [1, 0]),
+        await embedded('r2', 'black coffee', [0.9, 0.1]),
+        await create('r3', 'tea without vector'),
+      ]),
+    );
+    const hits = await store.search({
+      scope: USER,
+      text: 'tea',
+      embedding: { vector: [1, 0], modelId: 'emb-1' },
+    });
+    expect(Object.fromEntries(hits.map((hit) => [hit.record.id, hit.match]))).toEqual({
+      r1: 'hybrid',
+      r2: 'vector',
+      r3: 'lexical',
+    });
+    expect(hits[0]!.record.id).toBe('r1');
+  });
+
+  it('refuses a query vector of another model or size', async () => {
+    const { store } = setup();
+    await committed(store, await op('op-1', [await embedded('r1', 'north', [1, 0, 0])]));
+    for (const embedding of [
+      { vector: [1, 0, 0], modelId: 'emb-2' },
+      { vector: [1, 0], modelId: 'emb-1' },
+    ]) {
+      const error = await store
+        .search({ scope: USER, embedding })
+        .catch((reason: unknown) => reason);
+      expect(error).toBeInstanceOf(EmbeddingMismatchError);
+      expect(error).toMatchObject({
+        code: 'embedding_mismatch',
+        expected: { modelId: 'emb-1', dims: 3, generation: 1 },
+      });
+    }
+  });
+
+  it('filters kind, retracted and expired records, and caps at topK (default 5)', async () => {
+    const { store, tick } = setup();
+    const many = await Promise.all(
+      Array.from({ length: 7 }, (_, index) => create(`n${index}`, `note ${index}`)),
+    );
+    await committed(
+      store,
+      await op('op-1', [
+        ...many,
+        await create('k1', 'note as procedure', { kind: 'procedural' }),
+        await create('e1', 'note that expires', { expiresAt: 1_005 }),
+      ]),
+    );
+    await committed(store, await op('op-2', [{ type: 'retract', id: 'n0', expectedRevision: 1 }]));
+    expect(await store.search({ scope: USER, text: 'note' })).toHaveLength(5);
+    const all = await store.search({ scope: USER, text: 'note', topK: 50 });
+    expect(all.map((hit) => hit.record.id).sort()).toEqual(
+      ['e1', 'k1', 'n1', 'n2', 'n3', 'n4', 'n5', 'n6'].sort(),
+    );
+    const procedural = await store.search({ scope: USER, text: 'note', kind: 'procedural' });
+    expect(procedural.map((hit) => hit.record.id)).toEqual(['k1']);
+    tick(10);
+    const later = await store.search({ scope: USER, text: 'note', topK: 50 });
+    expect(later.map((hit) => hit.record.id)).not.toContain('e1');
+    const withExpired = await store.search({
+      scope: USER,
+      text: 'note',
+      topK: 50,
+      includeExpired: true,
+    });
+    expect(withExpired.map((hit) => hit.record.id)).toContain('e1');
+    const judgedEarlier = await store.search({ scope: USER, text: 'expires', now: 1_001 });
+    expect(judgedEarlier.map((hit) => hit.record.id)).toEqual(['e1']);
+    const retracted = await store.search({ scope: USER, text: 'note 0', includeRetracted: true });
+    expect(retracted[0]).toMatchObject({ record: { id: 'n0', status: 'retracted' } });
+  });
+
+  it('answers what the store knew at recordedAsOf', async () => {
+    const { store, tick } = setup();
+    await committed(store, await op('op-1', [await create('r1', 'lives in London')]));
+    const before = tick(5);
+    tick(5);
+    await committed(
+      store,
+      await op('op-2', [
+        { type: 'revise', id: 'r1', expectedRevision: 1, changes: { text: 'lives in Paris' } },
+      ]),
+    );
+    tick(10);
+    await committed(store, await op('op-3', [await create('r2', 'lives near a park')]));
+    const retractedAt = tick(10);
+    await committed(store, await op('op-4', [{ type: 'retract', id: 'r1', expectedRevision: 2 }]));
+
+    const then = await store.search({ scope: USER, text: 'lives', recordedAsOf: before, topK: 10 });
+    expect(then.map((hit) => [hit.record.id, hit.record.revision, hit.record.text])).toEqual([
+      ['r1', 1, 'lives in London'],
+    ]);
+    const beforeRetract = await store.search({
+      scope: USER,
+      text: 'lives',
+      recordedAsOf: retractedAt - 1,
+      topK: 10,
+    });
+    expect(beforeRetract.map((hit) => `${hit.record.id}@${hit.record.revision}`).sort()).toEqual([
+      'r1@2',
+      'r2@1',
+    ]);
+    const now = await store.search({ scope: USER, text: 'lives', topK: 10 });
+    expect(now.map((hit) => hit.record.id)).toEqual(['r2']);
+    expect(await store.search({ scope: USER, text: 'lives', recordedAsOf: 999 })).toEqual([]);
+  });
+
+  it('never carries a vector to a revised text, but keeps it for an unchanged one', async () => {
+    const { store } = setup();
+    await committed(
+      store,
+      await op('op-1', [
+        await embedded('r1', 'north', [1, 0]),
+        await embedded('r2', 'east', [0, 1]),
+      ]),
+    );
+    await committed(
+      store,
+      await op('op-2', [
+        { type: 'revise', id: 'r1', expectedRevision: 1, changes: { text: 'south' } },
+        { type: 'revise', id: 'r2', expectedRevision: 1, changes: { importance: 0.9 } },
+      ]),
+    );
+    expect((await store.get(USER, 'r1'))!.embedding).toBeUndefined();
+    expect((await store.get(USER, 'r2'))!.embedding).toMatchObject({ revision: 2 });
+    const hits = await store.search({
+      scope: USER,
+      embedding: { vector: [1, 0], modelId: 'emb-1' },
+    });
+    expect(hits.map((hit) => hit.record.id)).toEqual(['r2']);
+    const lexical = await store.search({ scope: USER, text: 'south' });
+    expect(lexical.map((hit) => hit.record.id)).toEqual(['r1']);
+  });
+
+  it('refuses a commit vector of another model or size, or of another text', async () => {
+    const { store } = setup();
+    await committed(store, await op('op-1', [await embedded('r1', 'north', [1, 0])]));
+    await expect(
+      store.commit(await op('op-2', [await embedded('r2', 'east', [0, 1], 'emb-2')])),
+    ).rejects.toBeInstanceOf(EmbeddingMismatchError);
+    await expect(
+      store.commit(await op('op-3', [await embedded('r2', 'east', [0, 1, 0])])),
+    ).rejects.toBeInstanceOf(EmbeddingMismatchError);
+    const stale = {
+      type: 'revise' as const,
+      id: 'r1',
+      expectedRevision: 1,
+      changes: { text: 'south' },
+      embedding: { vector: [1, 0], modelId: 'emb-1', textDigest: await sha256Digest('north') },
+    };
+    await expect(store.commit(await op('op-4', [stale]))).rejects.toBeInstanceOf(
+      InvalidRequestError,
+    );
+    expect(await store.scopeRevision(USER)).toBe(1);
+    expect(await store.get(USER, 'r2')).toBeUndefined();
+  });
+
+  it('lists the most recent records when the query has neither text nor vector', async () => {
+    const { store, tick } = setup();
+    await committed(store, await op('op-1', [await create('r1', 'one')]));
+    tick();
+    await committed(store, await op('op-2', [await create('r2', 'two')]));
+    const hits = await store.search({ scope: USER });
+    expect(hits.map((hit) => hit.record.id)).toEqual(['r2', 'r1']);
   });
 });

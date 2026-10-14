@@ -8,6 +8,7 @@ import { EmbeddingMismatchError, OperationConflictError } from '../../errors';
 import { isSha256Digest, type Sha256Digest } from '../../internal/digest';
 import { notImplemented } from '../../internal/not-implemented';
 import { resolveDependencies } from '../../internal/resolve-deps';
+import { cosineSimilarity, rankFuse } from '../../internal/vector';
 import type { Dependencies } from '../../types/deps';
 import {
   Mutex,
@@ -20,6 +21,7 @@ import {
   copy,
   invalid,
   isMemoryKind,
+  lexicalScore,
   isOrigin,
   recordDigest,
   scopeKey,
@@ -29,6 +31,7 @@ import type {
   MemoryEmbeddingGeneration,
   VersionedMemoryCommit,
   VersionedMemoryCommitResult,
+  VersionedMemoryHit,
   VersionedMemoryMutation,
   VersionedMemoryReceipt,
   VersionedMemoryRecord,
@@ -416,8 +419,118 @@ export function createInMemoryVersionedMemoryStore(options?: {
       return present(key, stored);
     },
 
-    async search() {
-      return notImplemented('VersionedMemoryStore.search');
+    async search(query) {
+      if (query === null || typeof query !== 'object') throw invalid('A search needs a query.');
+      const key = scopeKey(checkScope(query.scope));
+      const topK = query.topK ?? 5;
+      if (!Number.isSafeInteger(topK) || topK < 0)
+        throw invalid('topK must be a non-negative integer.');
+      const now = checkTime(query.now, 'now') ?? deps.clock.now();
+      const asOf = checkTime(query.recordedAsOf, 'recordedAsOf');
+      const active = activeGeneration();
+      let queryVector: number[] | undefined;
+      if (query.embedding !== undefined) {
+        const { vector, modelId } = query.embedding;
+        if (
+          typeof modelId !== 'string' ||
+          !Array.isArray(vector) ||
+          vector.some((item) => typeof item !== 'number' || !Number.isFinite(item))
+        )
+          throw invalid('A query embedding needs a modelId and a vector of finite numbers.');
+        if (active && (modelId !== active.modelId || vector.length !== active.dims))
+          throw new EmbeddingMismatchError({
+            expected: { modelId: active.modelId, dims: active.dims, generation: active.generation },
+            actual: { modelId, dims: vector.length },
+          });
+        if (active) queryVector = vector;
+      }
+
+      const candidates: StoredRevision[] = [];
+      for (const history of records.get(key)?.values() ?? []) {
+        const stored =
+          asOf === undefined
+            ? history.at(-1)
+            : history.findLast((item) => item.record.recordedAt <= asOf);
+        if (!stored) continue;
+        const record = stored.record;
+        if (record.status === 'retracted' && !query.includeRetracted) continue;
+        if (record.expiresAt !== undefined && record.expiresAt <= now && !query.includeExpired)
+          continue;
+        if (query.kind !== undefined && record.kind !== query.kind) continue;
+        candidates.push(stored);
+      }
+      const newestFirst = (left: StoredRevision, right: StoredRevision): number =>
+        right.record.recordedAt - left.record.recordedAt ||
+        (left.record.id < right.record.id ? -1 : left.record.id > right.record.id ? 1 : 0);
+      const ranked = (scored: { stored: StoredRevision; score: number }[]) =>
+        scored.sort(
+          (left, right) => right.score - left.score || newestFirst(left.stored, right.stored),
+        );
+
+      const text = query.text?.trim();
+      const lexical = text
+        ? ranked(
+            candidates.map((stored) => ({ stored, score: lexicalScore(text, stored.record.text) })),
+          ).filter((item) => item.score > 0)
+        : undefined;
+      let vectorHits: { stored: StoredRevision; score: number }[] | undefined;
+      if (queryVector && active) {
+        const byKey = vectors.get(active.generation);
+        const scored: { stored: StoredRevision; score: number }[] = [];
+        for (const stored of candidates) {
+          const vector = byKey?.get(vectorKey(key, stored.record.id, stored.record.revision));
+          if (vector) scored.push({ stored, score: cosineSimilarity(queryVector, vector.vector) });
+        }
+        vectorHits = ranked(scored);
+      }
+
+      let hits: VersionedMemoryHit[];
+      if (lexical && vectorHits) {
+        const name = (item: { stored: StoredRevision }) => item.stored.record.id;
+        const fused = rankFuse([
+          { key: name, items: lexical },
+          { key: name, items: vectorHits },
+        ]);
+        const inText = new Set(lexical.map(name));
+        const inVector = new Set(vectorHits.map(name));
+        const byId = new Map([...lexical, ...vectorHits].map((item) => [name(item), item.stored]));
+        hits = [...byId]
+          .map(([id, stored]) => ({
+            stored,
+            score: fused.get(id) ?? 0,
+            match: (inText.has(id) && inVector.has(id)
+              ? 'hybrid'
+              : inText.has(id)
+                ? 'lexical'
+                : 'vector') as VersionedMemoryHit['match'],
+          }))
+          .sort((left, right) => right.score - left.score || newestFirst(left.stored, right.stored))
+          .map((item) => ({
+            record: present(key, item.stored),
+            score: item.score,
+            match: item.match,
+          }));
+      } else if (lexical) {
+        hits = lexical.map((item) => ({
+          record: present(key, item.stored),
+          score: item.score,
+          match: 'lexical',
+        }));
+      } else if (vectorHits) {
+        hits = vectorHits.map((item) => ({
+          record: present(key, item.stored),
+          score: item.score,
+          match: 'vector',
+        }));
+      } else if (query.embedding !== undefined) {
+        // A vector query with no generation yet: nothing has a vector to match.
+        hits = [];
+      } else {
+        hits = candidates
+          .sort(newestFirst)
+          .map((stored) => ({ record: present(key, stored), score: 0, match: 'lexical' }));
+      }
+      return hits.slice(0, topK);
     },
 
     async history(scope, id) {
