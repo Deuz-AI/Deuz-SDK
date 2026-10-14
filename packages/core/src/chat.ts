@@ -1622,3 +1622,16 @@ export function deserializeChatRecord(json: string): ChatRecord {
  */
 export { validateChatRequest, parseDeuzChatRequest } from './chat-request';
 export type { DeuzChatRequest, ValidateChatOptions, ValidateChatResult } from './chat-request';
+
+// ===================================================================
+// Conditional chat and transcript search (2.4) — re-exported onto this subpath
+// ===================================================================
+
+export type * from './types/chat-conditional';
+export {
+  createInMemoryConditionalChatStore,
+  createInMemoryTranscriptIndex,
+  indexChat,
+} from './chat-conditional';
+export type { InMemoryConditionalChatStoreOptions } from './chat-conditional';
+export { RevisionConflictError } from './errors';
