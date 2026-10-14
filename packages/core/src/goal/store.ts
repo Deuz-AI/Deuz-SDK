@@ -35,8 +35,20 @@ function decodeCursor(cursor: unknown): { updatedAt: number; goalId: string } {
   return { updatedAt: position[0] as number, goalId: position[1] as string };
 }
 
-/** Validates a listing query; a malformed one throws a TypeError. */
-function planList(query: GoalListQuery | undefined) {
+/** A validated listing query: what every goal store filters and pages on. */
+export interface GoalListPlan {
+  statuses: readonly GoalStatus[] | undefined;
+  scope: string | undefined;
+  limit: number;
+  /** The last goal of the previous page. */
+  after: { updatedAt: number; goalId: string } | undefined;
+}
+
+/**
+ * Validates a listing query; a malformed one throws a TypeError. Shared with
+ * the 2.4 goal runtime stores, so every store refuses the same queries.
+ */
+export function planGoalList(query: GoalListQuery | undefined): GoalListPlan {
   if (query !== undefined && (typeof query !== 'object' || query === null))
     throw new TypeError('A goal listing query must be an object');
   const { statuses, scope, limit = 100, cursor } = query ?? {};
@@ -51,24 +63,36 @@ function planList(query: GoalListQuery | undefined) {
   if (scope !== undefined && typeof scope !== 'string')
     throw new TypeError('Goal listing scope must be a string');
   return {
-    statuses,
+    statuses: statuses as readonly GoalStatus[] | undefined,
     scope,
     limit,
     after: cursor !== undefined ? decodeCursor(cursor) : undefined,
   };
 }
 
+/** The cursor after `goal`, the last of a page. */
+export function goalListCursor(goal: Pick<GoalRecord, 'updatedAt' | 'goalId'>): string {
+  return JSON.stringify([goal.updatedAt, goal.goalId]);
+}
+
 /**
  * An in-memory `GoalStore` (2.3): copies in and out, a save only at the
  * stored revision plus one (1 for a new goal), and `list`. Records are checked
  * on save (`invalid_goal`); a conflict rejects with `revision_conflict`.
+ * Since 2.4 `load` also takes a `scope`: a goal of another scope then reads as
+ * undefined.
  */
-export function createInMemoryGoalStore(): GoalStore & Required<Pick<GoalStore, 'list'>> {
+export function createInMemoryGoalStore(): GoalStore &
+  Required<Pick<GoalStore, 'list'>> & {
+    load(goalId: string, options?: { scope?: string }): GoalRecord | undefined;
+  } {
   const goals = new Map<string, GoalRecord>();
   return {
-    load(goalId) {
+    load(goalId: string, options?: { scope?: string }) {
       const record = goals.get(goalId);
-      return record ? structuredClone(record) : undefined;
+      if (!record || (options?.scope !== undefined && record.scope !== options.scope))
+        return undefined;
+      return structuredClone(record);
     },
     save(record) {
       const next = readGoal(record);
@@ -81,7 +105,7 @@ export function createInMemoryGoalStore(): GoalStore & Required<Pick<GoalStore, 
       goals.set(next.goalId, structuredClone(next));
     },
     async list(query) {
-      const plan = planList(query);
+      const plan = planGoalList(query);
       const matches = [...goals.values()]
         .filter(
           (goal) =>
@@ -93,7 +117,7 @@ export function createInMemoryGoalStore(): GoalStore & Required<Pick<GoalStore, 
       const page = matches.slice(0, plan.limit).map((goal) => structuredClone(goal));
       const last = page.at(-1);
       return matches.length > plan.limit && last
-        ? { goals: page, cursor: JSON.stringify([last.updatedAt, last.goalId]) }
+        ? { goals: page, cursor: goalListCursor(last) }
         : { goals: page };
     },
   };
