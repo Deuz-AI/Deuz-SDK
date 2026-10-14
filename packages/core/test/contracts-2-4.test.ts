@@ -108,8 +108,15 @@ describe('/chat and /ui 2.4 additions', () => {
     expectStub('createInMemoryConditionalChatStore', () =>
       chat.createInMemoryConditionalChatStore(),
     );
-    expectStub('createInMemoryTranscriptIndex', () => chat.createInMemoryTranscriptIndex());
-    await expectAsyncStub('indexChat', () => chat.indexChat(any, any));
+    // Implemented by L7a: the in-memory index and the backfill.
+    const index = chat.createInMemoryTranscriptIndex();
+    await chat.indexChat(index, {
+      chatId: 'c',
+      scope: { userId: 'u' },
+      messages: [{ role: 'user', content: 'hello' }],
+      updatedAt: 1,
+    });
+    expect(await index.search({ userId: 'u' }, 'hello')).toHaveLength(1);
     expect(chat.RevisionConflictError).toBe(errors.RevisionConflictError);
   });
 
