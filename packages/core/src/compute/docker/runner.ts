@@ -266,17 +266,14 @@ export function createDockerRunnerFromOptions(
       ...(info.startedAt !== undefined ? { startedAt: info.startedAt } : {}),
       endedAt: info.finishedAt ?? deps.clock.now(),
       ...(output ? { output } : {}),
-      ...(info.oomKilled
+      // An earlier, transient error (a daemon that was out of reach) is over.
+      error: info.oomKilled
         ? {
-            error: {
-              name: 'OutOfMemory',
-              message: 'The container was killed for exceeding its memory limit.',
-              code: 'oom_killed',
-            },
+            name: 'OutOfMemory',
+            message: 'The container was killed for exceeding its memory limit.',
+            code: 'oom_killed',
           }
-        : state === 'cancelled'
-          ? { error: undefined }
-          : {}),
+        : undefined,
     });
     if (result.ok)
       recordSpan(deps, DEUZ_SPAN.processExit, {
@@ -352,21 +349,24 @@ export function createDockerRunnerFromOptions(
         );
         containerId = found?.id;
       }
+      const gone = async () =>
+        (await commit(record, { state: 'cancelled', endedAt: deps.clock.now(), error: undefined }))
+          .record;
       let info = containerId !== undefined ? await engine.inspect(containerId) : undefined;
-      if (!info)
-        return (
-          await commit(record, { state: 'cancelled', endedAt: deps.clock.now(), error: undefined })
-        ).record;
+      if (!info) return gone();
       if (info.running) {
+        // Any other failure of stop or kill shows in the inspection after it.
         await engine.stop(info.id, CANCEL_GRACE_SECONDS).catch((error: unknown) => {
           if (isUnavailable(error)) throw error;
         });
-        info = (await engine.inspect(info.id)) ?? info;
+        info = await engine.inspect(info.id);
+        if (!info) return gone();
         if (info.running) {
           await engine.kill(info.id).catch((error: unknown) => {
             if (isUnavailable(error)) throw error;
           });
-          info = (await engine.inspect(info.id)) ?? info;
+          info = await engine.inspect(info.id);
+          if (!info) return gone();
         }
         if (info.running) {
           const result = await commit(record, {
