@@ -268,8 +268,8 @@ test('the Dependencies seams a consumer injects', () => {
 test('a model middleware', () => {
   const middleware: LanguageModelMiddleware = {
     name: 'audit',
-    transformParams: async (options, ctx) => {
-      expectTypeOf<'stream' | 'generate'>().toExtend<typeof ctx.operation>();
+    transformParams: async (options, _ctx) => {
+      expectTypeOf<'stream' | 'generate'>().toExtend<typeof _ctx.operation>();
       return options;
     },
     wrapGenerate: async (next, options, _ctx) => next(options),
