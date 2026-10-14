@@ -217,9 +217,6 @@ describe('2.4 Node stores on their entries', () => {
     expectStub('createPostgresConditionalChatStore', () =>
       storesPostgres.createPostgresConditionalChatStore(any),
     );
-    expectStub('createPostgresDurableStreamStateStore', () =>
-      storesPostgres.createPostgresDurableStreamStateStore(any),
-    );
     expectStub('createRedisDurableStreamStateStore', () =>
       storesRedis.createRedisDurableStreamStateStore(any),
     );
@@ -234,6 +231,11 @@ describe('2.4 Node stores on their entries', () => {
     const sqlite = storesSqlite.createSqliteDurableStreamStateStore({ path: ':memory:' });
     expect(sqlite.durable).toBe(true);
     await sqlite.close();
+    const postgres = storesPostgres.createPostgresDurableStreamStateStore({
+      connectionString: 'postgres://unused@127.0.0.1:1/none',
+    });
+    expect(postgres.durable).toBe(true);
+    await postgres.close();
   });
 
   it('keep the existing entry factories exported as before', () => {
