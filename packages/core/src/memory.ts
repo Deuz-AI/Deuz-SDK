@@ -707,7 +707,17 @@ async function dedupeAddEvents(
   return dropped.size ? events.filter((ev) => !dropped.has(ev)) : events;
 }
 
-async function applyMutations(store: MemoryStore, mutations: MemoryMutation[]): Promise<void> {
+/**
+ * Apply a plan from {@link remember} with `apply: false` (or {@link planMemory})
+ * to the store (2.4 export): every upsert in one `upsert` call, then every
+ * delete in one `delete` call, then each invalidation (`update`, or a hard
+ * delete on a backend without it). Not a transaction: a failure part-way leaves
+ * the earlier calls applied.
+ */
+export async function applyMutations(
+  store: MemoryStore,
+  mutations: MemoryMutation[],
+): Promise<void> {
   const upserts = mutations.filter(
     (m): m is Extract<MemoryMutation, { op: 'upsert' }> => m.op === 'upsert',
   );

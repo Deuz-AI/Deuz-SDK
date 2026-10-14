@@ -2,6 +2,7 @@
 export {
   recall,
   remember,
+  applyMutations,
   sweepExpired,
   formatMemoriesForPrompt,
   defaultMemoryScorer,
