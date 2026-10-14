@@ -5,7 +5,6 @@
  */
 import type { Dependencies } from '../../types/deps';
 import { resolveDependencies } from '../../internal/resolve-deps';
-import { notImplemented } from '../../internal/not-implemented';
 import { planGoalList, goalListCursor } from '../store';
 import type { GoalRecord } from '../types';
 import {
@@ -17,6 +16,9 @@ import {
   checkGoal,
   checkIntentInput,
   checkMark,
+  checkPruneOptions,
+  checkWatermarkAdvance,
+  FINISHED_INTENT_STATUSES,
   checkRuntimeState,
   checkScheduleInput,
   checkScheduleOptions,
@@ -46,6 +48,9 @@ import {
   planIntentRecord,
   planOccurrenceList,
   planRuntimeSave,
+  planWatermarkAdvance,
+  settledBefore,
+  tombstone,
   planScheduleCancel,
   planScheduleList,
   planSchedulePause,
@@ -60,6 +65,7 @@ import type {
   DurableSchedule,
   GoalInboxEnqueue,
   GoalInboxEntry,
+  GoalLedgerWatermark,
   GoalRunIntent,
   GoalRuntimePolicy,
   GoalRuntimeState,
@@ -121,7 +127,11 @@ export function createInMemoryGoalRuntimeStore(options?: {
   const schedules = new Map<string, DurableSchedule>();
   /** By `[scope, occurrenceId]`. */
   const occurrences = new Map<string, ScheduleOccurrenceRecord>();
+  /** By `[scope, goalId, runId]`. */
+  const watermarks = new Map<string, GoalLedgerWatermark>();
   const scoped = (scope: string, id: string): string => JSON.stringify([scope, id]);
+  const watermarkKey = (scope: string, goalId: string, runId: string): string =>
+    JSON.stringify([scope, goalId, runId]);
 
   /** Applies a plan's writes; each one is already checked, so nothing here can fail half way. */
   const apply = (writes: readonly GoalRuntimeWrite[]): void => {
@@ -133,7 +143,12 @@ export function createInMemoryGoalRuntimeStore(options?: {
         intents.set(scoped(write.intent.scope, write.intent.intentId), write.intent);
       else if (write.kind === 'schedule')
         schedules.set(scoped(write.schedule.scope, write.schedule.scheduleId), write.schedule);
-      else occurrences.set(scoped(write.record.scope, write.record.occurrenceId), write.record);
+      else if (write.kind === 'occurrence')
+        occurrences.set(scoped(write.record.scope, write.record.occurrenceId), write.record);
+      else {
+        const { scope, goalId, runId } = write.watermark;
+        watermarks.set(watermarkKey(scope, goalId, runId), write.watermark);
+      }
     }
   };
 
@@ -149,8 +164,6 @@ export function createInMemoryGoalRuntimeStore(options?: {
 
   const inScope = <T extends { scope: string }>(value: T | undefined, scope: string) =>
     value !== undefined && value.scope === scope ? jsonCopy(value) : undefined;
-
-  const todo = (): never => notImplemented('createInMemoryGoalRuntimeStore');
 
   return {
     async load(goalId, loadOptions) {
@@ -380,10 +393,66 @@ export function createInMemoryGoalRuntimeStore(options?: {
         );
       },
     },
-    watermarks: { get: todo, advance: todo },
-    prunePayloads: todo,
-    pruneInbox: todo,
-    pruneOccurrences: todo,
-    pruneIntents: todo,
+    watermarks: {
+      async get(scope, goalId, runId) {
+        return inScope(watermarks.get(watermarkKey(scope, goalId, runId)), scope);
+      },
+      async advance(advance) {
+        const next = checkWatermarkAdvance(advance);
+        return commit(
+          planWatermarkAdvance(
+            {
+              watermark: watermarks.get(watermarkKey(next.scope, next.goalId, next.runId)),
+              goal: goals.get(next.goalId),
+            },
+            next,
+            clock.now(),
+          ),
+        );
+      },
+    },
+    async prunePayloads(pruneOptions) {
+      const cut = checkPruneOptions(pruneOptions);
+      let pruned = 0;
+      for (const entry of entries.values())
+        if (settledBefore(entry, cut) && entry.payload !== undefined) {
+          entries.set(entry.id, tombstone(entry));
+          pruned++;
+        }
+      return pruned;
+    },
+    async pruneInbox(pruneOptions) {
+      const cut = checkPruneOptions(pruneOptions);
+      return deleteWhere(entries, (entry) => settledBefore(entry, cut));
+    },
+    async pruneOccurrences(pruneOptions) {
+      const cut = checkPruneOptions(pruneOptions);
+      return deleteWhere(
+        occurrences,
+        (record) =>
+          record.recordedAt < cut.before && (cut.scope === undefined || record.scope === cut.scope),
+      );
+    },
+    async pruneIntents(pruneOptions) {
+      const cut = checkPruneOptions(pruneOptions);
+      return deleteWhere(
+        intents,
+        (intent) =>
+          FINISHED_INTENT_STATUSES.includes(intent.status) &&
+          intent.updatedAt < cut.before &&
+          (cut.scope === undefined || intent.scope === cut.scope),
+      );
+    },
   };
+}
+
+/** Deletes the values `doomed` picks; returns how many. */
+function deleteWhere<T>(map: Map<string, T>, doomed: (value: T) => boolean): number {
+  let deleted = 0;
+  for (const [key, value] of map)
+    if (doomed(value)) {
+      map.delete(key);
+      deleted++;
+    }
+  return deleted;
 }

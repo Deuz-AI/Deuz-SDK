@@ -1438,5 +1438,250 @@ export function goalRuntimeStoreContracts(
         }),
       );
     });
+
+    describe('ledger watermarks', () => {
+      const charged = (goal: GoalRecord, tokens: number, key: string) =>
+        transitionGoal(goal, { type: 'charge', tokens, usd: tokens / 1000, key }, { now: T0 + 1 })
+          .record;
+
+      it(
+        'advances a watermark with the charged goal in one write, once per revision',
+        withStore(async (store, time) => {
+          const goal = runtimeGoal('g');
+          await store.save(goal);
+          expect(await store.watermarks.get('tenant', 'g', 'r1')).toBeUndefined();
+          await time.advance(20);
+          const next = { tokens: 100, usd: 0.1, reservedTokens: 20, reservedUsd: 0.02 };
+          const first = charged(goal, 100, 'r1:100');
+          const advance = {
+            scope: 'tenant',
+            goalId: 'g',
+            runId: 'r1',
+            expectedRevision: 0,
+            next,
+            goal: first,
+          };
+          expect(await store.watermarks.advance(advance)).toEqual({ status: 'committed' });
+          expect(await store.watermarks.get('tenant', 'g', 'r1')).toEqual({
+            scope: 'tenant',
+            goalId: 'g',
+            runId: 'r1',
+            ...next,
+            revision: 1,
+            updatedAt: T0 + 20,
+          });
+          expect(await store.load('g')).toEqual(first);
+          expect(await store.watermarks.get('other', 'g', 'r1')).toBeUndefined();
+          // The same advance again charges nothing twice.
+          expect(await store.watermarks.advance(advance)).toEqual({
+            status: 'conflict',
+            reason: 'watermark-revision',
+          });
+          // A stale goal refuses the whole write.
+          const later = { ...next, tokens: 150, usd: 0.15, reservedTokens: 0, reservedUsd: 0 };
+          expect(
+            await store.watermarks.advance({
+              ...advance,
+              expectedRevision: 1,
+              next: later,
+              goal: charged(goal, 50, 'r1:150'),
+            }),
+          ).toEqual({ status: 'conflict', reason: 'goal-revision' });
+          expect((await store.watermarks.get('tenant', 'g', 'r1'))?.tokens).toBe(100);
+          // Reservations may be released; charged amounts never go back.
+          expect(
+            await store.watermarks.advance({
+              ...advance,
+              expectedRevision: 1,
+              next: later,
+              goal: charged(first, 50, 'r1:150'),
+            }),
+          ).toEqual({ status: 'committed' });
+          expect(await store.watermarks.get('tenant', 'g', 'r1')).toMatchObject({
+            ...later,
+            revision: 2,
+          });
+          await expect(
+            store.watermarks.advance({
+              ...advance,
+              expectedRevision: 2,
+              next: { ...later, tokens: 140 },
+              goal: charged(charged(first, 50, 'r1:150'), 1, 'r1:x'),
+            }),
+          ).rejects.toThrow(TypeError);
+        }),
+      );
+
+      it(
+        "keeps a watermark in its goal's scope",
+        withStore(async (store) => {
+          const goal = runtimeGoal('g', 'tenant-a');
+          await store.save(goal);
+          const advance = {
+            scope: 'tenant-a',
+            goalId: 'g',
+            runId: 'r1',
+            expectedRevision: 0,
+            next: { tokens: 1, usd: 0, reservedTokens: 0, reservedUsd: 0 },
+            goal: charged(goal, 1, 'k'),
+          };
+          for (const patch of [
+            { scope: 'tenant-b' },
+            { goalId: 'h' },
+            { goal: { ...charged(goal, 1, 'k'), scope: 'tenant-b' } },
+          ])
+            expect(
+              await store.watermarks.advance({ ...advance, ...patch }),
+              JSON.stringify(patch),
+            ).toEqual({ status: 'conflict', reason: 'scope-mismatch' });
+          expect(await store.watermarks.get('tenant-a', 'g', 'r1')).toBeUndefined();
+          for (const next of [
+            { tokens: -1, usd: 0, reservedTokens: 0, reservedUsd: 0 },
+            { tokens: 1, usd: Number.NaN, reservedTokens: 0, reservedUsd: 0 },
+          ])
+            await expect(
+              Promise.resolve().then(() => store.watermarks.advance({ ...advance, next })),
+            ).rejects.toThrow(TypeError);
+        }),
+      );
+    });
+
+    describe('retention', () => {
+      /** Settles `deliveryId` of goal `g` at the current clock time. */
+      const settle = async (store: GoalRuntimeStore, deliveryId: string) => {
+        const id = goalInboxKey('tenant', 'webhook:github', deliveryId);
+        await store.inbox.apply({
+          scope: 'tenant',
+          goalId: 'g',
+          entryId: id,
+          disposition: 'stale',
+        });
+        return id;
+      };
+
+      it(
+        'drops settled payloads to content-free tombstones, keeping ids and dedupe',
+        withStore(async (store, time) => {
+          const goal = runtimeGoal('g');
+          await store.save(goal);
+          const x = runtimeGoal('x', 'other');
+          await store.save(x);
+          for (const id of ['old', 'recent', 'pending', 'bare'])
+            await store.inbox.enqueue(
+              delivery(goal, id, id === 'bare' ? { payload: undefined } : {}),
+            );
+          await store.inbox.enqueue(delivery(x, 'foreign'));
+          const old = await settle(store, 'old');
+          await settle(store, 'bare');
+          await store.inbox.apply({
+            scope: 'other',
+            goalId: 'x',
+            entryId: goalInboxKey('other', 'webhook:github', 'foreign'),
+            disposition: 'stale',
+          });
+          await time.advance(1_000);
+          const recent = await settle(store, 'recent');
+          expect(await store.prunePayloads({ before: T0 + 1_000, scope: 'tenant' })).toBe(1);
+          const tomb = await store.inbox.get('tenant', old);
+          expect(tomb).toMatchObject({ id: old, deliveryId: 'old', payloadPruned: true });
+          expect(tomb?.payload).toBeUndefined();
+          expect((await store.inbox.get('tenant', recent))?.payload).toBeDefined();
+          expect(
+            (await store.inbox.get('tenant', goalInboxKey('tenant', 'webhook:github', 'pending')))
+              ?.payload,
+          ).toBeDefined();
+          expect(
+            (await store.inbox.get('other', goalInboxKey('other', 'webhook:github', 'foreign')))
+              ?.payload,
+          ).toBeDefined();
+          // The id still dedupes.
+          expect((await store.inbox.enqueue(delivery(goal, 'old'))).status).toBe('duplicate');
+          // Without a scope, every scope; a second prune finds nothing left to drop.
+          expect(await store.prunePayloads({ before: T0 + 1_001 })).toBe(2);
+          expect(await store.prunePayloads({ before: T0 + 1_001 })).toBe(0);
+        }),
+      );
+
+      it(
+        'deletes settled entries, ids included, only when asked',
+        withStore(async (store, time) => {
+          const goal = runtimeGoal('g');
+          await store.save(goal);
+          for (const id of ['old', 'pending']) await store.inbox.enqueue(delivery(goal, id));
+          const old = await settle(store, 'old');
+          await time.advance(10);
+          expect(await store.pruneInbox({ before: T0, scope: 'tenant' })).toBe(0);
+          expect(await store.pruneInbox({ before: T0 + 10, scope: 'other' })).toBe(0);
+          expect(await store.pruneInbox({ before: T0 + 10 })).toBe(1);
+          expect(await store.inbox.get('tenant', old)).toBeUndefined();
+          expect((await store.inbox.list({ scope: 'tenant' })).entries).toHaveLength(1);
+          // A repeated delivery is queued again once its id is gone.
+          expect((await store.inbox.enqueue(delivery(goal, 'old'))).status).toBe('enqueued');
+        }),
+      );
+
+      it(
+        'deletes old occurrence records and finished intents',
+        withStore(async (store, time) => {
+          const goal = await goalWithSchedule(store);
+          await store.schedules.advance({
+            scope: 'tenant',
+            scheduleId: 's1',
+            expectedRevision: 1,
+            fromCursor: T0,
+            toCursor: T0 + MINUTE,
+            occurrences: [occurrence(goal, 's1', T0 + MINUTE, 'catch-up-none')],
+          });
+          for (const id of ['done', 'open']) await store.intents.record(runIntent(goal, id));
+          await store.intents.claim('tenant', 'done', {
+            owner: 'w',
+            token: 1,
+            expectedRevision: 1,
+          });
+          await store.intents.complete('tenant', 'done', {
+            token: 1,
+            expectedRevision: 2,
+            status: 'completed',
+          });
+          await time.advance(5);
+          await store.schedules.advance({
+            scope: 'tenant',
+            scheduleId: 's1',
+            expectedRevision: 1,
+            fromCursor: T0 + MINUTE,
+            toCursor: T0 + 2 * MINUTE,
+            occurrences: [occurrence(goal, 's1', T0 + 2 * MINUTE, 'catch-up-none')],
+          });
+          expect(await store.pruneOccurrences({ before: T0 + 5, scope: 'other' })).toBe(0);
+          expect(await store.pruneOccurrences({ before: T0 + 5 })).toBe(1);
+          expect(
+            (await store.schedules.occurrences!({ scope: 'tenant' })).occurrences.map(
+              (record) => record.at,
+            ),
+          ).toEqual([T0 + 2 * MINUTE]);
+          expect(await store.pruneIntents({ before: T0 + 5, scope: 'other' })).toBe(0);
+          expect(await store.pruneIntents({ before: T0 + 5 })).toBe(1);
+          expect(await store.intents.get('tenant', 'done')).toBeUndefined();
+          expect((await store.intents.get('tenant', 'open'))?.status).toBe('pending');
+        }),
+      );
+
+      it(
+        'refuses malformed retention options',
+        withStore(async (store) => {
+          for (const options of [{ before: Number.NaN }, { before: T0, scope: '' }, {}])
+            for (const prune of [
+              store.prunePayloads,
+              store.pruneInbox,
+              store.pruneOccurrences,
+              store.pruneIntents,
+            ])
+              await expect(
+                Promise.resolve().then(() => prune.call(store, options as never)),
+                JSON.stringify(options),
+              ).rejects.toThrow(TypeError);
+        }),
+      );
+    });
   });
 }

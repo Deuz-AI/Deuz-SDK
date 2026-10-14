@@ -25,12 +25,15 @@ import type {
   GoalInboxEnqueueResult,
   GoalInboxEntry,
   GoalInboxQuery,
+  GoalLedgerWatermark,
   GoalRunIntent,
   GoalRunIntentInput,
   GoalRunIntentQuery,
   GoalRuntimeCommitResult,
   GoalRuntimePhase,
+  GoalRuntimePruneOptions,
   GoalRuntimeState,
+  GoalWatermarkAdvance,
   ScheduleAdvance,
   ScheduleAdvanceResult,
   ScheduleOccurrenceQuery,
@@ -69,7 +72,8 @@ export type GoalRuntimeWrite =
   | { kind: 'entry'; entry: GoalInboxEntry; created: boolean }
   | { kind: 'intent'; intent: GoalRunIntent; created: boolean }
   | { kind: 'schedule'; schedule: DurableSchedule; created: boolean }
-  | { kind: 'occurrence'; record: ScheduleOccurrenceRecord };
+  | { kind: 'occurrence'; record: ScheduleOccurrenceRecord }
+  | { kind: 'watermark'; watermark: GoalLedgerWatermark; created: boolean };
 
 /** A planner's answer: the result, and the writes that commit it (none when refused). */
 export interface GoalRuntimePlan<R> {
@@ -1371,3 +1375,105 @@ export function matchesOccurrenceList(
     return occurrencesOldestFirst(record, { at: plan.after[0], occurrenceId: plan.after[1] }) > 0;
   return true;
 }
+
+// ===================================================================
+// Ledger watermarks
+// ===================================================================
+
+/** A checked watermark advance, its goal checked and copied. Throws a TypeError. */
+export function checkWatermarkAdvance(value: unknown): GoalWatermarkAdvance {
+  const check = new RuntimeChecker('watermark advance');
+  const advance = check.object(value, 'advance');
+  check.string(advance.scope, 'scope');
+  check.string(advance.goalId, 'goalId');
+  check.string(advance.runId, 'runId');
+  check.count(advance.expectedRevision, 'expectedRevision');
+  const next = check.object(advance.next, 'next');
+  for (const key of ['tokens', 'usd', 'reservedTokens', 'reservedUsd'] as const)
+    check.amount(next[key], `next.${key}`);
+  return {
+    scope: advance.scope as string,
+    goalId: advance.goalId as string,
+    runId: advance.runId as string,
+    expectedRevision: advance.expectedRevision as number,
+    next: {
+      tokens: next.tokens as number,
+      usd: next.usd as number,
+      reservedTokens: next.reservedTokens as number,
+      reservedUsd: next.reservedUsd as number,
+    },
+    goal: checkGoal(advance.goal),
+  };
+}
+
+/**
+ * `watermarks.advance`: the watermark at `expectedRevision` (0 for the first)
+ * and the charged goal at its stored revision plus one, together. Charged
+ * amounts never go back (a TypeError); reservations may be released.
+ */
+export function planWatermarkAdvance(
+  snapshot: { watermark: GoalLedgerWatermark | undefined; goal: StoredGoal | undefined },
+  advance: GoalWatermarkAdvance,
+  now: number,
+): GoalRuntimePlan<GoalRuntimeCommitResult> {
+  const owner = { goalId: advance.goalId, scope: advance.scope };
+  if (!namesGoal(owner, advance.goal)) return refused('scope-mismatch');
+  if (snapshot.goal !== undefined && snapshot.goal.scope !== owner.scope)
+    return refused('scope-mismatch');
+  const stored = snapshot.watermark;
+  if ((stored?.revision ?? 0) !== advance.expectedRevision) return refused('watermark-revision');
+  const goal = goalPart(snapshot.goal, owner, advance.goal);
+  if (typeof goal === 'string') return refused(goal);
+  if (
+    stored !== undefined &&
+    (advance.next.tokens < stored.tokens || advance.next.usd < stored.usd)
+  )
+    throw new TypeError(
+      `A ledger watermark never goes back: run ${advance.runId} of goal ${advance.goalId} is charged up to ${stored.tokens} tokens and ${stored.usd} USD`,
+    );
+  const watermark: GoalLedgerWatermark = {
+    scope: advance.scope,
+    goalId: advance.goalId,
+    runId: advance.runId,
+    ...advance.next,
+    revision: (stored?.revision ?? 0) + 1,
+    updatedAt: now,
+  };
+  return committed([{ kind: 'watermark', watermark, created: stored === undefined }, goal!]);
+}
+
+// ===================================================================
+// Retention
+// ===================================================================
+
+/** Checked retention options. Throws a TypeError. */
+export function checkPruneOptions(value: unknown): GoalRuntimePruneOptions {
+  const check = new RuntimeChecker('retention options');
+  const options = check.object(value, 'options');
+  const before = check.time(options.before, 'before');
+  if (options.scope === undefined) return { before };
+  return { before, scope: check.string(options.scope, 'scope') };
+}
+
+/** Whether a settled entry falls under a retention cut. */
+export function settledBefore(entry: GoalInboxEntry, options: GoalRuntimePruneOptions): boolean {
+  return (
+    entry.disposition !== 'pending' &&
+    entry.settledAt !== undefined &&
+    entry.settledAt < options.before &&
+    (options.scope === undefined || entry.scope === options.scope)
+  );
+}
+
+/** An entry's content-free tombstone: everything but the payload, marked pruned. */
+export function tombstone(entry: GoalInboxEntry): GoalInboxEntry {
+  const { payload: _payload, ...rest } = entry;
+  return { ...rest, payloadPruned: true };
+}
+
+/** The intent statuses `pruneIntents` deletes. */
+export const FINISHED_INTENT_STATUSES: readonly GoalRunIntent['status'][] = [
+  'completed',
+  'failed',
+  'cancelled',
+];
