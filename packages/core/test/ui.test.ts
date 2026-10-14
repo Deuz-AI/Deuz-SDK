@@ -869,7 +869,8 @@ describe('Deuz UI wire v2 (resumable)', () => {
     manual.end();
     const parts: DeuzUIPart[] = [];
     for await (const p of readDeuzStream(res)) parts.push(p);
-    expect(parts.map((p) => p.type)).toEqual(['start', 'text-delta']);
+    // 2.4 (H1): the leg is not journaled, and the client is told so.
+    expect(parts.map((p) => p.type)).toEqual(['start', 'warning', 'text-delta']);
     expect(storeErrors.length).toBeGreaterThan(0);
 
     // Resume against the same broken store: redacted error part, no hang.

@@ -509,27 +509,55 @@ export function createInMemoryStreamStateStore(
  * Pending appends are bounded by the response length; a store.append that
  * never settles stalls only the final flush (`settled()`), never the wire.
  * Adapters should put their own timeout on writes.
+ *
+ * The first failed append ends the journal of the leg (2.4, H2): the appends
+ * queued behind it are skipped and `onFailure` hears it once. Writing on
+ * would leave a hole in the log, and a replay reads `seq > cursor`, so it
+ * would skip the lost frame without a word.
  */
 function createStoreWriter(
   store: StreamStateStore,
   streamId: string,
-  onError?: (error: unknown) => void,
+  onFailure: (error: unknown) => void,
 ): { append(seq: number, part: StreamStateRecord['part']): void; settled(): Promise<void> } {
   let chain: Promise<void> = Promise.resolve();
+  let failed = false;
   return {
     append(seq, part) {
+      if (failed) return;
       chain = chain
-        .then(() => store.append(streamId, seq, part))
-        .catch((error) => {
-          try {
-            onError?.(error);
-          } catch {
-            /* observer errors must not break the pipeline */
-          }
+        .then(() => (failed ? undefined : store.append(streamId, seq, part)))
+        .catch((error: unknown) => {
+          if (failed) return;
+          failed = true;
+          onFailure(error);
         });
     },
     settled: () => chain,
   };
+}
+
+/**
+ * The warning a legacy leg sends when its store fails (2.4, H1/H2): the
+ * frames still flow, but the leg is not journaled and cannot be resumed. The
+ * store's own error goes to `onStoreError` only: it may name hosts or
+ * credentials a browser must not see.
+ */
+const STORE_FAILURE_WARNING: DeuzUIPart = {
+  type: 'warning',
+  warning: {
+    type: 'stream-store-error',
+    message: 'The stream store failed: this response is not journaled and cannot be resumed.',
+  },
+};
+
+/** Calls an `onStoreError` observer; its own errors are not the stream's to raise. */
+function reportStoreError(onStoreError: ((error: unknown) => void) | undefined, error: unknown) {
+  try {
+    onStoreError?.(error);
+  } catch {
+    /* observer errors must not break the pipeline */
+  }
 }
 
 async function lastStoredSeq(store: StreamStateStore, streamId: string): Promise<number> {
@@ -866,8 +894,6 @@ function deuzSSEResponse(
   if (store && !streamId) {
     throw new Error(`${label}: \`streamId\` is required when \`store\` is set.`);
   }
-  let writer =
-    store && streamId ? createStoreWriter(store, streamId, options.onStoreError) : undefined;
 
   // The client can vanish mid-stream (refresh, tab close, network drop) — the
   // response body dies, but the STORE must keep recording: resumability exists
@@ -884,6 +910,21 @@ function deuzSSEResponse(
           clientGone = true;
         }
       };
+      // A store failure (2.4, H1/H2) is told to the client once, off-journal
+      // and off-seq like a transient part; a v1 client gets no v2-only part.
+      let warned = false;
+      const warnStoreFailure = (): void => {
+        if (warned || version === 'v1') return;
+        warned = true;
+        enqueue(`data: ${JSON.stringify(STORE_FAILURE_WARNING)}\n\n`);
+      };
+      let writer =
+        store && streamId
+          ? createStoreWriter(store, streamId, (error) => {
+              reportStoreError(options.onStoreError, error);
+              warnStoreFailure();
+            })
+          : undefined;
       // A detached leg (see `journaled`) carries no journal coordinates.
       let ids = version === 'v2';
       if (writer && journaled && !(await journaled())) {
@@ -892,6 +933,7 @@ function deuzSSEResponse(
       }
       let seq = 0;
       let resumed = false;
+      let unreadable = false;
       if (writer && store && streamId) {
         try {
           const last = await lastStoredSeq(store, streamId);
@@ -900,13 +942,14 @@ function deuzSSEResponse(
             resumed = true;
           }
         } catch (error) {
-          // A store outage must not kill the live response (the appends will
-          // route their own failures to onStoreError too).
-          try {
-            options.onStoreError?.(error);
-          } catch {
-            /* observer errors are not ours to raise */
-          }
+          // A store outage must not kill the live response. Without the stored
+          // last seq the leg cannot know its numbers (2.3 restarted at 0, over
+          // the frames already stored: H1), so it is detached instead: no
+          // journal writes and no `id:` lines, and the client is warned.
+          writer = undefined;
+          ids = false;
+          unreadable = true;
+          reportStoreError(options.onStoreError, error);
         }
       }
       const send = (part: DeuzUIPart, sendOptions?: SendOptions): void => {
@@ -940,8 +983,12 @@ function deuzSSEResponse(
           enqueue(`data: ${JSON.stringify(part)}\n\n`);
           return;
         }
-        // Store BEFORE wire: a part in flight during a disconnect must still
-        // land in the log even though its enqueue never happens.
+        // The append is QUEUED before the enqueue, never awaited: the wire does
+        // not wait for the store, so a frame can reach the client before the
+        // store has it, and a write that fails is lost to replay (it ends the
+        // journal of the leg and warns the client, H2). Queued first, a part in
+        // flight during a disconnect still lands in the log even though its
+        // enqueue never happens. Persist-before-publish is the durable mode.
         writer?.append(seq, part);
         enqueue(`${ids ? `id: ${seq}\n` : ''}data: ${JSON.stringify(part)}\n\n`);
         seq++;
@@ -950,6 +997,7 @@ function deuzSSEResponse(
         const messageId = options.messageId ?? options.generateId?.() ?? 'deuz-msg';
         send({ type: 'start', messageId });
       }
+      if (unreadable) warnStoreFailure();
       await produce(send, () => seq);
       // Leg-end sentinel: appended for EVERY ended leg (complete, errored, or
       // suspended-for-approval). Replay treats it as terminal only when
