@@ -58,8 +58,11 @@ export const SUBPATH_DESCRIPTIONS = {
   '@deuz-sdk/core/workspace':
     'A file-tree seam agents use as externalized memory, plus the tools that drive it.',
   '@deuz-sdk/core/workspace/node': 'Real-filesystem workspace (Node only).',
-  '@deuz-sdk/core/compute': 'CodeAct: let the model act by writing code; sandbox seam and shell tool.',
+  '@deuz-sdk/core/compute':
+    'CodeAct: let the model act by writing code; sandbox seam and shell tool.',
   '@deuz-sdk/core/compute/node': 'Node child-process sandbox for the compute tools.',
+  '@deuz-sdk/core/compute/docker':
+    'Preview (Node only): local Docker sandbox for the compute tools and a reconnectable process runner with its operation store.',
   '@deuz-sdk/core/agent':
     'Native run/stream/resume/reconcile, validated outputs, execution policies, shared and persistent budgets; also createAgent templates and handoff.',
   '@deuz-sdk/core/swarm':
@@ -85,6 +88,11 @@ export const SUBPATH_DESCRIPTIONS = {
     'Five-field UTC cron, a tick-driven scheduler with dedupe, and verified webhooks.',
   '@deuz-sdk/core/goal':
     'Goals, wakeups and events: versioned records, pure transitions, evidence-based acceptance, a GoalStore seam.',
+  '@deuz-sdk/core/goal/runtime':
+    'Durable goals: a supervisor over the native executor, the goal runtime store, a time-zone aware durable scheduler, webhook delivery and verifyGoalAcceptance.',
+  '@deuz-sdk/core/goal/runtime/sqlite':
+    'Node-only SQLite goal runtime store: the first durable GoalStore.',
+  '@deuz-sdk/core/goal/runtime/postgres': 'Node-only Postgres goal runtime store.',
   '@deuz-sdk/core/autonomy':
     'Ensemble strategies: best-of-N, self-consistency, parallel agents, task planning.',
   '@deuz-sdk/core/runtime':
@@ -116,12 +124,22 @@ export const SUBPATH_DESCRIPTIONS = {
     'Long-term memory: extract, reconcile, apply — behind one swappable store seam.',
   '@deuz-sdk/core/memory/markdown':
     'Obsidian-style markdown vault as the memory store (Node only).',
+  '@deuz-sdk/core/memory/versioned':
+    'Versioned memory with provenance: revisions, receipts, idempotent operations, forget, re-embed and the legacy import.',
+  '@deuz-sdk/core/memory/versioned/sqlite':
+    'Node-only SQLite versioned memory store: hybrid FTS5 + vector search.',
+  '@deuz-sdk/core/memory/versioned/postgres':
+    'Node-only Postgres versioned memory store: hybrid tsvector + vector search, pgvector optional.',
+  '@deuz-sdk/core/context':
+    'One token budget for memory, RAG, transcript and skills: compileContext, the context compiler, working memory and the token estimator.',
   '@deuz-sdk/core/rag':
     'Edge-safe RAG: sniff, parse, chunk, embed, dense + BM25 hybrid retrieval, citations.',
   '@deuz-sdk/core/rag/node': 'PDF / DOCX / XLSX / HTML parsers for the RAG registry (Node only).',
   '@deuz-sdk/core/skills':
     'Agent Skills: SKILL.md parsing, registry, matchers, catalog rendering, tool scoping.',
   '@deuz-sdk/core/skills/node': 'Load skills from directories on disk (Node only).',
+  '@deuz-sdk/core/skills/learning':
+    'Experimental: a sourced, inert skill proposal from a verified run (proposeSkillFromRun).',
   '@deuz-sdk/core/vertex':
     'Claude and Gemini through Vertex AI; edge-safe service-account JWT signing.',
   '@deuz-sdk/core/vertex/node': 'Vertex Application Default Credentials (Node only).',
@@ -178,7 +196,8 @@ export function resolveStampDate({ date, env = process.env } = {}) {
   if (epoch === undefined || epoch === '') {
     throw new Error('no stamp date: pass --date YYYY-MM-DD or set SOURCE_DATE_EPOCH');
   }
-  if (!/^\d+$/.test(epoch)) throw new Error(`SOURCE_DATE_EPOCH must be whole seconds, got "${epoch}"`);
+  if (!/^\d+$/.test(epoch))
+    throw new Error(`SOURCE_DATE_EPOCH must be whole seconds, got "${epoch}"`);
   return new Date(Number(epoch) * 1000).toISOString().slice(0, 10);
 }
 
