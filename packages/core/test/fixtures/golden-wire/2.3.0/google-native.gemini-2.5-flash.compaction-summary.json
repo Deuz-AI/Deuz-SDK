@@ -1,0 +1,102 @@
+{
+  "scenario": "google-native.gemini-2.5-flash.compaction-summary",
+  "recordedFrom": "2.3.0",
+  "requests": [
+    {
+      "method": "POST",
+      "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse",
+      "headers": {
+        "content-type": "application/json",
+        "x-goog-api-key": "<secret>"
+      },
+      "json": {
+        "contents": [
+          {
+            "role": "user",
+            "parts": [
+              {
+                "text": "ASSISTANT: [calls get_weather({\"city\":\"Paris\"})]\nTOOL: [tool result: {\"city\":\"Paris\",\"tempC\":21}]\nASSISTANT: It is 21 °C in Paris.\nUSER: And in Rome?\nASSISTANT: [calls get_weather({\"city\":\"Rome\"})]\nTOOL: [tool result: {\"city\":\"Rome\",\"tempC\":25}]\n\nSummarize the conversation transcript above as concise notes: preserve key facts, decisions made, tool results that still matter, and any open task threads. Output only the summary."
+              }
+            ]
+          }
+        ],
+        "generationConfig": {
+          "maxOutputTokens": 64000
+        }
+      }
+    },
+    {
+      "method": "POST",
+      "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse",
+      "headers": {
+        "content-type": "application/json",
+        "x-goog-api-key": "<secret>"
+      },
+      "json": {
+        "contents": [
+          {
+            "role": "user",
+            "parts": [
+              {
+                "text": "What is the weather in Paris?"
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "parts": [
+              {
+                "text": "[Earlier conversation summarized]\nParis 21 °C, Rome 25 °C."
+              }
+            ]
+          },
+          {
+            "role": "model",
+            "parts": [
+              {
+                "text": "It is 25 °C in Rome."
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "parts": [
+              {
+                "text": "Which city is warmer?"
+              }
+            ]
+          }
+        ],
+        "generationConfig": {
+          "maxOutputTokens": 64000
+        },
+        "tools": [
+          {
+            "functionDeclarations": [
+              {
+                "name": "get_weather",
+                "description": "Current weather for a city.",
+                "parameters": {
+                  "type": "OBJECT",
+                  "properties": {
+                    "city": {
+                      "type": "STRING",
+                      "description": "The city name."
+                    }
+                  },
+                  "propertyOrdering": ["city"],
+                  "required": ["city"]
+                }
+              }
+            ]
+          }
+        ],
+        "toolConfig": {
+          "functionCallingConfig": {
+            "mode": "AUTO"
+          }
+        }
+      }
+    }
+  ]
+}

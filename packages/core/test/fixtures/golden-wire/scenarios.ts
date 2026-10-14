@@ -22,8 +22,26 @@ import {
 import { createAzure } from '../../../src/azure';
 import { createBedrock } from '../../../src/bedrock';
 import { createXai } from '../../../src/xai';
-import { createVoyage } from '../../../src/voyage';
-import { createYunwuChat, createYunwuEmbedding } from '../../../src/yunwu';
+import { createVoyage, createVoyageReranker } from '../../../src/voyage';
+import { createCohereReranker } from '../../../src/rag';
+import {
+  createYunwuChat,
+  createYunwuEmbedding,
+  createYunwuImage,
+  createYunwuVideo,
+} from '../../../src/yunwu';
+import { createImageProvider, generateImage } from '../../../src/image';
+import { createElevenLabs, createOpenAISpeech, generateSpeech } from '../../../src/speech';
+import { createDeepgram, createOpenAITranscription, transcribe } from '../../../src/transcription';
+import { createVideoProvider, submitVideo } from '../../../src/video';
+import { submitImagine } from '../../../src/midjourney';
+import { createBatchClient } from '../../../src/batch/client';
+import type { BatchRequest } from '../../../src/batch/types';
+import {
+  createEmbedder,
+  createInMemoryMemoryStore,
+  type MemoryCallOptions,
+} from '../../../src/memory';
 import {
   createCerebras,
   createCohere,
@@ -52,7 +70,16 @@ import type { Message } from '../../../src/types/message';
 import type { ToolSet } from '../../../src/types/tool';
 import type { AgentToolSet } from '../../../src/types/agent-run';
 import type { JSONSchema } from '../../../src/types/schema';
-import { SECRET, jsonAnswer, turn, type ScriptStep, type Wire, type WireRequest } from './harness';
+import {
+  FIXED_NOW,
+  SECRET,
+  bytesAnswer,
+  jsonAnswer,
+  turn,
+  type ScriptStep,
+  type Wire,
+  type WireRequest,
+} from './harness';
 
 export interface GoldenScenario {
   /** The fixture file name, without `.json`. */
@@ -121,6 +148,118 @@ const IMAGE_MESSAGES: Message[] = [
   },
 ];
 
+/** One reasoning block of each family: a wire replays only its own. */
+const REASONING_HISTORY: Message[] = [
+  { role: 'user', content: 'Where should I travel?' },
+  {
+    role: 'assistant',
+    content: [
+      {
+        type: 'reasoning',
+        text: 'Weighing the options.',
+        signature: 'sig-anthropic',
+        source: 'anthropic',
+      },
+      {
+        type: 'reasoning',
+        text: 'b3BhcXVl',
+        signature: 'rs_golden',
+        encrypted: true,
+        source: 'openai',
+      },
+      {
+        type: 'reasoning',
+        text: 'Considering seasons.',
+        signature: 'sig-google',
+        source: 'google',
+      },
+      { type: 'text', text: 'Paris.' },
+    ],
+  },
+  { role: 'user', content: 'Why?' },
+];
+
+/** Two finished tool rounds and a new question, for the compaction layers. */
+const TOOL_HISTORY: Message[] = [
+  { role: 'user', content: 'What is the weather in Paris?' },
+  {
+    role: 'assistant',
+    content: [
+      { type: 'tool_use', id: 'call_paris', name: 'get_weather', input: { city: 'Paris' } },
+    ],
+  },
+  {
+    role: 'tool',
+    content: [
+      { type: 'tool_result', toolUseId: 'call_paris', result: { city: 'Paris', tempC: 21 } },
+    ],
+  },
+  { role: 'assistant', content: 'It is 21 °C in Paris.' },
+  { role: 'user', content: 'And in Rome?' },
+  {
+    role: 'assistant',
+    content: [{ type: 'tool_use', id: 'call_rome', name: 'get_weather', input: { city: 'Rome' } }],
+  },
+  {
+    role: 'tool',
+    content: [{ type: 'tool_result', toolUseId: 'call_rome', result: { city: 'Rome', tempC: 25 } }],
+  },
+  { role: 'assistant', content: 'It is 25 °C in Rome.' },
+  { role: 'user', content: 'Which city is warmer?' },
+];
+
+/**
+ * A compaction that always fires (a fixed huge token count) and only prunes
+ * tool results. Compaction runs in the tool loop, so the call offers a tool.
+ */
+const COMPACTION = {
+  keepRecentSteps: 1,
+  layers: ['prune-tool-results' as const],
+  countTokens: () => 10_000_000,
+};
+
+/** The same, with the summarize layer only: one summary side call before the step. */
+const SUMMARY_COMPACTION = { ...COMPACTION, layers: ['summarize' as const] };
+
+/**
+ * Memory recall over one stored fact. The fact's vector equals the query's
+ * (cosine 1, same model and dimensions), so it is recalled under every recall
+ * rule; extraction is off, so the only provider calls are the query embedding
+ * and the model calls.
+ */
+async function memoryOptions(
+  fetch: typeof globalThis.fetch,
+  deps: Dependencies,
+): Promise<MemoryCallOptions> {
+  const store = createInMemoryMemoryStore();
+  await store.upsert([
+    {
+      id: 'mem_golden',
+      text: 'The user prefers temperatures in Celsius.',
+      hash: 'hash_golden',
+      kind: 'semantic',
+      scope: { userId: 'golden-user' },
+      embedding: [0.1, 0.2, 0.3],
+      embeddingModelId: 'text-embedding-3-small',
+      createdAt: FIXED_NOW,
+      updatedAt: FIXED_NOW,
+    },
+  ]);
+  const embedding = createOpenAIEmbedding({ ...key, fetch })('text-embedding-3-small');
+  let next = 0;
+  return {
+    seams: {
+      store,
+      embedder: createEmbedder(embedding, { deps }),
+      llm: async () => '',
+      clock: deps.clock!,
+      generateId: () => `mem_${++next}`,
+    },
+    scope: { userId: 'golden-user' },
+    extract: false,
+  };
+}
+
 const CALL = { name: 'get_weather', args: '{"city":"Paris"}' };
 const OBJECT_JSON = '{"city":"Paris","tempC":21}';
 
@@ -147,7 +286,12 @@ type ChatKind =
   | 'generate-object'
   | 'run-agent'
   | 'call-options'
-  | 'image-input';
+  | 'image-input'
+  | 'reasoning-replay'
+  | 'compaction'
+  | 'compaction-summary'
+  | 'memory-recall'
+  | 'run-agent-memory';
 
 const ALL: readonly ChatKind[] = [
   'generate-text',
@@ -157,6 +301,19 @@ const ALL: readonly ChatKind[] = [
   'run-agent',
   'call-options',
   'image-input',
+];
+/**
+ * The main wires also run with the 2.3 features a caller switches on (memory
+ * recall, compaction) and with replayed reasoning: a 2.4 process with its own
+ * new features off must send these exactly as 2.3 did.
+ */
+const FEATURED: readonly ChatKind[] = [
+  ...ALL,
+  'reasoning-replay',
+  'compaction',
+  'compaction-summary',
+  'memory-recall',
+  'run-agent-memory',
 ];
 /** Named compatible hosts with a pinned registry row: a plain call and a tool round. */
 const HOST: readonly ChatKind[] = ['generate-text', 'tool-round'];
@@ -178,7 +335,7 @@ const CHAT_TARGETS: readonly ChatTarget[] = [
     name: 'anthropic.claude-sonnet-4-5',
     wire: 'anthropic',
     model: (fetch) => createAnthropic({ ...key, fetch })('claude-sonnet-4-5'),
-    kinds: ALL,
+    kinds: FEATURED,
   },
   {
     name: 'anthropic.claude-opus-5-5',
@@ -190,19 +347,19 @@ const CHAT_TARGETS: readonly ChatTarget[] = [
     name: 'openai-chat.gpt-5.5',
     wire: 'chat',
     model: (fetch) => createOpenAI({ ...key, fetch })('gpt-5.5'),
-    kinds: ALL,
+    kinds: FEATURED,
   },
   {
     name: 'openai-responses.gpt-5.4',
     wire: 'responses',
     model: (fetch) => createOpenAIResponses({ ...key, fetch })('gpt-5.4'),
-    kinds: ALL,
+    kinds: FEATURED,
   },
   {
     name: 'google-native.gemini-2.5-flash',
     wire: 'gemini',
     model: (fetch) => createGoogleNative({ ...key, fetch })('gemini-2.5-flash'),
-    kinds: ALL,
+    kinds: FEATURED,
   },
   {
     name: 'google-native.gemini-3.1-pro',
@@ -505,6 +662,77 @@ function chatScenario(target: ChatTarget, kind: ChatKind): GoldenScenario {
           await generateText({ model, messages: IMAGE_MESSAGES, deps });
         },
       };
+    case 'reasoning-replay':
+      return {
+        id,
+        script: [turn(wire, { text: 'Because of the museums.' })],
+        async run(fetch, deps) {
+          const model = target.model(fetch);
+          await generateText({ model, messages: REASONING_HISTORY, deps });
+        },
+      };
+    case 'compaction':
+      return {
+        id,
+        script: [turn(wire, { text: 'Rome.' })],
+        async run(fetch, deps) {
+          const model = target.model(fetch);
+          await generateText({
+            model,
+            messages: TOOL_HISTORY,
+            tools: TOOLS,
+            compaction: COMPACTION,
+            deps,
+          });
+        },
+      };
+    case 'compaction-summary':
+      return {
+        id,
+        script: [turn(wire, { text: 'Paris 21 °C, Rome 25 °C.' }), turn(wire, { text: 'Rome.' })],
+        async run(fetch, deps) {
+          const model = target.model(fetch);
+          await generateText({
+            model,
+            messages: TOOL_HISTORY,
+            tools: TOOLS,
+            compaction: SUMMARY_COMPACTION,
+            deps,
+          });
+        },
+      };
+    case 'memory-recall':
+      return {
+        id,
+        script: [openaiShaped(1), turn(wire, { text: 'Hello.' })],
+        async run(fetch, deps) {
+          const model = target.model(fetch);
+          await generateText({
+            model,
+            prompt: 'What is the weather in Paris?',
+            memory: await memoryOptions(fetch, deps),
+            deps,
+          });
+        },
+      };
+    case 'run-agent-memory':
+      return {
+        id,
+        script: [openaiShaped(1), turn(wire, { call: CALL }), turn(wire, { text: 'It is 21 °C.' })],
+        async run(fetch, deps) {
+          const model = target.model(fetch);
+          const result = await runAgent({
+            model,
+            prompt: 'What is the weather in Paris?',
+            tools: AGENT_TOOLS,
+            memory: await memoryOptions(fetch, deps),
+            deps,
+          });
+          if (result.status !== 'completed') {
+            throw new Error(`golden-wire: ${id} ended ${result.status}`);
+          }
+        },
+      };
     case 'run-agent':
       return {
         id,
@@ -615,8 +843,212 @@ function embeddingScenario(entry: EmbeddingCase): GoldenScenario {
   };
 }
 
+// ---------------------------------------------------------------------------
+// Media, rerank and relay requests.
+// ---------------------------------------------------------------------------
+
+const AUDIO = new Uint8Array([0x49, 0x44, 0x33, 0x04, 0x00, 0x00, 0x00, 0x00]);
+
+const CANDIDATES = [
+  { text: DOCUMENTS[0]!, index: 0, score: 0.5 },
+  { text: DOCUMENTS[1]!, index: 1, score: 0.4 },
+];
+
+const rerankResults = [
+  { index: 1, relevance_score: 0.9 },
+  { index: 0, relevance_score: 0.2 },
+];
+
+const MEDIA_SCENARIOS: readonly GoldenScenario[] = [
+  {
+    id: 'image.gpt-image-1.generate-image',
+    script: [jsonAnswer({ created: 0, data: [{ url: 'https://images.example.test/1.png' }] })],
+    async run(fetch, deps) {
+      const model = createImageProvider({ ...key, fetch })('gpt-image-1');
+      await generateImage({ model, prompt: 'A lighthouse at dusk.', size: '1024x1024', deps });
+    },
+  },
+  {
+    id: 'yunwu-image.gpt-image-1.5.generate-image',
+    script: [jsonAnswer({ created: 0, data: [{ b64_json: 'aGVsbG8=' }] })],
+    async run(fetch, deps) {
+      const model = createYunwuImage({ ...key, fetch })('gpt-image-1.5');
+      await generateImage({
+        model,
+        prompt: 'A lighthouse at dusk.',
+        responseFormat: 'b64_json',
+        deps,
+      });
+    },
+  },
+  {
+    id: 'openai-speech.gpt-4o-mini-tts.generate-speech',
+    script: [bytesAnswer(AUDIO, 'audio/mpeg')],
+    async run(fetch, deps) {
+      const model = createOpenAISpeech({ ...key, fetch })('gpt-4o-mini-tts');
+      await generateSpeech({ model, text: 'Hello there.', voice: 'alloy', deps });
+    },
+  },
+  {
+    id: 'elevenlabs.eleven_multilingual_v2.generate-speech',
+    script: [bytesAnswer(AUDIO, 'audio/mpeg')],
+    async run(fetch, deps) {
+      const model = createElevenLabs({ ...key, fetch })('eleven_multilingual_v2');
+      await generateSpeech({ model, text: 'Hello there.', voice: 'golden-voice', deps });
+    },
+  },
+  {
+    id: 'openai-transcription.whisper-1.transcribe',
+    script: [jsonAnswer({ text: 'Hello there.' })],
+    async run(fetch, deps) {
+      const model = createOpenAITranscription({ ...key, fetch })('whisper-1');
+      await transcribe({ model, audio: AUDIO, mediaType: 'audio/mpeg', language: 'en', deps });
+    },
+  },
+  {
+    id: 'deepgram.nova-3.transcribe',
+    script: [
+      jsonAnswer({
+        metadata: { request_id: 'golden', duration: 1 },
+        results: {
+          channels: [{ alternatives: [{ transcript: 'Hello there.', confidence: 0.9 }] }],
+        },
+      }),
+    ],
+    async run(fetch, deps) {
+      const model = createDeepgram({ ...key, fetch })('nova-3');
+      await transcribe({ model, audio: AUDIO, mediaType: 'audio/mpeg', language: 'en', deps });
+    },
+  },
+  {
+    id: 'video.sora-2.submit-video',
+    script: [jsonAnswer({ id: 'video_golden', status: 'queued', model: 'sora-2' })],
+    async run(fetch, deps) {
+      const model = createVideoProvider({ ...key, fetch })('sora-2');
+      await submitVideo({ model, prompt: 'Waves at night.', size: '1280x720', seconds: 8, deps });
+    },
+  },
+  {
+    id: 'yunwu-video.veo3.submit-video',
+    script: [jsonAnswer({ id: 'video_golden', status: 'queued', model: 'veo3' })],
+    async run(fetch, deps) {
+      const model = createYunwuVideo({ ...key, fetch })('veo3');
+      await submitVideo({ model, prompt: 'Waves at night.', deps });
+    },
+  },
+  {
+    id: 'midjourney.submit-imagine',
+    script: [jsonAnswer({ code: 1, description: 'Submit success', result: 'task_golden' })],
+    async run(fetch, deps) {
+      await submitImagine({ ...key, fetch, prompt: 'A lighthouse at dusk --ar 16:9', deps });
+    },
+  },
+  {
+    id: 'voyage-rerank.rerank-2.5.rerank',
+    script: [jsonAnswer({ object: 'list', data: rerankResults, usage: { total_tokens: 20 } })],
+    async run(fetch, deps) {
+      await createVoyageReranker({ ...key, fetch, deps }).rerank('capital of Italy', CANDIDATES, 2);
+    },
+  },
+  {
+    id: 'cohere-rerank.rerank-v4.0-pro.rerank',
+    script: [jsonAnswer({ id: 'golden', results: rerankResults })],
+    async run(fetch, deps) {
+      await createCohereReranker({ ...key, fetch, deps }).rerank('capital of Italy', CANDIDATES, 1);
+    },
+  },
+];
+
+// ---------------------------------------------------------------------------
+// Batch submission (the requests a batch job is created with).
+// ---------------------------------------------------------------------------
+
+const BATCH_REQUESTS: BatchRequest[] = [
+  { id: 'q1', prompt: 'One?', maxOutputTokens: 64 },
+  { id: 'q2', instructions: 'Answer in French.', prompt: 'Two?' },
+];
+
+const anthropicBatch = jsonAnswer({
+  id: 'msgbatch_golden',
+  type: 'message_batch',
+  processing_status: 'in_progress',
+  request_counts: { processing: 2, succeeded: 0, errored: 0, canceled: 0, expired: 0 },
+  created_at: '2026-01-02T03:04:05Z',
+  expires_at: '2026-01-03T03:04:05Z',
+  ended_at: null,
+  cancel_initiated_at: null,
+  archived_at: null,
+  results_url: null,
+});
+
+const openaiFile = jsonAnswer({
+  id: 'file-golden',
+  object: 'file',
+  purpose: 'batch',
+  status: 'processed',
+  bytes: 512,
+});
+
+const openaiBatch = (endpoint: string) =>
+  jsonAnswer({
+    id: 'batch_golden',
+    object: 'batch',
+    endpoint,
+    input_file_id: 'file-golden',
+    completion_window: '24h',
+    status: 'validating',
+    created_at: 1_767_323_045,
+    expires_at: 1_767_409_445,
+    request_counts: { total: 2, completed: 0, failed: 0 },
+  });
+
+const geminiBatch = jsonAnswer({
+  name: 'batches/golden',
+  metadata: {
+    '@type': 'type.googleapis.com/google.ai.generativelanguage.v1main.GenerateContentBatch',
+    model: 'models/gemini-2.5-flash',
+    state: 'BATCH_STATE_PENDING',
+    createTime: '2026-01-02T03:04:05Z',
+  },
+});
+
+function batchScenario(
+  id: string,
+  script: readonly ScriptStep[],
+  model: (fetch: typeof globalThis.fetch) => LanguageModel,
+): GoldenScenario {
+  return {
+    id,
+    script,
+    async run(fetch, deps) {
+      await createBatchClient({ model: model(fetch), deps }).submit(BATCH_REQUESTS);
+    },
+  };
+}
+
+const BATCH_SCENARIOS: readonly GoldenScenario[] = [
+  batchScenario('batch.anthropic.claude-sonnet-4-5.submit', [anthropicBatch], (fetch) =>
+    createAnthropic({ ...key, fetch })('claude-sonnet-4-5'),
+  ),
+  batchScenario(
+    'batch.openai-chat.gpt-5.5.submit',
+    [openaiFile, openaiBatch('/v1/chat/completions')],
+    (fetch) => createOpenAI({ ...key, fetch })('gpt-5.5'),
+  ),
+  batchScenario(
+    'batch.openai-responses.gpt-5.4.submit',
+    [openaiFile, openaiBatch('/v1/responses')],
+    (fetch) => createOpenAIResponses({ ...key, fetch })('gpt-5.4'),
+  ),
+  batchScenario('batch.google-native.gemini-2.5-flash.submit', [geminiBatch], (fetch) =>
+    createGoogleNative({ ...key, fetch })('gemini-2.5-flash'),
+  ),
+];
+
 /** Every golden scenario, in a stable order. */
 export const GOLDEN_SCENARIOS: readonly GoldenScenario[] = [
   ...CHAT_TARGETS.flatMap((target) => target.kinds.map((kind) => chatScenario(target, kind))),
   ...EMBEDDING_CASES.map(embeddingScenario),
+  ...MEDIA_SCENARIOS,
+  ...BATCH_SCENARIOS,
 ];

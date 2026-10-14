@@ -1,0 +1,56 @@
+{
+  "scenario": "batch.anthropic.claude-sonnet-4-5.submit",
+  "recordedFrom": "2.3.0",
+  "requests": [
+    {
+      "method": "POST",
+      "url": "https://api.anthropic.com/v1/messages/batches",
+      "headers": {
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+        "x-api-key": "<secret>"
+      },
+      "json": {
+        "requests": [
+          {
+            "custom_id": "q1",
+            "params": {
+              "model": "claude-sonnet-4-5",
+              "max_tokens": 64,
+              "messages": [
+                {
+                  "role": "user",
+                  "content": [
+                    {
+                      "type": "text",
+                      "text": "One?"
+                    }
+                  ]
+                }
+              ]
+            }
+          },
+          {
+            "custom_id": "q2",
+            "params": {
+              "model": "claude-sonnet-4-5",
+              "max_tokens": 64000,
+              "messages": [
+                {
+                  "role": "user",
+                  "content": [
+                    {
+                      "type": "text",
+                      "text": "Two?"
+                    }
+                  ]
+                }
+              ],
+              "system": "Answer in French."
+            }
+          }
+        ]
+      }
+    }
+  ]
+}

@@ -12,6 +12,9 @@ One file per scenario, `2.3.0/<scenario id>.json`:
 - `method` and the full `url` (scheme, host, path and query, so default base
   URLs, Azure's `api-version` and Vertex paths are pinned too);
 - every `header`, sorted by name;
+- a multipart body as its entries (`form`): `fetch` writes a random boundary,
+  so the fields and each file's name, type and content are pinned instead of
+  the bytes; a binary body as `bodyBase64`;
 - the body as its JSON value, `json`. At recording time the bytes 2.3.0 sent
   were checked to be exactly `JSON.stringify(json)`, so the test compares the
   bytes sent now against that text. A body that was not such canonical JSON
@@ -54,6 +57,23 @@ Every chat target runs some of these calls (see `CHAT_TARGETS`):
 | `call-options`    | `temperature`, `topP`, `maxOutputTokens`, `stopSequences`, `effort: 'low'`     |
 | `image-input`     | a user message with a text part and a base64 PNG image part                    |
 
+The four main wires (Anthropic Claude Sonnet 4.5, OpenAI Chat Completions,
+OpenAI Responses, Gemini native) also run with the 2.3 features a caller
+switches on, because a 2.4 process with its own new features off must send
+these exactly as 2.3 did:
+
+| Kind                 | Call                                                                                     |
+| -------------------- | ---------------------------------------------------------------------------------------- |
+| `reasoning-replay`   | a history with one reasoning block per family (Anthropic, OpenAI, Google)                |
+| `compaction`         | the tool loop over two finished tool rounds, `prune-tool-results` forced by `countTokens` |
+| `compaction-summary` | the same with the `summarize` layer: the summary side call, then the step                 |
+| `memory-recall`      | `generateText` with memory recall (query embedding, then the call); extraction off        |
+| `run-agent-memory`   | native `runAgent` with memory recall and one tool round; extraction off                   |
+
+The memory scenarios store one fact whose vector equals the query's (cosine 1,
+same embedding model and dimensions), so it is recalled under every recall rule,
+including the 2.4 exclusion of mismatched or zero-score vectors.
+
 Full matrix: Anthropic (Claude Sonnet 4.5, Claude Opus 5.5), OpenAI Chat
 Completions, OpenAI Responses, Gemini native (2.5 Flash, 3.1 Pro), Gemini
 OpenAI-compat, Vertex (Anthropic, Gemini compat, Gemini native), Azure,
@@ -62,7 +82,11 @@ named compatible host with a pinned registry row runs `generate-text` and
 `tool-round`; hosts without one (tools off by default), Perplexity, the keyless
 local hosts and a Responses-shaped gateway run `generate-text`. The embedding
 adapters (OpenAI, Gemini, Voyage, Yunwu) run `embed` and `embedMany` with task
-types, a title and `dimensions`.
+types, a title and `dimensions`. The media and relay requests are pinned too:
+image generation (OpenAI-shaped, Yunwu), speech (OpenAI, ElevenLabs),
+transcription (OpenAI multipart, Deepgram raw bytes), video and Midjourney
+submission, the Voyage and Cohere rerankers, and batch submission (Anthropic,
+OpenAI Chat Completions and Responses through the Files API, Gemini).
 
 ## Rules
 

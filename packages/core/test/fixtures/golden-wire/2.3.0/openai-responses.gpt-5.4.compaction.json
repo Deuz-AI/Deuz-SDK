@@ -1,0 +1,83 @@
+{
+  "scenario": "openai-responses.gpt-5.4.compaction",
+  "recordedFrom": "2.3.0",
+  "requests": [
+    {
+      "method": "POST",
+      "url": "https://api.openai.com/v1/responses",
+      "headers": {
+        "authorization": "Bearer <secret>",
+        "content-type": "application/json"
+      },
+      "json": {
+        "model": "gpt-5.4",
+        "input": [
+          {
+            "role": "user",
+            "content": "What is the weather in Paris?"
+          },
+          {
+            "type": "function_call",
+            "call_id": "call_paris",
+            "name": "get_weather",
+            "arguments": "{\"city\":\"Paris\"}"
+          },
+          {
+            "type": "function_call_output",
+            "call_id": "call_paris",
+            "output": "[pruned 27 chars]"
+          },
+          {
+            "role": "assistant",
+            "content": "It is 21 °C in Paris."
+          },
+          {
+            "role": "user",
+            "content": "And in Rome?"
+          },
+          {
+            "type": "function_call",
+            "call_id": "call_rome",
+            "name": "get_weather",
+            "arguments": "{\"city\":\"Rome\"}"
+          },
+          {
+            "type": "function_call_output",
+            "call_id": "call_rome",
+            "output": "[pruned 26 chars]"
+          },
+          {
+            "role": "assistant",
+            "content": "It is 25 °C in Rome."
+          },
+          {
+            "role": "user",
+            "content": "Which city is warmer?"
+          }
+        ],
+        "stream": true,
+        "max_output_tokens": 128000,
+        "store": false,
+        "include": ["reasoning.encrypted_content"],
+        "tools": [
+          {
+            "type": "function",
+            "name": "get_weather",
+            "description": "Current weather for a city.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string",
+                  "description": "The city name."
+                }
+              },
+              "required": ["city"],
+              "additionalProperties": false
+            }
+          }
+        ]
+      }
+    }
+  ]
+}

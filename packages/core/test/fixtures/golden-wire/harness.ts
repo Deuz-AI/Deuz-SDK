@@ -11,23 +11,37 @@
 import { sseEvents, sseResponse } from '../../../src/testing';
 import type { Dependencies } from '../../../src/types/deps';
 
-/** One captured HTTP request, as the fixture files store it. */
+/**
+ * One entry of a multipart body, in order. `fetch` writes the boundary itself
+ * (a random value), so a multipart request is pinned by its entries: every
+ * field, and every file's name, type and bytes (as text for a text or JSON
+ * file, else base64).
+ */
+export type FormEntry =
+  | { name: string; value: string }
+  | { name: string; file: { name: string; type: string; text?: string; base64?: string } };
+
+/** One captured HTTP request. */
 export interface WireRequest {
   method: string;
   /** The full URL: scheme, host, path and query. */
   url: string;
-  /** Every header, sorted by name; the test keys read `<secret>` (see {@link SECRET}). */
+  /** Every header, sorted by name; the test key reads `<secret>` (see {@link SECRET}). */
   headers: Record<string, string>;
-  /** The body exactly as sent (the bytes of the JSON text), or null without one. */
+  /** A text body exactly as sent (the bytes of the JSON text), else null. */
   body: string | null;
+  /** A multipart body. */
+  form?: FormEntry[];
+  /** A binary body, base64. */
+  bodyBase64?: string;
 }
 
 /**
  * One request as a fixture file stores it. A JSON body is kept as its value
  * (`json`), so the file stays readable: the bytes 2.3.0 sent were checked at
  * recording time to be exactly `JSON.stringify(json)`, and the test compares
- * the bytes sent now against that text. A body that is not such canonical JSON
- * would be kept verbatim in `bodyText`; no request without a body is captured.
+ * the bytes sent now against that text. Any other text body is kept verbatim
+ * in `bodyText`; multipart and binary bodies as `form` and `bodyBase64`.
  */
 export interface FixtureRequest {
   method: string;
@@ -35,6 +49,8 @@ export interface FixtureRequest {
   headers: Record<string, string>;
   json?: unknown;
   bodyText?: string;
+  form?: FormEntry[];
+  bodyBase64?: string;
 }
 
 /** A fixture file under `<release>/`. */
@@ -107,13 +123,42 @@ function headerRecord(headers: HeadersInit | undefined): Record<string, string> 
 
 const hideSecret = (value: string): string => value.split(SECRET).join('<secret>');
 
-function bodyText(body: BodyInit | null | undefined): string | null {
-  if (body === undefined || body === null) return null;
-  if (typeof body === 'string') return body;
-  if (body instanceof Uint8Array) return new TextDecoder().decode(body);
-  if (body instanceof ArrayBuffer) return new TextDecoder().decode(new Uint8Array(body));
-  // A FormData or stream body carries a generated boundary or no fixed bytes:
-  // no scenario sends one, and a scenario that does must say how it is pinned.
+function base64(bytes: Uint8Array): string {
+  let binary = '';
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary);
+}
+
+async function captureBody(
+  body: BodyInit | null | undefined,
+): Promise<Pick<WireRequest, 'body' | 'form' | 'bodyBase64'>> {
+  if (body === undefined || body === null) return { body: null };
+  if (typeof body === 'string') return { body };
+  if (body instanceof URLSearchParams) return { body: body.toString() };
+  if (body instanceof FormData) {
+    const form: FormEntry[] = [];
+    for (const [name, value] of body.entries()) {
+      if (typeof value === 'string') {
+        form.push({ name, value });
+        continue;
+      }
+      const bytes = new Uint8Array(await value.arrayBuffer());
+      const content = /^text\/|json/.test(value.type)
+        ? { text: new TextDecoder().decode(bytes) }
+        : { base64: base64(bytes) };
+      form.push({ name, file: { name: value.name, type: value.type, ...content } });
+    }
+    return { body: null, form };
+  }
+  if (body instanceof Blob) {
+    return { body: null, bodyBase64: base64(new Uint8Array(await body.arrayBuffer())) };
+  }
+  if (body instanceof ArrayBuffer) return { body: null, bodyBase64: base64(new Uint8Array(body)) };
+  if (ArrayBuffer.isView(body)) {
+    const view = new Uint8Array(body.buffer, body.byteOffset, body.byteLength);
+    return { body: null, bodyBase64: base64(view) };
+  }
+  // A stream has no fixed bytes to pin: no scenario sends one.
   throw new TypeError(`golden-wire: cannot capture a ${Object.prototype.toString.call(body)} body`);
 }
 
@@ -135,7 +180,7 @@ export function recordingFetch(script: readonly ScriptStep[]) {
       method: init?.method ?? 'GET',
       url: hideSecret(url),
       headers: headerRecord(init?.headers),
-      body: bodyText(init?.body),
+      ...(await captureBody(init?.body)),
     };
     requests.push(request);
     const step = script[Math.min(requests.length - 1, script.length - 1)];
@@ -146,11 +191,18 @@ export function recordingFetch(script: readonly ScriptStep[]) {
   return { fetch, requests };
 }
 
-/** A JSON answer (embeddings, rerank). */
+/** A JSON answer (embeddings, rerank, media). */
 export const jsonAnswer = (value: unknown) => (): Response =>
   new Response(JSON.stringify(value), {
     status: 200,
     headers: { 'content-type': 'application/json' },
+  });
+
+/** A binary answer (speech audio). */
+export const bytesAnswer = (bytes: Uint8Array, type: string) => (): Response =>
+  new Response(new Blob([new Uint8Array(bytes)]), {
+    status: 200,
+    headers: { 'content-type': type },
   });
 
 // ---------------------------------------------------------------------------

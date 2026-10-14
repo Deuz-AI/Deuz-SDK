@@ -66,6 +66,8 @@ function expectSameRequest(
   // which also catch key order and number or string formatting.
   expect(parsed(actual.body), `${at}: body (as JSON)`).toEqual(parsed(body));
   expect(actual.body, `${at}: body bytes (same JSON value, other bytes: key order?)`).toBe(body);
+  expect(actual.form, `${at}: multipart entries`).toEqual(expected.form);
+  expect(actual.bodyBase64, `${at}: binary body`).toEqual(expected.bodyBase64);
 }
 
 describe('golden wire: default requests are byte-identical to 2.3.0', () => {

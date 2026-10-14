@@ -1,0 +1,20 @@
+{
+  "scenario": "yunwu-image.gpt-image-1.5.generate-image",
+  "recordedFrom": "2.3.0",
+  "requests": [
+    {
+      "method": "POST",
+      "url": "https://yunwu.ai/v1/images/generations",
+      "headers": {
+        "authorization": "Bearer <secret>",
+        "content-type": "application/json"
+      },
+      "json": {
+        "model": "gpt-image-1.5",
+        "prompt": "A lighthouse at dusk.",
+        "n": 1,
+        "response_format": "b64_json"
+      }
+    }
+  ]
+}
