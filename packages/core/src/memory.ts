@@ -1097,7 +1097,7 @@ async function askMemoryLLM(
     const { chargeMemoryCall } = await import('./internal/memory-accounting');
     answer = await chargeMemoryCall<string | AccountedMemoryLLMResult>({
       execution,
-      requestId: `memory:${seams.generateId()}`,
+      id: seams.generateId(),
       kind: 'memory-llm',
       callback: llm,
       input: [prompt.system, prompt.user],
@@ -1124,7 +1124,7 @@ async function embedWith(
   type Answer = Awaited<ReturnType<typeof embedder.embed>>;
   return chargeMemoryCall<Answer>({
     execution,
-    requestId: `memory:${seams.generateId()}`,
+    id: seams.generateId(),
     kind: 'memory-embedding',
     callback: embedder,
     input: texts,

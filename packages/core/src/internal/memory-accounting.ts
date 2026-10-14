@@ -8,10 +8,11 @@
  * free) with one `unaccounted-usage` warning. A call that throws is marked
  * unknown too, since it may have been billed.
  *
- * Host callbacks name their model only in their answer, so the reservation's
- * model is the call kind and the USD side is unpriced: tokens are accounted,
- * USD is not. Loaded lazily by `memory.ts`, only when `seams.execution` is
- * set, so the 2.3 path carries none of this. Edge-safe.
+ * Host callbacks name their model only in their answer, so the reservation
+ * names `'memory-llm'` or `'memory-embedder'` (as the versioned memory session
+ * does by default) and is unpriced: tokens are accounted, USD is not. Loaded
+ * lazily by `memory.ts`, only when `seams.execution` is set, so the 2.3 path
+ * carries none of this. Edge-safe.
  */
 import type { AccountedUsage } from '../types/accounting';
 import type { NativeExecutionContext } from '../types/execution';
@@ -19,16 +20,22 @@ import type { CallWarning } from '../types/methods';
 import { isAccounted } from './accounting';
 import { createTokenEstimator } from './estimate-tokens';
 
-/** The two kinds of memory helper call, also the reservation's `kind` and model. */
+/** The two kinds of memory helper call: the reservation's `kind`. */
 export type MemoryCallKind = 'memory-llm' | 'memory-embedding';
+
+/** The model a reservation names for each kind: a host callback names its own only afterwards. */
+const RESERVED_MODEL: Readonly<Record<MemoryCallKind, string>> = {
+  'memory-llm': 'memory-llm',
+  'memory-embedding': 'memory-embedder',
+};
 
 /** Output tokens held for a memory LLM answer on top of its prompt. */
 const LLM_OUTPUT_ALLOWANCE = 1024;
 
 export interface ChargedMemoryCall<T> {
   execution: NativeExecutionContext;
-  /** Unique per call. */
-  requestId: string;
+  /** Unique per call; scoped under the context: `<scopeId>/memory/<id>`. */
+  id: string;
   kind: MemoryCallKind;
   /** The callback (or embedder object) the call goes to: its mark decides accounted or not. */
   callback: unknown;
@@ -56,18 +63,19 @@ export function unaccountedWarning(kind: MemoryCallKind): CallWarning {
 }
 
 export async function chargeMemoryCall<T>(call: ChargedMemoryCall<T>): Promise<T> {
-  const { execution, requestId, kind } = call;
+  const { execution, kind } = call;
+  const requestId = `${execution.scopeId}/memory/${call.id}`;
   const accounted = isAccounted(call.callback);
   const estimate = createTokenEstimator().estimate(
     call.input.map((text) => ({ role: 'user' as const, content: text })),
   );
   await execution.reserve({
     requestId,
-    modelId: kind,
+    modelId: RESERVED_MODEL[kind],
     kind,
     tokens: estimate + (kind === 'memory-llm' ? LLM_OUTPUT_ALLOWANCE : 0),
     now: call.now,
-    ...(execution.budget.usd !== undefined ? { unpriced: true } : {}),
+    unpriced: true,
     ...(accounted ? {} : { unaccounted: true }),
   });
   let answer: T;
