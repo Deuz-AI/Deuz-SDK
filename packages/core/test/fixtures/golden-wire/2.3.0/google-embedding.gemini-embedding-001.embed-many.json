@@ -1,0 +1,42 @@
+{
+  "scenario": "google-embedding.gemini-embedding-001.embed-many",
+  "recordedFrom": "2.3.0",
+  "requests": [
+    {
+      "method": "POST",
+      "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:batchEmbedContents",
+      "headers": {
+        "content-type": "application/json",
+        "x-goog-api-key": "<secret>"
+      },
+      "json": {
+        "requests": [
+          {
+            "model": "models/gemini-embedding-001",
+            "content": {
+              "parts": [
+                {
+                  "text": "Paris is the capital of France."
+                }
+              ]
+            },
+            "taskType": "RETRIEVAL_DOCUMENT",
+            "title": "Capitals"
+          },
+          {
+            "model": "models/gemini-embedding-001",
+            "content": {
+              "parts": [
+                {
+                  "text": "Rome is the capital of Italy."
+                }
+              ]
+            },
+            "taskType": "RETRIEVAL_DOCUMENT",
+            "title": "Capitals"
+          }
+        ]
+      }
+    }
+  ]
+}

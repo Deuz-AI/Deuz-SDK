@@ -1,0 +1,36 @@
+{
+  "scenario": "google-native.gemini-3.1-pro.call-options",
+  "recordedFrom": "2.3.0",
+  "requests": [
+    {
+      "method": "POST",
+      "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-pro:streamGenerateContent?alt=sse",
+      "headers": {
+        "content-type": "application/json",
+        "x-goog-api-key": "<secret>"
+      },
+      "json": {
+        "contents": [
+          {
+            "role": "user",
+            "parts": [
+              {
+                "text": "Say hello."
+              }
+            ]
+          }
+        ],
+        "generationConfig": {
+          "maxOutputTokens": 256,
+          "temperature": 0.2,
+          "topP": 0.9,
+          "stopSequences": ["END"],
+          "thinkingConfig": {
+            "includeThoughts": true,
+            "thinkingLevel": "low"
+          }
+        }
+      }
+    }
+  ]
+}

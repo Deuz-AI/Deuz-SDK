@@ -1,0 +1,20 @@
+{
+  "scenario": "voyage.voyage-3.5-lite.embed-many",
+  "recordedFrom": "2.3.0",
+  "requests": [
+    {
+      "method": "POST",
+      "url": "https://api.voyageai.com/v1/embeddings",
+      "headers": {
+        "authorization": "Bearer <secret>",
+        "content-type": "application/json"
+      },
+      "json": {
+        "model": "voyage-3.5-lite",
+        "input": ["Paris is the capital of France.", "Rome is the capital of Italy."],
+        "input_type": "document",
+        "encoding_format": "base64"
+      }
+    }
+  ]
+}

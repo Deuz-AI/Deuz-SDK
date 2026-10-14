@@ -1,0 +1,35 @@
+{
+  "scenario": "vertex-anthropic.claude-sonnet-4-5.call-options",
+  "recordedFrom": "2.3.0",
+  "requests": [
+    {
+      "method": "POST",
+      "url": "https://us-east5-aiplatform.googleapis.com/v1/projects/golden-project/locations/us-east5/publishers/anthropic/models/claude-sonnet-4-5:streamRawPredict",
+      "headers": {
+        "authorization": "Bearer <secret>",
+        "content-type": "application/json"
+      },
+      "json": {
+        "max_tokens": 5024,
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "Say hello."
+              }
+            ]
+          }
+        ],
+        "stream": true,
+        "thinking": {
+          "type": "enabled",
+          "budget_tokens": 4000
+        },
+        "stop_sequences": ["END"],
+        "anthropic_version": "vertex-2023-10-16"
+      }
+    }
+  ]
+}

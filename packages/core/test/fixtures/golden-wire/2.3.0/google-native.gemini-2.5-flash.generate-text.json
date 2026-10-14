@@ -1,0 +1,36 @@
+{
+  "scenario": "google-native.gemini-2.5-flash.generate-text",
+  "recordedFrom": "2.3.0",
+  "requests": [
+    {
+      "method": "POST",
+      "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse",
+      "headers": {
+        "content-type": "application/json",
+        "x-goog-api-key": "<secret>"
+      },
+      "json": {
+        "contents": [
+          {
+            "role": "user",
+            "parts": [
+              {
+                "text": "Say hello."
+              }
+            ]
+          }
+        ],
+        "generationConfig": {
+          "maxOutputTokens": 64000
+        },
+        "systemInstruction": {
+          "parts": [
+            {
+              "text": "You are a concise assistant."
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

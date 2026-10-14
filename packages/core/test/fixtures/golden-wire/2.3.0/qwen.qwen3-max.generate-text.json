@@ -1,0 +1,32 @@
+{
+  "scenario": "qwen.qwen3-max.generate-text",
+  "recordedFrom": "2.3.0",
+  "requests": [
+    {
+      "method": "POST",
+      "url": "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+      "headers": {
+        "authorization": "Bearer <secret>",
+        "content-type": "application/json"
+      },
+      "json": {
+        "model": "qwen3-max",
+        "messages": [
+          {
+            "role": "system",
+            "content": "You are a concise assistant."
+          },
+          {
+            "role": "user",
+            "content": "Say hello."
+          }
+        ],
+        "stream": true,
+        "max_tokens": 8192,
+        "stream_options": {
+          "include_usage": true
+        }
+      }
+    }
+  ]
+}

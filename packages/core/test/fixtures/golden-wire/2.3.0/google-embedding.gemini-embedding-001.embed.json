@@ -1,0 +1,29 @@
+{
+  "scenario": "google-embedding.gemini-embedding-001.embed",
+  "recordedFrom": "2.3.0",
+  "requests": [
+    {
+      "method": "POST",
+      "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:batchEmbedContents",
+      "headers": {
+        "content-type": "application/json",
+        "x-goog-api-key": "<secret>"
+      },
+      "json": {
+        "requests": [
+          {
+            "model": "models/gemini-embedding-001",
+            "content": {
+              "parts": [
+                {
+                  "text": "golden query"
+                }
+              ]
+            },
+            "taskType": "RETRIEVAL_QUERY"
+          }
+        ]
+      }
+    }
+  ]
+}

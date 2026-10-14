@@ -1,0 +1,32 @@
+{
+  "scenario": "glm.glm-4.6.generate-text",
+  "recordedFrom": "2.3.0",
+  "requests": [
+    {
+      "method": "POST",
+      "url": "https://open.bigmodel.cn/api/paas/v4/chat/completions",
+      "headers": {
+        "authorization": "Bearer <secret>",
+        "content-type": "application/json"
+      },
+      "json": {
+        "model": "glm-4.6",
+        "messages": [
+          {
+            "role": "system",
+            "content": "You are a concise assistant."
+          },
+          {
+            "role": "user",
+            "content": "Say hello."
+          }
+        ],
+        "stream": true,
+        "max_tokens": 8192,
+        "stream_options": {
+          "include_usage": true
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,35 @@
+{
+  "scenario": "openai-compatible.gateway-model.stream-chat",
+  "recordedFrom": "2.3.0",
+  "requests": [
+    {
+      "method": "POST",
+      "url": "https://gateway.example.test/v1/chat/completions",
+      "headers": {
+        "authorization": "Bearer <secret>",
+        "content-type": "application/json"
+      },
+      "json": {
+        "model": "gateway-model",
+        "messages": [
+          {
+            "role": "user",
+            "content": "What is 2 + 2?"
+          },
+          {
+            "role": "assistant",
+            "content": "4"
+          },
+          {
+            "role": "user",
+            "content": "And 3 + 3?"
+          }
+        ],
+        "stream": true,
+        "stream_options": {
+          "include_usage": true
+        }
+      }
+    }
+  ]
+}

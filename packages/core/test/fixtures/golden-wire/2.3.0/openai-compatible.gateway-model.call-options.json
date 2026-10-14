@@ -1,0 +1,31 @@
+{
+  "scenario": "openai-compatible.gateway-model.call-options",
+  "recordedFrom": "2.3.0",
+  "requests": [
+    {
+      "method": "POST",
+      "url": "https://gateway.example.test/v1/chat/completions",
+      "headers": {
+        "authorization": "Bearer <secret>",
+        "content-type": "application/json"
+      },
+      "json": {
+        "model": "gateway-model",
+        "messages": [
+          {
+            "role": "user",
+            "content": "Say hello."
+          }
+        ],
+        "stream": true,
+        "max_tokens": 256,
+        "temperature": 0.2,
+        "top_p": 0.9,
+        "stop": ["END"],
+        "stream_options": {
+          "include_usage": true
+        }
+      }
+    }
+  ]
+}

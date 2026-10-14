@@ -1,0 +1,36 @@
+{
+  "scenario": "azure.gpt-5.5.stream-chat",
+  "recordedFrom": "2.3.0",
+  "requests": [
+    {
+      "method": "POST",
+      "url": "https://golden-resource.openai.azure.com/openai/deployments/gpt-5.5/chat/completions?api-version=2024-12-01-preview",
+      "headers": {
+        "api-key": "<secret>",
+        "content-type": "application/json"
+      },
+      "json": {
+        "model": "gpt-5.5",
+        "messages": [
+          {
+            "role": "user",
+            "content": "What is 2 + 2?"
+          },
+          {
+            "role": "assistant",
+            "content": "4"
+          },
+          {
+            "role": "user",
+            "content": "And 3 + 3?"
+          }
+        ],
+        "stream": true,
+        "max_completion_tokens": 128000,
+        "stream_options": {
+          "include_usage": true
+        }
+      }
+    }
+  ]
+}

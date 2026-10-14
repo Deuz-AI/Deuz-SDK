@@ -1,0 +1,19 @@
+{
+  "scenario": "yunwu-embedding.text-embedding-3-small.embed",
+  "recordedFrom": "2.3.0",
+  "requests": [
+    {
+      "method": "POST",
+      "url": "https://yunwu.ai/v1/embeddings",
+      "headers": {
+        "authorization": "Bearer <secret>",
+        "content-type": "application/json"
+      },
+      "json": {
+        "model": "text-embedding-3-small",
+        "input": ["golden query"],
+        "encoding_format": "base64"
+      }
+    }
+  ]
+}
