@@ -18,6 +18,12 @@
  * after the projection, so a failed write leaves the cursor behind for the
  * next save to repair. Every save replaces the whole record, which makes a
  * repeat idempotent.
+ *
+ * A `ConditionalChatStore` (2.4) is written with compare-and-set instead of
+ * the load-then-save: the projection is decided against the revision it read
+ * and written at that revision, decided again on a conflict (three attempts),
+ * and never written over a deletion tombstone (`chat-projection-cas.ts`,
+ * loaded only for such a store).
  */
 import type { Message } from '../types/message';
 import type { Clock } from '../types/deps';
@@ -28,6 +34,7 @@ import type {
   AgentRunTranscript,
   AgentToolReceipt,
 } from '../types/agent-run';
+import type { ConditionalChatStore } from '../types/chat-conditional';
 import { scopeKey } from './native-scope';
 
 /**
@@ -115,13 +122,14 @@ export function replaceLastTurn(
   transcript.synced = syncPoint(canonical);
 }
 
-interface Projection {
+/** What a projection writes and records (its type is shared with `chat-projection-cas.ts`). */
+export interface Projection {
   messageIds: string[];
   turns: string[];
   invocations: AgentRunChatInvocation[];
 }
 
-function project(
+export function project(
   runId: string,
   transcript: AgentRunTranscript,
   previous: AgentRunChatState | undefined,
@@ -187,18 +195,30 @@ function project(
   return { messageIds, turns, invocations };
 }
 
-function errorOf(error: unknown): { name: string; message: string } {
+export function errorOf(error: unknown): { name: string; message: string } {
   return error instanceof Error
     ? { name: error.name, message: error.message }
     : { name: 'Error', message: String(error) };
 }
 
 /** `prefix` is the first `prefix.length` messages of `messages`. */
-function isPrefix(prefix: readonly Message[], messages: readonly Message[]): boolean {
+export function isPrefix(prefix: readonly Message[], messages: readonly Message[]): boolean {
   if (prefix.length > messages.length) return false;
   for (let index = 0; index < prefix.length; index++)
     if (fingerprint(prefix[index]) !== fingerprint(messages[index])) return false;
   return true;
+}
+
+/** `isConditionalChatStore` (from `/chat`) without loading the conditional chat module. */
+function isConditional(
+  store: ChatPersistOptions['store'],
+): store is ConditionalChatStore & ChatPersistOptions['store'] {
+  const candidate = store as Partial<ConditionalChatStore>;
+  return (
+    candidate.conditional === true &&
+    typeof candidate.readChat === 'function' &&
+    typeof candidate.writeChat === 'function'
+  );
 }
 
 /**
@@ -226,6 +246,21 @@ export async function saveProjection(
   clock: Clock,
   repair: boolean,
 ): Promise<AgentRunChatState> {
+  if (isConditional(chat.store)) {
+    // Loaded only for a conditional store: a run on any other store never pays for it.
+    const { saveConditionalProjection } = await import('./chat-projection-cas');
+    return saveConditionalProjection(
+      { project, isPrefix, errorOf, fingerprint },
+      chat,
+      chat.store,
+      runId,
+      transcript,
+      previous,
+      receipts,
+      clock,
+      repair,
+    );
+  }
   const behind = {
     chatId: chat.chatId,
     cursor: previous?.cursor ?? 0,

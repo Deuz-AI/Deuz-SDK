@@ -69,7 +69,10 @@ export interface ConditionalChatStore {
   ): Promise<ConditionalChatWriteResult>;
   /**
    * Replaces the chat by a tombstone at `expectedRevision + 1` and drops it
-   * from the transcript index; `'conflict'` when the revision moved.
+   * from the transcript index; `'conflict'` when the revision moved or the
+   * chat already is a tombstone. A chat that was never written
+   * (`expectedRevision` 0) gets a tombstone too, with an empty scope, so a
+   * first write that arrives late cannot create it.
    */
   tombstoneChat(
     chatId: string,
@@ -79,11 +82,31 @@ export interface ConditionalChatStore {
   saveChat(record: ChatRecord): Promise<void>;
   /** The legacy read: the record (with its `revision`), absent for a missing or deleted chat. */
   loadChat(chatId: string): Promise<ConditionalChatRecord | undefined>;
-  /** Tombstones the chat at whatever revision is stored. */
+  /**
+   * Tombstones the chat at whatever revision is stored (a chat never written
+   * included); a tombstone stays as it is.
+   */
   deleteChat(chatId: string): Promise<void>;
   listChats(scope?: MemoryScope): Promise<string[]>;
   /** Retention: deletes tombstones older than `before` (epoch ms); a pruned id can be reused. */
   pruneTombstones(before: number): Promise<number>;
+}
+
+/**
+ * The merge step of `updateConditionalChat` (2.4): given the chat as stored
+ * now (and which attempt this is, from 1), the record to write, or
+ * `undefined` to write nothing. It runs again on every conflict, against the
+ * newly stored chat, so it must not have side effects of its own.
+ */
+export type ConditionalChatMerge = (
+  current: ConditionalChatRead,
+  attempt: number,
+) => ChatRecord | undefined | Promise<ChatRecord | undefined>;
+
+/** Options of `updateConditionalChat`. */
+export interface UpdateConditionalChatOptions {
+  /** Read-merge-write attempts in all, the first included. Default 3. */
+  attempts?: number;
 }
 
 /** Options of `TranscriptIndex.search`. */
@@ -94,7 +117,11 @@ export interface TranscriptSearchOptions {
   around?: number;
   /** Only these chats. */
   chatIds?: readonly string[];
-  /** Only messages indexed before / after this time (epoch ms, the store's clock). */
+  /**
+   * Only messages indexed before / after this time (epoch ms, the store's
+   * clock), both strict. A message's time is when its id was first indexed:
+   * indexing its chat again keeps it.
+   */
   before?: number;
   after?: number;
   signal?: AbortSignal;
@@ -129,6 +156,9 @@ export interface TranscriptIndex {
   /**
    * Messages matching `query` in chats whose scope matches every field set in
    * `scope` (as `listChats(scope)` does), best first. Never crosses scopes.
+   * A message matches when it holds any of the query's terms (letters and
+   * digits, case and diacritics folded); the best hit scores 1. System
+   * messages are not indexed. An empty `scope` matches every chat.
    */
   search(
     scope: MemoryScope,

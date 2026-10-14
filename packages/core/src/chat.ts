@@ -1650,6 +1650,8 @@ export {
   createInMemoryConditionalChatStore,
   createInMemoryTranscriptIndex,
   indexChat,
+  isConditionalChatStore,
+  updateConditionalChat,
 } from './chat-conditional';
 export type { InMemoryConditionalChatStoreOptions } from './chat-conditional';
 export { RevisionConflictError } from './errors';

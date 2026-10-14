@@ -103,12 +103,18 @@ describe('/context skeleton', () => {
 });
 
 describe('/chat and /ui 2.4 additions', () => {
-  it('publishes the conditional chat store, transcript index and backfill as stubs', async () => {
-    expectStub('createInMemoryConditionalChatStore', () =>
-      chat.createInMemoryConditionalChatStore(),
-    );
-    expectStub('createInMemoryTranscriptIndex', () => chat.createInMemoryTranscriptIndex());
-    await expectAsyncStub('indexChat', () => chat.indexChat(any, any));
+  it('publishes the conditional chat store, transcript index and backfill', async () => {
+    // Implemented by L7a: the in-memory store, index and backfill.
+    const store = chat.createInMemoryConditionalChatStore();
+    expect(await store.readChat('c')).toEqual({ status: 'missing' });
+    const index = chat.createInMemoryTranscriptIndex();
+    await chat.indexChat(index, {
+      chatId: 'c',
+      scope: { userId: 'u' },
+      messages: [{ role: 'user', content: 'hello' }],
+      updatedAt: 1,
+    });
+    expect(await index.search({ userId: 'u' }, 'hello')).toHaveLength(1);
     expect(chat.RevisionConflictError).toBe(errors.RevisionConflictError);
   });
 
@@ -214,15 +220,17 @@ describe('/compute/docker (Node-only, implemented by L6)', () => {
 
 describe('2.4 Node stores on their entries', () => {
   it('reach the existing /stores and /ops entries through appended exports', () => {
-    expectStub('createSqliteConditionalChatStore', () =>
-      storesSqlite.createSqliteConditionalChatStore(any),
+    // Implemented by L7a; it opens lazily, so building one opens nothing.
+    expect(storesSqlite.createSqliteConditionalChatStore({ path: ':memory:' }).conditional).toBe(
+      true,
     );
     expectStub('createSqliteDurableStreamStateStore', () =>
       storesSqlite.createSqliteDurableStreamStateStore(any),
     );
-    expectStub('createPostgresConditionalChatStore', () =>
-      storesPostgres.createPostgresConditionalChatStore(any),
-    );
+    expect(
+      storesPostgres.createPostgresConditionalChatStore({ connectionString: 'postgres://unused' })
+        .conditional,
+    ).toBe(true);
     expectStub('createPostgresDurableStreamStateStore', () =>
       storesPostgres.createPostgresDurableStreamStateStore(any),
     );
