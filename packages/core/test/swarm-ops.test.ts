@@ -10,6 +10,7 @@ import { swarmKey } from '../src/swarm/store';
 import type { SqliteDatabaseLike } from '../src/node/store-sqlite';
 import type { Clock } from '../src/types/deps';
 import type { LeaseProvider } from '../src/types/lease';
+import { SLOW_TEST_TIMEOUT_MS } from './fixtures/timeouts';
 import type { SwarmReducerBinding, SwarmSnapshot, SwarmStore, SwarmTask } from '../src/types/swarm';
 import { manualClock } from './fixtures/manual-clock';
 
@@ -588,5 +589,7 @@ describe('swarm recover', () => {
       liveGate.resolve();
       expect((await live.result).run.status).toBe('completed');
     },
+    // Several connections on one WAL file: about 4 s alone on Windows, over 5 s in a full run.
+    SLOW_TEST_TIMEOUT_MS,
   );
 });
