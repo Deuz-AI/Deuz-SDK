@@ -226,9 +226,10 @@ describe('2.4 Node stores on their entries', () => {
     expectStub('createSqliteDurableStreamStateStore', () =>
       storesSqlite.createSqliteDurableStreamStateStore(any),
     );
-    expectStub('createPostgresConditionalChatStore', () =>
-      storesPostgres.createPostgresConditionalChatStore(any),
-    );
+    expect(
+      storesPostgres.createPostgresConditionalChatStore({ connectionString: 'postgres://unused' })
+        .conditional,
+    ).toBe(true);
     expectStub('createPostgresDurableStreamStateStore', () =>
       storesPostgres.createPostgresDurableStreamStateStore(any),
     );
