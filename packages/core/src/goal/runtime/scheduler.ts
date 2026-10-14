@@ -9,6 +9,11 @@
  */
 import type { Dependencies } from '../../types/deps';
 import { notImplemented } from '../../internal/not-implemented';
+import { resolveDependencies } from '../../internal/resolve-deps';
+import { parseCron } from '../../schedule/cron';
+import type { ScheduleCatchUp } from '../../schedule/scheduler';
+import { assertTimeZone } from '../../schedule/zoned';
+import { GoalError } from '../errors';
 import type {
   DurableSchedule,
   DurableScheduleInput,
@@ -90,6 +95,78 @@ export interface DurableScheduler {
   start(options?: { signal?: AbortSignal }): { stop(): Promise<void> };
 }
 
+const CATCH_UP: readonly ScheduleCatchUp[] = ['latest', 'all', 'none'];
+
+function nonEmpty(value: unknown, name: string): string {
+  if (typeof value !== 'string' || value === '')
+    throw new TypeError(`A schedule's ${name} must be a nonempty string`);
+  return value;
+}
+
+/** A checked copy of a schedule, with every default spelled out. */
+function checkSchedule(input: DurableScheduleInput): DurableScheduleInput {
+  if (typeof input !== 'object' || input === null)
+    throw new TypeError('A schedule must be an object');
+  const scheduleId = nonEmpty(input.scheduleId, 'scheduleId');
+  const scope = nonEmpty(input.scope, 'scope');
+  const goalId = nonEmpty(input.goalId, 'goalId');
+  const spec = input.spec;
+  if (typeof spec !== 'object' || spec === null)
+    throw new TypeError(`Schedule ${scheduleId} needs a spec`);
+  parseCron(spec.cron);
+  const timezone = assertTimeZone(spec.timezone ?? 'UTC');
+  const dstGap = spec.dstGap ?? 'shift';
+  if (dstGap !== 'shift' && dstGap !== 'skip')
+    throw new TypeError(`dstGap must be 'shift' or 'skip', not ${JSON.stringify(dstGap)}`);
+  const dstOverlap = spec.dstOverlap ?? 'first';
+  if (dstOverlap !== 'first' && dstOverlap !== 'both')
+    throw new TypeError(`dstOverlap must be 'first' or 'both', not ${JSON.stringify(dstOverlap)}`);
+  const catchUp = spec.catchUp ?? 'latest';
+  if (!CATCH_UP.includes(catchUp))
+    throw new TypeError(
+      `catchUp must be one of ${CATCH_UP.join(', ')}, not ${JSON.stringify(catchUp)}`,
+    );
+  const event = input.event;
+  if (event !== undefined) {
+    if (typeof event !== 'object' || event === null)
+      throw new TypeError(`Schedule ${scheduleId}'s event must be an object`);
+    if (event.correlationId !== undefined) nonEmpty(event.correlationId, 'event.correlationId');
+    if (
+      event.expiresAfterMs !== undefined &&
+      (typeof event.expiresAfterMs !== 'number' ||
+        !Number.isFinite(event.expiresAfterMs) ||
+        event.expiresAfterMs <= 0)
+    )
+      throw new TypeError('event.expiresAfterMs must be a positive number of milliseconds');
+  }
+  return {
+    scheduleId,
+    scope,
+    goalId,
+    spec: { cron: spec.cron, timezone, dstGap, dstOverlap, catchUp },
+    ...(event !== undefined
+      ? {
+          event: {
+            ...(event.correlationId !== undefined ? { correlationId: event.correlationId } : {}),
+            ...(event.expiresAfterMs !== undefined ? { expiresAfterMs: event.expiresAfterMs } : {}),
+          },
+        }
+      : {}),
+  };
+}
+
+function checkLimit(
+  value: number | undefined,
+  name: string,
+  fallback: number,
+  min: number,
+): number {
+  if (value === undefined) return fallback;
+  if (!Number.isSafeInteger(value) || value < min)
+    throw new TypeError(`${name} must be an integer >= ${min}`);
+  return value;
+}
+
 /**
  * A durable scheduler over a `GoalRuntimeStore` (2.4).
  *
@@ -108,6 +185,130 @@ export interface DurableScheduler {
  * - Reports one `deuz.schedule.delivery` span per occurrence (occurrence id,
  *   disposition, catch-up mode).
  */
-export function createDurableScheduler(_options: DurableSchedulerOptions): DurableScheduler {
-  return notImplemented('createDurableScheduler');
+export function createDurableScheduler(options: DurableSchedulerOptions): DurableScheduler {
+  if (typeof options !== 'object' || options === null || typeof options.store !== 'object')
+    throw new TypeError('createDurableScheduler needs a GoalRuntimeStore');
+  const { store } = options;
+  checkLimit(options.graceMs, 'graceMs', DEFAULT_DURABLE_SCHEDULER.graceMs, 0);
+  checkLimit(
+    options.maxDeliveriesPerTick,
+    'maxDeliveriesPerTick',
+    DEFAULT_DURABLE_SCHEDULER.maxDeliveriesPerTick,
+    1,
+  );
+  checkLimit(options.maxScanMinutes, 'maxScanMinutes', DEFAULT_DURABLE_SCHEDULER.maxScanMinutes, 1);
+  checkLimit(options.pollMs, 'pollMs', DEFAULT_DURABLE_SCHEDULER.pollMs, 1);
+  const deps = resolveDependencies(options.deps);
+
+  /** The stored schedule, or `scope_mismatch` (a schedule of another scope reads as missing). */
+  async function existing(scope: string, scheduleId: string): Promise<DurableSchedule> {
+    const schedule = await store.schedules.get(scope, scheduleId);
+    if (!schedule)
+      throw new GoalError('scope_mismatch', `No schedule ${scheduleId} in scope ${scope}.`);
+    return schedule;
+  }
+
+  function conflict(
+    scope: string,
+    scheduleId: string,
+    expected: number,
+    actual?: number,
+  ): GoalError {
+    return new GoalError(
+      'revision_conflict',
+      `Schedule ${scheduleId} in scope ${scope} is at revision ${String(actual ?? 0)}, not ${expected}.`,
+    );
+  }
+
+  function cancelled(schedule: DurableSchedule): GoalError {
+    return new GoalError(
+      'invalid_command',
+      `Schedule ${schedule.scheduleId} in scope ${schedule.scope} is cancelled; put a new one instead.`,
+    );
+  }
+
+  /** The revision a change is based on: the caller's, checked, or the stored one. */
+  function basis(
+    schedule: DurableSchedule,
+    change: DurableScheduleChangeOptions | undefined,
+  ): number {
+    const expected = change?.expectedRevision ?? schedule.revision;
+    if (expected !== schedule.revision)
+      throw conflict(schedule.scope, schedule.scheduleId, expected, schedule.revision);
+    return expected;
+  }
+
+  async function committed(
+    result: { status: 'committed'; schedule: DurableSchedule } | { status: 'conflict' },
+    scope: string,
+    scheduleId: string,
+    expected: number,
+  ): Promise<DurableSchedule> {
+    if (result.status === 'committed') return result.schedule;
+    const now = await store.schedules.get(scope, scheduleId);
+    throw conflict(scope, scheduleId, expected, now?.revision);
+  }
+
+  return {
+    async put(input, change) {
+      const schedule = checkSchedule(input);
+      const { scope, scheduleId, goalId } = schedule;
+      if (!(await store.load(goalId, { scope })))
+        throw new GoalError(
+          'scope_mismatch',
+          `Schedule ${scheduleId} targets goal ${goalId}, which does not exist in scope ${scope}.`,
+        );
+      const stored = await store.schedules.get(scope, scheduleId);
+      if (stored?.status === 'cancelled') throw cancelled(stored);
+      const expected = change?.expectedRevision ?? stored?.revision ?? 0;
+      if (expected !== (stored?.revision ?? 0))
+        throw conflict(scope, scheduleId, expected, stored?.revision);
+      const result = await store.schedules.put(schedule, {
+        expectedRevision: expected,
+        effectiveFrom: deps.clock.now(),
+      });
+      return committed(result, scope, scheduleId, expected);
+    },
+
+    async pause(scope, scheduleId, change) {
+      const schedule = await existing(scope, scheduleId);
+      const expected = basis(schedule, change);
+      if (schedule.status === 'cancelled') throw cancelled(schedule);
+      if (schedule.status === 'paused') return schedule;
+      const result = await store.schedules.pause(scope, scheduleId, { expectedRevision: expected });
+      return committed(result, scope, scheduleId, expected);
+    },
+
+    async resume(scope, scheduleId, change) {
+      const schedule = await existing(scope, scheduleId);
+      const expected = basis(schedule, change);
+      if (schedule.status === 'cancelled') throw cancelled(schedule);
+      if (schedule.status === 'active') return schedule;
+      const result = await store.schedules.resume(scope, scheduleId, {
+        expectedRevision: expected,
+        effectiveFrom: deps.clock.now(),
+      });
+      return committed(result, scope, scheduleId, expected);
+    },
+
+    async cancel(scope, scheduleId, change) {
+      const schedule = await existing(scope, scheduleId);
+      const expected = basis(schedule, change);
+      if (schedule.status === 'cancelled') return schedule;
+      const result = await store.schedules.cancel(scope, scheduleId, {
+        expectedRevision: expected,
+      });
+      return committed(result, scope, scheduleId, expected);
+    },
+
+    get: (scope, scheduleId) => store.schedules.get(scope, scheduleId),
+    list: (query) => store.schedules.list(query),
+
+    tick() {
+      return notImplemented('DurableScheduler.tick');
+    },
+    start() {
+      return notImplemented('DurableScheduler.start');
+    },
+  };
 }
