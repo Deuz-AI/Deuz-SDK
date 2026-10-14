@@ -29,6 +29,7 @@ import type {
   VersionedMemoryStore,
 } from '../memory/versioned/types';
 import type { Clock, Logger } from '../types/deps';
+import type { Observer } from '../types/observe';
 import type { Sha256Digest } from '../internal/digest';
 import { InvalidRequestError } from '../errors';
 import { decodeVector, encodeVector } from '../internal/vector';
@@ -64,6 +65,7 @@ import {
   queryTokens,
   rankByCosine,
   replayOrRefuse,
+  retentionSpan,
   scopeKey,
   snapshotFingerprint,
   validateCommit,
@@ -82,6 +84,8 @@ export type SqliteVersionedMemoryStoreOptions = SqliteConnectionOptions & {
   clock?: Clock;
   /** Where `pruneOperations` warns that it gave up dedupe protection. Default: silent. */
   logger?: Logger;
+  /** Reports `deuz.memory.op` spans for `pruneHistory` and `pruneOperations`. */
+  observer?: Observer;
 };
 
 /** A SQLite `VersionedMemoryStore`; `close()` closes only a connection it opened. */
@@ -809,30 +813,32 @@ export function createSqliteVersionedMemoryStore(
       if (typeof olderThan !== 'number' || !Number.isFinite(olderThan))
         throw new InvalidRequestError({ message: 'pruneHistory needs olderThan (epoch ms).' });
       const key = pruneOptions.scope ? scopeKey(pruneOptions.scope) : undefined;
-      return write((s) =>
-        sqliteTransaction(s.db, () => {
-          syncFts(s, true);
-          const rows = all(
-            s,
-            'SELECT r.seq, r.id, r.revision, r.text FROM deuz_vmem_revisions r ' +
-              'JOIN deuz_vmem_records c ON c.id = r.id ' +
-              'JOIN deuz_vmem_revisions cur ON cur.id = c.id AND cur.revision = c.revision ' +
-              'WHERE r.revision < c.revision AND r.recorded_at < ? ' +
-              "AND (cur.status = 'retracted' OR (cur.expires_at IS NOT NULL AND cur.expires_at <= ?))" +
-              (key ? ' AND c.scope_key = ?' : ''),
-            key ? [olderThan, clock.now(), key] : [olderThan, clock.now()],
-          );
-          for (const row of rows) {
-            unindexRevision(s, num(row.seq), text(row.text));
-            run(s, 'DELETE FROM deuz_vmem_vectors WHERE id = ? AND revision = ?', [
-              text(row.id),
-              num(row.revision),
-            ]);
-            run(s, 'DELETE FROM deuz_vmem_revisions WHERE seq = ?', [num(row.seq)]);
-          }
-          if (rows.length) markWritten(s);
-          return rows.length;
-        }),
+      return retentionSpan(options.observer, clock, 'prune-history', () =>
+        write((s) =>
+          sqliteTransaction(s.db, () => {
+            syncFts(s, true);
+            const rows = all(
+              s,
+              'SELECT r.seq, r.id, r.revision, r.text FROM deuz_vmem_revisions r ' +
+                'JOIN deuz_vmem_records c ON c.id = r.id ' +
+                'JOIN deuz_vmem_revisions cur ON cur.id = c.id AND cur.revision = c.revision ' +
+                'WHERE r.revision < c.revision AND r.recorded_at < ? ' +
+                "AND (cur.status = 'retracted' OR (cur.expires_at IS NOT NULL AND cur.expires_at <= ?))" +
+                (key ? ' AND c.scope_key = ?' : ''),
+              key ? [olderThan, clock.now(), key] : [olderThan, clock.now()],
+            );
+            for (const row of rows) {
+              unindexRevision(s, num(row.seq), text(row.text));
+              run(s, 'DELETE FROM deuz_vmem_vectors WHERE id = ? AND revision = ?', [
+                text(row.id),
+                num(row.revision),
+              ]);
+              run(s, 'DELETE FROM deuz_vmem_revisions WHERE seq = ?', [num(row.seq)]);
+            }
+            if (rows.length) markWritten(s);
+            return rows.length;
+          }),
+        ),
       );
     },
 
@@ -840,16 +846,18 @@ export function createSqliteVersionedMemoryStore(
       const olderThan = pruneOptions?.olderThan;
       if (typeof olderThan !== 'number' || !Number.isFinite(olderThan))
         throw new InvalidRequestError({ message: 'pruneOperations needs olderThan (epoch ms).' });
-      const count = await write((s) =>
-        sqliteTransaction(s.db, () => {
-          run(
-            s,
-            'DELETE FROM deuz_vmem_receipt_records WHERE operation_id IN ' +
-              '(SELECT operation_id FROM deuz_vmem_receipts WHERE committed_at < ?)',
-            [olderThan],
-          );
-          return run(s, 'DELETE FROM deuz_vmem_receipts WHERE committed_at < ?', [olderThan]);
-        }),
+      const count = await retentionSpan(options.observer, clock, 'prune-operations', () =>
+        write((s) =>
+          sqliteTransaction(s.db, () => {
+            run(
+              s,
+              'DELETE FROM deuz_vmem_receipt_records WHERE operation_id IN ' +
+                '(SELECT operation_id FROM deuz_vmem_receipts WHERE committed_at < ?)',
+              [olderThan],
+            );
+            return run(s, 'DELETE FROM deuz_vmem_receipts WHERE committed_at < ?', [olderThan]);
+          }),
+        ),
       );
       if (count > 0) logger.warn(pruneOperationsWarning(count), { count });
       return count;

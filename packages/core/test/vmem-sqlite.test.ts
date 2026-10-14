@@ -14,6 +14,7 @@ import { fileURLToPath } from 'node:url';
 import { build } from 'esbuild';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { VersionedMemoryCommit } from '../src/memory/versioned/types';
+import type { ObserveEvent } from '../src/types/observe';
 import { digestJson, sha256Digest } from '../src/internal/digest';
 import type { SqliteDatabaseLike, SqliteStatementLike } from '../src/node/store-sqlite';
 import { createSqliteStores } from '../src/node/store-sqlite';
@@ -253,4 +254,26 @@ describe('createSqliteVersionedMemoryStore: a commit that fails half way', () =>
       db.close();
     },
   );
+});
+
+describe('createSqliteVersionedMemoryStore: telemetry', () => {
+  it('reports deuz.memory.op spans for the retention calls, with counts only', async () => {
+    const events: ObserveEvent[] = [];
+    const store = createSqliteVersionedMemoryStore({
+      path: ':memory:',
+      observer: { emit: (event) => events.push(event) },
+    });
+    await store.commit(await createOp('op-1', 'r1', 'secret fact'));
+    await store.pruneHistory({ olderThan: Date.now() + 1 });
+    await store.pruneOperations({ olderThan: Date.now() + 1 });
+    const completed = events.filter(
+      (event) => event.type === 'operation.completed' && event.operation === 'deuz.memory.op',
+    );
+    expect(completed.map((event) => (event as { attributes?: unknown }).attributes)).toEqual([
+      { 'deuz.memory.operation': 'prune-history', 'deuz.memory.record_count': 0 },
+      { 'deuz.memory.operation': 'prune-operations', 'deuz.memory.record_count': 1 },
+    ]);
+    expect(JSON.stringify(events)).not.toContain('secret');
+    await store.close();
+  });
 });

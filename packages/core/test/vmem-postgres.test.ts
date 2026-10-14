@@ -10,6 +10,7 @@ import { PGlite } from '@electric-sql/pglite';
 import pg from 'pg';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import type { VersionedMemoryCommit } from '../src/memory/versioned/types';
+import type { ObserveEvent } from '../src/types/observe';
 import { digestJson, sha256Digest } from '../src/internal/digest';
 import type { PgPoolClientLike, PgPoolLike } from '../src/node/pg-tx';
 import { createPostgresStores } from '../src/node/store-postgres';
@@ -322,5 +323,27 @@ describe.skipIf(!url)('createPostgresVersionedMemoryStore (live server)', () => 
       ).toEqual([{ n: 0 }]);
     failing.fail.on = false;
     expect((await store.commit(op)).status).toBe('committed');
+  });
+});
+
+describe('createPostgresVersionedMemoryStore: telemetry', { timeout: SLOW_TEST_TIMEOUT_MS }, () => {
+  it('reports deuz.memory.op spans for the retention calls, with counts only', async () => {
+    const events: ObserveEvent[] = [];
+    const store = createPostgresVersionedMemoryStore({
+      pool: litePool,
+      schema: await liteSchema(),
+      observer: { emit: (event) => events.push(event) },
+    });
+    await store.commit(await createOp('op-1', 'r1', 'secret fact'));
+    await store.pruneHistory({ olderThan: Date.now() + 1 });
+    await store.pruneOperations({ olderThan: Date.now() + 1 });
+    const completed = events.filter(
+      (event) => event.type === 'operation.completed' && event.operation === 'deuz.memory.op',
+    );
+    expect(completed.map((event) => (event as { attributes?: unknown }).attributes)).toEqual([
+      { 'deuz.memory.operation': 'prune-history', 'deuz.memory.record_count': 0 },
+      { 'deuz.memory.operation': 'prune-operations', 'deuz.memory.record_count': 1 },
+    ]);
+    expect(JSON.stringify(events)).not.toContain('secret');
   });
 });

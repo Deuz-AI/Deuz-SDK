@@ -26,9 +26,12 @@ import type {
   VersionedMemoryVector,
 } from '../memory/versioned/types';
 import type { Clock, Logger } from '../types/deps';
+import type { Observer } from '../types/observe';
 import { EmbeddingMismatchError, InvalidRequestError, OperationConflictError } from '../errors';
 import { canonicalJson, digestJson, sha256Digest, type Sha256Digest } from '../internal/digest';
 import { cosineSimilarity, rankFuse } from '../internal/vector';
+import { resolveDependencies } from '../internal/resolve-deps';
+import { DEUZ_ATTR, DEUZ_SPAN, observeSpan } from '../internal/telemetry';
 
 /** The schema-meta name: the version lives in `deuz_vmem_schema`. */
 export const VMEM_SCHEMA_NAME = 'deuz_vmem';
@@ -627,6 +630,41 @@ export function fuseHits(
             ? ('vector' as const)
             : ('lexical' as const),
     }));
+}
+
+/**
+ * Runs a store-level retention call as a `deuz.memory.op` span (spec §3.6)
+ * when the store has an observer: the operation and how many rows it removed,
+ * never content. The session reports its own operations; the store reports
+ * only the maintenance a host calls on it directly.
+ */
+export function retentionSpan(
+  observer: Observer | undefined,
+  clock: Pick<Clock, 'now'>,
+  operation: 'prune-history' | 'prune-operations',
+  fn: () => Promise<number>,
+): Promise<number> {
+  if (!observer) return fn();
+  const deps = resolveDependencies({
+    observer,
+    clock: {
+      now: () => clock.now(),
+      setTimeout: (callback, ms) => {
+        const timer = setTimeout(callback, ms);
+        return () => clearTimeout(timer);
+      },
+    },
+  });
+  return observeSpan(
+    deps,
+    DEUZ_SPAN.memoryOp,
+    { [DEUZ_ATTR.memoryOperation]: operation },
+    async (annotate) => {
+      const count = await fn();
+      annotate({ [DEUZ_ATTR.memoryOperation]: operation, [DEUZ_ATTR.memoryRecordCount]: count });
+      return count;
+    },
+  );
 }
 
 /** The message `pruneOperations` warns with. */

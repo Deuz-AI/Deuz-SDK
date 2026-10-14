@@ -33,6 +33,7 @@ import type {
   VersionedMemoryStore,
 } from '../memory/versioned/types';
 import type { Clock, Logger } from '../types/deps';
+import type { Observer } from '../types/observe';
 import type { Sha256Digest } from '../internal/digest';
 import { InvalidRequestError } from '../errors';
 import type { PostgresConnectionOptions } from './store-connection';
@@ -61,6 +62,7 @@ import {
   queryTokens,
   rankByCosine,
   replayOrRefuse,
+  retentionSpan,
   scopeKey,
   validateCommit,
   validateGeneration,
@@ -80,6 +82,8 @@ export type PostgresVersionedMemoryStoreOptions = PostgresConnectionOptions & {
   clock?: Clock;
   /** Where `pruneOperations` warns that it gave up dedupe protection. Default: silent. */
   logger?: Logger;
+  /** Reports `deuz.memory.op` spans for `pruneHistory` and `pruneOperations`. */
+  observer?: Observer;
 };
 
 /** A PostgreSQL `VersionedMemoryStore` with an explicit `migrate`. */
@@ -796,46 +800,50 @@ export function createPostgresVersionedMemoryStore(
       if (typeof olderThan !== 'number' || !Number.isFinite(olderThan))
         throw new InvalidRequestError({ message: 'pruneHistory needs olderThan (epoch ms).' });
       const key = pruneOptions.scope ? scopeKey(pruneOptions.scope) : undefined;
-      return tx(async (q) => {
-        const bind = binder();
-        const rows = await q.query(
-          `SELECT r.id, r.revision FROM ${t('revisions')} r JOIN ${t('records')} c ON c.id = r.id ` +
-            `JOIN ${t('revisions')} cur ON cur.id = c.id AND cur.revision = c.revision ` +
-            `WHERE r.revision < c.revision AND r.recorded_at < ${bind.add(olderThan)} ` +
-            `AND (cur.status = 'retracted' OR (cur.expires_at IS NOT NULL AND cur.expires_at <= ${bind.add(clock.now())}))` +
-            (key ? ` AND c.scope_key = ${bind.add(key)}` : ''),
-          bind.params,
-        );
-        for (const row of rows.rows) {
-          await q.query(`DELETE FROM ${t('vectors')} WHERE id = $1 AND revision = $2`, [
-            str(row.id),
-            num(row.revision),
-          ]);
-          await q.query(`DELETE FROM ${t('revisions')} WHERE id = $1 AND revision = $2`, [
-            str(row.id),
-            num(row.revision),
-          ]);
-        }
-        return rows.rows.length;
-      });
+      return retentionSpan(options.observer, clock, 'prune-history', () =>
+        tx(async (q) => {
+          const bind = binder();
+          const rows = await q.query(
+            `SELECT r.id, r.revision FROM ${t('revisions')} r JOIN ${t('records')} c ON c.id = r.id ` +
+              `JOIN ${t('revisions')} cur ON cur.id = c.id AND cur.revision = c.revision ` +
+              `WHERE r.revision < c.revision AND r.recorded_at < ${bind.add(olderThan)} ` +
+              `AND (cur.status = 'retracted' OR (cur.expires_at IS NOT NULL AND cur.expires_at <= ${bind.add(clock.now())}))` +
+              (key ? ` AND c.scope_key = ${bind.add(key)}` : ''),
+            bind.params,
+          );
+          for (const row of rows.rows) {
+            await q.query(`DELETE FROM ${t('vectors')} WHERE id = $1 AND revision = $2`, [
+              str(row.id),
+              num(row.revision),
+            ]);
+            await q.query(`DELETE FROM ${t('revisions')} WHERE id = $1 AND revision = $2`, [
+              str(row.id),
+              num(row.revision),
+            ]);
+          }
+          return rows.rows.length;
+        }),
+      );
     },
 
     async pruneOperations(pruneOptions) {
       const olderThan = pruneOptions?.olderThan;
       if (typeof olderThan !== 'number' || !Number.isFinite(olderThan))
         throw new InvalidRequestError({ message: 'pruneOperations needs olderThan (epoch ms).' });
-      const count = await tx(async (q) => {
-        await q.query(
-          `DELETE FROM ${t('receipt_records')} WHERE operation_id IN ` +
-            `(SELECT operation_id FROM ${t('receipts')} WHERE committed_at < $1)`,
-          [olderThan],
-        );
-        const { rows } = await q.query(
-          `DELETE FROM ${t('receipts')} WHERE committed_at < $1 RETURNING operation_id`,
-          [olderThan],
-        );
-        return rows.length;
-      });
+      const count = await retentionSpan(options.observer, clock, 'prune-operations', () =>
+        tx(async (q) => {
+          await q.query(
+            `DELETE FROM ${t('receipt_records')} WHERE operation_id IN ` +
+              `(SELECT operation_id FROM ${t('receipts')} WHERE committed_at < $1)`,
+            [olderThan],
+          );
+          const { rows } = await q.query(
+            `DELETE FROM ${t('receipts')} WHERE committed_at < $1 RETURNING operation_id`,
+            [olderThan],
+          );
+          return rows.length;
+        }),
+      );
       if (count > 0) logger.warn(pruneOperationsWarning(count), { count });
       return count;
     },
