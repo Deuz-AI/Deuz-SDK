@@ -13,6 +13,7 @@ import { BudgetStoreError } from '../src/budget-store';
 import type { PersistentBudgetScope } from '../src/types/budget-store';
 import { budgetStoreContracts } from './fixtures/budget-store-conformance';
 import { liveRedisServer, liveRedisUrl, mockRedisServer, wait } from './fixtures/redis-harness';
+import { SLOW_HOOK_TIMEOUT_MS, SLOW_TEST_TIMEOUT_MS } from './fixtures/timeouts';
 
 budgetStoreContracts(
   'Redis budget store (ioredis-mock, server time)',
@@ -199,7 +200,8 @@ describe('Redis budget store contention', () => {
 });
 
 // A network round trip per script, and real waits for server time.
-if (liveRedisUrl) vi.setConfig({ testTimeout: 30_000, hookTimeout: 60_000 });
+if (liveRedisUrl)
+  vi.setConfig({ testTimeout: SLOW_TEST_TIMEOUT_MS, hookTimeout: SLOW_HOOK_TIMEOUT_MS });
 
 describe.skipIf(!liveRedisUrl)('Redis budget store on a live server', () => {
   let server: Awaited<ReturnType<typeof liveRedisServer>>;

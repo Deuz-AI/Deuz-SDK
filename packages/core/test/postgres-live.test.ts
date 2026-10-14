@@ -34,10 +34,11 @@ import {
 } from './fixtures/schedule-claim-conformance';
 import { budgetStoreContracts } from './fixtures/budget-store-conformance';
 import { initialSnapshot, swarmStoreContracts } from './fixtures/swarm-store-conformance';
+import { SLOW_HOOK_TIMEOUT_MS, SLOW_TEST_TIMEOUT_MS } from './fixtures/timeouts';
 
 const url = process.env.DEUZ_TEST_POSTGRES_URL || undefined;
 // A network round trip per statement, and real waits for database time.
-if (url) vi.setConfig({ testTimeout: 30_000, hookTimeout: 60_000 });
+if (url) vi.setConfig({ testTimeout: SLOW_TEST_TIMEOUT_MS, hookTimeout: SLOW_HOOK_TIMEOUT_MS });
 /** Enough for the contention cases below plus a connection to watch them with. */
 const POOL_SIZE = 6;
 const REPEATABLE_READ =

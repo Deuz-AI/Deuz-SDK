@@ -33,6 +33,7 @@ import {
   wait,
   type MockRedisServer,
 } from './fixtures/redis-harness';
+import { SLOW_HOOK_TIMEOUT_MS, SLOW_TEST_TIMEOUT_MS } from './fixtures/timeouts';
 
 const fresh = () => {
   const server = mockRedisServer();
@@ -278,7 +279,8 @@ describe('Redis ops store { url }', () => {
 });
 
 // A network round trip per script, and real waits for server time.
-if (liveRedisUrl) vi.setConfig({ testTimeout: 30_000, hookTimeout: 60_000 });
+if (liveRedisUrl)
+  vi.setConfig({ testTimeout: SLOW_TEST_TIMEOUT_MS, hookTimeout: SLOW_HOOK_TIMEOUT_MS });
 
 describe.skipIf(!liveRedisUrl)('Redis ops store on a live server', () => {
   let server: Awaited<ReturnType<typeof liveRedisServer>>;

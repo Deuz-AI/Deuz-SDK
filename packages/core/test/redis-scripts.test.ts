@@ -19,6 +19,7 @@ import {
 } from '../src/node/redis-scripts';
 import type { RedisScriptClient } from '../src/node/store-redis';
 import { liveRedisServer, liveRedisUrl, mockRedisServer } from './fixtures/redis-harness';
+import { SLOW_TEST_TIMEOUT_MS } from './fixtures/timeouts';
 
 const byCodeUnits = (left: string, right: string) => (left < right ? -1 : left > right ? 1 : 0);
 
@@ -241,7 +242,7 @@ describe.skipIf(!liveRedisUrl)('live Redis', () => {
   let server: Awaited<ReturnType<typeof liveRedisServer>>;
   beforeAll(async () => {
     server = await liveRedisServer(liveRedisUrl!);
-  }, 30_000);
+  }, SLOW_TEST_TIMEOUT_MS);
   afterAll(() => server?.close());
   helperContracts('live', async () => server.client);
 });

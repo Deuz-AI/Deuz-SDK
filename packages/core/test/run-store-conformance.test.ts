@@ -17,9 +17,10 @@ import { createSqliteStores, type SqliteDatabaseLike } from '../src/node/store-s
 import { createPostgresStores, type PgClientLike } from '../src/node/store-postgres';
 import { createRedisStores, wrapIoredisClient } from '../src/node/store-redis';
 import { runStoreContracts } from './fixtures/run-store-conformance';
+import { SLOW_TEST_TIMEOUT_MS } from './fixtures/timeouts';
 
 /** Disk and database stores: a loaded machine makes their file and query I/O slow. */
-const SLOW = { timeout: 30_000 };
+const SLOW = { timeout: SLOW_TEST_TIMEOUT_MS };
 
 runStoreContracts('memory', async () => ({ store: createInMemoryRunStore() }));
 
@@ -82,7 +83,7 @@ runStoreContracts('redis pack (ioredis-mock)', async () => ({
 const url = process.env.DEUZ_TEST_REDIS_URL || undefined;
 describe.skipIf(!url)('Redis pack on a live server', () => {
   const client = createClient({ url });
-  beforeAll(() => client.connect(), 30_000);
+  beforeAll(() => client.connect(), SLOW_TEST_TIMEOUT_MS);
   afterAll(() => client.quit());
   // One prefix per store, so runs on the shared server never meet.
   const run = `deuz-live-${Date.now().toString(36)}`;

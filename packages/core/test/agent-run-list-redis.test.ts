@@ -22,6 +22,7 @@ import type {
 import type { Clock } from '../src/types/deps';
 import { agentRunListContracts, envelope } from './fixtures/agent-run-store-conformance';
 import { liveRedisServer, liveRedisUrl, mockRedisServer, wait } from './fixtures/redis-harness';
+import { SLOW_HOOK_TIMEOUT_MS, SLOW_TEST_TIMEOUT_MS } from './fixtures/timeouts';
 
 const fresh = () => {
   const server = mockRedisServer();
@@ -269,7 +270,8 @@ describe('findStaleAgentRuns on the Redis ops store', () => {
 });
 
 // A network round trip per script, and real waits for server time.
-if (liveRedisUrl) vi.setConfig({ testTimeout: 30_000, hookTimeout: 60_000 });
+if (liveRedisUrl)
+  vi.setConfig({ testTimeout: SLOW_TEST_TIMEOUT_MS, hookTimeout: SLOW_HOOK_TIMEOUT_MS });
 
 describe.skipIf(!liveRedisUrl)('Redis agent run listing on a live server', () => {
   let server: Awaited<ReturnType<typeof liveRedisServer>>;
