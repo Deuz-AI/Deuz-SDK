@@ -4,7 +4,7 @@
  * the host saves what they return, fenced by the record's revision.
  */
 import { GoalError } from './errors';
-import { UNSUPPORTED_PASS, assessGoal, supportsPass } from './acceptance';
+import { assessGoal, passProblem } from './acceptance';
 import {
   GOAL_RECORD_VERSION,
   GOAL_SEEN_LIMIT,
@@ -647,11 +647,15 @@ function evaluate(
       ...(input.note !== undefined ? { note: input.note } : {}),
       at: input.at ?? draft.now,
     };
-    // A model saying "done" is recorded as what it is.
-    if (result.verdict === 'passed' && !supportsPass(result, recorded)) {
+    // A model saying "done" is recorded as what it is, and so is a pass on
+    // evidence for another criterion or an older spec generation (2.4).
+    const problem =
+      result.verdict === 'passed'
+        ? passProblem(result, recorded, draft.current.specGeneration)
+        : undefined;
+    if (problem !== undefined) {
       result.verdict = 'inconclusive';
-      result.note =
-        input.note !== undefined ? `${UNSUPPORTED_PASS} ${input.note}` : UNSUPPORTED_PASS;
+      result.note = input.note !== undefined ? `${problem} ${input.note}` : problem;
     }
     const index = results.findIndex((item) => item.criterionId === result.criterionId);
     if (index < 0) results.push(result);
@@ -663,15 +667,40 @@ function evaluate(
   return applied(assessGoal(draft.current));
 }
 
+/**
+ * Starts the goal's next spec generation (2.4): generation 1 for a goal that
+ * opts in now. Every verdict reached before it becomes inconclusive in the
+ * record itself, so no reader, a 2.3 one included, completes the goal on it;
+ * what each rested on stays.
+ */
+function nextGeneration(draft: Draft): void {
+  const next = draft.edit();
+  const previous = next.specGeneration;
+  const generation = (previous ?? 0) + 1;
+  next.specGeneration = generation;
+  const note =
+    previous === undefined
+      ? `Recorded before the goal had spec generations; it is now at generation ${generation}.`
+      : `Recorded for spec generation ${previous}; the goal is now at generation ${generation}.`;
+  next.results = next.results.map((result) =>
+    result.verdict === 'inconclusive' ? result : { ...result, verdict: 'inconclusive', note },
+  );
+}
+
 function revise(draft: Draft, command: Extract<GoalCommand, { type: 'revise' }>): Step {
   if (typeof command.deadline === 'number' && command.deadline <= draft.now)
     return rejected('deadline-passed');
   const goal = draft.current;
   const differs = (left: unknown, right: unknown) => JSON.stringify(left) !== JSON.stringify(right);
+  // A goal with spec generations (2.4) answers a change of its spec with the
+  // next generation; one without keeps the 2.3 rules below.
+  const generations = goal.specGeneration !== undefined;
   let changed = false;
+  let specChanged = command.nextSpecGeneration === true;
   if (command.objective !== undefined && command.objective !== goal.objective) {
     draft.edit().objective = command.objective;
     changed = true;
+    specChanged = true;
   }
   if (command.criteria !== undefined) {
     const criteria = command.criteria.map(criterionOf);
@@ -681,10 +710,13 @@ function revise(draft: Draft, command: Extract<GoalCommand, { type: 'revise' }>)
       criteria.some((criterion, index) => !sameCriterion(criterion, goal.criteria[index]!))
     ) {
       const next = draft.edit();
-      // A verdict stands only for a criterion that still says the same.
+      // A verdict stands only for a criterion that still says the same; under
+      // spec generations, for one that still exists, until the next generation
+      // below makes it inconclusive.
       next.results = next.results.filter((result) => {
         const before = stored.get(result.criterionId);
         const after = criteria.find((item) => item.id === result.criterionId);
+        if (generations) return after !== undefined;
         return before !== undefined && after !== undefined && sameCriterion(before, after);
       });
       // What a later 2.x release added to a criterion stays with it.
@@ -693,7 +725,12 @@ function revise(draft: Draft, command: Extract<GoalCommand, { type: 'revise' }>)
         ...addedFields(stored.get(criterion.id)),
       }));
       changed = true;
+      specChanged = true;
     }
+  }
+  if (specChanged && (generations || command.nextSpecGeneration === true)) {
+    nextGeneration(draft);
+    changed = true;
   }
   if (command.budget !== undefined && differs(command.budget ?? undefined, goal.budget)) {
     const next = draft.edit();
