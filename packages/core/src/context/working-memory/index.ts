@@ -4,7 +4,8 @@
  * published from `@deuz-sdk/core/context`.
  */
 import type { AgentToolSet } from '../../types/agent-run';
-import { notImplemented } from '../../internal/not-implemented';
+import { applyPatch, createSnapshot } from './patch';
+import { createWorkingMemoryTools } from './tools';
 import type {
   ApplyWorkingMemoryPatchOptions,
   CreateWorkingMemoryInput,
@@ -21,8 +22,8 @@ export type * from './types';
  * `'host'`), the task list copy (`listRevision` 1) and its active task, empty
  * lists otherwise. Pure.
  */
-export function createWorkingMemory(_input: CreateWorkingMemoryInput): WorkingMemorySnapshot {
-  return notImplemented('createWorkingMemory');
+export function createWorkingMemory(input: CreateWorkingMemoryInput): WorkingMemorySnapshot {
+  return createSnapshot(input);
 }
 
 /**
@@ -41,11 +42,11 @@ export function createWorkingMemory(_input: CreateWorkingMemoryInput): WorkingMe
  * operation changes that status.
  */
 export function applyWorkingMemoryPatch(
-  _snapshot: WorkingMemorySnapshot,
-  _patch: WorkingMemoryPatch,
-  _options: ApplyWorkingMemoryPatchOptions,
+  snapshot: WorkingMemorySnapshot,
+  patch: WorkingMemoryPatch,
+  options: ApplyWorkingMemoryPatchOptions,
 ): WorkingMemoryPatchResult {
-  return notImplemented('applyWorkingMemoryPatch');
+  return applyPatch(snapshot, patch, options);
 }
 
 /**
@@ -56,6 +57,6 @@ export function applyWorkingMemoryPatch(
  * `'duplicate'`); a refusal is returned to the model as a tool error. The
  * tools never persist anything themselves: the run's checkpoint does.
  */
-export function workingMemoryTools(_options: WorkingMemoryToolsOptions): AgentToolSet {
-  return notImplemented('workingMemoryTools');
+export function workingMemoryTools(options: WorkingMemoryToolsOptions): AgentToolSet {
+  return createWorkingMemoryTools(options);
 }

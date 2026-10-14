@@ -7,6 +7,12 @@
  * The host alone sets the goal and constraints and confirms hypotheses and
  * decisions; what a model adds is a proposal, never a verified fact.
  *
+ * The critical fields are the goal, the constraints and the active task: the
+ * context compiler always places them in the working memory tail, whatever
+ * the budget, and selects the other items by priority within the working
+ * memory share. Only the host writes the goal and the constraints, so no
+ * model write can drop a critical field.
+ *
  * The snapshot is plain JSON. The native V3 run checkpoints it (with the task
  * list itself, not only a reference), so the active task survives a restart.
  */
@@ -234,4 +240,11 @@ export interface WorkingMemoryToolsOptions {
   memory: WorkingMemoryHandle;
   /** Tool name prefix. Default `'working_memory'`. */
   prefix?: string;
+  /**
+   * The agent the memory belongs to, as `ToolExecuteContext.agentPath` names
+   * it. Default `[]`, the root run. A write from another agent path (a
+   * sub-agent the tools were handed to) is refused: sub-agents get no shared
+   * writable working memory. Reads are allowed.
+   */
+  agentPath?: readonly string[];
 }
