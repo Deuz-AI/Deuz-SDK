@@ -15,6 +15,7 @@
 import { RevisionConflictError, UnsupportedStoreError } from './errors';
 import { isSha256Digest, type Sha256Digest } from './internal/digest';
 import { summarizeAgentRun } from './internal/agent-run-list';
+import { assertRetentionTime } from './internal/ops-retention';
 import { decodeSwarm, encodeSwarm } from './swarm/store';
 import type { AgentRunSummary } from './types/agent-run';
 import type {
@@ -159,16 +160,16 @@ export function decodeAgentRunEnvelopeV3(payload: string): AgentRunEnvelopeV3 {
  */
 export function assertEnvelopeRevisionV3(
   stored: { revision: number } | undefined,
-  next: { runId: string; revision: number },
+  next: { runId: string; revision?: number },
 ): void {
   const current = stored?.revision ?? 0;
   if (next.revision === current + 1) return;
   throw new RevisionConflictError({
     subsystem: 'run',
     key: next.runId,
-    expectedRevision: next.revision - 1,
+    ...(next.revision !== undefined ? { expectedRevision: next.revision - 1 } : {}),
     ...(stored !== undefined ? { actualRevision: stored.revision } : {}),
-    message: `Agent run revision conflict for ${next.runId}: expected ${current + 1}, got ${next.revision}.`,
+    message: `Agent run revision conflict for ${next.runId}: expected ${current + 1}, got ${String(next.revision)}.`,
   });
 }
 
@@ -185,6 +186,16 @@ export function summarizeAgentRunEnvelopeV3(
     phase: envelope.phase,
     status: envelope.result?.status,
   });
+}
+
+/** The argument of `AgentRunStoreV3.prune`, checked: returns its finite `terminalBefore`. */
+export function assertPruneOptions(options: unknown): number {
+  if (options === null || typeof options !== 'object')
+    throw new TypeError('prune needs { terminalBefore }: epoch ms on the store clock.');
+  return assertRetentionTime(
+    (options as { terminalBefore?: unknown }).terminalBefore,
+    'terminalBefore',
+  );
 }
 
 /**

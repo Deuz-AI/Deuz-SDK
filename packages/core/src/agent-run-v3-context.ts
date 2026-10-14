@@ -19,7 +19,11 @@
 import type { ContextBlock, ContextPackage } from './context/types';
 import { canonicalJson, isSha256Digest, sha256Digest, type Sha256Digest } from './internal/digest';
 import type { MemoryForgetEvent } from './memory/versioned/types';
-import type { AgentRunContextStepV3, AgentRunStoreV3 } from './types/agent-run-v3';
+import type {
+  AgentRunContextStepV3,
+  AgentRunEnvelopeV3,
+  AgentRunStoreV3,
+} from './types/agent-run-v3';
 
 /** One memory record revision a blob holds; no `revision` when the source has none. */
 export interface ContextBlobRecord {
@@ -151,4 +155,20 @@ export function isForgotten(record: ContextBlobRecord, tombstone: ContextBlobRec
       tombstone.revision === undefined ||
       record.revision === tombstone.revision)
   );
+}
+
+/**
+ * Marks the manifest of every step whose package blob a forget redacted
+ * (`redacted: true`), in place, as a store does when it loads a run. The mark
+ * is read from the blobs at every load, never written by the redaction, so
+ * it needs no save and never moves the run's revision.
+ */
+export function markRedactedSteps(
+  envelope: AgentRunEnvelopeV3,
+  redacted: ReadonlySet<Sha256Digest>,
+): AgentRunEnvelopeV3 {
+  if (redacted.size === 0) return envelope;
+  for (const step of envelope.context?.steps ?? [])
+    if (redacted.has(step.blob.digest)) step.manifest.redacted = true;
+  return envelope;
 }
