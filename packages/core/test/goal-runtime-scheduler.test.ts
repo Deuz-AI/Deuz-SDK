@@ -338,4 +338,231 @@ describe('createDurableScheduler: tick', () => {
     expect(logged.some((entry) => entry.fields?.scheduleId === 'bad')).toBe(true);
     expect(await pending(store)).toEqual([occurrence('good', '2026-10-10T10:01:00Z')]);
   });
+
+  it('stops before stepping when its signal is aborted', async () => {
+    const { scheduler, store, time } = await setup();
+    await scheduler.put(input({ spec: { cron: '* * * * *' } }));
+    await time.advance(MINUTE);
+    const controller = new AbortController();
+    controller.abort();
+    const result = await scheduler.tick({ signal: controller.signal });
+    expect(result).toMatchObject({ occurrences: [], backlog: 1 });
+    expect(await pending(store)).toEqual([]);
+  });
+});
+
+describe('createDurableScheduler: catch-up and backlog', () => {
+  const skippedReasons = (result: { occurrences: { disposition: string; reason?: string }[] }) =>
+    result.occurrences.filter((o) => o.disposition === 'skipped').map((o) => o.reason);
+  const deliveredIds = (result: { occurrences: { disposition: string; occurrenceId: string }[] }) =>
+    result.occurrences.filter((o) => o.disposition === 'delivered').map((o) => o.occurrenceId);
+
+  it('latest (the default) delivers only the newest missed occurrence and records the rest as skipped', async () => {
+    const { scheduler, store, time } = await setup();
+    await scheduler.put(input({ spec: { cron: '*/10 * * * *' } }));
+    await time.advance(65 * MINUTE);
+    const result = await scheduler.tick();
+    expect(result.occurrences.map((o) => o.at)).toEqual(
+      [10, 20, 30, 40, 50, 60].map((minutes) => T0 + minutes * MINUTE),
+    );
+    expect(skippedReasons(result)).toEqual(Array(5).fill('catch-up-latest'));
+    expect(deliveredIds(result)).toEqual([`s@${T0 + 60 * MINUTE}`]);
+    expect(result.backlog).toBe(0);
+    expect(await pending(store)).toEqual([`s@${T0 + 60 * MINUTE}`]);
+    expect(await store.schedules.get('tenant', 's')).toMatchObject({
+      scheduleCursor: T0 + 65 * MINUTE,
+    });
+    expect((await store.schedules.get('tenant', 's'))?.scanTo).toBeUndefined();
+  });
+
+  it('latest delivers nothing before a window longer than the scan limit is fully scanned', async () => {
+    const { scheduler, store, time } = await setup({ maxScanMinutes: 60 });
+    await scheduler.put(input({ spec: { cron: '*/10 * * * *' } }));
+    await time.advance(3 * 60 * MINUTE);
+    const first = await scheduler.tick();
+    expect(deliveredIds(first)).toEqual([]);
+    expect(skippedReasons(first)).toHaveLength(6);
+    expect(first.backlog).toBe(1);
+    expect(await pending(store)).toEqual([]);
+    // The window survives a restart: it lives in the store, not in the scheduler.
+    expect(await store.schedules.get('tenant', 's')).toMatchObject({
+      scheduleCursor: T0 + 60 * MINUTE,
+      scanTo: T0 + 180 * MINUTE,
+    });
+    const restarted = createDurableScheduler({
+      store,
+      deps: { clock: time.clock },
+      maxScanMinutes: 60,
+    });
+    const second = await restarted.tick();
+    expect(deliveredIds(second)).toEqual([]);
+    expect(await pending(store)).toEqual([]);
+    await time.advance(30_000);
+    const third = await restarted.tick();
+    expect(skippedReasons(third)).toHaveLength(5);
+    expect(deliveredIds(third)).toEqual([`s@${T0 + 180 * MINUTE}`]);
+    expect(third.backlog).toBe(0);
+    expect(await pending(store)).toEqual([`s@${T0 + 180 * MINUTE}`]);
+  });
+
+  it('latest writes at most maxDeliveriesPerTick records per advance, finishing the window in one tick', async () => {
+    let largest = 0;
+    let advances = 0;
+    const { scheduler, store, time } = await setup({
+      wrap: (double) =>
+        withStoreFaults(double, {
+          advance: (_call, advance) => {
+            advances += 1;
+            largest = Math.max(largest, advance.occurrences.length);
+            return undefined;
+          },
+        }),
+    });
+    await scheduler.put(input({ spec: { cron: '* * * * *' } }));
+    await time.advance(250 * MINUTE);
+    const result = await scheduler.tick();
+    expect(result.occurrences).toHaveLength(250);
+    expect(deliveredIds(result)).toEqual([`s@${T0 + 250 * MINUTE}`]);
+    expect(largest).toBe(100);
+    expect(advances).toBe(3);
+    expect(await pending(store)).toEqual([`s@${T0 + 250 * MINUTE}`]);
+  });
+
+  it('all delivers every missed occurrence, 100 per tick, the rest from the persistent cursor', async () => {
+    const { scheduler, store, time } = await setup();
+    await scheduler.put(input({ spec: { cron: '* * * * *', catchUp: 'all' } }));
+    await time.advance(250 * MINUTE);
+    const expected = Array.from({ length: 250 }, (_, index) => `s@${T0 + (index + 1) * MINUTE}`);
+    const first = await scheduler.tick();
+    expect(deliveredIds(first)).toEqual(expected.slice(0, 100));
+    expect(first.backlog).toBe(1);
+    const restarted = createDurableScheduler({ store, deps: { clock: time.clock } });
+    const second = await restarted.tick();
+    expect(deliveredIds(second)).toEqual(expected.slice(100, 200));
+    const third = await restarted.tick();
+    expect(deliveredIds(third)).toEqual(expected.slice(200));
+    expect(third.backlog).toBe(0);
+    expect(await pending(store)).toEqual(expected);
+    expect((await restarted.tick()).occurrences).toEqual([]);
+  });
+
+  it('none skips missed occurrences and delivers those still within grace', async () => {
+    const { scheduler, store, time } = await setup();
+    await scheduler.put(input({ spec: { cron: '* * * * *', catchUp: 'none' } }));
+    await time.advance(10 * MINUTE + 30_000);
+    const result = await scheduler.tick();
+    expect(skippedReasons(result)).toEqual(Array(9).fill('catch-up-none'));
+    expect(deliveredIds(result)).toEqual([`s@${T0 + 10 * MINUTE}`]);
+    expect(await pending(store)).toEqual([`s@${T0 + 10 * MINUTE}`]);
+  });
+
+  it('counts an occurrence found within graceMs as on time', async () => {
+    const strict = await setup({ graceMs: 0 });
+    await strict.scheduler.put(input({ spec: { cron: '*/5 * * * *', catchUp: 'none' } }));
+    await strict.time.advance(5 * MINUTE + 1_000);
+    expect(skippedReasons(await strict.scheduler.tick())).toEqual(['catch-up-none']);
+    const lenient = await setup();
+    await lenient.scheduler.put(input({ spec: { cron: '*/5 * * * *', catchUp: 'none' } }));
+    await lenient.time.advance(5 * MINUTE + 59_000);
+    expect(deliveredIds(await lenient.scheduler.tick())).toEqual([`s@${T0 + 5 * MINUTE}`]);
+  });
+
+  it('scans at most maxScanMinutes of UTC time per schedule per tick', async () => {
+    const { scheduler, store, time } = await setup({ maxScanMinutes: 24 * 60 });
+    await scheduler.put(input({ spec: { cron: '0 12 * * *', catchUp: 'all' } }));
+    await time.advance(5 * 24 * 60 * MINUTE);
+    const noon = (day: number) => `s@${Date.parse(`2026-10-${10 + day}T12:00:00Z`)}`;
+    for (let day = 0; day < 5; day++) {
+      const result = await scheduler.tick();
+      expect(deliveredIds(result)).toEqual([noon(day)]);
+      expect(result.backlog).toBe(day < 4 ? 1 : 0);
+      expect((await store.schedules.get('tenant', 's'))?.scheduleCursor).toBe(
+        T0 + (day + 1) * 24 * 60 * MINUTE,
+      );
+    }
+    expect(await pending(store)).toEqual([0, 1, 2, 3, 4].map(noon));
+  });
+
+  it('serves schedules in turn, so one backlog never starves the others', async () => {
+    const { scheduler, store, time } = await setup();
+    await scheduler.put(
+      input({ scheduleId: 'backlog', spec: { cron: '* * * * *', catchUp: 'all' } }),
+    );
+    await time.advance(500 * MINUTE);
+    for (const scheduleId of ['b', 'c'])
+      await scheduler.put(input({ scheduleId, goalId: 'goal-2', spec: { cron: '* * * * *' } }));
+    await time.advance(MINUTE);
+    const result = await scheduler.tick();
+    const byId = (id: string) => result.occurrences.filter((o) => o.scheduleId === id).length;
+    expect([byId('backlog'), byId('b'), byId('c')]).toEqual([98, 1, 1]);
+    expect(result.backlog).toBe(1);
+    expect(await pending(store, 'goal-2')).toHaveLength(2);
+  });
+
+  it('starts the next tick after the schedule served last', async () => {
+    const { scheduler, time } = await setup({ maxDeliveriesPerTick: 2 });
+    for (const scheduleId of ['a', 'b', 'c'])
+      await scheduler.put(input({ scheduleId, spec: { cron: '* * * * *', catchUp: 'all' } }));
+    await time.advance(10 * MINUTE);
+    const served = async () =>
+      (await scheduler.tick()).occurrences.map((o) => o.scheduleId).join('');
+    // Three backlogs, two deliveries per tick: each schedule waits at most one tick.
+    expect([await served(), await served(), await served()]).toEqual(['ab', 'ca', 'bc']);
+  });
+
+  it('applies a change from its boundary: no occurrence of either revision is invented before it', async () => {
+    const { scheduler, store, time } = await setup();
+    await scheduler.put(input({ spec: { cron: '0 * * * *' } }));
+    await time.advance(3.5 * 60 * MINUTE);
+    await scheduler.put(input({ goalId: 'goal-2', spec: { cron: '30 * * * *', catchUp: 'all' } }));
+    await time.advance(MINUTE);
+    expect((await scheduler.tick()).occurrences).toEqual([]);
+    await time.advance(59 * MINUTE);
+    const result = await scheduler.tick();
+    expect(deliveredIds(result)).toEqual([`s@${Date.parse('2026-10-10T14:30:00Z')}`]);
+    expect(result.occurrences[0]?.goalId).toBe('goal-2');
+    expect(await pending(store, 'goal-2')).toHaveLength(1);
+    expect(await pending(store, 'goal-1')).toEqual([]);
+  });
+
+  it('stops scanning while paused and continues from the resume boundary', async () => {
+    const { scheduler, store, time } = await setup();
+    await scheduler.put(input({ spec: { cron: '*/5 * * * *', catchUp: 'all' } }));
+    await time.advance(2 * MINUTE);
+    await scheduler.pause('tenant', 's');
+    await time.advance(28 * MINUTE);
+    expect((await scheduler.tick()).occurrences).toEqual([]);
+    await scheduler.resume('tenant', 's');
+    await time.advance(MINUTE);
+    expect((await scheduler.tick()).occurrences).toEqual([]);
+    await time.advance(4 * MINUTE);
+    expect(deliveredIds(await scheduler.tick())).toEqual([`s@${T0 + 35 * MINUTE}`]);
+    expect(await pending(store)).toEqual([`s@${T0 + 35 * MINUTE}`]);
+  });
+
+  it('cancel ends the deliveries not yet applied and the schedule with them', async () => {
+    const { scheduler, store, time } = await setup();
+    await scheduler.put(input({ spec: { cron: '*/5 * * * *', catchUp: 'all' } }));
+    await time.advance(10 * MINUTE);
+    await scheduler.tick();
+    expect(await pending(store)).toHaveLength(2);
+    await scheduler.cancel('tenant', 's');
+    expect(await pending(store)).toEqual([]);
+    const ended = await store.inbox.list({ scope: 'tenant', dispositions: ['cancelled'] });
+    expect(ended.entries).toHaveLength(2);
+    await time.advance(10 * MINUTE);
+    expect((await scheduler.tick()).occurrences).toEqual([]);
+  });
+
+  it('moves an idle cursor up now and then, so a later scan starts close by', async () => {
+    const { scheduler, store, time } = await setup({ maxScanMinutes: 60 });
+    await scheduler.put(input({ spec: { cron: '0 0 1 1 *' } }));
+    await time.advance(29 * MINUTE);
+    await scheduler.tick();
+    expect((await store.schedules.get('tenant', 's'))?.scheduleCursor).toBe(T0);
+    await time.advance(MINUTE);
+    const idle = await scheduler.tick();
+    expect(idle.occurrences).toEqual([]);
+    expect((await store.schedules.get('tenant', 's'))?.scheduleCursor).toBe(T0 + 30 * MINUTE);
+  });
 });
