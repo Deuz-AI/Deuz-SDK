@@ -110,8 +110,8 @@ export function deliveryKey(
 /**
  * The in-memory `GoalRuntimeStore` (2.4): the reference for tests and one
  * process. Copies in and out; every multi-part write is applied whole or not
- * at all; passes the goal-store conformance fixture and the schedule-store
- * conformance fixture. Times it stamps come from `deps.clock`.
+ * at all; passes the goal-store, goal-runtime-store and schedule-store
+ * conformance fixtures. Times it stamps come from `deps.clock`.
  */
 export function createInMemoryGoalRuntimeStore(options?: {
   deps?: Dependencies;
