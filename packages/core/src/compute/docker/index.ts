@@ -10,6 +10,7 @@ import type { ComputeSandbox } from '../../types/compute';
 import type { Dependencies } from '../../types/deps';
 import { notImplemented } from '../../internal/not-implemented';
 import type { DockerSandboxOptions, ProcessOperationStore, ProcessRunner } from './types';
+import { createInMemoryProcessOperationStore as createMemoryStore } from './memory-store';
 
 export type * from './types';
 export { OperationConflictError } from '../../errors';
@@ -57,8 +58,8 @@ export function createDockerProcessRunner(
 }
 
 /** The in-memory `ProcessOperationStore` (2.4): for tests and one process. */
-export function createInMemoryProcessOperationStore(_options?: {
+export function createInMemoryProcessOperationStore(options?: {
   deps?: Dependencies;
 }): ProcessOperationStore {
-  return notImplemented('createInMemoryProcessOperationStore');
+  return createMemoryStore(options);
 }

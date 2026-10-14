@@ -184,13 +184,11 @@ describe('/skills/learning skeleton', () => {
   });
 });
 
-describe('/compute/docker skeleton (Node-only)', () => {
-  it('publishes the sandbox, runner and operation stores as stubs', () => {
+describe('/compute/docker (Node-only, implemented by L6)', () => {
+  it('publishes the sandbox, runner and operation stores', () => {
     expectStub('createDockerSandbox', () => docker.createDockerSandbox(any));
     expectStub('createDockerProcessRunner', () => docker.createDockerProcessRunner(any));
-    expectStub('createInMemoryProcessOperationStore', () =>
-      docker.createInMemoryProcessOperationStore(),
-    );
+    expect(docker.createInMemoryProcessOperationStore()).toHaveProperty('create');
     expectStub('createSqliteProcessOperationStore', () =>
       docker.createSqliteProcessOperationStore(any),
     );
