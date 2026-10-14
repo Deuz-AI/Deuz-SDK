@@ -701,6 +701,15 @@ export function createOtelObserver(options: OtelTracerOptions = {}): Observer {
     return state;
   };
 
+  /**
+   * A standalone auxiliary operation is its own leg, forgotten once it ends.
+   * One inside a run leg (memory recall, a 2.4 context compile) leaves the leg
+   * alone: its run span and open children still close with the run.
+   */
+  const forgetIdle = (state: ExecutionState, event: ObserveEvent): void => {
+    if (!state.root && state.spans.size === 0) executions.delete(event.executionId);
+  };
+
   const parentOf = (state: ExecutionState, event: ObserveEvent): WriterSpan | undefined =>
     (event.parentSpanId !== undefined ? state.spans.get(event.parentSpanId) : undefined) ??
     state.root;
@@ -1072,7 +1081,9 @@ export function createOtelObserver(options: OtelTracerOptions = {}): Observer {
 
       case 'operation.started': {
         // Auxiliary subsystems (image, midjourney, …) run without a `run.*`
-        // lifecycle; no semconv operation covers them, so stay namespaced.
+        // lifecycle; no semconv operation covers them, so stay namespaced. The
+        // 2.4 subsystems name theirs by span (`deuz.context.compile`, …) and
+        // carry their own `deuz.<subsystem>.*` attributes.
         const span = writer.start(
           event.operation,
           'internal',
@@ -1080,6 +1091,7 @@ export function createOtelObserver(options: OtelTracerOptions = {}): Observer {
             'deuz.subsystem': event.subsystem,
             'deuz.operation': event.operation,
             ...(event.itemCount !== undefined ? { 'deuz.item.count': event.itemCount } : {}),
+            ...event.attributes,
             ...childAttributes(event),
           },
           parentOf(state, event),
@@ -1093,20 +1105,22 @@ export function createOtelObserver(options: OtelTracerOptions = {}): Observer {
         if (!span) break;
         span.attr('deuz.result.count', event.resultCount);
         if (event.usage) span.attrs(runUsageAttributes(event.usage));
+        if (event.attributes) span.attrs(event.attributes);
         span.end();
         state.spans.delete(event.spanId);
-        executions.delete(event.executionId);
+        forgetIdle(state, event);
         break;
       }
 
       case 'operation.failed': {
         const span = state.spans.get(event.spanId);
         if (!span) break;
+        if (event.attributes) span.attrs(event.attributes);
         span.attr('error.type', event.error.code ?? event.error.name);
         span.error(event.error);
         span.end();
         state.spans.delete(event.spanId);
-        executions.delete(event.executionId);
+        forgetIdle(state, event);
         break;
       }
 

@@ -677,13 +677,28 @@ export type ObservedSubsystem =
   // 2.0 modalities — same `operation.*` shape as `image`/`embedding`.
   | 'speech'
   | 'transcription'
-  | 'video';
+  | 'video'
+  // 2.4: the context compiler, goal supervisor, durable scheduler, Docker
+  // process runner and durable stream store. Their operations are named by
+  // their `deuz.*` span name and carry `attributes`; most run inside a leg.
+  | 'context'
+  | 'goal'
+  | 'schedule'
+  | 'process'
+  | 'stream';
 
 export interface OperationStartedEvent extends ObserveEventBase {
   type: 'operation.started';
   subsystem: ObservedSubsystem;
   operation: string;
   itemCount?: number;
+  /**
+   * Subsystem attributes (2.4): scalar counts, ids, digests, token values and
+   * small enums under `deuz.<subsystem>.*` keys, never content (no memory
+   * text, transcript or tool output). An OTel observer copies them onto the
+   * span.
+   */
+  attributes?: Readonly<Record<string, string | number | boolean>>;
 }
 
 export interface OperationCompletedEvent extends ObserveEventBase {
@@ -694,6 +709,13 @@ export interface OperationCompletedEvent extends ObserveEventBase {
   itemCount?: number;
   resultCount?: number;
   usage?: Usage;
+  /**
+   * Subsystem attributes (2.4): scalar counts, ids, digests, token values and
+   * small enums under `deuz.<subsystem>.*` keys, never content (no memory
+   * text, transcript or tool output). An OTel observer copies them onto the
+   * span.
+   */
+  attributes?: Readonly<Record<string, string | number | boolean>>;
 }
 
 export interface OperationFailedEvent extends ObserveEventBase {
@@ -702,6 +724,13 @@ export interface OperationFailedEvent extends ObserveEventBase {
   operation: string;
   durationMs: number;
   error: ObservedError;
+  /**
+   * Subsystem attributes (2.4): scalar counts, ids, digests, token values and
+   * small enums under `deuz.<subsystem>.*` keys, never content (no memory
+   * text, transcript or tool output). An OTel observer copies them onto the
+   * span.
+   */
+  attributes?: Readonly<Record<string, string | number | boolean>>;
 }
 
 // ---------------------------------------------------------------------------
