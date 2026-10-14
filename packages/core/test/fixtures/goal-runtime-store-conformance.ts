@@ -1175,5 +1175,268 @@ export function goalRuntimeStoreContracts(
         }),
       );
     });
+
+    describe('run intents', () => {
+      it(
+        'records an intent once, for a goal of its scope',
+        withStore(async (store, time) => {
+          const goal = runtimeGoal('g');
+          await store.save(goal);
+          await time.advance(3);
+          expect(await store.intents.record(runIntent(goal, 'i1'))).toEqual({
+            status: 'committed',
+          });
+          expect(await store.intents.get('tenant', 'i1')).toEqual({
+            ...runIntent(goal, 'i1'),
+            status: 'pending',
+            revision: 1,
+            recordedAt: T0 + 3,
+            updatedAt: T0 + 3,
+          });
+          expect(await store.intents.record(runIntent(goal, 'i1', { attempt: 2 }))).toEqual({
+            status: 'conflict',
+            reason: 'intent-exists',
+          });
+          expect(
+            await store.intents.record(runIntent({ goalId: 'g', scope: 'other' }, 'i2')),
+          ).toEqual({ status: 'conflict', reason: 'scope-mismatch' });
+          expect(await store.intents.record(runIntent(runtimeGoal('missing'), 'i3'))).toEqual({
+            status: 'conflict',
+            reason: 'scope-mismatch',
+          });
+          for (const bad of [
+            runIntent(goal, 'i4', { kind: 'restart' as never }),
+            runIntent(goal, 'i4', { attempt: 0 }),
+            runIntent(goal, ''),
+          ])
+            await expect(
+              Promise.resolve().then(() => store.intents.record(bad)),
+              JSON.stringify(bad),
+            ).rejects.toThrow(TypeError);
+          expect(await store.intents.get('tenant', 'i4')).toBeUndefined();
+        }),
+      );
+
+      it(
+        'claims a pending intent, and lets a higher token fence the old executor out',
+        withStore(async (store, time) => {
+          const goal = runtimeGoal('g');
+          await store.save(goal);
+          await store.intents.record(runIntent(goal, 'i1'));
+          await time.advance(10);
+          const first = await store.intents.claim('tenant', 'i1', {
+            owner: 'worker-a',
+            token: 1,
+            expectedRevision: 1,
+          });
+          expect(first).toMatchObject({
+            status: 'committed',
+            intent: {
+              status: 'claimed',
+              revision: 2,
+              claim: { owner: 'worker-a', token: 1, at: T0 + 10 },
+            },
+          });
+          // The same token, a lower one, or a stale revision: refused.
+          for (const claim of [
+            { owner: 'worker-b', token: 1, expectedRevision: 2 },
+            { owner: 'worker-b', token: 0, expectedRevision: 2 },
+            { owner: 'worker-b', token: 2, expectedRevision: 1 },
+          ])
+            expect(await store.intents.claim('tenant', 'i1', claim), JSON.stringify(claim)).toEqual(
+              { status: 'conflict' },
+            );
+          expect(
+            await store.intents.claim('tenant', 'nope', {
+              owner: 'worker-b',
+              token: 5,
+              expectedRevision: 1,
+            }),
+          ).toEqual({ status: 'conflict' });
+          expect(
+            await store.intents.claim('other', 'i1', {
+              owner: 'worker-b',
+              token: 5,
+              expectedRevision: 2,
+            }),
+          ).toEqual({ status: 'conflict' });
+          // A higher token takes it over; the old holder can no longer mark it.
+          const second = await store.intents.claim('tenant', 'i1', {
+            owner: 'worker-b',
+            token: 2,
+            expectedRevision: 2,
+          });
+          expect(second).toMatchObject({
+            status: 'committed',
+            intent: { status: 'claimed', revision: 3, claim: { owner: 'worker-b', token: 2 } },
+          });
+          expect(
+            await store.intents.launched('tenant', 'i1', { token: 1, expectedRevision: 3 }),
+          ).toEqual({ status: 'conflict', reason: 'intent-revision' });
+          expect(
+            await store.intents.launched('tenant', 'i1', { token: 2, expectedRevision: 2 }),
+          ).toEqual({ status: 'conflict', reason: 'intent-revision' });
+          expect(
+            await store.intents.launched('tenant', 'i1', { token: 2, expectedRevision: 3 }),
+          ).toEqual({ status: 'committed' });
+          expect(await store.intents.get('tenant', 'i1')).toMatchObject({
+            status: 'launched',
+            revision: 4,
+          });
+          // A launched run's intent is taken over too, and stays launched (resume, not restart).
+          const third = await store.intents.claim('tenant', 'i1', {
+            owner: 'worker-c',
+            token: 3,
+            expectedRevision: 4,
+          });
+          expect(third).toMatchObject({
+            status: 'committed',
+            intent: { status: 'launched', revision: 5, claim: { owner: 'worker-c', token: 3 } },
+          });
+          expect(
+            await store.intents.launched('nope', 'i1', { token: 3, expectedRevision: 5 }),
+          ).toEqual({ status: 'conflict', reason: 'scope-mismatch' });
+        }),
+      );
+
+      it(
+        'records the outcome with the runtime state and the goal in one write',
+        withStore(async (store, time) => {
+          const goal = runtimeGoal('g');
+          await store.runtime.save(runtimeState(goal, 1, { phase: 'running' }), goal);
+          await store.intents.record(runIntent(goal, 'i1'));
+          await store.intents.claim('tenant', 'i1', { owner: 'w', token: 1, expectedRevision: 1 });
+          await store.intents.launched('tenant', 'i1', { token: 1, expectedRevision: 2 });
+          await time.advance(100);
+          const outcome = { status: 'failed' as const, error: { name: 'Error', message: 'boom' } };
+          const completion = (patch: object) => ({
+            token: 1,
+            expectedRevision: 3,
+            status: 'failed' as const,
+            outcome,
+            runtime: runtimeState(goal, 2, { phase: 'retrying', retries: 1 }),
+            goal: nextGoal(goal),
+            ...patch,
+          });
+          const cases: [object, string][] = [
+            [{ token: 2 }, 'intent-revision'],
+            [{ expectedRevision: 2 }, 'intent-revision'],
+            [{ runtime: runtimeState(goal, 1) }, 'runtime-revision'],
+            [{ goal: { ...nextGoal(goal), revision: 3 } }, 'goal-revision'],
+            [{ runtime: runtimeState({ goalId: 'g', scope: 'other' }, 2) }, 'scope-mismatch'],
+            [{ goal: { ...nextGoal(goal), goalId: 'h' } }, 'scope-mismatch'],
+          ];
+          for (const [patch, reason] of cases)
+            expect(
+              await store.intents.complete('tenant', 'i1', completion(patch)),
+              JSON.stringify(patch),
+            ).toEqual({ status: 'conflict', reason });
+          expect((await store.intents.get('tenant', 'i1'))?.status).toBe('launched');
+          expect((await store.runtime.get('tenant', 'g'))?.revision).toBe(1);
+          expect((await store.load('g'))?.revision).toBe(1);
+          expect(await store.intents.complete('tenant', 'i1', completion({}))).toEqual({
+            status: 'committed',
+          });
+          expect(await store.intents.get('tenant', 'i1')).toMatchObject({
+            status: 'failed',
+            outcome,
+            revision: 4,
+            updatedAt: T0 + 100,
+          });
+          expect((await store.runtime.get('tenant', 'g'))?.phase).toBe('retrying');
+          expect((await store.load('g'))?.revision).toBe(2);
+          // A finished intent takes no claim, mark or second outcome.
+          expect(
+            await store.intents.claim('tenant', 'i1', {
+              owner: 'w2',
+              token: 9,
+              expectedRevision: 4,
+            }),
+          ).toEqual({ status: 'conflict' });
+          expect(
+            await store.intents.complete('tenant', 'i1', {
+              token: 1,
+              expectedRevision: 4,
+              status: 'completed',
+            }),
+          ).toEqual({ status: 'conflict', reason: 'intent-revision' });
+        }),
+      );
+
+      it(
+        'completes only a claimed intent, under its claim',
+        withStore(async (store) => {
+          const goal = runtimeGoal('g');
+          await store.save(goal);
+          await store.intents.record(runIntent(goal, 'i1'));
+          expect(
+            await store.intents.complete('tenant', 'i1', {
+              token: 0,
+              expectedRevision: 1,
+              status: 'cancelled',
+            }),
+          ).toEqual({ status: 'conflict', reason: 'intent-revision' });
+          expect(
+            await store.intents.complete('tenant', 'nope', {
+              token: 0,
+              expectedRevision: 1,
+              status: 'cancelled',
+            }),
+          ).toEqual({ status: 'conflict', reason: 'scope-mismatch' });
+          await store.intents.claim('tenant', 'i1', { owner: 'w', token: 4, expectedRevision: 1 });
+          expect(
+            await store.intents.complete('tenant', 'i1', {
+              token: 4,
+              expectedRevision: 2,
+              status: 'cancelled',
+              outcome: { status: 'stopped', reason: 'cancel requested' },
+            }),
+          ).toEqual({ status: 'committed' });
+          expect((await store.intents.get('tenant', 'i1'))?.status).toBe('cancelled');
+        }),
+      );
+
+      it(
+        'lists the intents to recover by default, oldest first, page by page',
+        withStore(async (store, time) => {
+          const g = runtimeGoal('g');
+          const x = runtimeGoal('x', 'other');
+          await store.save(g);
+          await store.save(x);
+          await store.intents.record(runIntent(g, 'b'));
+          await store.intents.record(runIntent(g, 'a'));
+          await time.advance(1);
+          await store.intents.record(runIntent(x, 'c'));
+          await time.advance(1);
+          await store.intents.record(runIntent(g, 'd'));
+          await store.intents.claim('tenant', 'd', { owner: 'w', token: 1, expectedRevision: 1 });
+          await store.intents.complete('tenant', 'd', {
+            token: 1,
+            expectedRevision: 2,
+            status: 'completed',
+          });
+          const ids = async (query?: Parameters<GoalRuntimeStore['intents']['list']>[0]) =>
+            (await store.intents.list(query)).intents.map((intent) => intent.intentId);
+          expect(await ids()).toEqual(['a', 'b', 'c']);
+          expect(await ids({ scope: 'tenant' })).toEqual(['a', 'b']);
+          expect(await ids({ goalId: 'x' })).toEqual(['c']);
+          expect(await ids({ statuses: ['completed'] })).toEqual(['d']);
+          expect(await ids({ statuses: [] })).toEqual([]);
+          const pages: string[][] = [];
+          let cursor: string | undefined;
+          do {
+            const page = await store.intents.list({ limit: 2, cursor });
+            pages.push(page.intents.map((intent) => intent.intentId));
+            cursor = page.cursor;
+          } while (cursor);
+          expect(pages).toEqual([['a', 'b'], ['c']]);
+          for (const query of [{ limit: 0 }, { cursor: 'nope' }, { statuses: ['lost'] }])
+            await expect(
+              Promise.resolve().then(() => store.intents.list(query as never)),
+              JSON.stringify(query),
+            ).rejects.toThrow(TypeError);
+        }),
+      );
+    });
   });
 }

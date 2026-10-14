@@ -27,6 +27,7 @@ import type {
   GoalInboxQuery,
   GoalRunIntent,
   GoalRunIntentInput,
+  GoalRunIntentQuery,
   GoalRuntimeCommitResult,
   GoalRuntimePhase,
   GoalRuntimeState,
@@ -691,6 +692,242 @@ export function planIntentRecord(
     return refused('scope-mismatch');
   if (snapshot.intent !== undefined) return refused('intent-exists');
   return committed([{ kind: 'intent', intent: newIntent(input, now), created: true }]);
+}
+
+/** Checks a claim. Throws a TypeError. */
+export function checkClaim(value: unknown): {
+  owner: string;
+  token: number;
+  expectedRevision: number;
+} {
+  const check = new RuntimeChecker('intent claim');
+  const claim = check.object(value, 'claim');
+  return {
+    owner: check.string(claim.owner, 'owner'),
+    token: check.count(claim.token, 'token'),
+    expectedRevision: check.count(claim.expectedRevision, 'expectedRevision', 1),
+  };
+}
+
+/** What `intents.claim` answers. */
+export type IntentClaimResult =
+  | { status: 'committed'; intent: GoalRunIntent }
+  | { status: 'conflict' };
+
+/** An intent that holds a claim and has not finished yet. */
+function claimable(intent: GoalRunIntent): boolean {
+  return intent.status === 'claimed' || intent.status === 'launched';
+}
+
+/**
+ * `intents.claim`: a pending intent, or one held under a lower token (claimed
+ * or launched), at `expectedRevision`. A taken-over launched intent stays
+ * launched: its run exists and is resumed, never started again.
+ */
+export function planIntentClaim(
+  stored: GoalRunIntent | undefined,
+  claim: { owner: string; token: number; expectedRevision: number },
+  now: number,
+): GoalRuntimePlan<IntentClaimResult> {
+  const free =
+    stored !== undefined &&
+    stored.revision === claim.expectedRevision &&
+    (stored.status === 'pending' ||
+      (claimable(stored) && stored.claim !== undefined && stored.claim.token < claim.token));
+  if (!free) return { result: { status: 'conflict' }, writes: [] };
+  const intent: GoalRunIntent = {
+    ...stored,
+    status: stored.status === 'pending' ? 'claimed' : stored.status,
+    revision: stored.revision + 1,
+    claim: { owner: claim.owner, token: claim.token, at: now },
+    updatedAt: now,
+  };
+  return {
+    result: { status: 'committed', intent },
+    writes: [{ kind: 'intent', intent, created: false }],
+  };
+}
+
+/** Checks the options of `launched`. Throws a TypeError. */
+export function checkMark(value: unknown): { token: number; expectedRevision: number } {
+  const check = new RuntimeChecker('intent mark');
+  const mark = check.object(value, 'options');
+  return {
+    token: check.count(mark.token, 'token'),
+    expectedRevision: check.count(mark.expectedRevision, 'expectedRevision', 1),
+  };
+}
+
+/** Whether `stored` is held under exactly `token` at `expectedRevision`. */
+function heldBy(stored: GoalRunIntent, mark: { token: number; expectedRevision: number }): boolean {
+  return (
+    claimable(stored) &&
+    stored.claim?.token === mark.token &&
+    stored.revision === mark.expectedRevision
+  );
+}
+
+/** `intents.launched`: the holder of the claim marks the run launched. */
+export function planIntentLaunched(
+  stored: GoalRunIntent | undefined,
+  mark: { token: number; expectedRevision: number },
+  now: number,
+): GoalRuntimePlan<GoalRuntimeCommitResult> {
+  if (stored === undefined) return refused('scope-mismatch');
+  if (!heldBy(stored, mark)) return refused('intent-revision');
+  return committed([
+    {
+      kind: 'intent',
+      intent: { ...stored, status: 'launched', revision: stored.revision + 1, updatedAt: now },
+      created: false,
+    },
+  ]);
+}
+
+/** A checked completion, its runtime state and goal checked and copied. Throws a TypeError. */
+export function checkCompletion(value: unknown): {
+  token: number;
+  expectedRevision: number;
+  status: 'completed' | 'failed' | 'cancelled';
+  outcome?: GoalRunIntent['outcome'];
+  runtime?: GoalRuntimeState;
+  goal?: GoalRecord;
+} {
+  const check = new RuntimeChecker('intent completion');
+  const completion = check.object(value, 'completion');
+  const { token, expectedRevision } = checkMark(completion);
+  const status = check.oneOf(
+    completion.status,
+    ['completed', 'failed', 'cancelled'] as const,
+    'status',
+  );
+  let outcome: GoalRunIntent['outcome'];
+  if (completion.outcome !== undefined) {
+    const fields = check.object(completion.outcome, 'outcome');
+    check.string(fields.status, 'outcome.status');
+    check.optionalString(fields.reason, 'outcome.reason');
+    if (fields.error !== undefined) {
+      const error = check.object(fields.error, 'outcome.error');
+      check.string(error.name, 'outcome.error.name');
+      if (typeof error.message !== 'string')
+        check.fail('outcome.error.message', 'must be a string');
+      check.optionalString(error.code, 'outcome.error.code');
+    }
+    check.json(fields, 'outcome');
+    outcome = jsonCopy(fields) as unknown as GoalRunIntent['outcome'];
+  }
+  return {
+    token,
+    expectedRevision,
+    status,
+    ...(outcome !== undefined ? { outcome } : {}),
+    ...(completion.runtime !== undefined ? { runtime: checkRuntimeState(completion.runtime) } : {}),
+    ...(completion.goal !== undefined ? { goal: checkGoal(completion.goal) } : {}),
+  };
+}
+
+/**
+ * `intents.complete`: the holder of the claim records the outcome, with the
+ * runtime state and the goal at their stored revisions plus one.
+ */
+export function planIntentComplete(
+  snapshot: {
+    intent: GoalRunIntent | undefined;
+    goal: StoredGoal | undefined;
+    runtime: GoalRuntimeState | undefined;
+  },
+  completion: ReturnType<typeof checkCompletion>,
+  now: number,
+): GoalRuntimePlan<GoalRuntimeCommitResult> {
+  const stored = snapshot.intent;
+  if (stored === undefined) return refused('scope-mismatch');
+  const owner = { goalId: stored.goalId, scope: stored.scope };
+  if (completion.goal !== undefined && !namesGoal(owner, completion.goal))
+    return refused('scope-mismatch');
+  const runtime = runtimePart(snapshot, owner, completion.runtime, completion.goal);
+  if (runtime === 'scope-mismatch') return refused(runtime);
+  if (!heldBy(stored, completion)) return refused('intent-revision');
+  const goal = goalPart(snapshot.goal, owner, completion.goal);
+  if (typeof goal === 'string') return refused(goal);
+  if (typeof runtime === 'string') return refused(runtime);
+  if (completion.runtime !== undefined) assertCancelKept(snapshot.runtime, completion.runtime);
+  const { outcome: _outcome, ...rest } = stored;
+  const writes: GoalRuntimeWrite[] = [
+    {
+      kind: 'intent',
+      intent: {
+        ...rest,
+        status: completion.status,
+        ...(completion.outcome !== undefined ? { outcome: completion.outcome } : {}),
+        revision: stored.revision + 1,
+        updatedAt: now,
+      },
+      created: false,
+    },
+  ];
+  if (goal) writes.push(goal);
+  if (runtime) writes.push(runtime);
+  return committed(writes);
+}
+
+/** A validated intent listing. */
+export interface IntentListPlan {
+  scope: string | undefined;
+  goalId: string | undefined;
+  statuses: readonly GoalRunIntent['status'][];
+  limit: number;
+  /** The sort key of the previous page's last intent. */
+  after: readonly [recordedAt: number, scope: string, intentId: string] | undefined;
+}
+
+export function planIntentList(query: GoalRunIntentQuery | undefined): IntentListPlan {
+  const fields = checkQuery(query, 'intent listing');
+  return {
+    scope: optionalQueryString(fields.scope, 'Intent listing scope'),
+    goalId: optionalQueryString(fields.goalId, 'Intent listing goalId'),
+    statuses: checkStatuses(fields.statuses, INTENT_STATUSES, 'Intent listing statuses') ?? [
+      'pending',
+      'claimed',
+      'launched',
+    ],
+    limit: checkLimit(fields.limit, 'Intent listing'),
+    after:
+      fields.cursor === undefined
+        ? undefined
+        : decodeCursor(fields.cursor, ['number', 'string', 'string'] as const, 'intent listing'),
+  };
+}
+
+/** Oldest first, then scope, then intent id (code point order). */
+export function intentsOldestFirst(
+  left: Pick<GoalRunIntent, 'recordedAt' | 'scope' | 'intentId'>,
+  right: Pick<GoalRunIntent, 'recordedAt' | 'scope' | 'intentId'>,
+): number {
+  if (left.recordedAt !== right.recordedAt) return left.recordedAt - right.recordedAt;
+  return compareText(left.scope, right.scope) || compareText(left.intentId, right.intentId);
+}
+
+/** The sort key an intent cursor carries. */
+export const intentKey = (intent: GoalRunIntent): [number, string, string] => [
+  intent.recordedAt,
+  intent.scope,
+  intent.intentId,
+];
+
+/** Whether `intent` belongs on a listing (for a store that filters in process). */
+export function matchesIntentList(intent: GoalRunIntent, plan: IntentListPlan): boolean {
+  if (plan.scope !== undefined && intent.scope !== plan.scope) return false;
+  if (plan.goalId !== undefined && intent.goalId !== plan.goalId) return false;
+  if (!plan.statuses.includes(intent.status)) return false;
+  if (plan.after !== undefined)
+    return (
+      intentsOldestFirst(intent, {
+        recordedAt: plan.after[0],
+        scope: plan.after[1],
+        intentId: plan.after[2],
+      }) > 0
+    );
+  return true;
 }
 
 // ===================================================================

@@ -11,9 +11,12 @@ import type { GoalRecord } from '../types';
 import {
   checkAdvance,
   checkApplication,
+  checkClaim,
+  checkCompletion,
   checkEnqueue,
   checkGoal,
   checkIntentInput,
+  checkMark,
   checkRuntimeState,
   checkScheduleInput,
   checkScheduleOptions,
@@ -22,7 +25,10 @@ import {
   inboxOldestFirst,
   isPendingDeliveryOf,
   jsonCopy,
+  intentKey,
+  intentsOldestFirst,
   matchesInboxList,
+  matchesIntentList,
   matchesOccurrenceList,
   matchesScheduleList,
   occurrenceKey,
@@ -33,6 +39,10 @@ import {
   planEnqueue,
   planGoalSave,
   planInboxList,
+  planIntentClaim,
+  planIntentComplete,
+  planIntentLaunched,
+  planIntentList,
   planIntentRecord,
   planOccurrenceList,
   planRuntimeSave,
@@ -336,10 +346,39 @@ export function createInMemoryGoalRuntimeStore(options?: {
       async get(scope, intentId) {
         return inScope(intents.get(scoped(scope, intentId)), scope);
       },
-      claim: todo,
-      launched: todo,
-      complete: todo,
-      list: todo,
+      async claim(scope, intentId, claim) {
+        const next = checkClaim(claim);
+        return commit(planIntentClaim(intents.get(scoped(scope, intentId)), next, clock.now()));
+      },
+      async launched(scope, intentId, mark) {
+        const next = checkMark(mark);
+        return commit(planIntentLaunched(intents.get(scoped(scope, intentId)), next, clock.now()));
+      },
+      async complete(scope, intentId, completion) {
+        const next = checkCompletion(completion);
+        const intent = intents.get(scoped(scope, intentId));
+        return commit(
+          planIntentComplete(
+            {
+              intent,
+              goal: intent && goals.get(intent.goalId),
+              runtime: intent && runtimes.get(intent.goalId),
+            },
+            next,
+            clock.now(),
+          ),
+        );
+      },
+      async list(query) {
+        const plan = planIntentList(query);
+        const rows = [...intents.values()]
+          .filter((intent) => matchesIntentList(intent, plan))
+          .sort(intentsOldestFirst);
+        const page = pageOf(rows, plan.limit, intentKey);
+        return jsonCopy(
+          page.cursor ? { intents: page.rows, cursor: page.cursor } : { intents: page.rows },
+        );
+      },
     },
     watermarks: { get: todo, advance: todo },
     prunePayloads: todo,
