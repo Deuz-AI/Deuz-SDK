@@ -7,12 +7,15 @@
  */
 import { describe, expect, it } from 'vitest';
 import * as errors from '../src/errors';
+import { GoalError } from '../src/goal/errors';
 import { NotImplementedError } from '../src/internal/not-implemented';
 import * as versioned from '../src/memory/versioned';
 import * as context from '../src/context';
 import * as chat from '../src/chat';
 import * as ui from '../src/ui';
 import { createTokenEstimator } from '../src/internal/estimate-tokens';
+import * as goalRuntime from '../src/goal/runtime';
+import { agentRunLeaseKey } from '../src/ops';
 
 function expectStub(name: string, call: () => unknown): void {
   let thrown: unknown;
@@ -105,5 +108,57 @@ describe('/chat and /ui 2.4 additions', () => {
     expect(ui.DEFAULT_DURABLE_STREAM_BATCH).toEqual({ maxDelayMs: 20, maxBytes: 16_384 });
     expect(ui.DEUZ_CAPABILITIES_HEADER).toBe('x-deuz-capabilities');
     expect(typeof ui.parseDeuzCapabilities).toBe('function');
+  });
+});
+
+describe('/goal/runtime skeleton', () => {
+  it('publishes the supervisor, scheduler, webhook, store and acceptance entry points as stubs', async () => {
+    expectStub('createGoalSupervisor', () => goalRuntime.createGoalSupervisor(any));
+    expectStub('createNativeRunLauncher', () => goalRuntime.createNativeRunLauncher(any));
+    expectStub('createDurableScheduler', () => goalRuntime.createDurableScheduler(any));
+    expectStub('createWebhookHandler', () => goalRuntime.createWebhookHandler(any));
+    expectStub('toNodeHandler', () => goalRuntime.toNodeHandler(any));
+    expectStub('createInMemoryGoalRuntimeStore', () =>
+      goalRuntime.createInMemoryGoalRuntimeStore(),
+    );
+    await expectAsyncStub('verifyGoalAcceptance', () => goalRuntime.verifyGoalAcceptance(any));
+  });
+
+  it('keys an inbox entry by scope, namespace and delivery id, on every store alike', () => {
+    expect(goalRuntime.goalInboxKey('tenant-a', 'webhook:github', 'd-1')).toBe(
+      'inbox:["tenant-a","webhook:github","d-1"]',
+    );
+    // A separator inside a part can never make two deliveries collide.
+    expect(goalRuntime.goalInboxKey('a', 'b:c', 'd')).not.toBe(
+      goalRuntime.goalInboxKey('a:b', 'c', 'd'),
+    );
+    expect(() => goalRuntime.goalInboxKey('', 'n', 'd')).toThrow(TypeError);
+    expect(() => goalRuntime.goalInboxKey('s', 'n', '')).toThrow(TypeError);
+  });
+
+  it('keys the goal lease like a native run lease', () => {
+    expect(goalRuntime.goalLeaseKey('tenant-a', 'g-1')).toBe('goal:["tenant-a","g-1"]');
+    expect(agentRunLeaseKey({ scope: 'tenant-a', runId: 'g-1' })).toBe('agent:["tenant-a","g-1"]');
+  });
+
+  it('pins the spec defaults of the supervisor and the scheduler', () => {
+    expect(goalRuntime.DEFAULT_GOAL_RUNTIME_POLICY).toEqual({
+      maxRuns: 10,
+      maxRetries: 3,
+      retryDelaysMs: [1_000, 5_000, 30_000],
+      retainPayloadMs: 604_800_000,
+    });
+    expect(goalRuntime.DEFAULT_GOAL_SUPERVISOR).toEqual({
+      concurrency: 1,
+      leaseTtlMs: 30_000,
+      pollMs: 1_000,
+    });
+    expect(goalRuntime.DEFAULT_DURABLE_SCHEDULER).toEqual({
+      graceMs: 60_000,
+      maxDeliveriesPerTick: 100,
+      maxScanMinutes: 10_000,
+      pollMs: 1_000,
+    });
+    expect(goalRuntime.GoalError).toBe(GoalError);
   });
 });

@@ -25,6 +25,25 @@ import type {
 import type { BudgetReservation, BudgetReservationInput, BudgetTotals } from '../src/agent';
 import type { DurableStreamStateStore, StreamStateStore } from '../src/ui';
 import type { ConflictSubsystem, StoreFeature } from '../src/errors';
+import type { GoalStore } from '../src/goal';
+import type {
+  FetchHandler,
+  GoalRuntimeStore,
+  ScheduleSpec,
+  GoalInboxEnqueueResult,
+} from '../src/goal/runtime';
+import type {
+  AgentEvent,
+  AgentRunEnvelope,
+  AgentRunMemoryExtraction,
+  AgentStream,
+} from '../src/types/agent-run';
+import type {
+  AgentEventV3,
+  AgentRunEnvelopeV3,
+  AgentRunMemoryExtractionV3,
+  AgentStreamV3,
+} from '../src/types/agent-run-v3';
 
 describe('2.4 stores plug into their 2.3 seams', () => {
   it('a conditional chat store is a ChatStore', () => {
@@ -118,5 +137,51 @@ describe('error codes', () => {
       | 'transcript-index'
       | 'process-operations'
     >();
+  });
+});
+
+describe('goal runtime', () => {
+  it('a goal runtime store is a GoalStore (the 2.3 conformance fixture runs against it)', () => {
+    expectTypeOf<GoalRuntimeStore>().toMatchTypeOf<GoalStore>();
+  });
+
+  it('serves webhooks with the Fetch API signature', () => {
+    expectTypeOf<FetchHandler>().toEqualTypeOf<(request: Request) => Promise<Response>>();
+    expectTypeOf<GoalInboxEnqueueResult['status']>().toEqualTypeOf<
+      'enqueued' | 'duplicate' | 'conflict'
+    >();
+  });
+
+  it('names the DST and catch-up policies of spec §3.2', () => {
+    expectTypeOf<NonNullable<ScheduleSpec['dstGap']>>().toEqualTypeOf<'shift' | 'skip'>();
+    expectTypeOf<NonNullable<ScheduleSpec['dstOverlap']>>().toEqualTypeOf<'first' | 'both'>();
+    expectTypeOf<NonNullable<ScheduleSpec['catchUp']>>().toEqualTypeOf<'latest' | 'all' | 'none'>();
+  });
+});
+
+describe('V3 runs', () => {
+  it('keeps the 2.3 envelope and its closed unions as they are', () => {
+    expectTypeOf<AgentRunEnvelope['version']>().toEqualTypeOf<1 | 2>();
+    expectTypeOf<AgentRunMemoryExtraction['status']>().toEqualTypeOf<
+      'pending' | 'completed' | 'failed'
+    >();
+    expectTypeOf<AgentEvent['type']>().toEqualTypeOf<
+      'part' | 'phase' | 'partial-output' | 'array-element' | 'tool-output' | 'result'
+    >();
+  });
+
+  it('adds version 3, the partial extraction and a separate event union', () => {
+    expectTypeOf<AgentRunEnvelopeV3['version']>().toEqualTypeOf<3>();
+    expectTypeOf<AgentRunMemoryExtractionV3['status']>().toEqualTypeOf<
+      'pending' | 'completed' | 'partial' | 'failed'
+    >();
+    expectTypeOf<AgentEvent>().toMatchTypeOf<AgentEventV3>();
+    expectTypeOf<AgentEventV3['type']>().toEqualTypeOf<
+      AgentEvent['type'] | 'context' | 'working-memory' | 'memory-intent'
+    >();
+  });
+
+  it('streams a V3 run as an AgentStream, so the UI bridge takes it unchanged', () => {
+    expectTypeOf<AgentStreamV3>().toMatchTypeOf<AgentStream>();
   });
 });
