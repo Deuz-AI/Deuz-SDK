@@ -1,0 +1,40 @@
+{
+  "scenario": "batch.openai-responses.gpt-5.4.submit",
+  "recordedFrom": "2.3.0",
+  "requests": [
+    {
+      "method": "POST",
+      "url": "https://api.openai.com/v1/files",
+      "headers": {
+        "authorization": "Bearer <secret>"
+      },
+      "form": [
+        {
+          "name": "purpose",
+          "value": "batch"
+        },
+        {
+          "name": "file",
+          "file": {
+            "name": "deuz-batch.jsonl",
+            "type": "application/jsonl",
+            "text": "{\"custom_id\":\"q1\",\"method\":\"POST\",\"url\":\"/v1/responses\",\"body\":{\"model\":\"gpt-5.4\",\"input\":[{\"role\":\"user\",\"content\":\"One?\"}],\"max_output_tokens\":64,\"store\":false,\"include\":[\"reasoning.encrypted_content\"]}}\n{\"custom_id\":\"q2\",\"method\":\"POST\",\"url\":\"/v1/responses\",\"body\":{\"model\":\"gpt-5.4\",\"input\":[{\"role\":\"user\",\"content\":\"Two?\"}],\"max_output_tokens\":128000,\"instructions\":\"Answer in French.\",\"store\":false,\"include\":[\"reasoning.encrypted_content\"]}}\n"
+          }
+        }
+      ]
+    },
+    {
+      "method": "POST",
+      "url": "https://api.openai.com/v1/batches",
+      "headers": {
+        "authorization": "Bearer <secret>",
+        "content-type": "application/json"
+      },
+      "json": {
+        "input_file_id": "file-golden",
+        "endpoint": "/v1/responses",
+        "completion_window": "24h"
+      }
+    }
+  ]
+}

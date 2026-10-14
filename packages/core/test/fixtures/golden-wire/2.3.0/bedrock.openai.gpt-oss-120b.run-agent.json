@@ -1,0 +1,115 @@
+{
+  "scenario": "bedrock.openai.gpt-oss-120b.run-agent",
+  "recordedFrom": "2.3.0",
+  "requests": [
+    {
+      "method": "POST",
+      "url": "https://bedrock-mantle.us-west-2.api.aws/openai/v1/chat/completions",
+      "headers": {
+        "authorization": "Bearer <secret>",
+        "content-type": "application/json"
+      },
+      "json": {
+        "model": "openai.gpt-oss-120b",
+        "messages": [
+          {
+            "role": "system",
+            "content": "You are a concise assistant."
+          },
+          {
+            "role": "user",
+            "content": "What is the weather in Paris?"
+          }
+        ],
+        "stream": true,
+        "stream_options": {
+          "include_usage": true
+        },
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "get_weather",
+              "description": "Current weather for a city.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "city": {
+                    "type": "string",
+                    "description": "The city name."
+                  }
+                },
+                "required": ["city"],
+                "additionalProperties": false
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "method": "POST",
+      "url": "https://bedrock-mantle.us-west-2.api.aws/openai/v1/chat/completions",
+      "headers": {
+        "authorization": "Bearer <secret>",
+        "content-type": "application/json"
+      },
+      "json": {
+        "model": "openai.gpt-oss-120b",
+        "messages": [
+          {
+            "role": "system",
+            "content": "You are a concise assistant."
+          },
+          {
+            "role": "user",
+            "content": "What is the weather in Paris?"
+          },
+          {
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [
+              {
+                "id": "call_golden_1",
+                "type": "function",
+                "function": {
+                  "name": "get_weather",
+                  "arguments": "{\"city\":\"Paris\"}"
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "tool_call_id": "call_golden_1",
+            "content": "{\"city\":\"Paris\",\"tempC\":21,\"sky\":\"clear\"}"
+          }
+        ],
+        "stream": true,
+        "stream_options": {
+          "include_usage": true
+        },
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "get_weather",
+              "description": "Current weather for a city.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "city": {
+                    "type": "string",
+                    "description": "The city name."
+                  }
+                },
+                "required": ["city"],
+                "additionalProperties": false
+              }
+            }
+          }
+        ]
+      }
+    }
+  ]
+}

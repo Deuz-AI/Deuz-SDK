@@ -1,0 +1,82 @@
+{
+  "scenario": "openai-chat.gpt-5.5.compaction-summary",
+  "recordedFrom": "2.3.0",
+  "requests": [
+    {
+      "method": "POST",
+      "url": "https://api.openai.com/v1/chat/completions",
+      "headers": {
+        "authorization": "Bearer <secret>",
+        "content-type": "application/json"
+      },
+      "json": {
+        "model": "gpt-5.5",
+        "messages": [
+          {
+            "role": "user",
+            "content": "ASSISTANT: [calls get_weather({\"city\":\"Paris\"})]\nTOOL: [tool result: {\"city\":\"Paris\",\"tempC\":21}]\nASSISTANT: It is 21 °C in Paris.\nUSER: And in Rome?\nASSISTANT: [calls get_weather({\"city\":\"Rome\"})]\nTOOL: [tool result: {\"city\":\"Rome\",\"tempC\":25}]\n\nSummarize the conversation transcript above as concise notes: preserve key facts, decisions made, tool results that still matter, and any open task threads. Output only the summary."
+          }
+        ],
+        "stream": true,
+        "max_completion_tokens": 128000,
+        "stream_options": {
+          "include_usage": true
+        }
+      }
+    },
+    {
+      "method": "POST",
+      "url": "https://api.openai.com/v1/chat/completions",
+      "headers": {
+        "authorization": "Bearer <secret>",
+        "content-type": "application/json"
+      },
+      "json": {
+        "model": "gpt-5.5",
+        "messages": [
+          {
+            "role": "user",
+            "content": "What is the weather in Paris?"
+          },
+          {
+            "role": "user",
+            "content": "[Earlier conversation summarized]\nParis 21 °C, Rome 25 °C."
+          },
+          {
+            "role": "assistant",
+            "content": "It is 25 °C in Rome."
+          },
+          {
+            "role": "user",
+            "content": "Which city is warmer?"
+          }
+        ],
+        "stream": true,
+        "max_completion_tokens": 128000,
+        "stream_options": {
+          "include_usage": true
+        },
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "get_weather",
+              "description": "Current weather for a city.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "city": {
+                    "type": "string",
+                    "description": "The city name."
+                  }
+                },
+                "required": ["city"],
+                "additionalProperties": false
+              }
+            }
+          }
+        ]
+      }
+    }
+  ]
+}

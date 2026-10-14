@@ -1,0 +1,20 @@
+{
+  "scenario": "voyage-rerank.rerank-2.5.rerank",
+  "recordedFrom": "2.3.0",
+  "requests": [
+    {
+      "method": "POST",
+      "url": "https://api.voyageai.com/v1/rerank",
+      "headers": {
+        "authorization": "Bearer <secret>",
+        "content-type": "application/json"
+      },
+      "json": {
+        "model": "rerank-2.5",
+        "query": "capital of Italy",
+        "documents": ["Paris is the capital of France.", "Rome is the capital of Italy."],
+        "top_k": 2
+      }
+    }
+  ]
+}

@@ -1,0 +1,36 @@
+{
+  "scenario": "vertex-google-native.gemini-2.5-flash.call-options",
+  "recordedFrom": "2.3.0",
+  "requests": [
+    {
+      "method": "POST",
+      "url": "https://aiplatform.googleapis.com/v1/projects/golden-project/locations/global/publishers/google/models/gemini-2.5-flash:streamGenerateContent?alt=sse",
+      "headers": {
+        "authorization": "Bearer <secret>",
+        "content-type": "application/json"
+      },
+      "json": {
+        "contents": [
+          {
+            "role": "user",
+            "parts": [
+              {
+                "text": "Say hello."
+              }
+            ]
+          }
+        ],
+        "generationConfig": {
+          "maxOutputTokens": 256,
+          "temperature": 0.2,
+          "topP": 0.9,
+          "stopSequences": ["END"],
+          "thinkingConfig": {
+            "includeThoughts": true,
+            "thinkingBudget": 4096
+          }
+        }
+      }
+    }
+  ]
+}

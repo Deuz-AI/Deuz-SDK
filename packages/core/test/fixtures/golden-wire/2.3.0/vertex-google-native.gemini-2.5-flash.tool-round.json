@@ -1,0 +1,132 @@
+{
+  "scenario": "vertex-google-native.gemini-2.5-flash.tool-round",
+  "recordedFrom": "2.3.0",
+  "requests": [
+    {
+      "method": "POST",
+      "url": "https://aiplatform.googleapis.com/v1/projects/golden-project/locations/global/publishers/google/models/gemini-2.5-flash:streamGenerateContent?alt=sse",
+      "headers": {
+        "authorization": "Bearer <secret>",
+        "content-type": "application/json"
+      },
+      "json": {
+        "contents": [
+          {
+            "role": "user",
+            "parts": [
+              {
+                "text": "What is the weather in Paris?"
+              }
+            ]
+          }
+        ],
+        "generationConfig": {
+          "maxOutputTokens": 64000
+        },
+        "tools": [
+          {
+            "functionDeclarations": [
+              {
+                "name": "get_weather",
+                "description": "Current weather for a city.",
+                "parameters": {
+                  "type": "OBJECT",
+                  "properties": {
+                    "city": {
+                      "type": "STRING",
+                      "description": "The city name."
+                    }
+                  },
+                  "propertyOrdering": ["city"],
+                  "required": ["city"]
+                }
+              }
+            ]
+          }
+        ],
+        "toolConfig": {
+          "functionCallingConfig": {
+            "mode": "AUTO"
+          }
+        }
+      }
+    },
+    {
+      "method": "POST",
+      "url": "https://aiplatform.googleapis.com/v1/projects/golden-project/locations/global/publishers/google/models/gemini-2.5-flash:streamGenerateContent?alt=sse",
+      "headers": {
+        "authorization": "Bearer <secret>",
+        "content-type": "application/json"
+      },
+      "json": {
+        "contents": [
+          {
+            "role": "user",
+            "parts": [
+              {
+                "text": "What is the weather in Paris?"
+              }
+            ]
+          },
+          {
+            "role": "model",
+            "parts": [
+              {
+                "functionCall": {
+                  "name": "get_weather",
+                  "args": {
+                    "city": "Paris"
+                  }
+                }
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "parts": [
+              {
+                "functionResponse": {
+                  "name": "get_weather",
+                  "response": {
+                    "city": "Paris",
+                    "tempC": 21,
+                    "sky": "clear"
+                  }
+                }
+              }
+            ]
+          }
+        ],
+        "generationConfig": {
+          "maxOutputTokens": 64000
+        },
+        "tools": [
+          {
+            "functionDeclarations": [
+              {
+                "name": "get_weather",
+                "description": "Current weather for a city.",
+                "parameters": {
+                  "type": "OBJECT",
+                  "properties": {
+                    "city": {
+                      "type": "STRING",
+                      "description": "The city name."
+                    }
+                  },
+                  "propertyOrdering": ["city"],
+                  "required": ["city"]
+                }
+              }
+            ]
+          }
+        ],
+        "toolConfig": {
+          "functionCallingConfig": {
+            "mode": "AUTO"
+          }
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,18 @@
+{
+  "scenario": "elevenlabs.eleven_multilingual_v2.generate-speech",
+  "recordedFrom": "2.3.0",
+  "requests": [
+    {
+      "method": "POST",
+      "url": "https://api.elevenlabs.io/v1/text-to-speech/golden-voice?output_format=mp3_44100_128",
+      "headers": {
+        "content-type": "application/json",
+        "xi-api-key": "<secret>"
+      },
+      "json": {
+        "text": "Hello there.",
+        "model_id": "eleven_multilingual_v2"
+      }
+    }
+  ]
+}

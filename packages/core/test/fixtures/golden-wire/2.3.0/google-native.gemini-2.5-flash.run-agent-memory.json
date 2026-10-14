@@ -1,0 +1,159 @@
+{
+  "scenario": "google-native.gemini-2.5-flash.run-agent-memory",
+  "recordedFrom": "2.3.0",
+  "requests": [
+    {
+      "method": "POST",
+      "url": "https://api.openai.com/v1/embeddings",
+      "headers": {
+        "authorization": "Bearer <secret>",
+        "content-type": "application/json"
+      },
+      "json": {
+        "model": "text-embedding-3-small",
+        "input": ["What is the weather in Paris?"],
+        "encoding_format": "base64"
+      }
+    },
+    {
+      "method": "POST",
+      "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse",
+      "headers": {
+        "content-type": "application/json",
+        "x-goog-api-key": "<secret>"
+      },
+      "json": {
+        "contents": [
+          {
+            "role": "user",
+            "parts": [
+              {
+                "text": "What is the weather in Paris?"
+              }
+            ]
+          }
+        ],
+        "generationConfig": {
+          "maxOutputTokens": 64000
+        },
+        "systemInstruction": {
+          "parts": [
+            {
+              "text": "Relevant memories:\n- The user prefers temperatures in Celsius."
+            }
+          ]
+        },
+        "tools": [
+          {
+            "functionDeclarations": [
+              {
+                "name": "get_weather",
+                "description": "Current weather for a city.",
+                "parameters": {
+                  "type": "OBJECT",
+                  "properties": {
+                    "city": {
+                      "type": "STRING",
+                      "description": "The city name."
+                    }
+                  },
+                  "propertyOrdering": ["city"],
+                  "required": ["city"]
+                }
+              }
+            ]
+          }
+        ],
+        "toolConfig": {
+          "functionCallingConfig": {
+            "mode": "AUTO"
+          }
+        }
+      }
+    },
+    {
+      "method": "POST",
+      "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse",
+      "headers": {
+        "content-type": "application/json",
+        "x-goog-api-key": "<secret>"
+      },
+      "json": {
+        "contents": [
+          {
+            "role": "user",
+            "parts": [
+              {
+                "text": "What is the weather in Paris?"
+              }
+            ]
+          },
+          {
+            "role": "model",
+            "parts": [
+              {
+                "functionCall": {
+                  "name": "get_weather",
+                  "args": {
+                    "city": "Paris"
+                  }
+                }
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "parts": [
+              {
+                "functionResponse": {
+                  "name": "get_weather",
+                  "response": {
+                    "city": "Paris",
+                    "tempC": 21,
+                    "sky": "clear"
+                  }
+                }
+              }
+            ]
+          }
+        ],
+        "generationConfig": {
+          "maxOutputTokens": 64000
+        },
+        "systemInstruction": {
+          "parts": [
+            {
+              "text": "Relevant memories:\n- The user prefers temperatures in Celsius."
+            }
+          ]
+        },
+        "tools": [
+          {
+            "functionDeclarations": [
+              {
+                "name": "get_weather",
+                "description": "Current weather for a city.",
+                "parameters": {
+                  "type": "OBJECT",
+                  "properties": {
+                    "city": {
+                      "type": "STRING",
+                      "description": "The city name."
+                    }
+                  },
+                  "propertyOrdering": ["city"],
+                  "required": ["city"]
+                }
+              }
+            ]
+          }
+        ],
+        "toolConfig": {
+          "functionCallingConfig": {
+            "mode": "AUTO"
+          }
+        }
+      }
+    }
+  ]
+}

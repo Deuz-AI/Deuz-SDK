@@ -1,0 +1,47 @@
+{
+  "scenario": "openai-responses.gpt-5.4.generate-object",
+  "recordedFrom": "2.3.0",
+  "requests": [
+    {
+      "method": "POST",
+      "url": "https://api.openai.com/v1/responses",
+      "headers": {
+        "authorization": "Bearer <secret>",
+        "content-type": "application/json"
+      },
+      "json": {
+        "model": "gpt-5.4",
+        "input": [
+          {
+            "role": "user",
+            "content": "Report the weather in Paris."
+          }
+        ],
+        "stream": true,
+        "max_output_tokens": 128000,
+        "store": false,
+        "include": ["reasoning.encrypted_content"],
+        "text": {
+          "format": {
+            "type": "json_schema",
+            "name": "weather",
+            "strict": true,
+            "schema": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string"
+                },
+                "tempC": {
+                  "type": "number"
+                }
+              },
+              "required": ["city", "tempC"],
+              "additionalProperties": false
+            }
+          }
+        }
+      }
+    }
+  ]
+}

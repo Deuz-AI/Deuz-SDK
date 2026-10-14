@@ -1,0 +1,2089 @@
+{
+  "postgres/budget": {
+    "tables": {
+      "deuz_budget_counters": {
+        "columns": [
+          {
+            "name": "key",
+            "type": "text",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "bucket",
+            "type": "bigint",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "model_id",
+            "type": "text",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "tokens",
+            "type": "bigint",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "usd",
+            "type": "double precision",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          }
+        ],
+        "indexes": [
+          {
+            "name": "deuz_budget_counters_pkey",
+            "definition": "CREATE UNIQUE INDEX deuz_budget_counters_pkey ON <schema>.deuz_budget_counters USING btree (key, bucket, model_id)"
+          }
+        ]
+      },
+      "deuz_budget_requests": {
+        "columns": [
+          {
+            "name": "request_id",
+            "type": "text",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "fingerprint",
+            "type": "text",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "model_id",
+            "type": "text",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "tokens",
+            "type": "bigint",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "usd",
+            "type": "double precision",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "state",
+            "type": "text",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "charges",
+            "type": "jsonb",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "actual_tokens",
+            "type": "bigint",
+            "notNull": false,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "actual_usd",
+            "type": "double precision",
+            "notNull": false,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "outcome",
+            "type": "jsonb",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "created_at",
+            "type": "bigint",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          }
+        ],
+        "indexes": [
+          {
+            "name": "deuz_budget_requests_pkey",
+            "definition": "CREATE UNIQUE INDEX deuz_budget_requests_pkey ON <schema>.deuz_budget_requests USING btree (request_id)"
+          },
+          {
+            "name": "deuz_budget_requests_state",
+            "definition": "CREATE INDEX deuz_budget_requests_state ON <schema>.deuz_budget_requests USING btree (state, created_at)"
+          }
+        ]
+      },
+      "deuz_budget_schema": {
+        "columns": [
+          {
+            "name": "singleton",
+            "type": "integer",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "version",
+            "type": "integer",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          }
+        ],
+        "indexes": [
+          {
+            "name": "deuz_budget_schema_pkey",
+            "definition": "CREATE UNIQUE INDEX deuz_budget_schema_pkey ON <schema>.deuz_budget_schema USING btree (singleton)"
+          }
+        ]
+      },
+      "deuz_budget_scopes": {
+        "columns": [
+          {
+            "name": "key",
+            "type": "text",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "window_ms",
+            "type": "bigint",
+            "notNull": false,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "buckets",
+            "type": "integer",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "bucket_ms",
+            "type": "bigint",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "ring_idx",
+            "type": "ARRAY",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "ring_tokens",
+            "type": "ARRAY",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "ring_usd",
+            "type": "ARRAY",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          }
+        ],
+        "indexes": [
+          {
+            "name": "deuz_budget_scopes_pkey",
+            "definition": "CREATE UNIQUE INDEX deuz_budget_scopes_pkey ON <schema>.deuz_budget_scopes USING btree (key)"
+          }
+        ]
+      }
+    }
+  },
+  "postgres/ops": {
+    "tables": {
+      "deuz_agent_runs": {
+        "columns": [
+          {
+            "name": "run_id",
+            "type": "text",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "scope",
+            "type": "text",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "revision",
+            "type": "bigint",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "payload",
+            "type": "text",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "updated_at",
+            "type": "bigint",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          }
+        ],
+        "indexes": [
+          {
+            "name": "deuz_agent_runs_pkey",
+            "definition": "CREATE UNIQUE INDEX deuz_agent_runs_pkey ON <schema>.deuz_agent_runs USING btree (run_id)"
+          },
+          {
+            "name": "deuz_agent_runs_updated_at",
+            "definition": "CREATE INDEX deuz_agent_runs_updated_at ON <schema>.deuz_agent_runs USING btree (updated_at)"
+          }
+        ]
+      },
+      "deuz_claims": {
+        "columns": [
+          {
+            "name": "key",
+            "type": "text",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "claimed_at",
+            "type": "bigint",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          }
+        ],
+        "indexes": [
+          {
+            "name": "deuz_claims_claimed_at",
+            "definition": "CREATE INDEX deuz_claims_claimed_at ON <schema>.deuz_claims USING btree (claimed_at)"
+          },
+          {
+            "name": "deuz_claims_pkey",
+            "definition": "CREATE UNIQUE INDEX deuz_claims_pkey ON <schema>.deuz_claims USING btree (key)"
+          }
+        ]
+      },
+      "deuz_leases": {
+        "columns": [
+          {
+            "name": "key",
+            "type": "text",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "owner",
+            "type": "text",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "token",
+            "type": "bigint",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "expires_at",
+            "type": "bigint",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "signals",
+            "type": "jsonb",
+            "notNull": true,
+            "default": "'[]'::jsonb",
+            "pk": 0
+          }
+        ],
+        "indexes": [
+          {
+            "name": "deuz_leases_pkey",
+            "definition": "CREATE UNIQUE INDEX deuz_leases_pkey ON <schema>.deuz_leases USING btree (key)"
+          }
+        ]
+      },
+      "deuz_ops_schema": {
+        "columns": [
+          {
+            "name": "singleton",
+            "type": "integer",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "version",
+            "type": "integer",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          }
+        ],
+        "indexes": [
+          {
+            "name": "deuz_ops_schema_pkey",
+            "definition": "CREATE UNIQUE INDEX deuz_ops_schema_pkey ON <schema>.deuz_ops_schema USING btree (singleton)"
+          }
+        ]
+      }
+    }
+  },
+  "postgres/stores": {
+    "tables": {
+      "deuz_chats": {
+        "columns": [
+          {
+            "name": "chat_id",
+            "type": "text",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "user_id",
+            "type": "text",
+            "notNull": false,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "agent_id",
+            "type": "text",
+            "notNull": false,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "run_id",
+            "type": "text",
+            "notNull": false,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "actor_id",
+            "type": "text",
+            "notNull": false,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "scope_chat_id",
+            "type": "text",
+            "notNull": false,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "parent_id",
+            "type": "text",
+            "notNull": false,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "record",
+            "type": "text",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "updated_at",
+            "type": "bigint",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          }
+        ],
+        "indexes": [
+          {
+            "name": "deuz_chats_pkey",
+            "definition": "CREATE UNIQUE INDEX deuz_chats_pkey ON <schema>.deuz_chats USING btree (chat_id)"
+          }
+        ]
+      },
+      "deuz_memory": {
+        "columns": [
+          {
+            "name": "id",
+            "type": "text",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "text",
+            "type": "text",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "hash",
+            "type": "text",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "kind",
+            "type": "text",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "user_id",
+            "type": "text",
+            "notNull": false,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "agent_id",
+            "type": "text",
+            "notNull": false,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "run_id",
+            "type": "text",
+            "notNull": false,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "actor_id",
+            "type": "text",
+            "notNull": false,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "chat_id",
+            "type": "text",
+            "notNull": false,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "importance",
+            "type": "double precision",
+            "notNull": false,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "metadata",
+            "type": "jsonb",
+            "notNull": false,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "embedding_json",
+            "type": "ARRAY",
+            "notNull": false,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "embedding_model_id",
+            "type": "text",
+            "notNull": false,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "created_at",
+            "type": "bigint",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "updated_at",
+            "type": "bigint",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "last_accessed_at",
+            "type": "bigint",
+            "notNull": false,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "expires_at",
+            "type": "bigint",
+            "notNull": false,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "valid_at",
+            "type": "bigint",
+            "notNull": false,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "invalid_at",
+            "type": "bigint",
+            "notNull": false,
+            "default": null,
+            "pk": 0
+          }
+        ],
+        "indexes": [
+          {
+            "name": "deuz_memory_expires_idx",
+            "definition": "CREATE INDEX deuz_memory_expires_idx ON <schema>.deuz_memory USING btree (expires_at) WHERE (expires_at IS NOT NULL)"
+          },
+          {
+            "name": "deuz_memory_hash_idx",
+            "definition": "CREATE INDEX deuz_memory_hash_idx ON <schema>.deuz_memory USING btree (hash)"
+          },
+          {
+            "name": "deuz_memory_pkey",
+            "definition": "CREATE UNIQUE INDEX deuz_memory_pkey ON <schema>.deuz_memory USING btree (id)"
+          },
+          {
+            "name": "deuz_memory_scope_idx",
+            "definition": "CREATE INDEX deuz_memory_scope_idx ON <schema>.deuz_memory USING btree (user_id, agent_id, chat_id)"
+          }
+        ]
+      },
+      "deuz_meta": {
+        "columns": [
+          {
+            "name": "key",
+            "type": "text",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "value",
+            "type": "text",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          }
+        ],
+        "indexes": [
+          {
+            "name": "deuz_meta_pkey",
+            "definition": "CREATE UNIQUE INDEX deuz_meta_pkey ON <schema>.deuz_meta USING btree (key)"
+          }
+        ]
+      },
+      "deuz_runs": {
+        "columns": [
+          {
+            "name": "run_id",
+            "type": "text",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "status",
+            "type": "text",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "record",
+            "type": "jsonb",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "created_at",
+            "type": "bigint",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "updated_at",
+            "type": "bigint",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          }
+        ],
+        "indexes": [
+          {
+            "name": "deuz_runs_pkey",
+            "definition": "CREATE UNIQUE INDEX deuz_runs_pkey ON <schema>.deuz_runs USING btree (run_id)"
+          },
+          {
+            "name": "deuz_runs_status_idx",
+            "definition": "CREATE INDEX deuz_runs_status_idx ON <schema>.deuz_runs USING btree (status)"
+          }
+        ]
+      },
+      "deuz_sessions": {
+        "columns": [
+          {
+            "name": "run_id",
+            "type": "text",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "status",
+            "type": "text",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "step_index",
+            "type": "integer",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "checkpoint",
+            "type": "text",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "created_at",
+            "type": "bigint",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          }
+        ],
+        "indexes": [
+          {
+            "name": "deuz_sessions_pkey",
+            "definition": "CREATE UNIQUE INDEX deuz_sessions_pkey ON <schema>.deuz_sessions USING btree (run_id)"
+          }
+        ]
+      }
+    }
+  },
+  "postgres/swarm": {
+    "tables": {
+      "deuz_swarm_channels": {
+        "columns": [
+          {
+            "name": "scope",
+            "type": "text",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "run_id",
+            "type": "text",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "channel",
+            "type": "text",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "sequence",
+            "type": "bigint",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "entry_id",
+            "type": "text",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "payload",
+            "type": "text",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          }
+        ],
+        "indexes": [
+          {
+            "name": "deuz_swarm_channels_pkey",
+            "definition": "CREATE UNIQUE INDEX deuz_swarm_channels_pkey ON <schema>.deuz_swarm_channels USING btree (scope, run_id, channel, sequence)"
+          },
+          {
+            "name": "deuz_swarm_channels_scope_run_id_entry_id_key",
+            "definition": "CREATE UNIQUE INDEX deuz_swarm_channels_scope_run_id_entry_id_key ON <schema>.deuz_swarm_channels USING btree (scope, run_id, entry_id)"
+          }
+        ]
+      },
+      "deuz_swarm_events": {
+        "columns": [
+          {
+            "name": "scope",
+            "type": "text",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "run_id",
+            "type": "text",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "sequence",
+            "type": "bigint",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "payload",
+            "type": "text",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          }
+        ],
+        "indexes": [
+          {
+            "name": "deuz_swarm_events_pkey",
+            "definition": "CREATE UNIQUE INDEX deuz_swarm_events_pkey ON <schema>.deuz_swarm_events USING btree (scope, run_id, sequence)"
+          }
+        ]
+      },
+      "deuz_swarm_pg_schema": {
+        "columns": [
+          {
+            "name": "singleton",
+            "type": "integer",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "version",
+            "type": "integer",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          }
+        ],
+        "indexes": [
+          {
+            "name": "deuz_swarm_pg_schema_pkey",
+            "definition": "CREATE UNIQUE INDEX deuz_swarm_pg_schema_pkey ON <schema>.deuz_swarm_pg_schema USING btree (singleton)"
+          }
+        ]
+      },
+      "deuz_swarm_runs": {
+        "columns": [
+          {
+            "name": "scope",
+            "type": "text",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "run_id",
+            "type": "text",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "payload",
+            "type": "text",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "status",
+            "type": "text",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "updated_at",
+            "type": "double precision",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "revision",
+            "type": "bigint",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "last_sequence",
+            "type": "bigint",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          }
+        ],
+        "indexes": [
+          {
+            "name": "deuz_swarm_runs_pkey",
+            "definition": "CREATE UNIQUE INDEX deuz_swarm_runs_pkey ON <schema>.deuz_swarm_runs USING btree (scope, run_id)"
+          },
+          {
+            "name": "deuz_swarm_runs_scope_status",
+            "definition": "CREATE INDEX deuz_swarm_runs_scope_status ON <schema>.deuz_swarm_runs USING btree (scope, status, updated_at)"
+          },
+          {
+            "name": "deuz_swarm_runs_status",
+            "definition": "CREATE INDEX deuz_swarm_runs_status ON <schema>.deuz_swarm_runs USING btree (status, updated_at)"
+          }
+        ]
+      },
+      "deuz_swarm_tasks": {
+        "columns": [
+          {
+            "name": "scope",
+            "type": "text",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "run_id",
+            "type": "text",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "task_id",
+            "type": "text",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "ordinal",
+            "type": "integer",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "payload",
+            "type": "text",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          }
+        ],
+        "indexes": [
+          {
+            "name": "deuz_swarm_tasks_pkey",
+            "definition": "CREATE UNIQUE INDEX deuz_swarm_tasks_pkey ON <schema>.deuz_swarm_tasks USING btree (scope, run_id, task_id)"
+          }
+        ]
+      }
+    }
+  },
+  "sqlite/budget": {
+    "tables": {
+      "deuz_budget_schema": {
+        "columns": [
+          {
+            "name": "singleton",
+            "type": "INTEGER",
+            "notNull": false,
+            "default": null,
+            "pk": 1
+          },
+          {
+            "name": "version",
+            "type": "INTEGER",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          }
+        ],
+        "indexes": []
+      },
+      "deuz_budget_scopes": {
+        "columns": [
+          {
+            "name": "key",
+            "type": "TEXT",
+            "notNull": false,
+            "default": null,
+            "pk": 1
+          },
+          {
+            "name": "window_ms",
+            "type": "INTEGER",
+            "notNull": false,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "buckets",
+            "type": "INTEGER",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "bucket_ms",
+            "type": "INTEGER",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          }
+        ],
+        "indexes": [
+          {
+            "name": "sqlite_autoindex_deuz_budget_scopes_1",
+            "definition": "unique:1 origin:pk columns:key"
+          }
+        ]
+      },
+      "deuz_budget_counters": {
+        "columns": [
+          {
+            "name": "key",
+            "type": "TEXT",
+            "notNull": true,
+            "default": null,
+            "pk": 1
+          },
+          {
+            "name": "bucket",
+            "type": "INTEGER",
+            "notNull": true,
+            "default": null,
+            "pk": 2
+          },
+          {
+            "name": "model_id",
+            "type": "TEXT",
+            "notNull": true,
+            "default": null,
+            "pk": 3
+          },
+          {
+            "name": "tokens",
+            "type": "INTEGER",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "usd",
+            "type": "REAL",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          }
+        ],
+        "indexes": [
+          {
+            "name": "sqlite_autoindex_deuz_budget_counters_1",
+            "definition": "unique:1 origin:pk columns:key,bucket,model_id"
+          }
+        ]
+      },
+      "deuz_budget_requests": {
+        "columns": [
+          {
+            "name": "request_id",
+            "type": "TEXT",
+            "notNull": false,
+            "default": null,
+            "pk": 1
+          },
+          {
+            "name": "fingerprint",
+            "type": "TEXT",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "model_id",
+            "type": "TEXT",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "tokens",
+            "type": "INTEGER",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "usd",
+            "type": "REAL",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "state",
+            "type": "TEXT",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "charges",
+            "type": "TEXT",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "actual_tokens",
+            "type": "INTEGER",
+            "notNull": false,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "actual_usd",
+            "type": "REAL",
+            "notNull": false,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "outcome",
+            "type": "TEXT",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "created_at",
+            "type": "INTEGER",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          }
+        ],
+        "indexes": [
+          {
+            "name": "deuz_budget_requests_state",
+            "definition": "unique:0 origin:c columns:state,created_at"
+          },
+          {
+            "name": "sqlite_autoindex_deuz_budget_requests_1",
+            "definition": "unique:1 origin:pk columns:request_id"
+          }
+        ]
+      },
+      "deuz_budget_totals": {
+        "columns": [
+          {
+            "name": "key",
+            "type": "TEXT",
+            "notNull": false,
+            "default": null,
+            "pk": 1
+          },
+          {
+            "name": "tokens",
+            "type": "INTEGER",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "usd",
+            "type": "REAL",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          }
+        ],
+        "indexes": [
+          {
+            "name": "sqlite_autoindex_deuz_budget_totals_1",
+            "definition": "unique:1 origin:pk columns:key"
+          }
+        ]
+      }
+    },
+    "triggers": {
+      "deuz_budget_totals_insert": "CREATE TRIGGER deuz_budget_totals_insert AFTER INSERT ON deuz_budget_counters BEGIN\n      INSERT INTO deuz_budget_totals(key, tokens, usd) VALUES (NEW.key, NEW.tokens, NEW.usd)\n      ON CONFLICT(key) DO UPDATE SET tokens = tokens + excluded.tokens, usd = usd + excluded.usd;\n    END",
+      "deuz_budget_totals_update": "CREATE TRIGGER deuz_budget_totals_update AFTER UPDATE ON deuz_budget_counters BEGIN\n      UPDATE deuz_budget_totals SET tokens = tokens + NEW.tokens - OLD.tokens,\n        usd = usd + NEW.usd - OLD.usd WHERE key = NEW.key;\n    END",
+      "deuz_budget_totals_delete": "CREATE TRIGGER deuz_budget_totals_delete AFTER DELETE ON deuz_budget_counters BEGIN\n      UPDATE deuz_budget_totals SET tokens = tokens - OLD.tokens, usd = usd - OLD.usd\n        WHERE key = OLD.key;\n    END"
+    },
+    "sql": [
+      "CREATE TABLE deuz_budget_schema (singleton INTEGER PRIMARY KEY CHECK(singleton = 1), version INTEGER NOT NULL)",
+      "CREATE TABLE deuz_budget_scopes (\n            key TEXT PRIMARY KEY, window_ms INTEGER, buckets INTEGER NOT NULL, bucket_ms INTEGER NOT NULL)",
+      "CREATE TABLE deuz_budget_counters (\n            key TEXT NOT NULL, bucket INTEGER NOT NULL, model_id TEXT NOT NULL,\n            tokens INTEGER NOT NULL, usd REAL NOT NULL, PRIMARY KEY(key, bucket, model_id))",
+      "CREATE TABLE deuz_budget_requests (\n            request_id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, model_id TEXT NOT NULL,\n            tokens INTEGER NOT NULL, usd REAL NOT NULL, state TEXT NOT NULL, charges TEXT NOT NULL,\n            actual_tokens INTEGER, actual_usd REAL, outcome TEXT NOT NULL, created_at INTEGER NOT NULL)",
+      "CREATE INDEX deuz_budget_requests_state ON deuz_budget_requests(state, created_at)",
+      "CREATE TABLE deuz_budget_totals (key TEXT PRIMARY KEY, tokens INTEGER NOT NULL, usd REAL NOT NULL)",
+      "CREATE TRIGGER deuz_budget_totals_insert AFTER INSERT ON deuz_budget_counters BEGIN\n      INSERT INTO deuz_budget_totals(key, tokens, usd) VALUES (NEW.key, NEW.tokens, NEW.usd)\n      ON CONFLICT(key) DO UPDATE SET tokens = tokens + excluded.tokens, usd = usd + excluded.usd;\n    END",
+      "CREATE TRIGGER deuz_budget_totals_update AFTER UPDATE ON deuz_budget_counters BEGIN\n      UPDATE deuz_budget_totals SET tokens = tokens + NEW.tokens - OLD.tokens,\n        usd = usd + NEW.usd - OLD.usd WHERE key = NEW.key;\n    END",
+      "CREATE TRIGGER deuz_budget_totals_delete AFTER DELETE ON deuz_budget_counters BEGIN\n      UPDATE deuz_budget_totals SET tokens = tokens - OLD.tokens, usd = usd - OLD.usd\n        WHERE key = OLD.key;\n    END"
+    ]
+  },
+  "sqlite/evolve": {
+    "tables": {
+      "deuz_evolve_schema": {
+        "columns": [
+          {
+            "name": "singleton",
+            "type": "INTEGER",
+            "notNull": false,
+            "default": null,
+            "pk": 1
+          },
+          {
+            "name": "version",
+            "type": "INTEGER",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          }
+        ],
+        "indexes": []
+      },
+      "deuz_evolve_runs": {
+        "columns": [
+          {
+            "name": "scope",
+            "type": "TEXT",
+            "notNull": true,
+            "default": null,
+            "pk": 1
+          },
+          {
+            "name": "run_id",
+            "type": "TEXT",
+            "notNull": true,
+            "default": null,
+            "pk": 2
+          },
+          {
+            "name": "generation",
+            "type": "INTEGER",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "status",
+            "type": "TEXT",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "updated_at",
+            "type": "INTEGER",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "payload",
+            "type": "TEXT",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          }
+        ],
+        "indexes": [
+          {
+            "name": "sqlite_autoindex_deuz_evolve_runs_1",
+            "definition": "unique:1 origin:pk columns:scope,run_id"
+          }
+        ]
+      },
+      "deuz_evolve_candidates": {
+        "columns": [
+          {
+            "name": "scope",
+            "type": "TEXT",
+            "notNull": true,
+            "default": null,
+            "pk": 1
+          },
+          {
+            "name": "run_id",
+            "type": "TEXT",
+            "notNull": true,
+            "default": null,
+            "pk": 2
+          },
+          {
+            "name": "candidate_id",
+            "type": "TEXT",
+            "notNull": true,
+            "default": null,
+            "pk": 3
+          },
+          {
+            "name": "generation",
+            "type": "INTEGER",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "island",
+            "type": "INTEGER",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "slot",
+            "type": "INTEGER",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "payload",
+            "type": "TEXT",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          }
+        ],
+        "indexes": [
+          {
+            "name": "deuz_evolve_candidates_order",
+            "definition": "unique:0 origin:c columns:scope,run_id,generation,island,slot"
+          },
+          {
+            "name": "sqlite_autoindex_deuz_evolve_candidates_1",
+            "definition": "unique:1 origin:pk columns:scope,run_id,candidate_id"
+          }
+        ]
+      }
+    },
+    "triggers": {},
+    "sql": [
+      "CREATE TABLE deuz_evolve_schema (singleton INTEGER PRIMARY KEY CHECK(singleton = 1), version INTEGER NOT NULL)",
+      "CREATE TABLE deuz_evolve_runs (\n              scope TEXT NOT NULL, run_id TEXT NOT NULL, generation INTEGER NOT NULL,\n              status TEXT NOT NULL, updated_at INTEGER NOT NULL, payload TEXT NOT NULL,\n              PRIMARY KEY(scope, run_id))",
+      "CREATE TABLE deuz_evolve_candidates (\n              scope TEXT NOT NULL, run_id TEXT NOT NULL, candidate_id TEXT NOT NULL,\n              generation INTEGER NOT NULL, island INTEGER NOT NULL, slot INTEGER NOT NULL,\n              payload TEXT NOT NULL, PRIMARY KEY(scope, run_id, candidate_id))",
+      "CREATE INDEX deuz_evolve_candidates_order\n              ON deuz_evolve_candidates(scope, run_id, generation, island, slot)"
+    ]
+  },
+  "sqlite/ops": {
+    "tables": {
+      "deuz_ops_schema": {
+        "columns": [
+          {
+            "name": "singleton",
+            "type": "INTEGER",
+            "notNull": false,
+            "default": null,
+            "pk": 1
+          },
+          {
+            "name": "version",
+            "type": "INTEGER",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          }
+        ],
+        "indexes": []
+      },
+      "deuz_leases": {
+        "columns": [
+          {
+            "name": "key",
+            "type": "TEXT",
+            "notNull": false,
+            "default": null,
+            "pk": 1
+          },
+          {
+            "name": "owner",
+            "type": "TEXT",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "token",
+            "type": "INTEGER",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "expires_at",
+            "type": "INTEGER",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "signals",
+            "type": "TEXT",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          }
+        ],
+        "indexes": [
+          {
+            "name": "sqlite_autoindex_deuz_leases_1",
+            "definition": "unique:1 origin:pk columns:key"
+          }
+        ]
+      },
+      "deuz_agent_runs": {
+        "columns": [
+          {
+            "name": "run_id",
+            "type": "TEXT",
+            "notNull": false,
+            "default": null,
+            "pk": 1
+          },
+          {
+            "name": "scope",
+            "type": "TEXT",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "revision",
+            "type": "INTEGER",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "payload",
+            "type": "TEXT",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "updated_at",
+            "type": "INTEGER",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          }
+        ],
+        "indexes": [
+          {
+            "name": "deuz_agent_runs_updated_at",
+            "definition": "unique:0 origin:c columns:updated_at"
+          },
+          {
+            "name": "sqlite_autoindex_deuz_agent_runs_1",
+            "definition": "unique:1 origin:pk columns:run_id"
+          }
+        ]
+      },
+      "deuz_claims": {
+        "columns": [
+          {
+            "name": "key",
+            "type": "TEXT",
+            "notNull": false,
+            "default": null,
+            "pk": 1
+          },
+          {
+            "name": "claimed_at",
+            "type": "INTEGER",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          }
+        ],
+        "indexes": [
+          {
+            "name": "deuz_claims_claimed_at",
+            "definition": "unique:0 origin:c columns:claimed_at"
+          },
+          {
+            "name": "sqlite_autoindex_deuz_claims_1",
+            "definition": "unique:1 origin:pk columns:key"
+          }
+        ]
+      }
+    },
+    "triggers": {},
+    "sql": [
+      "CREATE TABLE deuz_ops_schema (singleton INTEGER PRIMARY KEY CHECK(singleton = 1), version INTEGER NOT NULL)",
+      "CREATE TABLE deuz_leases (\n              key TEXT PRIMARY KEY, owner TEXT NOT NULL, token INTEGER NOT NULL,\n              expires_at INTEGER NOT NULL, signals TEXT NOT NULL)",
+      "CREATE TABLE deuz_agent_runs (\n              run_id TEXT PRIMARY KEY, scope TEXT NOT NULL, revision INTEGER NOT NULL,\n              payload TEXT NOT NULL, updated_at INTEGER NOT NULL)",
+      "CREATE TABLE deuz_claims (key TEXT PRIMARY KEY, claimed_at INTEGER NOT NULL)",
+      "CREATE INDEX deuz_claims_claimed_at ON deuz_claims(claimed_at)",
+      "CREATE INDEX deuz_agent_runs_updated_at ON deuz_agent_runs(updated_at)"
+    ]
+  },
+  "sqlite/stores": {
+    "tables": {
+      "deuz_memory": {
+        "columns": [
+          {
+            "name": "id",
+            "type": "TEXT",
+            "notNull": false,
+            "default": null,
+            "pk": 1
+          },
+          {
+            "name": "text",
+            "type": "TEXT",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "hash",
+            "type": "TEXT",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "kind",
+            "type": "TEXT",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "user_id",
+            "type": "TEXT",
+            "notNull": false,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "agent_id",
+            "type": "TEXT",
+            "notNull": false,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "run_id",
+            "type": "TEXT",
+            "notNull": false,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "actor_id",
+            "type": "TEXT",
+            "notNull": false,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "chat_id",
+            "type": "TEXT",
+            "notNull": false,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "importance",
+            "type": "REAL",
+            "notNull": false,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "metadata",
+            "type": "TEXT",
+            "notNull": false,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "embedding",
+            "type": "BLOB",
+            "notNull": false,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "embedding_model_id",
+            "type": "TEXT",
+            "notNull": false,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "created_at",
+            "type": "INTEGER",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "updated_at",
+            "type": "INTEGER",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "last_accessed_at",
+            "type": "INTEGER",
+            "notNull": false,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "expires_at",
+            "type": "INTEGER",
+            "notNull": false,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "valid_at",
+            "type": "INTEGER",
+            "notNull": false,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "invalid_at",
+            "type": "INTEGER",
+            "notNull": false,
+            "default": null,
+            "pk": 0
+          }
+        ],
+        "indexes": [
+          {
+            "name": "deuz_memory_expiry_idx",
+            "definition": "unique:0 origin:c columns:expires_at"
+          },
+          {
+            "name": "deuz_memory_hash_idx",
+            "definition": "unique:0 origin:c columns:hash"
+          },
+          {
+            "name": "deuz_memory_scope_idx",
+            "definition": "unique:0 origin:c columns:user_id,agent_id,chat_id"
+          },
+          {
+            "name": "sqlite_autoindex_deuz_memory_1",
+            "definition": "unique:1 origin:pk columns:id"
+          }
+        ]
+      },
+      "deuz_chats": {
+        "columns": [
+          {
+            "name": "chat_id",
+            "type": "TEXT",
+            "notNull": false,
+            "default": null,
+            "pk": 1
+          },
+          {
+            "name": "user_id",
+            "type": "TEXT",
+            "notNull": false,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "agent_id",
+            "type": "TEXT",
+            "notNull": false,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "run_id",
+            "type": "TEXT",
+            "notNull": false,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "actor_id",
+            "type": "TEXT",
+            "notNull": false,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "scope_chat_id",
+            "type": "TEXT",
+            "notNull": false,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "parent_id",
+            "type": "TEXT",
+            "notNull": false,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "record",
+            "type": "TEXT",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "updated_at",
+            "type": "INTEGER",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          }
+        ],
+        "indexes": [
+          {
+            "name": "deuz_chats_scope_idx",
+            "definition": "unique:0 origin:c columns:user_id,agent_id,scope_chat_id"
+          },
+          {
+            "name": "sqlite_autoindex_deuz_chats_1",
+            "definition": "unique:1 origin:pk columns:chat_id"
+          }
+        ]
+      },
+      "deuz_sessions": {
+        "columns": [
+          {
+            "name": "run_id",
+            "type": "TEXT",
+            "notNull": false,
+            "default": null,
+            "pk": 1
+          },
+          {
+            "name": "status",
+            "type": "TEXT",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "step_index",
+            "type": "INTEGER",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "checkpoint",
+            "type": "TEXT",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "created_at",
+            "type": "INTEGER",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          }
+        ],
+        "indexes": [
+          {
+            "name": "sqlite_autoindex_deuz_sessions_1",
+            "definition": "unique:1 origin:pk columns:run_id"
+          }
+        ]
+      },
+      "deuz_runs": {
+        "columns": [
+          {
+            "name": "run_id",
+            "type": "TEXT",
+            "notNull": false,
+            "default": null,
+            "pk": 1
+          },
+          {
+            "name": "status",
+            "type": "TEXT",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "record",
+            "type": "TEXT",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "created_at",
+            "type": "INTEGER",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "updated_at",
+            "type": "INTEGER",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          }
+        ],
+        "indexes": [
+          {
+            "name": "deuz_runs_status_idx",
+            "definition": "unique:0 origin:c columns:status"
+          },
+          {
+            "name": "sqlite_autoindex_deuz_runs_1",
+            "definition": "unique:1 origin:pk columns:run_id"
+          }
+        ]
+      },
+      "deuz_memory_fts": {
+        "columns": [
+          {
+            "name": "text",
+            "type": "",
+            "notNull": false,
+            "default": null,
+            "pk": 0
+          }
+        ],
+        "indexes": []
+      }
+    },
+    "triggers": {
+      "deuz_memory_fts_ai": "CREATE TRIGGER deuz_memory_fts_ai AFTER INSERT ON deuz_memory BEGIN\n  INSERT INTO deuz_memory_fts(rowid, text) VALUES (new.rowid, new.text);\nEND",
+      "deuz_memory_fts_ad": "CREATE TRIGGER deuz_memory_fts_ad AFTER DELETE ON deuz_memory BEGIN\n  INSERT INTO deuz_memory_fts(deuz_memory_fts, rowid, text) VALUES ('delete', old.rowid, old.text);\nEND",
+      "deuz_memory_fts_au": "CREATE TRIGGER deuz_memory_fts_au AFTER UPDATE OF text ON deuz_memory BEGIN\n  INSERT INTO deuz_memory_fts(deuz_memory_fts, rowid, text) VALUES ('delete', old.rowid, old.text);\n  INSERT INTO deuz_memory_fts(rowid, text) VALUES (new.rowid, new.text);\nEND"
+    },
+    "sql": [
+      "CREATE TABLE deuz_memory (\n  id TEXT PRIMARY KEY,\n  text TEXT NOT NULL,\n  hash TEXT NOT NULL,\n  kind TEXT NOT NULL,\n  user_id TEXT,\n  agent_id TEXT,\n  run_id TEXT,\n  actor_id TEXT,\n  chat_id TEXT,\n  importance REAL,\n  metadata TEXT,\n  embedding BLOB,\n  embedding_model_id TEXT,\n  created_at INTEGER NOT NULL,\n  updated_at INTEGER NOT NULL,\n  last_accessed_at INTEGER,\n  expires_at INTEGER,\n  valid_at INTEGER,\n  invalid_at INTEGER\n)",
+      "CREATE INDEX deuz_memory_scope_idx ON deuz_memory (user_id, agent_id, chat_id)",
+      "CREATE INDEX deuz_memory_hash_idx ON deuz_memory (hash)",
+      "CREATE INDEX deuz_memory_expiry_idx ON deuz_memory (expires_at)\n  WHERE expires_at IS NOT NULL",
+      "CREATE TABLE deuz_chats (\n  chat_id TEXT PRIMARY KEY,\n  user_id TEXT,\n  agent_id TEXT,\n  run_id TEXT,\n  actor_id TEXT,\n  scope_chat_id TEXT,\n  parent_id TEXT,\n  record TEXT NOT NULL,\n  updated_at INTEGER NOT NULL\n)",
+      "CREATE INDEX deuz_chats_scope_idx ON deuz_chats (user_id, agent_id, scope_chat_id)",
+      "CREATE TABLE deuz_sessions (\n  run_id TEXT PRIMARY KEY,\n  status TEXT NOT NULL,\n  step_index INTEGER NOT NULL,\n  checkpoint TEXT NOT NULL,\n  created_at INTEGER NOT NULL\n)",
+      "CREATE TABLE deuz_runs (\n  run_id TEXT PRIMARY KEY,\n  status TEXT NOT NULL,\n  record TEXT NOT NULL,\n  created_at INTEGER NOT NULL,\n  updated_at INTEGER NOT NULL\n)",
+      "CREATE INDEX deuz_runs_status_idx ON deuz_runs (status)",
+      "CREATE VIRTUAL TABLE deuz_memory_fts\n  USING fts5(text, content='deuz_memory', content_rowid='rowid')",
+      "CREATE TRIGGER deuz_memory_fts_ai AFTER INSERT ON deuz_memory BEGIN\n  INSERT INTO deuz_memory_fts(rowid, text) VALUES (new.rowid, new.text);\nEND",
+      "CREATE TRIGGER deuz_memory_fts_ad AFTER DELETE ON deuz_memory BEGIN\n  INSERT INTO deuz_memory_fts(deuz_memory_fts, rowid, text) VALUES ('delete', old.rowid, old.text);\nEND",
+      "CREATE TRIGGER deuz_memory_fts_au AFTER UPDATE OF text ON deuz_memory BEGIN\n  INSERT INTO deuz_memory_fts(deuz_memory_fts, rowid, text) VALUES ('delete', old.rowid, old.text);\n  INSERT INTO deuz_memory_fts(rowid, text) VALUES (new.rowid, new.text);\nEND"
+    ]
+  },
+  "sqlite/swarm": {
+    "tables": {
+      "deuz_swarm_schema": {
+        "columns": [
+          {
+            "name": "singleton",
+            "type": "INTEGER",
+            "notNull": false,
+            "default": null,
+            "pk": 1
+          },
+          {
+            "name": "version",
+            "type": "INTEGER",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          }
+        ],
+        "indexes": []
+      },
+      "deuz_swarm_runs": {
+        "columns": [
+          {
+            "name": "scope",
+            "type": "TEXT",
+            "notNull": true,
+            "default": null,
+            "pk": 1
+          },
+          {
+            "name": "run_id",
+            "type": "TEXT",
+            "notNull": true,
+            "default": null,
+            "pk": 2
+          },
+          {
+            "name": "payload",
+            "type": "TEXT",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "status",
+            "type": "TEXT",
+            "notNull": false,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "updated_at",
+            "type": "INTEGER",
+            "notNull": false,
+            "default": null,
+            "pk": 0
+          }
+        ],
+        "indexes": [
+          {
+            "name": "deuz_swarm_runs_settled",
+            "definition": "unique:0 origin:c columns:status,updated_at"
+          },
+          {
+            "name": "deuz_swarm_runs_status",
+            "definition": "unique:0 origin:c columns:scope,status,updated_at"
+          },
+          {
+            "name": "sqlite_autoindex_deuz_swarm_runs_1",
+            "definition": "unique:1 origin:pk columns:scope,run_id"
+          }
+        ]
+      },
+      "deuz_swarm_tasks": {
+        "columns": [
+          {
+            "name": "scope",
+            "type": "TEXT",
+            "notNull": true,
+            "default": null,
+            "pk": 1
+          },
+          {
+            "name": "run_id",
+            "type": "TEXT",
+            "notNull": true,
+            "default": null,
+            "pk": 2
+          },
+          {
+            "name": "task_id",
+            "type": "TEXT",
+            "notNull": true,
+            "default": null,
+            "pk": 3
+          },
+          {
+            "name": "ordinal",
+            "type": "INTEGER",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "payload",
+            "type": "TEXT",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          }
+        ],
+        "indexes": [
+          {
+            "name": "sqlite_autoindex_deuz_swarm_tasks_1",
+            "definition": "unique:1 origin:pk columns:scope,run_id,task_id"
+          }
+        ]
+      },
+      "deuz_swarm_events": {
+        "columns": [
+          {
+            "name": "scope",
+            "type": "TEXT",
+            "notNull": true,
+            "default": null,
+            "pk": 1
+          },
+          {
+            "name": "run_id",
+            "type": "TEXT",
+            "notNull": true,
+            "default": null,
+            "pk": 2
+          },
+          {
+            "name": "sequence",
+            "type": "INTEGER",
+            "notNull": true,
+            "default": null,
+            "pk": 3
+          },
+          {
+            "name": "payload",
+            "type": "TEXT",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          }
+        ],
+        "indexes": [
+          {
+            "name": "sqlite_autoindex_deuz_swarm_events_1",
+            "definition": "unique:1 origin:pk columns:scope,run_id,sequence"
+          }
+        ]
+      },
+      "deuz_swarm_channels": {
+        "columns": [
+          {
+            "name": "scope",
+            "type": "TEXT",
+            "notNull": true,
+            "default": null,
+            "pk": 1
+          },
+          {
+            "name": "run_id",
+            "type": "TEXT",
+            "notNull": true,
+            "default": null,
+            "pk": 2
+          },
+          {
+            "name": "channel",
+            "type": "TEXT",
+            "notNull": true,
+            "default": null,
+            "pk": 3
+          },
+          {
+            "name": "sequence",
+            "type": "INTEGER",
+            "notNull": true,
+            "default": null,
+            "pk": 4
+          },
+          {
+            "name": "entry_id",
+            "type": "TEXT",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          },
+          {
+            "name": "payload",
+            "type": "TEXT",
+            "notNull": true,
+            "default": null,
+            "pk": 0
+          }
+        ],
+        "indexes": [
+          {
+            "name": "sqlite_autoindex_deuz_swarm_channels_1",
+            "definition": "unique:1 origin:pk columns:scope,run_id,channel,sequence"
+          },
+          {
+            "name": "sqlite_autoindex_deuz_swarm_channels_2",
+            "definition": "unique:1 origin:u columns:scope,run_id,entry_id"
+          }
+        ]
+      }
+    },
+    "triggers": {},
+    "sql": [
+      "CREATE TABLE deuz_swarm_schema (singleton INTEGER PRIMARY KEY CHECK(singleton = 1), version INTEGER NOT NULL)",
+      "CREATE TABLE deuz_swarm_runs (\n            scope TEXT NOT NULL, run_id TEXT NOT NULL, payload TEXT NOT NULL,\n            status TEXT, updated_at INTEGER, PRIMARY KEY(scope, run_id))",
+      "CREATE TABLE deuz_swarm_tasks (\n            scope TEXT NOT NULL, run_id TEXT NOT NULL, task_id TEXT NOT NULL, ordinal INTEGER NOT NULL,\n            payload TEXT NOT NULL, PRIMARY KEY(scope, run_id, task_id))",
+      "CREATE TABLE deuz_swarm_events (\n            scope TEXT NOT NULL, run_id TEXT NOT NULL, sequence INTEGER NOT NULL, payload TEXT NOT NULL,\n            PRIMARY KEY(scope, run_id, sequence))",
+      "CREATE TABLE deuz_swarm_channels (\n    scope TEXT NOT NULL, run_id TEXT NOT NULL, channel TEXT NOT NULL, sequence INTEGER NOT NULL,\n    entry_id TEXT NOT NULL, payload TEXT NOT NULL,\n    PRIMARY KEY(scope, run_id, channel, sequence), UNIQUE(scope, run_id, entry_id))",
+      "CREATE INDEX deuz_swarm_runs_status ON deuz_swarm_runs(scope, status, updated_at)",
+      "CREATE INDEX deuz_swarm_runs_settled ON deuz_swarm_runs(status, updated_at)"
+    ]
+  }
+}

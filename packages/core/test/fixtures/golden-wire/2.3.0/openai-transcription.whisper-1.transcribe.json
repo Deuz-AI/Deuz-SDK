@@ -1,0 +1,35 @@
+{
+  "scenario": "openai-transcription.whisper-1.transcribe",
+  "recordedFrom": "2.3.0",
+  "requests": [
+    {
+      "method": "POST",
+      "url": "https://api.openai.com/v1/audio/transcriptions",
+      "headers": {
+        "authorization": "Bearer <secret>"
+      },
+      "form": [
+        {
+          "name": "file",
+          "file": {
+            "name": "audio.mp3",
+            "type": "audio/mpeg",
+            "base64": "SUQzBAAAAAA="
+          }
+        },
+        {
+          "name": "model",
+          "value": "whisper-1"
+        },
+        {
+          "name": "language",
+          "value": "en"
+        },
+        {
+          "name": "response_format",
+          "value": "json"
+        }
+      ]
+    }
+  ]
+}

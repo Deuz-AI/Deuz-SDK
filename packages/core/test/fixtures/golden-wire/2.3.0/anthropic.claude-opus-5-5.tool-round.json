@@ -1,0 +1,119 @@
+{
+  "scenario": "anthropic.claude-opus-5-5.tool-round",
+  "recordedFrom": "2.3.0",
+  "requests": [
+    {
+      "method": "POST",
+      "url": "https://api.anthropic.com/v1/messages",
+      "headers": {
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+        "x-api-key": "<secret>"
+      },
+      "json": {
+        "model": "claude-opus-5-5",
+        "max_tokens": 128000,
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "What is the weather in Paris?"
+              }
+            ]
+          }
+        ],
+        "stream": true,
+        "tools": [
+          {
+            "name": "get_weather",
+            "description": "Current weather for a city.",
+            "input_schema": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string",
+                  "description": "The city name."
+                }
+              },
+              "required": ["city"],
+              "additionalProperties": false
+            }
+          }
+        ],
+        "tool_choice": {
+          "type": "auto"
+        }
+      }
+    },
+    {
+      "method": "POST",
+      "url": "https://api.anthropic.com/v1/messages",
+      "headers": {
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+        "x-api-key": "<secret>"
+      },
+      "json": {
+        "model": "claude-opus-5-5",
+        "max_tokens": 128000,
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "What is the weather in Paris?"
+              }
+            ]
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "tool_use",
+                "id": "call_golden_1",
+                "name": "get_weather",
+                "input": {
+                  "city": "Paris"
+                }
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "tool_result",
+                "tool_use_id": "call_golden_1",
+                "content": "{\"city\":\"Paris\",\"tempC\":21,\"sky\":\"clear\"}"
+              }
+            ]
+          }
+        ],
+        "stream": true,
+        "tools": [
+          {
+            "name": "get_weather",
+            "description": "Current weather for a city.",
+            "input_schema": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string",
+                  "description": "The city name."
+                }
+              },
+              "required": ["city"],
+              "additionalProperties": false
+            }
+          }
+        ],
+        "tool_choice": {
+          "type": "auto"
+        }
+      }
+    }
+  ]
+}

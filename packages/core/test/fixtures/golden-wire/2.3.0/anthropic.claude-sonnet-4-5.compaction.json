@@ -1,0 +1,133 @@
+{
+  "scenario": "anthropic.claude-sonnet-4-5.compaction",
+  "recordedFrom": "2.3.0",
+  "requests": [
+    {
+      "method": "POST",
+      "url": "https://api.anthropic.com/v1/messages",
+      "headers": {
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+        "x-api-key": "<secret>"
+      },
+      "json": {
+        "model": "claude-sonnet-4-5",
+        "max_tokens": 64000,
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "What is the weather in Paris?"
+              }
+            ]
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "tool_use",
+                "id": "call_paris",
+                "name": "get_weather",
+                "input": {
+                  "city": "Paris"
+                }
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "tool_result",
+                "tool_use_id": "call_paris",
+                "content": "[pruned 27 chars]"
+              }
+            ]
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "text",
+                "text": "It is 21 °C in Paris."
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "And in Rome?"
+              }
+            ]
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "tool_use",
+                "id": "call_rome",
+                "name": "get_weather",
+                "input": {
+                  "city": "Rome"
+                }
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "tool_result",
+                "tool_use_id": "call_rome",
+                "content": "[pruned 26 chars]"
+              }
+            ]
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "text",
+                "text": "It is 25 °C in Rome."
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "Which city is warmer?"
+              }
+            ]
+          }
+        ],
+        "stream": true,
+        "tools": [
+          {
+            "name": "get_weather",
+            "description": "Current weather for a city.",
+            "input_schema": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string",
+                  "description": "The city name."
+                }
+              },
+              "required": ["city"],
+              "additionalProperties": false
+            }
+          }
+        ],
+        "tool_choice": {
+          "type": "auto"
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,39 @@
+{
+  "scenario": "google-compat.gemini-2.5-flash.image-input",
+  "recordedFrom": "2.3.0",
+  "requests": [
+    {
+      "method": "POST",
+      "url": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+      "headers": {
+        "authorization": "Bearer <secret>",
+        "content-type": "application/json"
+      },
+      "json": {
+        "model": "gemini-2.5-flash",
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "Describe this image."
+              },
+              {
+                "type": "image_url",
+                "image_url": {
+                  "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII="
+                }
+              }
+            ]
+          }
+        ],
+        "stream": true,
+        "max_tokens": 64000,
+        "stream_options": {
+          "include_usage": true
+        }
+      }
+    }
+  ]
+}

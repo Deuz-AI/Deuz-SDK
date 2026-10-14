@@ -1,0 +1,43 @@
+{
+  "scenario": "google-native.gemini-2.5-flash.generate-object",
+  "recordedFrom": "2.3.0",
+  "requests": [
+    {
+      "method": "POST",
+      "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse",
+      "headers": {
+        "content-type": "application/json",
+        "x-goog-api-key": "<secret>"
+      },
+      "json": {
+        "contents": [
+          {
+            "role": "user",
+            "parts": [
+              {
+                "text": "Report the weather in Paris."
+              }
+            ]
+          }
+        ],
+        "generationConfig": {
+          "maxOutputTokens": 64000,
+          "responseMimeType": "application/json",
+          "responseSchema": {
+            "type": "OBJECT",
+            "properties": {
+              "city": {
+                "type": "STRING"
+              },
+              "tempC": {
+                "type": "NUMBER"
+              }
+            },
+            "propertyOrdering": ["city", "tempC"],
+            "required": ["city", "tempC"]
+          }
+        }
+      }
+    }
+  ]
+}

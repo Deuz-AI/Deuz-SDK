@@ -1,0 +1,32 @@
+{
+  "scenario": "hyperbolic.moonshotai-Kimi-K2-Instruct.generate-text",
+  "recordedFrom": "2.3.0",
+  "requests": [
+    {
+      "method": "POST",
+      "url": "https://api.hyperbolic.xyz/v1/chat/completions",
+      "headers": {
+        "authorization": "Bearer <secret>",
+        "content-type": "application/json"
+      },
+      "json": {
+        "model": "moonshotai/Kimi-K2-Instruct",
+        "messages": [
+          {
+            "role": "system",
+            "content": "You are a concise assistant."
+          },
+          {
+            "role": "user",
+            "content": "Say hello."
+          }
+        ],
+        "stream": true,
+        "max_tokens": 8192,
+        "stream_options": {
+          "include_usage": true
+        }
+      }
+    }
+  ]
+}

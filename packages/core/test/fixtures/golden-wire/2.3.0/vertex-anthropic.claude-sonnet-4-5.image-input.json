@@ -1,0 +1,38 @@
+{
+  "scenario": "vertex-anthropic.claude-sonnet-4-5.image-input",
+  "recordedFrom": "2.3.0",
+  "requests": [
+    {
+      "method": "POST",
+      "url": "https://us-east5-aiplatform.googleapis.com/v1/projects/golden-project/locations/us-east5/publishers/anthropic/models/claude-sonnet-4-5:streamRawPredict",
+      "headers": {
+        "authorization": "Bearer <secret>",
+        "content-type": "application/json"
+      },
+      "json": {
+        "max_tokens": 64000,
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "Describe this image."
+              },
+              {
+                "type": "image",
+                "source": {
+                  "type": "base64",
+                  "media_type": "image/png",
+                  "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII="
+                }
+              }
+            ]
+          }
+        ],
+        "stream": true,
+        "anthropic_version": "vertex-2023-10-16"
+      }
+    }
+  ]
+}

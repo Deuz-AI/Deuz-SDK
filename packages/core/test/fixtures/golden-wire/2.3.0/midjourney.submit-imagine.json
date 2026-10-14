@@ -1,0 +1,17 @@
+{
+  "scenario": "midjourney.submit-imagine",
+  "recordedFrom": "2.3.0",
+  "requests": [
+    {
+      "method": "POST",
+      "url": "https://yunwu.ai/mj/submit/imagine",
+      "headers": {
+        "authorization": "Bearer <secret>",
+        "content-type": "application/json"
+      },
+      "json": {
+        "prompt": "A lighthouse at dusk --ar 16:9"
+      }
+    }
+  ]
+}

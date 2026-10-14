@@ -1,0 +1,20 @@
+{
+  "scenario": "openai-speech.gpt-4o-mini-tts.generate-speech",
+  "recordedFrom": "2.3.0",
+  "requests": [
+    {
+      "method": "POST",
+      "url": "https://api.openai.com/v1/audio/speech",
+      "headers": {
+        "authorization": "Bearer <secret>",
+        "content-type": "application/json"
+      },
+      "json": {
+        "model": "gpt-4o-mini-tts",
+        "input": "Hello there.",
+        "voice": "alloy",
+        "response_format": "mp3"
+      }
+    }
+  ]
+}

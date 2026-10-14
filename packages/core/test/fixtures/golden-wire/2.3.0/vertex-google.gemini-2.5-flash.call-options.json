@@ -1,0 +1,31 @@
+{
+  "scenario": "vertex-google.gemini-2.5-flash.call-options",
+  "recordedFrom": "2.3.0",
+  "requests": [
+    {
+      "method": "POST",
+      "url": "https://us-central1-aiplatform.googleapis.com/v1beta1/projects/golden-project/locations/us-central1/endpoints/openapi/chat/completions",
+      "headers": {
+        "authorization": "Bearer <secret>",
+        "content-type": "application/json"
+      },
+      "json": {
+        "model": "google/gemini-2.5-flash",
+        "messages": [
+          {
+            "role": "user",
+            "content": "Say hello."
+          }
+        ],
+        "stream": true,
+        "max_tokens": 256,
+        "temperature": 0.2,
+        "top_p": 0.9,
+        "stop": ["END"],
+        "stream_options": {
+          "include_usage": true
+        }
+      }
+    }
+  ]
+}

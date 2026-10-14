@@ -1,0 +1,55 @@
+{
+  "scenario": "openai-compatible.gateway-model.generate-object",
+  "recordedFrom": "2.3.0",
+  "requests": [
+    {
+      "method": "POST",
+      "url": "https://gateway.example.test/v1/chat/completions",
+      "headers": {
+        "authorization": "Bearer <secret>",
+        "content-type": "application/json"
+      },
+      "json": {
+        "model": "gateway-model",
+        "messages": [
+          {
+            "role": "user",
+            "content": "Report the weather in Paris."
+          }
+        ],
+        "stream": true,
+        "stream_options": {
+          "include_usage": true
+        },
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "weather",
+              "description": "Return the structured result.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "city": {
+                    "type": "string"
+                  },
+                  "tempC": {
+                    "type": "number"
+                  }
+                },
+                "required": ["city", "tempC"],
+                "additionalProperties": false
+              }
+            }
+          }
+        ],
+        "tool_choice": {
+          "type": "function",
+          "function": {
+            "name": "weather"
+          }
+        }
+      }
+    }
+  ]
+}

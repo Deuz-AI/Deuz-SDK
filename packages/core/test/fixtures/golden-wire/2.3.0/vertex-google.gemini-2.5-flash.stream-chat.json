@@ -1,0 +1,35 @@
+{
+  "scenario": "vertex-google.gemini-2.5-flash.stream-chat",
+  "recordedFrom": "2.3.0",
+  "requests": [
+    {
+      "method": "POST",
+      "url": "https://us-central1-aiplatform.googleapis.com/v1beta1/projects/golden-project/locations/us-central1/endpoints/openapi/chat/completions",
+      "headers": {
+        "authorization": "Bearer <secret>",
+        "content-type": "application/json"
+      },
+      "json": {
+        "model": "google/gemini-2.5-flash",
+        "messages": [
+          {
+            "role": "user",
+            "content": "What is 2 + 2?"
+          },
+          {
+            "role": "assistant",
+            "content": "4"
+          },
+          {
+            "role": "user",
+            "content": "And 3 + 3?"
+          }
+        ],
+        "stream": true,
+        "stream_options": {
+          "include_usage": true
+        }
+      }
+    }
+  ]
+}
