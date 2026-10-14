@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
 import { spawn } from 'node:child_process';
 import { mkdir, mkdtemp, realpath, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -291,6 +291,60 @@ describe('createNodeSandbox — timeout and abort stay bounded when a grandchild
     expect(res.timedOut).toBe(true);
     expect(res.exitCode).toBeNull();
     expect(Date.now() - t0).toBeLessThan(5_000);
+  }, 15_000);
+});
+
+describe('createNodeSandbox — a timeout or abort kills the whole process tree (2.4)', () => {
+  // Before 2.4 only the direct child got SIGKILL: a program the shell (or the
+  // code) had started lived on and kept doing things after the run "ended".
+  // Now POSIX kills the child's process group and Windows runs taskkill /T /F.
+  let dir: string;
+  beforeAll(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'deuz-tree-'));
+    // Writes `marker` after 1.5 s unless it is killed first.
+    await writeFile(
+      join(dir, 'late.cjs'),
+      "setTimeout(()=>require('fs').writeFileSync(require('path').join(__dirname,'marker'),'x'),1500)",
+    );
+  });
+  afterAll(async () => {
+    await rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 20 });
+  });
+  beforeEach(async () => {
+    await rm(join(dir, 'marker'), { force: true });
+  });
+
+  const markerWritten = async (): Promise<boolean> => {
+    await new Promise((resolve) => setTimeout(resolve, 2_500));
+    return stat(join(dir, 'marker')).then(
+      () => true,
+      () => false,
+    );
+  };
+
+  it('runShell: the program the shell started dies with it', async () => {
+    const res = await createNodeSandbox({ cwd: dir }).runShell!({
+      command: 'node late.cjs && echo done',
+      timeoutMs: 500,
+    });
+    expect(res.timedOut).toBe(true);
+    expect(await markerWritten()).toBe(false);
+  }, 15_000);
+
+  // On Windows libuv already ends a node child's own children with it (a
+  // kill-on-close job object), so this one discriminates on POSIX; the runShell
+  // case above, where cmd.exe starts the program, discriminates on both.
+  it('runCode: a child the code spawned dies with it on abort', async () => {
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(), 500);
+    const res = await createNodeSandbox({ cwd: dir }).runCode({
+      language: 'node',
+      code: "require('child_process').spawn(process.execPath,['late.cjs'],{stdio:'inherit'});setInterval(()=>{},1000)",
+      timeoutMs: 20_000,
+      signal: controller.signal,
+    });
+    expect(res.timedOut).toBe(true);
+    expect(await markerWritten()).toBe(false);
   }, 15_000);
 });
 

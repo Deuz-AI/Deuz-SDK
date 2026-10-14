@@ -33,6 +33,7 @@ interface Writable {
   once(event: 'drain', listener: () => void): void;
 }
 interface ChildProcessLike {
+  pid?: number;
   stdout: Readable | null;
   stderr: Readable | null;
   stdin: Writable | null;
@@ -47,7 +48,9 @@ interface ChildProcessModule {
     options: {
       cwd?: string;
       env?: Record<string, string | undefined>;
-      stdio: ['ignore' | 'pipe', 'pipe', 'pipe'];
+      stdio: ['ignore' | 'pipe', 'pipe' | 'ignore', 'pipe' | 'ignore'];
+      windowsHide?: boolean;
+      detached?: boolean;
     },
   ): ChildProcessLike;
 }
@@ -57,6 +60,7 @@ interface NodeProcess {
   env: Record<string, string | undefined>;
   platform: string;
   cwd(): string;
+  kill(pid: number, signal?: string): boolean;
 }
 
 /** Minimal `node:path` / `node:fs/promises` shapes for the cwd check (H3). */
@@ -196,6 +200,8 @@ function buildEnv(
 }
 
 interface ExecInput {
+  /** The host process: its platform picks the tree kill, POSIX group kill goes through it. */
+  host: NodeProcess;
   command: string;
   args: string[];
   cwd?: string;
@@ -223,6 +229,54 @@ const STDIN_CHUNK_BYTES = 64 * 1024;
  * program to exit on its own, so the timeout bounded nothing.
  */
 const KILL_GRACE_MS = 500;
+
+/**
+ * Kills `child` and every process it started (2.4). Before 2.4 only the child
+ * got SIGKILL, so a program the shell or the code had started lived on. On
+ * POSIX the child leads its own process group (`detached`), so one signal to
+ * the group reaches the whole tree. Windows has no process groups: `taskkill
+ * /T /F` walks the tree, which it can only do while the child is alive, so the
+ * child is killed directly only when taskkill cannot run.
+ */
+function killProcessTree(
+  spawn: ChildProcessModule['spawn'],
+  host: NodeProcess,
+  child: ChildProcessLike,
+): void {
+  const pid = child.pid;
+  if (pid === undefined) {
+    child.kill('SIGKILL');
+    return;
+  }
+  if (host.platform !== 'win32') {
+    try {
+      host.kill(-pid, 'SIGKILL');
+    } catch {
+      child.kill('SIGKILL');
+    }
+    return;
+  }
+  const systemRoot = host.env.SystemRoot ?? host.env.SYSTEMROOT;
+  const taskkill = systemRoot ? `${systemRoot}\\System32\\taskkill.exe` : 'taskkill';
+  let fallback = false;
+  const directly = (): void => {
+    if (fallback) return;
+    fallback = true;
+    child.kill('SIGKILL');
+  };
+  try {
+    const killer = spawn(taskkill, ['/PID', String(pid), '/T', '/F'], {
+      stdio: ['ignore', 'ignore', 'ignore'],
+      windowsHide: true,
+    });
+    killer.on('error', directly);
+    killer.on('exit', (code) => {
+      if (code !== 0) directly();
+    });
+  } catch {
+    directly();
+  }
+}
 
 /**
  * Feed `text` to the child's stdin as UTF-8, then close it (EOF).
@@ -289,6 +343,10 @@ async function execProcess(
         // No stdin given: the null device, not a pipe nobody ever closes (a
         // program reading to EOF used to wait out the whole timeout, F10).
         stdio: [input.stdin === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'],
+        // 2.4: no console window flashes up on Windows, and on POSIX the child
+        // leads its own process group so a kill reaches everything it started.
+        windowsHide: true,
+        detached: input.host.platform !== 'win32',
       });
     } catch (err) {
       resolve({
@@ -336,11 +394,11 @@ async function execProcess(
       return decoder.decode(merged);
     };
 
-    // Timeout and abort both kill the child and report `timedOut: true`.
+    // Timeout and abort both kill the child's process tree and report `timedOut: true`.
     const kill = (): void => {
       if (settled || timedOut) return;
       timedOut = true;
-      child.kill('SIGKILL');
+      killProcessTree(spawn, input.host, child);
       graceTimer = setTimeout(() => finish(exitCode), KILL_GRACE_MS);
     };
     const timer = setTimeout(kill, input.timeoutMs);
@@ -385,9 +443,14 @@ async function execProcess(
  * `runCode` and `runShell` take the same `stdin`: omitted, the child's stdin is
  * the null device (a read sees EOF at once); a string, `''` included, is piped
  * as UTF-8 and then closed. Neither offers interactive input. A timeout or abort
- * kills the spawned process and settles within a short grace period even when a
- * program it started still holds the output pipes; that program is NOT killed
- * (one more reason this is not an isolation boundary).
+ * kills the spawned process and every process it started (2.4: the process
+ * group on POSIX, `taskkill /T /F` on Windows) and settles within a short grace
+ * period even if a program escaped the tree (a daemon that started its own
+ * group or session) and still holds the output pipes. Children run with
+ * `windowsHide`. On POSIX each child leads its own process group, so a
+ * terminal's Ctrl-C reaches the host but not the child: the host's own exit
+ * does not end a running child (one more reason this is not an isolation
+ * boundary).
  *
  * `runShell`'s `cwd` is confined to the sandbox root, `options.cwd` or else the
  * host's working directory (H3, 2.4): relative paths resolve against it, and a
@@ -419,6 +482,7 @@ export function createNodeSandbox(options: NodeSandboxOptions = {}): ComputeSand
       }
       const [spawn, proc] = await Promise.all([loadSpawn(), loadProcess()]);
       return execProcess(spawn, {
+        host: proc,
         command: interpreter.command,
         args: interpreter.args(request.code),
         ...(options.cwd !== undefined ? { cwd: options.cwd } : {}),
@@ -454,6 +518,7 @@ export function createNodeSandbox(options: NodeSandboxOptions = {}): ComputeSand
         cwd = resolved.cwd;
       }
       return execProcess(spawn, {
+        host: proc,
         command: shellCommand,
         args: shellArgs,
         ...(cwd !== undefined ? { cwd } : {}),
