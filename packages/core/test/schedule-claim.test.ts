@@ -16,6 +16,7 @@ import {
   scheduleClaimPruneContracts,
 } from './fixtures/schedule-claim-conformance';
 import { manualClock } from './fixtures/manual-clock';
+import { SLOW_TEST_TIMEOUT_MS } from './fixtures/timeouts';
 
 const sha256 = (text: string) =>
   `sha256:${createHash('sha256').update(text, 'utf8').digest('hex')}`;
@@ -102,27 +103,31 @@ describe.skipIf(!DatabaseSync)('SQLite ops store claims', () => {
     return { claim: ops.claims, advance, now: () => clock.now() };
   });
 
-  it('shares claims between two connections on one file and keeps them across a reopen', async () => {
-    const path = await tempFile();
-    const a = sqliteOps(path);
-    const b = sqliteOps(path);
-    expect(await a.claims('digest@1')).toBe(true);
-    expect(await b.claims('digest@1')).toBe(false);
-    await b.claims.release('digest@1');
-    expect(await a.claims('digest@1')).toBe(true);
-    const results = await Promise.all([
-      a.claims('race'),
-      b.claims('race'),
-      a.claims('race'),
-      b.claims('race'),
-    ]);
-    expect(results.filter(Boolean)).toHaveLength(1);
-    await a.close();
-    await b.close();
-    const reopened = sqliteOps(path);
-    expect(await reopened.claims('digest@1')).toBe(false);
-    expect(await reopened.claims('race')).toBe(false);
-  }, 30_000); // two connections and a reopen on one file: slow on a hosted Windows runner
+  it(
+    'shares claims between two connections on one file and keeps them across a reopen',
+    async () => {
+      const path = await tempFile();
+      const a = sqliteOps(path);
+      const b = sqliteOps(path);
+      expect(await a.claims('digest@1')).toBe(true);
+      expect(await b.claims('digest@1')).toBe(false);
+      await b.claims.release('digest@1');
+      expect(await a.claims('digest@1')).toBe(true);
+      const results = await Promise.all([
+        a.claims('race'),
+        b.claims('race'),
+        a.claims('race'),
+        b.claims('race'),
+      ]);
+      expect(results.filter(Boolean)).toHaveLength(1);
+      await a.close();
+      await b.close();
+      const reopened = sqliteOps(path);
+      expect(await reopened.claims('digest@1')).toBe(false);
+      expect(await reopened.claims('race')).toBe(false);
+    },
+    SLOW_TEST_TIMEOUT_MS,
+  ); // two connections and a reopen on one file: slow on a hosted Windows runner
 
   it('stores a key over 512 characters or holding a NUL as its SHA-256', async () => {
     const db = new DatabaseSync!(':memory:');
