@@ -100,7 +100,10 @@ export interface NodeSandboxOptions {
   cwd?: string;
   /** Default wall-clock timeout in ms (per run). Default 30_000. */
   defaultTimeoutMs?: number;
-  /** Max captured bytes per stream before truncation. Default 1_000_000. */
+  /**
+   * Max captured bytes per stream; the head is kept and the result's
+   * `truncated` (2.4) says which stream was cut. Default 1_000_000.
+   */
   maxOutputBytes?: number;
   /** Language → interpreter overrides (merged over the built-ins). */
   interpreters?: Record<string, Interpreter>;
@@ -239,6 +242,8 @@ async function execProcess(
     const errChunks: Uint8Array[] = [];
     let outBytes = 0;
     let errBytes = 0;
+    /** Bytes past maxOutputBytes were dropped (H4): reported, no longer silent. */
+    const cut = { stdout: false, stderr: false };
     let timedOut = false;
     let settled = false;
     /** From 'exit', for a killed run that settles before 'close' comes. */
@@ -247,8 +252,9 @@ async function execProcess(
 
     const collect = (chunks: Uint8Array[], countRef: 'out' | 'err') => (chunk: Uint8Array) => {
       const current = countRef === 'out' ? outBytes : errBytes;
-      if (current >= input.maxOutputBytes) return;
       const room = input.maxOutputBytes - current;
+      if (chunk.byteLength > room) cut[countRef === 'out' ? 'stdout' : 'stderr'] = true;
+      if (room <= 0) return;
       const slice = chunk.byteLength > room ? chunk.subarray(0, room) : chunk;
       chunks.push(slice);
       if (countRef === 'out') outBytes += slice.byteLength;
@@ -297,6 +303,7 @@ async function execProcess(
         exitCode: code,
         ...(timedOut ? { timedOut: true } : {}),
         durationMs: Date.now() - start,
+        ...(cut.stdout || cut.stderr ? { truncated: { ...cut } } : {}),
       });
     };
 

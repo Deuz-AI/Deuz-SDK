@@ -138,6 +138,42 @@ describe('createNodeSandbox (reference; spawns real node)', () => {
   });
 });
 
+describe('createNodeSandbox — output cut at maxOutputBytes says so (H4)', () => {
+  // Before 2.4 the bytes past maxOutputBytes were dropped silently: a caller
+  // could not tell a 10-byte program from a 10 MB one.
+  it('flags the stream that was cut and keeps the head of it', async () => {
+    const res = await createNodeSandbox({ maxOutputBytes: 10 }).runCode({
+      language: 'node',
+      code: "process.stdout.write('x'.repeat(50)); process.stderr.write('short')",
+      timeoutMs: 5_000,
+    });
+    expect(res.exitCode).toBe(0);
+    expect(res.stdout).toBe('x'.repeat(10));
+    expect(res.stderr).toBe('short');
+    expect(res.truncated).toEqual({ stdout: true, stderr: false });
+  });
+
+  it('flags stderr alone when only stderr overflows', async () => {
+    const res = await createNodeSandbox({ maxOutputBytes: 4 }).runCode({
+      language: 'node',
+      code: "process.stdout.write('ok'); process.stderr.write('e'.repeat(9))",
+      timeoutMs: 5_000,
+    });
+    expect(res.stderr).toBe('eeee');
+    expect(res.truncated).toEqual({ stdout: false, stderr: true });
+  });
+
+  it('leaves the field off when nothing was cut, as in 2.3', async () => {
+    const res = await createNodeSandbox({ maxOutputBytes: 10 }).runCode({
+      language: 'node',
+      code: "process.stdout.write('x'.repeat(10))",
+      timeoutMs: 5_000,
+    });
+    expect(res.stdout).toBe('x'.repeat(10));
+    expect(res).not.toHaveProperty('truncated');
+  });
+});
+
 /** Reads stdin to EOF, then prints `eof <byteCount>`. */
 const WAIT_FOR_EOF =
   "let n=0;process.stdin.on('data',d=>n+=d.length);process.stdin.on('end',()=>process.stdout.write('eof '+n))";

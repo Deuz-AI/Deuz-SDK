@@ -57,6 +57,12 @@ export interface CodeExecutionResult {
   artifacts?: ComputeArtifact[];
   /** Wall-clock duration in ms, when the backend measures it. */
   durationMs?: number;
+  /**
+   * Which streams the backend cut at its output limit (2.4): set when at
+   * least one was cut, absent otherwise. The Node sandbox keeps the head of a
+   * stream (`maxOutputBytes`), the Docker sandbox its tail.
+   */
+  truncated?: { stdout: boolean; stderr: boolean };
 }
 
 /** A request to run a shell command in the sandbox. */
