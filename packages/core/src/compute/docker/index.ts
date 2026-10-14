@@ -47,6 +47,18 @@ export const DEFAULT_DOCKER_SANDBOX = {
  * workspace staged in through a bounded archive, `cwd` resolved inside the
  * workspace (outside it refused), output a bounded tail with `truncated`,
  * and the container removed afterwards.
+ *
+ * Details (2.4): the image resolves once per sandbox to its immutable id
+ * (`image_not_found` when it is not local: never pulled); `runShell` runs
+ * `/bin/sh -c`, `runCode` the `interpreters` argv prefix plus the code (an
+ * image ENTRYPOINT is reset); env values travel in a private env file, never
+ * on the command line; a run without `timeoutMs` stops after
+ * `DEFAULT_DOCKER_SANDBOX.runTimeoutMs` (30 s), killed with `docker kill`;
+ * what the run changes in its workspace stays in the container. Infrastructure
+ * failures reject with `DockerSandboxError` (`docker_unavailable`,
+ * `image_not_found`, `staging_too_large`, ...); what the program does is the
+ * result. Option errors are TypeErrors at creation: `user` must be numeric
+ * (`uid` or `uid:gid`), `workdir` absolute, and `deuz.*` labels are the SDK's.
  */
 export function createDockerSandbox(options: DockerSandboxOptions): ComputeSandbox {
   return createDockerSandboxFromOptions(resolveDockerOptions(options, DEFAULT_DOCKER_SANDBOX));
@@ -56,6 +68,23 @@ export function createDockerSandbox(options: DockerSandboxOptions): ComputeSandb
  * A reconnectable process runner on local Docker (2.4, preview): records,
  * creates, stages, writes `'start-dispatched'` durably, issues one start and
  * inspects, in that order; reconnects through `store` after a restart.
+ *
+ * Details (2.4): the container is named `deuz-<hash of scope and operation
+ * id>`, so a create cut short by a crash is adopted, never repeated. `start`
+ * with the same id and request continues the operation wherever it stopped;
+ * an operation whose start outcome is unknown is `'needs-reconcile'`, and
+ * `reconcile` (once the record is 30 s old) marks it `'failed'` with
+ * `start_unconfirmed`, never starting it. A request with `stdin` is started
+ * with `docker start --attach --interactive` (the stdin is delivered, then
+ * closed). `poll`, `start` and `reconcile` finish a recorded cancel, notice
+ * an exit (storing the output tail) or a vanished container (`'lost'`), and
+ * cancel a process past its `deadlineAt`. Artifacts: only regular files
+ * under the workspace of a stopped container; a link, a directory, a device,
+ * a linked parent or a path that leaves the workspace is `artifact_rejected`.
+ * A hard link is refused when the archive marks it as one; Docker archives a
+ * single hard-linked file as a regular file. Nothing is ever deleted in the
+ * background: containers go with `dispose`, orphans with
+ * `reconcile({ removeOrphans: true })`, records with `store.prune`.
  */
 export function createDockerProcessRunner(
   options: DockerSandboxOptions & { store: ProcessOperationStore },
