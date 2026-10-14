@@ -118,10 +118,8 @@ describe('/chat and /ui 2.4 additions', () => {
     expect(chat.RevisionConflictError).toBe(errors.RevisionConflictError);
   });
 
-  it('publishes the durable stream store stub, its batch defaults and the capability handshake', () => {
-    expectStub('createInMemoryDurableStreamStateStore', () =>
-      ui.createInMemoryDurableStreamStateStore(),
-    );
+  it('publishes the durable stream store (implemented by L7b), its batch defaults and the capability handshake', () => {
+    expect(ui.createInMemoryDurableStreamStateStore().durable).toBe(true);
     expect(ui.DEFAULT_DURABLE_STREAM_BATCH).toEqual({ maxDelayMs: 20, maxBytes: 16_384 });
     expect(ui.DEUZ_CAPABILITIES_HEADER).toBe('x-deuz-capabilities');
     expect(typeof ui.parseDeuzCapabilities).toBe('function');
@@ -224,24 +222,29 @@ describe('2.4 Node stores on their entries', () => {
     expect(storesSqlite.createSqliteConditionalChatStore({ path: ':memory:' }).conditional).toBe(
       true,
     );
-    expectStub('createSqliteDurableStreamStateStore', () =>
-      storesSqlite.createSqliteDurableStreamStateStore(any),
-    );
     expect(
       storesPostgres.createPostgresConditionalChatStore({ connectionString: 'postgres://unused' })
         .conditional,
     ).toBe(true);
-    expectStub('createPostgresDurableStreamStateStore', () =>
-      storesPostgres.createPostgresDurableStreamStateStore(any),
-    );
-    expectStub('createRedisDurableStreamStateStore', () =>
-      storesRedis.createRedisDurableStreamStateStore(any),
-    );
     expectStub('createSqliteAgentRunStoreV3', () => opsSqlite.createSqliteAgentRunStoreV3(any));
     expectStub('createPostgresAgentRunStoreV3', () =>
       opsPostgres.createPostgresAgentRunStoreV3(any),
     );
     expectStub('createInMemoryAgentRunStoreV3', () => createInMemoryAgentRunStoreV3());
+  });
+
+  it('reach the durable stream state stores (implemented by L7b) through the /stores entries', async () => {
+    const sqlite = storesSqlite.createSqliteDurableStreamStateStore({ path: ':memory:' });
+    expect(sqlite.durable).toBe(true);
+    await sqlite.close();
+    const postgres = storesPostgres.createPostgresDurableStreamStateStore({
+      connectionString: 'postgres://unused@127.0.0.1:1/none',
+    });
+    expect(postgres.durable).toBe(true);
+    await postgres.close();
+    const redis = storesRedis.createRedisDurableStreamStateStore({ url: 'redis://127.0.0.1:1' });
+    expect(redis.durable).toBe(true);
+    await redis.close();
   });
 
   it('keep the existing entry factories exported as before', () => {

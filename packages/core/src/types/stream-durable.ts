@@ -9,6 +9,7 @@
  * `/stores/*` entries.
  */
 import type { StreamStateRecord } from '../ui';
+import type { Dependencies } from './deps';
 import type { LeaseProvider } from './lease';
 
 /** A batch of frames, committed together before any of them is sent. */
@@ -40,6 +41,23 @@ export type DurableStreamCommitResult =
  * answers the legacy `StreamStateStore` methods: `read` and `lastSeq` serve
  * replay; `append` (the legacy best-effort path) commits one record without
  * fencing and is never called by the durable serializer.
+ *
+ * The rules every store follows:
+ * - A stream keeps the highest token it was opened (or committed to) with.
+ *   `open` and `commit` with a lower token are refused (`fenced`); an equal
+ *   one goes through, so a producer may open again; a higher one becomes the
+ *   fence, even on a commit without an `open`.
+ * - A batch holds consecutive seqs (else a TypeError) starting at the stored
+ *   last seq plus one (else `conflict`); an empty batch stores nothing.
+ *   Ids, tokens and seqs are validated: a malformed call rejects with a
+ *   TypeError.
+ * - `append` replaces a record with the same seq; `lastSeq` is the highest.
+ * - A part is kept as its JSON text, so a replay sends the live bytes.
+ * - A stream is terminal while its highest record is the `done` sentinel; a
+ *   continued run appends past it. `prune` counts the last `open`, `commit`
+ *   or `append` as the stream's activity, so a stream opened again for a new
+ *   leg is not pruned under it. A pruned (or deleted) stream forgets its
+ *   fence: prune only streams no producer will continue.
  */
 export interface DurableStreamStateStore {
   /** Marks the store as durable. */
@@ -55,21 +73,48 @@ export interface DurableStreamStateStore {
   /**
    * Retention: deletes terminal streams (with a `done` record) whose last
    * commit is older than `terminalBefore` (epoch ms, store clock). Default
-   * policy in the docs: 24 hours.
+   * policy in the docs: 24 hours. Answers how many it deleted. The store
+   * clock is the injected one (memory, SQLite), the database's (Postgres) or
+   * the server's `TIME` (Redis). Nothing is deleted in the background.
    */
   prune(options: { terminalBefore: number }): Promise<number>;
 }
 
 /** How the durable serializer coalesces frames. Defaults: 20 ms or 16 KiB, whichever first. */
 export interface DurableStreamBatchOptions {
+  /** How long the first frame of a batch waits for company, in ms (default 20; 0 or more). */
   maxDelayMs?: number;
+  /** The encoded size that commits a batch at once, in bytes (default 16 384; positive). */
   maxBytes?: number;
 }
 
-/** The durable mode of a UI stream response (wired into the stream options by the stream lane). */
+/**
+ * The durable mode of a UI stream response (`ToDeuzStreamOptions.durable`,
+ * 2.4, preview). The response takes the producer lease, opens the stream with
+ * its token, then commits every batch before it sends it. It fails closed:
+ * when the lease is held by another producer or lost, when a newer producer
+ * fenced it off, when the stored log moved past it, or when the store fails,
+ * it sends nothing it did not commit, ends with a redacted `error` frame (no
+ * event id) and no `[DONE]`, stops reading its source and hands a thrown
+ * store error to `onStoreError`. A client that reconnects to the resume
+ * endpoint gets every committed frame once, in order.
+ */
 export interface DurableStreamOptions {
   store: DurableStreamStateStore;
-  /** The producer lease: key `stream:<streamId>`, its token the fencing token. */
+  /**
+   * The producer lease: key `stream:<streamId>`, its token the fencing token.
+   * `owner` defaults to a random id, `ttlMs` (an integer of at least 3) to
+   * 30 000; the lease is renewed every `ttlMs / 3` and released at the end.
+   */
   lease: { provider: LeaseProvider; owner?: string; ttlMs?: number };
   batch?: DurableStreamBatchOptions;
+  /**
+   * The seams the durable serializer uses (2.4 refinement): `clock` times the
+   * coalescing window, the lease renewals and the commit latency; `observer`
+   * (or `tracer`) receives the `deuz.stream.batch` and `deuz.stream.fenced`
+   * spans, whose attributes are counts, bytes, milliseconds and tokens, never
+   * content; `generateId` names the default lease owner. Default: the host
+   * clock, no observation, a random owner.
+   */
+  deps?: Dependencies;
 }

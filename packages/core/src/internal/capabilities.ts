@@ -83,3 +83,38 @@ export function parseDeuzCapabilities(
   }
   return capabilities;
 }
+
+/**
+ * How a response takes part in the capability handshake (2.4):
+ * `ToDeuzStreamOptions.capabilities` and `ResumeDeuzStreamOptions.capabilities`.
+ */
+export interface DeuzCapabilitiesOptions {
+  /**
+   * The client's request, its headers, or its `x-deuz-capabilities` value. A
+   * 2.4 client lists there what it understands. A request that lists nothing
+   * (every 2.3 client) gets no header and no capabilities frame, so its
+   * stream stays byte for byte what 2.3 sent.
+   */
+  request: Request | Headers | string | null | undefined;
+  /**
+   * What this response supports besides what the serializer knows itself
+   * (`durable-stream` for a durable response or a durable resume store), for
+   * example `DEUZ_CAPABILITY.messageIds` from a chat route. Lower-case tokens.
+   */
+  announce?: Iterable<string>;
+}
+
+/**
+ * The handshake of one response: its header value and first frame, or
+ * `undefined` when the request did not ask for one. Throws a TypeError for an
+ * announced string that is not a lower-case token, asked or not.
+ */
+export function capabilitiesHandshake(
+  options: DeuzCapabilitiesOptions | undefined,
+  known: Iterable<string>,
+): { header: string; part: DeuzCapabilitiesPart } | undefined {
+  if (!options) return undefined;
+  const header = formatDeuzCapabilities([...known, ...(options.announce ?? [])]);
+  if (parseDeuzCapabilities(options.request).size === 0) return undefined;
+  return { header, part: { type: 'capabilities', capabilities: header ? header.split(', ') : [] } };
+}
