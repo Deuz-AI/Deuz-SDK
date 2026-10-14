@@ -35,8 +35,9 @@ import {
 import { budgetStoreContracts } from './fixtures/budget-store-conformance';
 import { initialSnapshot, swarmStoreContracts } from './fixtures/swarm-store-conformance';
 import { SLOW_HOOK_TIMEOUT_MS, SLOW_TEST_TIMEOUT_MS } from './fixtures/timeouts';
+import { postgresUrl } from './fixtures/services';
 
-const url = process.env.DEUZ_TEST_POSTGRES_URL || undefined;
+const url = postgresUrl();
 // A network round trip per statement, and real waits for database time.
 if (url) vi.setConfig({ testTimeout: SLOW_TEST_TIMEOUT_MS, hookTimeout: SLOW_HOOK_TIMEOUT_MS });
 /** Enough for the contention cases below plus a connection to watch them with. */

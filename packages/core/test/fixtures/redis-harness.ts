@@ -10,13 +10,12 @@
  * Lua state per script, so the prelude never outlives one call.
  *
  * Live: DEUZ_TEST_REDIS_URL names a real server (the CI `integration` job
- * runs redis:7); time is the server's own, and advancing it means waiting.
+ * runs redis:7), looked up with `redisUrl()` from ./services; time is the
+ * server's own, and advancing it means waiting.
  */
 import RedisMock from 'ioredis-mock';
 import { createClient } from 'redis';
 import { wrapIoredisClient, type RedisScriptClient } from '../../src/node/store-redis';
-
-export const liveRedisUrl = process.env.DEUZ_TEST_REDIS_URL || undefined;
 
 // ioredis-mock shares data per host and port, as one server would: a fresh
 // server per mock.

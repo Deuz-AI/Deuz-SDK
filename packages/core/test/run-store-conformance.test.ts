@@ -18,6 +18,7 @@ import { createPostgresStores, type PgClientLike } from '../src/node/store-postg
 import { createRedisStores, wrapIoredisClient } from '../src/node/store-redis';
 import { runStoreContracts } from './fixtures/run-store-conformance';
 import { SLOW_TEST_TIMEOUT_MS } from './fixtures/timeouts';
+import { redisUrl } from './fixtures/services';
 
 /** Disk and database stores: a loaded machine makes their file and query I/O slow. */
 const SLOW = { timeout: SLOW_TEST_TIMEOUT_MS };
@@ -80,7 +81,7 @@ runStoreContracts('redis pack (ioredis-mock)', async () => ({
   store: createRedisStores({ client: wrapIoredisClient(new RedisMock({ port: port++ })) }).runs,
 }));
 
-const url = process.env.DEUZ_TEST_REDIS_URL || undefined;
+const url = redisUrl();
 describe.skipIf(!url)('Redis pack on a live server', () => {
   const client = createClient({ url });
   beforeAll(() => client.connect(), SLOW_TEST_TIMEOUT_MS);

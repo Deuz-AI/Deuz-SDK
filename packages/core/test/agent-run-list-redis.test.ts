@@ -21,8 +21,11 @@ import type {
 } from '../src/types/agent-run';
 import type { Clock } from '../src/types/deps';
 import { agentRunListContracts, envelope } from './fixtures/agent-run-store-conformance';
-import { liveRedisServer, liveRedisUrl, mockRedisServer, wait } from './fixtures/redis-harness';
+import { liveRedisServer, mockRedisServer, wait } from './fixtures/redis-harness';
+import { redisUrl } from './fixtures/services';
 import { SLOW_HOOK_TIMEOUT_MS, SLOW_TEST_TIMEOUT_MS } from './fixtures/timeouts';
+
+const liveRedisUrl = redisUrl();
 
 const fresh = () => {
   const server = mockRedisServer();

@@ -11,8 +11,11 @@ import { createRedisSwarmStore } from '../src/node/swarm-redis';
 import { createSwarm, SwarmConflictError } from '../src/swarm';
 import type { SwarmSnapshot } from '../src/types/swarm';
 import { initialSnapshot, swarmStoreContracts } from './fixtures/swarm-store-conformance';
-import { liveRedisServer, liveRedisUrl, mockRedisServer } from './fixtures/redis-harness';
+import { liveRedisServer, mockRedisServer } from './fixtures/redis-harness';
+import { redisUrl } from './fixtures/services';
 import { SLOW_HOOK_TIMEOUT_MS, SLOW_TEST_TIMEOUT_MS } from './fixtures/timeouts';
+
+const liveRedisUrl = redisUrl();
 
 const freshStore = () => createRedisSwarmStore({ client: mockRedisServer().client });
 

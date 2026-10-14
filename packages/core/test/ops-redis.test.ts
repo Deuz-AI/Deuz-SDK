@@ -28,12 +28,14 @@ import {
 } from './fixtures/schedule-claim-conformance';
 import {
   liveRedisServer,
-  liveRedisUrl,
   mockRedisServer,
   wait,
   type MockRedisServer,
 } from './fixtures/redis-harness';
+import { redisUrl } from './fixtures/services';
 import { SLOW_HOOK_TIMEOUT_MS, SLOW_TEST_TIMEOUT_MS } from './fixtures/timeouts';
+
+const liveRedisUrl = redisUrl();
 
 const fresh = () => {
   const server = mockRedisServer();
