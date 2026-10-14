@@ -165,6 +165,18 @@ describe('remember', () => {
     expect(await store.receipt('op-noop')).toMatchObject({ entries: [] });
   });
 
+  it('never adds a second record with the text of an existing one', async () => {
+    const store = createInMemoryVersionedMemoryStore();
+    await seed(store, USER, { id: 'r1', text: 'Likes tea' });
+    const script = scriptedLLM({
+      reconcile: () => ({ memory: [{ event: 'ADD', text: 'likes tea ' }] }),
+    });
+    const session = createMemorySession({ store, scope: USER, llm: script.llm });
+    const result = await session.remember({ text: 'I like tea' });
+    expect(result.receipt.entries).toEqual([]);
+    expect(await session.recall({ text: 'tea', topK: 10 })).toHaveLength(1);
+  });
+
   it('retracts a contradicted record and links the new one as superseding it', async () => {
     const store = createInMemoryVersionedMemoryStore();
     await seed(store, USER, { id: 'r1', text: 'eats no fish (vegetarian)' });

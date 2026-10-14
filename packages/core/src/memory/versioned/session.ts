@@ -416,10 +416,16 @@ export function createMemorySession(options: CreateMemorySessionOptions): Memory
         });
       }
     }
-    const added = new Set<string>();
+    // An ADD of a text the scope already holds is a duplicate, not a new memory.
+    const normalized = (text: string) => text.trim().toLowerCase();
+    const added = new Set(
+      candidates
+        .filter((record) => !touched.has(record.id))
+        .map((record) => normalized(record.text)),
+    );
     for (const add of adds) {
-      if (added.has(add.text)) continue;
-      added.add(add.text);
+      if (added.has(normalized(add.text))) continue;
+      added.add(normalized(add.text));
       mutations.push(create(add.text, [...add.links, ...superseded]));
     }
     return { mutations: await attachVectors(mutations), expectedScopeRevision };
