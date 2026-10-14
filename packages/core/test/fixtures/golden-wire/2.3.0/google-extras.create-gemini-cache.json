@@ -1,0 +1,36 @@
+{
+  "scenario": "google-extras.create-gemini-cache",
+  "recordedFrom": "2.3.0",
+  "requests": [
+    {
+      "method": "POST",
+      "url": "https://generativelanguage.googleapis.com/v1beta/cachedContents",
+      "headers": {
+        "content-type": "application/json",
+        "x-goog-api-key": "<secret>"
+      },
+      "json": {
+        "model": "models/gemini-2.5-flash",
+        "contents": [
+          {
+            "role": "user",
+            "parts": [
+              {
+                "text": "A long shared document."
+              }
+            ]
+          }
+        ],
+        "systemInstruction": {
+          "parts": [
+            {
+              "text": "You are a concise assistant."
+            }
+          ]
+        },
+        "ttl": "600s",
+        "displayName": "golden"
+      }
+    }
+  ]
+}

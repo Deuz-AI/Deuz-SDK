@@ -85,7 +85,8 @@ adapters (OpenAI, Gemini, Voyage, Yunwu) run `embed` and `embedMany` with task
 types, a title and `dimensions`. The media and relay requests are pinned too:
 image generation (OpenAI-shaped, Yunwu), speech (OpenAI, ElevenLabs),
 transcription (OpenAI multipart, Deepgram raw bytes), video and Midjourney
-submission, the Voyage and Cohere rerankers, and batch submission (Anthropic,
+submission, the Voyage and Cohere rerankers, the Gemini context cache (AI
+Studio and Vertex) and Files API upload, and batch submission (Anthropic,
 OpenAI Chat Completions and Responses through the Files API, Gemini).
 
 ## Rules

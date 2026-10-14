@@ -1,0 +1,28 @@
+{
+  "scenario": "google-extras-vertex.create-gemini-cache",
+  "recordedFrom": "2.3.0",
+  "requests": [
+    {
+      "method": "POST",
+      "url": "https://us-central1-aiplatform.googleapis.com/v1/projects/golden-project/locations/us-central1/cachedContents",
+      "headers": {
+        "authorization": "Bearer <secret>",
+        "content-type": "application/json"
+      },
+      "json": {
+        "model": "projects/golden-project/locations/us-central1/publishers/google/models/gemini-2.5-flash",
+        "contents": [
+          {
+            "role": "user",
+            "parts": [
+              {
+                "text": "A long shared document."
+              }
+            ]
+          }
+        ],
+        "ttl": "3600s"
+      }
+    }
+  ]
+}

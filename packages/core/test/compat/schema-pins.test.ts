@@ -61,6 +61,24 @@ const LAYOUT_FILE = join(
 );
 const RECORD = process.env.DEUZ_SCHEMA_PIN_RECORD === '1';
 const liveUrl = process.env.DEUZ_TEST_POSTGRES_URL || undefined;
+/** With DEUZ_TEST_REQUIRE_SERVICES=1 a missing live server fails instead of skipping. */
+const requireServices = process.env.DEUZ_TEST_REQUIRE_SERVICES === '1';
+
+function missingService(name: string, variable: string): void {
+  if (requireServices) {
+    describe(`${name} schema pins (live server)`, () => {
+      it(`needs ${variable} (DEUZ_TEST_REQUIRE_SERVICES=1)`, () => {
+        throw new Error(
+          `${variable} is not set, and DEUZ_TEST_REQUIRE_SERVICES=1 forbids skipping`,
+        );
+      });
+    });
+  } else {
+    describe.skip(`${name} schema pins (live server: ${variable} is not set)`, () => {
+      it('skipped', () => {});
+    });
+  }
+}
 // A network round trip per statement on the live servers; PGlite starts slowly.
 vi.setConfig({ testTimeout: 30_000, hookTimeout: 60_000 });
 
@@ -510,9 +528,7 @@ if (liveUrl) {
     false,
   );
 } else {
-  describe.skip('Postgres schema versions (live server: DEUZ_TEST_POSTGRES_URL is not set)', () => {
-    it('skipped', () => {});
-  });
+  missingService('Postgres', 'DEUZ_TEST_POSTGRES_URL');
 }
 
 // ---------------------------------------------------------------------------
@@ -589,6 +605,8 @@ if (liveRedisUrl) {
       close: () => live.close(),
     };
   });
+} else {
+  missingService('Redis', 'DEUZ_TEST_REDIS_URL');
 }
 
 // ---------------------------------------------------------------------------

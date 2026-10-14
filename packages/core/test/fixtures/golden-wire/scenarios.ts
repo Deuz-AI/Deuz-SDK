@@ -35,6 +35,7 @@ import { createElevenLabs, createOpenAISpeech, generateSpeech } from '../../../s
 import { createDeepgram, createOpenAITranscription, transcribe } from '../../../src/transcription';
 import { createVideoProvider, submitVideo } from '../../../src/video';
 import { submitImagine } from '../../../src/midjourney';
+import { createGeminiCache, uploadFile } from '../../../src/google-extras';
 import { createBatchClient } from '../../../src/batch/client';
 import type { BatchRequest } from '../../../src/batch/types';
 import {
@@ -941,6 +942,57 @@ const MEDIA_SCENARIOS: readonly GoldenScenario[] = [
     script: [jsonAnswer({ code: 1, description: 'Submit success', result: 'task_golden' })],
     async run(fetch, deps) {
       await submitImagine({ ...key, fetch, prompt: 'A lighthouse at dusk --ar 16:9', deps });
+    },
+  },
+  {
+    id: 'google-extras.create-gemini-cache',
+    script: [jsonAnswer({ name: 'cachedContents/golden', model: 'models/gemini-2.5-flash' })],
+    async run(fetch, deps) {
+      await createGeminiCache({
+        ...key,
+        fetch,
+        deps,
+        model: 'gemini-2.5-flash',
+        contents: [{ role: 'user', parts: [{ text: 'A long shared document.' }] }],
+        systemInstruction: { parts: [{ text: INSTRUCTIONS }] },
+        ttl: '600s',
+        displayName: 'golden',
+      });
+    },
+  },
+  {
+    id: 'google-extras-vertex.create-gemini-cache',
+    script: [jsonAnswer({ name: 'cachedContents/golden', model: 'gemini-2.5-flash' })],
+    async run(fetch, deps) {
+      await createGeminiCache({
+        accessToken: SECRET,
+        vertex: { project: 'golden-project', location: 'us-central1' },
+        fetch,
+        deps,
+        model: 'gemini-2.5-flash',
+        contents: [{ role: 'user', parts: [{ text: 'A long shared document.' }] }],
+      });
+    },
+  },
+  {
+    id: 'google-extras.upload-file',
+    script: [
+      () =>
+        new Response('{}', {
+          status: 200,
+          headers: { 'x-goog-upload-url': 'https://upload.example.test/session/golden' },
+        }),
+      jsonAnswer({ file: { name: 'files/golden', uri: 'https://files.example.test/golden' } }),
+    ],
+    async run(fetch, deps) {
+      await uploadFile({
+        ...key,
+        fetch,
+        deps,
+        bytes: new TextEncoder().encode('%PDF-1.4 golden'),
+        mimeType: 'application/pdf',
+        displayName: 'golden.pdf',
+      });
     },
   },
   {
