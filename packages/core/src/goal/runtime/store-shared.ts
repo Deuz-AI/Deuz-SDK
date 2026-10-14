@@ -16,11 +16,14 @@ import { GoalError } from '../errors';
 import { checkGoalEvent, readGoal } from '../validate';
 import type { GoalRecord } from '../types';
 import type {
+  GoalInboxApplication,
   GoalInboxDisposition,
   GoalInboxEnqueue,
   GoalInboxEnqueueResult,
   GoalInboxEntry,
   GoalInboxQuery,
+  GoalRunIntent,
+  GoalRunIntentInput,
   GoalRuntimeCommitResult,
   GoalRuntimePhase,
   GoalRuntimeState,
@@ -55,7 +58,8 @@ export interface StoredGoal {
 export type GoalRuntimeWrite =
   | { kind: 'goal'; record: GoalRecord; created: boolean }
   | { kind: 'runtime'; state: GoalRuntimeState; created: boolean }
-  | { kind: 'entry'; entry: GoalInboxEntry; created: boolean };
+  | { kind: 'entry'; entry: GoalInboxEntry; created: boolean }
+  | { kind: 'intent'; intent: GoalRunIntent; created: boolean };
 
 /** A planner's answer: the result, and the writes that commit it (none when refused). */
 export interface GoalRuntimePlan<R> {
@@ -548,4 +552,134 @@ export function matchesInboxList(entry: GoalInboxEntry, plan: InboxListPlan): bo
   if (plan.after !== undefined)
     return inboxOldestFirst(entry, { enqueuedAt: plan.after[0], id: plan.after[1] }) > 0;
   return true;
+}
+
+/** A checked application, its goal, runtime state and intent checked and copied. */
+export function checkApplication(value: unknown): GoalInboxApplication {
+  const check = new RuntimeChecker('inbox application');
+  const application = check.object(value, 'application');
+  check.string(application.scope, 'scope');
+  check.string(application.goalId, 'goalId');
+  check.string(application.entryId, 'entryId');
+  check.oneOf(
+    application.disposition,
+    INBOX_DISPOSITIONS.filter((disposition) => disposition !== 'pending'),
+    'disposition',
+  );
+  return {
+    scope: application.scope as string,
+    goalId: application.goalId as string,
+    entryId: application.entryId as string,
+    disposition: application.disposition as GoalInboxApplication['disposition'],
+    ...(application.goal !== undefined ? { goal: checkGoal(application.goal) } : {}),
+    ...(application.runtime !== undefined
+      ? { runtime: checkRuntimeState(application.runtime) }
+      : {}),
+    ...(application.intent !== undefined ? { intent: checkIntentInput(application.intent) } : {}),
+  };
+}
+
+/** What `inbox.apply` reads before it plans. */
+export interface ApplySnapshot {
+  entry: GoalInboxEntry | undefined;
+  goal: StoredGoal | undefined;
+  runtime: GoalRuntimeState | undefined;
+  /** Whether the application's intent id is already recorded in its scope. */
+  intentExists: boolean;
+}
+
+/**
+ * `inbox.apply`: every check first (scope, the entry still pending, the goal
+ * and the runtime state at their stored revisions plus one, the intent id
+ * new), then the entry's disposition, the goal, the state and the intent.
+ */
+export function planApply(
+  snapshot: ApplySnapshot,
+  application: GoalInboxApplication,
+  now: number,
+): GoalRuntimePlan<GoalRuntimeCommitResult> {
+  const { entry } = snapshot;
+  const owner = { goalId: application.goalId, scope: application.scope };
+  if (entry === undefined || entry.scope !== owner.scope || entry.goalId !== owner.goalId)
+    return refused('scope-mismatch');
+  if (application.goal !== undefined && !namesGoal(owner, application.goal))
+    return refused('scope-mismatch');
+  if (snapshot.goal !== undefined && snapshot.goal.scope !== owner.scope)
+    return refused('scope-mismatch');
+  const { intent } = application;
+  if (intent !== undefined && (intent.goalId !== owner.goalId || intent.scope !== owner.scope))
+    return refused('scope-mismatch');
+  const runtime = runtimePart(snapshot, owner, application.runtime, application.goal);
+  if (runtime === 'scope-mismatch') return refused(runtime);
+  if (entry.disposition !== 'pending') return refused('entry-settled');
+  const goal = goalPart(snapshot.goal, owner, application.goal);
+  if (typeof goal === 'string') return refused(goal);
+  if (typeof runtime === 'string') return refused(runtime);
+  if (intent !== undefined && snapshot.intentExists) return refused('intent-exists');
+  if (application.runtime !== undefined) assertCancelKept(snapshot.runtime, application.runtime);
+  const settled: GoalInboxEntry = {
+    ...entry,
+    disposition: application.disposition,
+    settledAt: now,
+    ...(application.goal !== undefined ? { goalRevision: application.goal.revision } : {}),
+    ...(intent !== undefined ? { intentId: intent.intentId } : {}),
+  };
+  const writes: GoalRuntimeWrite[] = [{ kind: 'entry', entry: settled, created: false }];
+  if (goal) writes.push(goal);
+  if (runtime) writes.push(runtime);
+  if (intent !== undefined)
+    writes.push({ kind: 'intent', intent: newIntent(intent, now), created: true });
+  return committed(writes);
+}
+
+// ===================================================================
+// Run intents
+// ===================================================================
+
+export const INTENT_STATUSES: readonly GoalRunIntent['status'][] = [
+  'pending',
+  'claimed',
+  'launched',
+  'completed',
+  'failed',
+  'cancelled',
+];
+
+/** A checked intent, as a JSON copy. Throws a TypeError naming the first field at fault. */
+export function checkIntentInput(value: unknown): GoalRunIntentInput {
+  const check = new RuntimeChecker('run intent');
+  const intent = check.object(value, 'intent');
+  check.string(intent.intentId, 'intentId');
+  check.string(intent.scope, 'scope');
+  check.string(intent.goalId, 'goalId');
+  check.oneOf(intent.kind, ['start', 'resume', 'retry'], 'kind');
+  check.string(intent.runId, 'runId');
+  check.count(intent.attempt, 'attempt', 1);
+  check.optionalTime(intent.notBefore, 'notBefore');
+  if (intent.cause !== undefined) {
+    const cause = check.object(intent.cause, 'cause');
+    check.optionalString(cause.inboxEntryId, 'cause.inboxEntryId');
+    check.optionalString(cause.command, 'cause.command');
+  }
+  if (intent.approvalResponses !== undefined && !Array.isArray(intent.approvalResponses))
+    check.fail('approvalResponses', 'must be an array');
+  check.json(intent, '');
+  return jsonCopy(intent as unknown as GoalRunIntentInput);
+}
+
+/** A newly recorded intent: pending, at revision 1. */
+function newIntent(input: GoalRunIntentInput, now: number): GoalRunIntent {
+  return { ...input, status: 'pending', revision: 1, recordedAt: now, updatedAt: now };
+}
+
+/** `intents.record`: a new id, for a goal stored in the intent's scope. */
+export function planIntentRecord(
+  snapshot: { intent: GoalRunIntent | undefined; goal: StoredGoal | undefined },
+  input: GoalRunIntentInput,
+  now: number,
+): GoalRuntimePlan<GoalRuntimeCommitResult> {
+  if (snapshot.goal === undefined || snapshot.goal.scope !== input.scope)
+    return refused('scope-mismatch');
+  if (snapshot.intent !== undefined) return refused('intent-exists');
+  return committed([{ kind: 'intent', intent: newIntent(input, now), created: true }]);
 }

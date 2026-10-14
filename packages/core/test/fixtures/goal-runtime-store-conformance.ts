@@ -19,8 +19,10 @@ import { createGoal, createGoalEvent, transitionGoal } from '../../src/goal';
 import type { GoalEvent, GoalRecord } from '../../src/goal';
 import { DEFAULT_GOAL_RUNTIME_POLICY, goalInboxKey } from '../../src/goal/runtime';
 import type {
+  GoalInboxApplication,
   GoalInboxEnqueue,
   GoalInboxQuery,
+  GoalRunIntentInput,
   GoalRuntimeState,
   GoalRuntimeStore,
 } from '../../src/goal/runtime';
@@ -113,6 +115,31 @@ export function delivery(
     digest: DIGEST_A,
     ...patch,
   };
+}
+
+/** A run intent for `goal`. */
+export function runIntent(
+  goal: Pick<GoalRecord, 'goalId' | 'scope'>,
+  intentId: string,
+  patch: Partial<GoalRunIntentInput> = {},
+): GoalRunIntentInput {
+  return {
+    intentId,
+    scope: goal.scope,
+    goalId: goal.goalId,
+    kind: 'start',
+    runId: `run-${intentId}`,
+    attempt: 1,
+    ...patch,
+  };
+}
+
+/** A goal with one queued delivery `d1` and a runtime state at revision 1. */
+async function goalWithDelivery(store: GoalRuntimeStore, goalId = 'g') {
+  const goal = runtimeGoal(goalId);
+  await store.runtime.save(runtimeState(goal), goal);
+  const { entry } = await store.inbox.enqueue(delivery(goal, 'd1'));
+  return { goal, entry };
 }
 
 export function goalRuntimeStoreContracts(
@@ -428,6 +455,140 @@ export function goalRuntimeStoreContracts(
               Promise.resolve().then(() => store.inbox.list(query as GoalInboxQuery)),
               JSON.stringify(query),
             ).rejects.toThrow(TypeError);
+        }),
+      );
+    });
+
+    describe('inbox apply', () => {
+      it(
+        'settles the entry with the goal, the runtime state and a run intent in one write',
+        withStore(async (store, time) => {
+          const { goal, entry } = await goalWithDelivery(store);
+          await time.advance(500);
+          const next = nextGoal(goal);
+          const result = await store.inbox.apply({
+            scope: 'tenant',
+            goalId: 'g',
+            entryId: entry.id,
+            disposition: 'applied',
+            goal: next,
+            runtime: runtimeState(goal, 2, { phase: 'dispatching' }),
+            intent: runIntent(goal, 'g#2', { cause: { inboxEntryId: entry.id } }),
+          });
+          expect(result).toEqual({ status: 'committed' });
+          expect(await store.inbox.get('tenant', entry.id)).toEqual({
+            ...entry,
+            disposition: 'applied',
+            settledAt: T0 + 500,
+            goalRevision: 2,
+            intentId: 'g#2',
+          });
+          expect(await store.load('g')).toEqual(next);
+          expect((await store.runtime.get('tenant', 'g'))?.phase).toBe('dispatching');
+          expect(await store.intents.get('tenant', 'g#2')).toEqual({
+            ...runIntent(goal, 'g#2', { cause: { inboxEntryId: entry.id } }),
+            status: 'pending',
+            revision: 1,
+            recordedAt: T0 + 500,
+            updatedAt: T0 + 500,
+          });
+          expect(await store.intents.get('other', 'g#2')).toBeUndefined();
+          expect((await store.inbox.list({ scope: 'tenant' })).entries).toEqual([]);
+        }),
+      );
+
+      it(
+        'settles an entry alone with an explicit disposition',
+        withStore(async (store) => {
+          const { goal, entry } = await goalWithDelivery(store);
+          for (const disposition of ['unmatched', 'stale', 'expired', 'terminal'] as const) {
+            const { entry: other } = await store.inbox.enqueue(delivery(goal, disposition));
+            expect(
+              await store.inbox.apply({
+                scope: 'tenant',
+                goalId: 'g',
+                entryId: other.id,
+                disposition,
+              }),
+            ).toEqual({ status: 'committed' });
+            expect((await store.inbox.get('tenant', other.id))?.disposition).toBe(disposition);
+          }
+          expect((await store.inbox.get('tenant', entry.id))?.disposition).toBe('pending');
+          expect((await store.load('g'))?.revision).toBe(1);
+          expect(
+            (
+              await store.inbox.list({ scope: 'tenant', dispositions: ['stale', 'expired'] })
+            ).entries
+              .map((settled) => settled.deliveryId)
+              .sort(),
+          ).toEqual(['expired', 'stale']);
+        }),
+      );
+
+      it(
+        'writes nothing when any one check fails',
+        withStore(async (store) => {
+          const { goal, entry } = await goalWithDelivery(store);
+          await store.intents.record(runIntent(goal, 'taken'));
+          const full = (patch: Partial<GoalInboxApplication>): GoalInboxApplication => ({
+            scope: 'tenant',
+            goalId: 'g',
+            entryId: entry.id,
+            disposition: 'applied',
+            goal: nextGoal(goal),
+            runtime: runtimeState(goal, 2),
+            intent: runIntent(goal, 'g#2'),
+            ...patch,
+          });
+          const cases: [Partial<GoalInboxApplication>, string][] = [
+            [{ goal: { ...nextGoal(goal), revision: 3 } }, 'goal-revision'],
+            [{ runtime: runtimeState(goal, 1) }, 'runtime-revision'],
+            [{ intent: runIntent(goal, 'taken') }, 'intent-exists'],
+            [{ entryId: goalInboxKey('tenant', 'webhook:github', 'nope') }, 'scope-mismatch'],
+            [{ scope: 'other' }, 'scope-mismatch'],
+            [{ goalId: 'h' }, 'scope-mismatch'],
+            [{ intent: runIntent(runtimeGoal('h'), 'g#2') }, 'scope-mismatch'],
+            [{ runtime: runtimeState({ goalId: 'g', scope: 'other' }, 2) }, 'scope-mismatch'],
+          ];
+          for (const [patch, reason] of cases)
+            expect(await store.inbox.apply(full(patch)), JSON.stringify(patch)).toEqual({
+              status: 'conflict',
+              reason,
+            });
+          expect(await store.inbox.get('tenant', entry.id)).toEqual(entry);
+          expect((await store.load('g'))?.revision).toBe(1);
+          expect((await store.runtime.get('tenant', 'g'))?.revision).toBe(1);
+          expect(await store.intents.get('tenant', 'g#2')).toBeUndefined();
+          // Then the full write commits, and a second apply finds the entry settled.
+          expect(await store.inbox.apply(full({}))).toEqual({ status: 'committed' });
+          expect(
+            await store.inbox.apply(
+              full({
+                goal: nextGoal(nextGoal(goal)),
+                runtime: runtimeState(goal, 3),
+                intent: undefined,
+              }),
+            ),
+          ).toEqual({ status: 'conflict', reason: 'entry-settled' });
+          expect((await store.load('g'))?.revision).toBe(2);
+        }),
+      );
+
+      it(
+        "refuses to settle an entry as 'pending'",
+        withStore(async (store) => {
+          const { entry } = await goalWithDelivery(store);
+          await expect(
+            Promise.resolve().then(() =>
+              store.inbox.apply({
+                scope: 'tenant',
+                goalId: 'g',
+                entryId: entry.id,
+                disposition: 'pending' as never,
+              }),
+            ),
+          ).rejects.toThrow(TypeError);
+          expect((await store.inbox.get('tenant', entry.id))?.disposition).toBe('pending');
         }),
       );
     });

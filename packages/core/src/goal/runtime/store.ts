@@ -8,8 +8,10 @@ import { notImplemented } from '../../internal/not-implemented';
 import { planGoalList, goalListCursor } from '../store';
 import type { GoalRecord } from '../types';
 import {
+  checkApplication,
   checkEnqueue,
   checkGoal,
+  checkIntentInput,
   checkRuntimeState,
   goalsNewestFirst,
   inboxKey,
@@ -17,15 +19,18 @@ import {
   jsonCopy,
   matchesInboxList,
   pageOf,
+  planApply,
   planEnqueue,
   planGoalSave,
   planInboxList,
+  planIntentRecord,
   planRuntimeSave,
   type GoalRuntimePlan,
   type GoalRuntimeWrite,
 } from './store-shared';
 import type {
   GoalInboxEntry,
+  GoalRunIntent,
   GoalRuntimePolicy,
   GoalRuntimeState,
   GoalRuntimeStore,
@@ -74,6 +79,9 @@ export function createInMemoryGoalRuntimeStore(options?: {
   const runtimes = new Map<string, GoalRuntimeState>();
   /** By entry ID, which holds the scope. */
   const entries = new Map<string, GoalInboxEntry>();
+  /** By `[scope, intentId]`. */
+  const intents = new Map<string, GoalRunIntent>();
+  const scoped = (scope: string, id: string): string => JSON.stringify([scope, id]);
 
   /** Applies a plan's writes; each one is already checked, so nothing here can fail half way. */
   const apply = (writes: readonly GoalRuntimeWrite[]): void => {
@@ -81,6 +89,8 @@ export function createInMemoryGoalRuntimeStore(options?: {
       if (write.kind === 'goal') goals.set(write.record.goalId, write.record);
       else if (write.kind === 'runtime') runtimes.set(write.state.goalId, write.state);
       else if (write.kind === 'entry') entries.set(write.entry.id, write.entry);
+      else if (write.kind === 'intent')
+        intents.set(scoped(write.intent.scope, write.intent.intentId), write.intent);
     }
   };
 
@@ -155,7 +165,23 @@ export function createInMemoryGoalRuntimeStore(options?: {
           ),
         );
       },
-      apply: todo,
+      async apply(application) {
+        const next = checkApplication(application);
+        return commit(
+          planApply(
+            {
+              entry: entries.get(next.entryId),
+              goal: goals.get(next.goalId),
+              runtime: runtimes.get(next.goalId),
+              intentExists:
+                next.intent !== undefined &&
+                intents.has(scoped(next.intent.scope, next.intent.intentId)),
+            },
+            next,
+            clock.now(),
+          ),
+        );
+      },
       async get(scope, entryId) {
         return inScope(entries.get(entryId), scope);
       },
@@ -179,7 +205,28 @@ export function createInMemoryGoalRuntimeStore(options?: {
       cancel: todo,
       advance: todo,
     },
-    intents: { record: todo, get: todo, claim: todo, launched: todo, complete: todo, list: todo },
+    intents: {
+      async record(intent) {
+        const next = checkIntentInput(intent);
+        return commit(
+          planIntentRecord(
+            {
+              intent: intents.get(scoped(next.scope, next.intentId)),
+              goal: goals.get(next.goalId),
+            },
+            next,
+            clock.now(),
+          ),
+        );
+      },
+      async get(scope, intentId) {
+        return inScope(intents.get(scoped(scope, intentId)), scope);
+      },
+      claim: todo,
+      launched: todo,
+      complete: todo,
+      list: todo,
+    },
     watermarks: { get: todo, advance: todo },
     prunePayloads: todo,
     pruneInbox: todo,
