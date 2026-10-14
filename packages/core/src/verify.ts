@@ -32,7 +32,9 @@
  * Its usage is metered like any other call: the `deps` given here flow straight
  * into `generateObject`, so `deps.onUsage` fires for the verifier's call exactly
  * once (G10 — `src/core/metering.ts`). Share one callback with the run you are
- * verifying and the verifier's tokens land in your total.
+ * verifying and the verifier's tokens land in your total. Pass `execution`
+ * (2.4) and each call is also reserved and settled on that context's budget
+ * ledger, under its policy.
  *
  * ## It never throws — fail-OPEN, and loudly
  *
@@ -66,6 +68,7 @@ import type { Message, Part } from './types/message';
 import type { Dependencies } from './types/deps';
 import type { JSONSchema } from './types/schema';
 import type { VerifyStep } from './types/config';
+import type { NativeExecutionContext } from './types/execution';
 import { generateObject } from './inference/generate-object';
 
 /** Why a verdict failed. Closed set — a rejection always carries one. */
@@ -118,6 +121,15 @@ export interface CreateVerifierOptions {
   maxChecks?: number;
   /** Seams for the verifier's own model call (`onUsage`, `fetch`, `logger`, …). */
   deps?: Dependencies;
+  /**
+   * Charge the judge calls to this execution context (2.4): each `verify()`
+   * call is admitted by its policy (allowed models, depth, deadline) and
+   * reserved and settled on its ledger, like every native model call. Pass
+   * the run's context, or a child of it, so the verifier's spend counts
+   * against the run's budget. A refused call degrades like any other verifier
+   * outage. Without it the call is not accounted, exactly as in 2.3.
+   */
+  execution?: NativeExecutionContext;
 }
 
 /** What `verify()` judges: an answer against a goal, optionally in context. */
@@ -343,10 +355,12 @@ export function createVerifier(options: CreateVerifierOptions): Verifier {
           { role: 'user', content: buildPrompt(input, maxChecks) },
         ],
         ...(options.deps ? { deps: options.deps } : {}),
+        ...(options.execution ? { execution: options.execution } : {}),
       });
       raw = result.object;
     } catch (error) {
-      // A broken verifier must not become a broken run (module JSDoc, point 1).
+      // A broken verifier must not become a broken run (module JSDoc, point 1),
+      // nor does a budget or policy that refuses its call (2.4).
       return degrade('the verifier model call failed', error);
     }
     // A raw JSON Schema is not validated by `schema/bridge.ts` (no zero-dep
