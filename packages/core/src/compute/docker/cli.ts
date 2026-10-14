@@ -14,6 +14,7 @@ interface ReadableLike {
 }
 interface WritableLike {
   on(event: 'error', listener: (error: Error) => void): void;
+  on(event: 'close' | 'finish', listener: () => void): void;
   end(chunk?: Uint8Array): void;
   destroy(): void;
 }
@@ -268,4 +269,56 @@ const textDecoder = new TextDecoder();
 /** stdout as trimmed text. */
 export function stdoutText(result: DockerRunResult): string {
   return textDecoder.decode(result.stdout).trim();
+}
+
+/**
+ * Starts a container with its stdin attached (`docker start --attach
+ * --interactive`): the one start command of a process whose request carries
+ * stdin. Resolves once the bytes are handed to the CLI and its stdin closed
+ * (or the CLI exited first); the CLI then lives on by itself until the
+ * container exits, holding nothing of the host. It runs detached, in its own
+ * process group and console, so a Ctrl-C at the host's terminal never reaches
+ * it (its signal proxy would forward it to the container), and its output is
+ * ignored: the daemon keeps the logs. Whether the container started is for
+ * the caller to inspect.
+ */
+export async function startAttachedWithStdin(
+  cli: DockerCli,
+  containerId: string,
+  stdin: Uint8Array,
+): Promise<{ exited: Promise<number | null> }> {
+  const spawn = await loadSpawn();
+  let child: ChildLike;
+  try {
+    child = spawn(
+      cli.dockerPath,
+      [...cli.dockerArgs, 'start', '--attach', '--interactive', containerId],
+      { stdio: ['pipe', 'ignore', 'ignore'], shell: false, windowsHide: true, detached: true },
+    );
+  } catch (error) {
+    throw new DockerSandboxError(
+      'docker_unavailable',
+      `The Docker CLI (${cli.dockerPath}) could not be started: ${(error as Error).message}`,
+      { command: 'start', cause: error },
+    );
+  }
+  const exited = new Promise<number | null>((resolve) => {
+    child.on('close', (code) => resolve(code));
+    child.on('error', () => resolve(null));
+  });
+  await new Promise<void>((resolve) => {
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      resolve();
+    };
+    if (!child.stdin) return finish();
+    child.stdin.on('error', finish);
+    child.stdin.on('close', finish);
+    child.stdin.end(stdin);
+    void exited.then(finish);
+  });
+  child.unref();
+  return { exited };
 }

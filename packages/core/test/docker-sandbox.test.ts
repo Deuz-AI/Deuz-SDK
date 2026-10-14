@@ -9,7 +9,7 @@
  * fake sits in a directory with spaces and non-ASCII characters, so every
  * call here also proves the argv survives Windows quoting.
  */
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { createDockerSandbox, DockerSandboxError } from '../src/compute/docker';
 import { createInMemoryWorkspace } from '../src/workspace';
 import { createMemoryObserver } from '../src/observe';
@@ -21,6 +21,10 @@ import {
   fakeDocker,
   type FakeDockerBundle,
 } from './fixtures/fake-docker';
+import { SLOW_TEST_TIMEOUT_MS } from './fixtures/timeouts';
+
+// Every docker call here starts a node process (the fake CLI): seconds, not milliseconds.
+vi.setConfig({ testTimeout: SLOW_TEST_TIMEOUT_MS });
 
 let bundle: FakeDockerBundle;
 beforeAll(async () => {

@@ -21,7 +21,8 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
-  rmdirSync,
+  renameSync,
+  rmSync,
   statSync,
   writeFileSync,
 } from 'node:fs';
@@ -109,24 +110,47 @@ function sleepSync(ms: number): void {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
+/** Whether the process that took the lock is gone (killed while holding it). */
+function lockIsStale(): boolean {
+  try {
+    const pid = Number(readFileSync(join(lockPath, 'pid'), 'utf8'));
+    if (!Number.isSafeInteger(pid) || pid <= 0) throw new Error('no pid yet');
+    process.kill(pid, 0);
+    return false;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ESRCH') return true;
+    // No pid file yet: the holder is between mkdir and its write.
+    try {
+      return Date.now() - statSync(lockPath).mtimeMs > 10_000;
+    } catch {
+      return false;
+    }
+  }
+}
+
 function withLock<T>(fn: (state: FakeState) => T): T {
-  const deadline = Date.now() + 20_000;
+  const deadline = Date.now() + 30_000;
   for (;;) {
     try {
       mkdirSync(lockPath);
+      writeFileSync(join(lockPath, 'pid'), String(process.pid));
       break;
     } catch {
       if (Date.now() > deadline) throw new Error('fake docker: lock timeout');
+      if (lockIsStale()) rmSync(lockPath, { recursive: true, force: true });
       sleepSync(3);
     }
   }
   try {
     const state = JSON.parse(readFileSync(statePath, 'utf8')) as FakeState;
     const result = fn(state);
-    writeFileSync(statePath, JSON.stringify(state));
+    // Atomic: a command killed mid-write never leaves half a state behind.
+    const temp = `${statePath}.${process.pid}`;
+    writeFileSync(temp, JSON.stringify(state));
+    renameSync(temp, statePath);
     return result;
   } finally {
-    rmdirSync(lockPath);
+    rmSync(lockPath, { recursive: true, force: true });
   }
 }
 
@@ -137,9 +161,18 @@ function readState(): FakeState {
 const out = (text: string | Uint8Array) => process.stdout.write(text);
 const err = (text: string) => process.stderr.write(text);
 
+/** Ends the command with an error; thrown, so a lock held around it is released. */
+class FakeExit extends Error {
+  constructor(
+    message: string,
+    readonly code: number,
+  ) {
+    super(message);
+  }
+}
+
 function fail(message: string, code = 1): never {
-  err(message.endsWith('\n') ? message : `${message}\n`);
-  process.exit(code);
+  throw new FakeExit(message, code);
 }
 
 function readStdin(): Uint8Array {
@@ -530,7 +563,7 @@ const VALUE_FLAGS = new Set([
 ]);
 const BOOLEAN_FLAGS = new Set(['--read-only', '-i', '--interactive', '--init']);
 
-function create(state: FakeState, rest: string[]): void {
+function create(state: FakeState, rest: string[]): string {
   let index = 0;
   const flags: string[] = [];
   const labels: Record<string, string> = {};
@@ -649,7 +682,7 @@ function create(state: FakeState, rest: string[]): void {
       putFile(state, container, path, { type: 'dir', uid: 0, gid: 0, mode: 0o755 });
   }
   state.containers[id] = container;
-  out(`${id}\n`);
+  return id;
 }
 
 function copyIn(state: FakeState, target: string, tar: Uint8Array): void {
@@ -669,7 +702,7 @@ function copyIn(state: FakeState, target: string, tar: Uint8Array): void {
   }
 }
 
-function copyOut(state: FakeState, source: string): void {
+function copyOut(state: FakeState, source: string): Uint8Array {
   const colon = source.indexOf(':');
   const container = needContainer(state, source.slice(0, colon));
   const path = resolveParents(state, container, posixJoin('/', source.slice(colon + 1)));
@@ -692,7 +725,7 @@ function copyOut(state: FakeState, source: string): void {
         });
       }
   }
-  out(writeTar(entries));
+  return writeTar(entries);
 }
 
 function filters(rest: string[]): ((labels: Record<string, string>) => boolean)[] {
@@ -772,17 +805,23 @@ function main(): void {
       out(`${id}\n`);
       return;
     }
-    case 'create':
-      withLock((state) => create(state, rest));
+    case 'create': {
+      const id = withLock((state) => create(state, rest));
       failAfter();
+      out(`${id}\n`);
       return;
+    }
     case 'cp': {
       const positional = rest.filter((arg) => arg !== '-a' && arg !== '--archive');
       if (positional[0] === '-') {
         const tar = readStdin();
         withLock((state) => copyIn(state, positional[1]!, tar));
       } else {
-        withLock((state) => copyOut(state, positional[0]!));
+        // Written last, with no lock held: the reader may stop us mid-way.
+        const tar = withLock((state) => copyOut(state, positional[0]!));
+        failAfter();
+        out(tar);
+        return;
       }
       failAfter();
       return;
@@ -797,12 +836,10 @@ function main(): void {
         if (container.state === 'running') return container.id;
         const [op] = scriptOf(container.command);
         if (op === 'missing-binary') {
+          // Saved with the state: the refusal is failed below, outside the lock.
           container.error = `exec: "${op}": executable file not found in $PATH`;
           container.exitCode = 127;
-          fail(
-            `Error response from daemon: failed to create task for container: ${container.error}: unknown`,
-            1,
-          );
+          return undefined;
         }
         container.state = 'running';
         container.startCount++;
@@ -814,6 +851,10 @@ function main(): void {
         run(state, container);
         return container.id;
       });
+      if (id === undefined)
+        fail(
+          'Error response from daemon: failed to create task for container: exec: "missing-binary": executable file not found in $PATH: unknown',
+        );
       failAfter();
       if (!attach) {
         out(`${ref}\n`);
@@ -826,7 +867,9 @@ function main(): void {
             out(container.stdout);
             err(container.stderr);
           }
-          process.exit(container?.exitCode ?? 1);
+          // Not process.exit: the output must drain first.
+          process.exitCode = container?.exitCode ?? 1;
+          return;
         }
         sleepSync(20);
       }
@@ -952,5 +995,12 @@ function main(): void {
   }
 }
 
-if (!existsSync(statePath) || !statSync(statePath).isFile()) fail('fake docker: no state.json');
-main();
+try {
+  if (!existsSync(statePath) || !statSync(statePath).isFile()) fail('fake docker: no state.json');
+  main();
+} catch (error) {
+  if (!(error instanceof FakeExit)) throw error;
+  process.stderr.write(error.message.endsWith('\n') ? error.message : `${error.message}\n`, () =>
+    process.exit(error.code),
+  );
+}

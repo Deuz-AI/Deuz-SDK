@@ -74,6 +74,8 @@ export interface ResolvedDockerOptions {
   labels: Record<string, string>;
   interpreters: Readonly<Record<string, readonly string[]>>;
   deps: ResolvedDependencies;
+  /** The host passed its own clock: timers go through it (else they never hold the process open). */
+  customClock: boolean;
 }
 
 function positiveInteger(value: unknown, name: string): number {
@@ -171,6 +173,7 @@ export function resolveDockerOptions(
     labels,
     interpreters,
     deps: resolveDependencies(options.deps),
+    customClock: options.deps?.clock !== undefined,
   };
 }
 
@@ -350,6 +353,8 @@ export interface DockerEngine {
   listDanglingVolumes(): Promise<string[]>;
   /** The bounded stdout/stderr tails of `docker logs`. */
   logs(containerId: string): Promise<ProcessOutput>;
+  /** The one detached start command (`docker start <id>`). */
+  start(containerId: string): Promise<void>;
   stop(containerId: string, graceSeconds: number): Promise<void>;
   kill(containerId: string): Promise<void>;
   /** Removes the container and its workspace volume; a missing one is fine. */
@@ -631,6 +636,10 @@ export function createDockerEngine(options: ResolvedDockerOptions): DockerEngine
         stderr: stderr.text(),
         truncated: { stdout: stdout.truncated, stderr: stderr.truncated },
       };
+    },
+
+    async start(containerId) {
+      await docker(cli, ['start', containerId], { timeoutMs: 120_000 });
     },
 
     async stop(containerId, graceSeconds) {

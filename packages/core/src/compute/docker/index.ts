@@ -8,11 +8,11 @@
  */
 import type { ComputeSandbox } from '../../types/compute';
 import type { Dependencies } from '../../types/deps';
-import { notImplemented } from '../../internal/not-implemented';
 import type { DockerSandboxOptions, ProcessOperationStore, ProcessRunner } from './types';
 import { createInMemoryProcessOperationStore as createMemoryStore } from './memory-store';
 import { resolveDockerOptions } from './engine';
 import { createDockerSandboxFromOptions } from './sandbox';
+import { createDockerRunnerFromOptions } from './runner';
 
 export type * from './types';
 export { OperationConflictError } from '../../errors';
@@ -58,9 +58,14 @@ export function createDockerSandbox(options: DockerSandboxOptions): ComputeSandb
  * inspects, in that order; reconnects through `store` after a restart.
  */
 export function createDockerProcessRunner(
-  _options: DockerSandboxOptions & { store: ProcessOperationStore },
+  options: DockerSandboxOptions & { store: ProcessOperationStore },
 ): ProcessRunner {
-  return notImplemented('createDockerProcessRunner');
+  if (!options?.store)
+    throw new TypeError('createDockerProcessRunner needs a ProcessOperationStore');
+  return createDockerRunnerFromOptions(
+    resolveDockerOptions(options, DEFAULT_DOCKER_SANDBOX),
+    options.store,
+  );
 }
 
 /** The in-memory `ProcessOperationStore` (2.4): for tests and one process. */

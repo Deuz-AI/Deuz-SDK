@@ -186,8 +186,14 @@ describe('/skills/learning skeleton', () => {
 
 describe('/compute/docker (Node-only, implemented by L6)', () => {
   it('publishes the sandbox, runner and operation stores', () => {
-    expectStub('createDockerSandbox', () => docker.createDockerSandbox(any));
-    expectStub('createDockerProcessRunner', () => docker.createDockerProcessRunner(any));
+    const image = 'alpine:3.20';
+    expect(docker.createDockerSandbox({ image })).toHaveProperty('runShell');
+    expect(
+      docker.createDockerProcessRunner({
+        image,
+        store: docker.createInMemoryProcessOperationStore(),
+      }),
+    ).toHaveProperty('reconcile');
     expect(docker.createInMemoryProcessOperationStore()).toHaveProperty('create');
     expect(docker.createSqliteProcessOperationStore({ path: ':memory:' })).toHaveProperty('close');
     expect(docker.OperationConflictError).toBe(errors.OperationConflictError);
