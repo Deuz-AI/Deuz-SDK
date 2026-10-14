@@ -103,6 +103,9 @@ async function resolveEmbeddingCall(
 
 const RETRYABLE = new Set([408, 409, 429, 500, 502, 503, 504, 529]);
 
+/** Statuses that refuse a request before it is billed, as the native request reads them (2.4). */
+const UNBILLED = new Set([400, 401, 403, 404, 422, 429]);
+
 /**
  * Observation (1.6): `embed()` delegates to `embedMany()` — mark the wrapped
  * options so exactly ONE run is emitted, labeled with the original operation.
@@ -127,6 +130,15 @@ interface EmbedObserve {
   spanId: string;
 }
 
+/**
+ * Whether any request of an accounted call may have been billed (2.4): a
+ * response other than a refusal before billing, or a transport failure after
+ * the request left. Unset without accounting.
+ */
+interface EmbedBilling {
+  billable: boolean;
+}
+
 /** One sub-batch request with pre-response retry (exp backoff + full jitter, Retry-After honored). */
 async function fetchBatch(
   adapter: EmbeddingAdapter,
@@ -138,6 +150,7 @@ async function fetchBatch(
   deps: ResolvedDependencies,
   signal: AbortSignal | undefined,
   observe: EmbedObserve | undefined,
+  billing?: EmbedBilling,
 ): Promise<{ vectors: number[][]; tokens?: number }> {
   const built = adapter.buildRequest({ call, values, opts, caps });
   const maxRetries = opts.maxRetries ?? 2;
@@ -169,6 +182,8 @@ async function fetchBatch(
     try {
       response = await fetchImpl(built.url, { ...built.init, signal });
     } catch (err) {
+      // The request may have reached the provider before it failed.
+      if (billing) billing.billable = true;
       if (signal?.aborted) throw new AbortError(undefined, { cause: err });
       if (attempt >= maxRetries) {
         throw new NetworkError({
@@ -184,6 +199,7 @@ async function fetchBatch(
       continue;
     }
 
+    if (billing && !UNBILLED.has(response.status)) billing.billable = true;
     if (response.ok) {
       const json = await response.json().catch(() => ({}));
       return adapter.parseResponse(json, caps);
@@ -351,9 +367,35 @@ async function embedManyCore(
     batches.push(options.values.slice(i, i + batchSize));
   }
 
-  const results = await mapWithConcurrency(batches, options.maxConcurrency ?? 5, (batch) =>
-    fetchBatch(adapter, call, fetchImpl, batch, options, caps, deps, options.signal, observe),
-  );
+  // 2.4: reserve the call on the ledger before its first request, only when asked.
+  const charge = options.accounting
+    ? await (
+        await import('./embed-accounting')
+      ).startEmbeddingCharge(options.accounting, options.model.modelId, options.values, deps)
+    : undefined;
+  const billing: EmbedBilling | undefined = charge ? { billable: false } : undefined;
+
+  let results: { vectors: number[][]; tokens?: number }[];
+  try {
+    results = await mapWithConcurrency(batches, options.maxConcurrency ?? 5, (batch) =>
+      fetchBatch(
+        adapter,
+        call,
+        fetchImpl,
+        batch,
+        options,
+        caps,
+        deps,
+        options.signal,
+        observe,
+        billing,
+      ),
+    );
+  } catch (error) {
+    // Other sub-batches may still be in flight: only a lone refused request is released.
+    if (charge) await charge.fail(billing!.billable || batches.length > 1).catch(() => undefined);
+    throw error;
+  }
 
   // Concatenate in original order; sum tokens across sub-batches.
   const embeddings: number[][] = [];
@@ -369,6 +411,8 @@ async function embedManyCore(
 
   const usage: Usage = embeddingUsage(sawTokens ? totalTokens : undefined);
   fireUsage(options as never, deps, usage, { model: options.model.modelId, reason: 'finished' });
+  // No reported tokens is no usage, not zero cost: the estimate stays held.
+  if (charge) await charge.settle(usage, sawTokens);
 
   return { embeddings, usage };
 }
