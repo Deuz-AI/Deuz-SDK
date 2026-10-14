@@ -1881,3 +1881,21 @@ export async function* connectDeuzStream(
     }
   }
 }
+
+// ===================================================================
+// Durable stream state and the capability handshake (2.4)
+// ===================================================================
+
+export type * from './types/stream-durable';
+export {
+  createInMemoryDurableStreamStateStore,
+  DEFAULT_DURABLE_STREAM_BATCH,
+} from './stream-durable';
+export {
+  DEUZ_CAPABILITIES,
+  DEUZ_CAPABILITIES_HEADER,
+  DEUZ_CAPABILITY,
+  formatDeuzCapabilities,
+  parseDeuzCapabilities,
+} from './internal/capabilities';
+export type { DeuzCapabilitiesPart, DeuzCapability } from './internal/capabilities';

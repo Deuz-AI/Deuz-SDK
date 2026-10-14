@@ -176,6 +176,16 @@
         "default": "./dist/compute/node.cjs"
       }
     },
+    "./compute/docker": {
+      "import": {
+        "types": "./dist/compute/docker.d.ts",
+        "default": "./dist/compute/docker.js"
+      },
+      "require": {
+        "types": "./dist/compute/docker.d.cts",
+        "default": "./dist/compute/docker.cjs"
+      }
+    },
     "./agent": {
       "import": {
         "types": "./dist/agent.d.ts",
@@ -304,6 +314,36 @@
       "require": {
         "types": "./dist/goal.d.cts",
         "default": "./dist/goal.cjs"
+      }
+    },
+    "./goal/runtime": {
+      "import": {
+        "types": "./dist/goal/runtime.d.ts",
+        "default": "./dist/goal/runtime.js"
+      },
+      "require": {
+        "types": "./dist/goal/runtime.d.cts",
+        "default": "./dist/goal/runtime.cjs"
+      }
+    },
+    "./goal/runtime/sqlite": {
+      "import": {
+        "types": "./dist/goal/runtime/sqlite.d.ts",
+        "default": "./dist/goal/runtime/sqlite.js"
+      },
+      "require": {
+        "types": "./dist/goal/runtime/sqlite.d.cts",
+        "default": "./dist/goal/runtime/sqlite.cjs"
+      }
+    },
+    "./goal/runtime/postgres": {
+      "import": {
+        "types": "./dist/goal/runtime/postgres.d.ts",
+        "default": "./dist/goal/runtime/postgres.js"
+      },
+      "require": {
+        "types": "./dist/goal/runtime/postgres.d.cts",
+        "default": "./dist/goal/runtime/postgres.cjs"
       }
     },
     "./autonomy": {
@@ -506,6 +546,46 @@
         "default": "./dist/memory/markdown.cjs"
       }
     },
+    "./memory/versioned": {
+      "import": {
+        "types": "./dist/memory/versioned.d.ts",
+        "default": "./dist/memory/versioned.js"
+      },
+      "require": {
+        "types": "./dist/memory/versioned.d.cts",
+        "default": "./dist/memory/versioned.cjs"
+      }
+    },
+    "./memory/versioned/sqlite": {
+      "import": {
+        "types": "./dist/memory/versioned/sqlite.d.ts",
+        "default": "./dist/memory/versioned/sqlite.js"
+      },
+      "require": {
+        "types": "./dist/memory/versioned/sqlite.d.cts",
+        "default": "./dist/memory/versioned/sqlite.cjs"
+      }
+    },
+    "./memory/versioned/postgres": {
+      "import": {
+        "types": "./dist/memory/versioned/postgres.d.ts",
+        "default": "./dist/memory/versioned/postgres.js"
+      },
+      "require": {
+        "types": "./dist/memory/versioned/postgres.d.cts",
+        "default": "./dist/memory/versioned/postgres.cjs"
+      }
+    },
+    "./context": {
+      "import": {
+        "types": "./dist/context.d.ts",
+        "default": "./dist/context.js"
+      },
+      "require": {
+        "types": "./dist/context.d.cts",
+        "default": "./dist/context.cjs"
+      }
+    },
     "./rag": {
       "import": {
         "types": "./dist/rag.d.ts",
@@ -544,6 +624,16 @@
       "require": {
         "types": "./dist/skills/node.d.cts",
         "default": "./dist/skills/node.cjs"
+      }
+    },
+    "./skills/learning": {
+      "import": {
+        "types": "./dist/skills/learning.d.ts",
+        "default": "./dist/skills/learning.js"
+      },
+      "require": {
+        "types": "./dist/skills/learning.d.cts",
+        "default": "./dist/skills/learning.cjs"
       }
     },
     "./vertex": {
@@ -739,8 +829,8 @@
     "./package.json": "./package.json"
   },
   "scripts": {
-    "build": "tsup",
-    "dev": "tsup --watch",
+    "build": "node tooling/build.mjs",
+    "dev": "node tooling/build.mjs --watch",
     "test": "vitest run",
     "test:protocol": "vitest run test/stream-protocol.test.ts",
     "test:conformance": "vitest run test/provider-conformance.test.ts",
@@ -754,8 +844,8 @@
     "verify:size": "node tooling/check-bundle-size.mjs",
     "verify:api": "node tooling/check-api-contract.mjs",
     "check": "npm run lint && npm run typecheck && npm run test && npm run test:types && npm run build && npm run verify:package && npm run verify:runtime && npm run verify:size && npm run verify:api",
-    "prepare": "tsup",
-    "prepublishOnly": "npm run check",
+    "prepare": "node tooling/build.mjs",
+    "prepublishOnly": "node tooling/prepublish-guard.mjs",
     "test:live": "vitest run --config vitest.live.config.ts"
   },
   "keywords": [

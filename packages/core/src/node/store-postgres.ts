@@ -1072,3 +1072,8 @@ export function createPostgresStores(options: PostgresStoreOptions): PostgresSto
     },
   };
 }
+
+// 2.4 stores on this entry: their own modules and tables (W0 skeleton; W1 lanes
+// implement them in place, never in this file).
+export * from './chat-conditional-postgres';
+export * from './stream-state-postgres';

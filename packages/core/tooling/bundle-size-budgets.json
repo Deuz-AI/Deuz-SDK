@@ -259,7 +259,19 @@
     "  mcp-server lazy  281325 B raw / 90338 gzip -> 285000 / 91200",
     "What grew: agent-run.ts +1.4 KB raw (B1: the settle record before a resume's first model call, the",
     "client-result settle tools, the 2.2 envelope-version rule, the reconcilable-receipt filter), the",
-    "loops +0.2 KB (internal hooks), the adapters +0.4 KB (K4/C1: Gemini finish reasons, OpenAI refusals)."
+    "loops +0.2 KB (internal hooks), the adapters +0.4 KB (K4/C1: Gemini finish reasons, OpenAI refusals).",
+    "",
+    "ADDED FOR 2.4 (W0D). Measured on wip/2.4-w0d, same pipeline, ~10% headroom:",
+    "  skills            5113 B raw / 2256 gzip -> 5650 / 2500 (2.3 code, budgeted for the first time)",
+    "  skills-node       4906 B raw / 2101 gzip -> 5400 / 2350 (lazy node: imports, so it bundles here)",
+    "  memory-versioned  1124 B raw /  595 gzip -> 1250 /  660",
+    "  context           2080 B raw / 1028 gzip -> 2300 / 1150 (includes the real createTokenEstimator)",
+    "  goal-runtime      1274 B raw /  693 gzip -> 1400 /  770",
+    "  skills-learning    867 B raw /  531 gzip ->  960 /  590",
+    "The last four measure the W0 contract STUBS (each factory throws NotImplementedError). They are",
+    "meant to trip: raise each one deliberately, with its measurement, when its W1 lane lands the",
+    "implementation. The Node-only 2.4 entries (versioned memory and goal runtime stores, compute/docker)",
+    "are not budgeted, like the other Node-only stores."
   ],
   "bundles": {
     "core": {
@@ -653,6 +665,66 @@
       ],
       "maxRawBytes": 50500,
       "maxGzipBytes": 16800
+    },
+    "skills": {
+      "from": "@deuz-sdk/core/skills",
+      "exports": [
+        "parseSkill",
+        "createSkillRegistry",
+        "renderSkillCatalog",
+        "lexicalMatcher",
+        "scopeToolsToSkill"
+      ],
+      "maxRawBytes": 5650,
+      "maxGzipBytes": 2500
+    },
+    "skills-node": {
+      "from": "@deuz-sdk/core/skills/node",
+      "exports": ["nodeSkillSource"],
+      "maxRawBytes": 5400,
+      "maxGzipBytes": 2350
+    },
+    "memory-versioned": {
+      "from": "@deuz-sdk/core/memory/versioned",
+      "exports": [
+        "createMemorySession",
+        "createVersionedMemoryTools",
+        "createInMemoryVersionedMemoryStore",
+        "importLegacyMemory"
+      ],
+      "maxRawBytes": 1250,
+      "maxGzipBytes": 660
+    },
+    "context": {
+      "from": "@deuz-sdk/core/context",
+      "exports": [
+        "compileContext",
+        "createContextCompiler",
+        "createWorkingMemory",
+        "applyWorkingMemoryPatch",
+        "workingMemoryTools",
+        "createTokenEstimator"
+      ],
+      "maxRawBytes": 2300,
+      "maxGzipBytes": 1150
+    },
+    "goal-runtime": {
+      "from": "@deuz-sdk/core/goal/runtime",
+      "exports": [
+        "createGoalSupervisor",
+        "createDurableScheduler",
+        "createWebhookHandler",
+        "createInMemoryGoalRuntimeStore",
+        "verifyGoalAcceptance"
+      ],
+      "maxRawBytes": 1400,
+      "maxGzipBytes": 770
+    },
+    "skills-learning": {
+      "from": "@deuz-sdk/core/skills/learning",
+      "exports": ["proposeSkillFromRun"],
+      "maxRawBytes": 960,
+      "maxGzipBytes": 590
     }
   }
 }

@@ -964,3 +964,8 @@ export function createSqliteStores(options: SqliteStoreOptions): SqliteStores {
     },
   };
 }
+
+// 2.4 stores on this entry: their own modules and tables (W0 skeleton; W1 lanes
+// implement them in place, never in this file).
+export * from './chat-conditional-sqlite';
+export * from './stream-state-sqlite';

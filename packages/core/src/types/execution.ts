@@ -68,6 +68,16 @@ export interface BudgetReservationInput {
    * (`missing_reservation`). Never combined with `usd`.
    */
   readonly unpriced?: boolean;
+  /**
+   * The attempt runs through a host callback that reports no usage (2.4): a
+   * plain `MemoryLLM`, a RAG `Embedder` or memory `Embedder` without the
+   * `accounted` mark. It is never counted as free. Under the default
+   * `unknownPrice: 'warn'` it is admitted at its estimates, ends `unknown`
+   * (the estimates stay held) and the caller reports one `unaccounted-usage`
+   * warning; under `'reject'` it is refused before the callback runs, so a
+   * strict budget needs the accounted variant.
+   */
+  readonly unaccounted?: boolean;
 }
 
 export interface BudgetReservation {
@@ -86,6 +96,11 @@ export interface BudgetReservation {
    * settled as the charge (`actual.usd`).
    */
   readonly unpriced?: true;
+  /**
+   * The attempt ran through a callback that reports no usage (2.4); see
+   * `BudgetReservationInput.unaccounted`. Its actual amounts stay unknown.
+   */
+  readonly unaccounted?: true;
 }
 
 export interface BudgetSettlement {
@@ -109,6 +124,11 @@ export interface BudgetTotals {
    * bound. Omitted when zero.
    */
   readonly unpriced?: number;
+  /**
+   * Attempts through callbacks that report no usage (2.4): counted in
+   * `unknownTokens`/`unknownUsd` at their held estimates. Omitted when zero.
+   */
+  readonly unaccounted?: number;
 }
 
 /**
