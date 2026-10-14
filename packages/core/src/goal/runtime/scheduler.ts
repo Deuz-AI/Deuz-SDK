@@ -8,19 +8,26 @@
  * library loop in the host process, not a service. Edge-safe.
  */
 import type { Dependencies } from '../../types/deps';
-import { notImplemented } from '../../internal/not-implemented';
 import { resolveDependencies } from '../../internal/resolve-deps';
+import { DEUZ_ATTR, DEUZ_SPAN, recordSpan } from '../../internal/telemetry';
 import { parseCron } from '../../schedule/cron';
 import type { ScheduleCatchUp } from '../../schedule/scheduler';
-import { assertTimeZone } from '../../schedule/zoned';
+import { assertTimeZone, nextZonedOccurrence, zonedOccurrencesBetween } from '../../schedule/zoned';
+import type { ZonedCronOptions } from '../../schedule/zoned';
 import { GoalError } from '../errors';
+import { goalEventFromOccurrence } from '../events';
+import { goalDeliveryDigest } from './delivery';
+import { goalInboxKey } from './store';
 import type {
   DurableSchedule,
   DurableScheduleInput,
   DurableSchedulePage,
   DurableScheduleQuery,
+  GoalInboxEnqueue,
   GoalRuntimeStore,
+  ScheduleAdvance,
   ScheduleOccurrenceRecord,
+  ScheduleSpec,
 } from './store-types';
 
 /** The scheduler's limits (spec §3.2). */
@@ -60,6 +67,11 @@ export interface DurableSchedulerTickResult {
   duplicates: number;
   /** Schedules whose backlog continues next tick. */
   backlog: number;
+  /**
+   * Schedules whose step failed (a store error, say): logged, left where
+   * they were, and tried again next tick. The other schedules still advance.
+   */
+  errors: { scope: string; scheduleId: string; error: unknown }[];
 }
 
 /**
@@ -96,6 +108,36 @@ export interface DurableScheduler {
 }
 
 const CATCH_UP: readonly ScheduleCatchUp[] = ['latest', 'all', 'none'];
+const MINUTE = 60_000;
+/** Advance conflicts (another scheduler, a change) tolerated per schedule per tick. */
+const MAX_CONFLICTS = 3;
+
+/** An occurrence as planned, before the store records it. */
+type PlannedOccurrence = Omit<ScheduleOccurrenceRecord, 'recordedAt' | 'inboxEntryId'>;
+
+/** One step of one schedule: the advance to commit. */
+interface StepPlan {
+  toCursor: number;
+  scanTo?: number;
+  occurrences: PlannedOccurrence[];
+  /** UTC time scanned, against the per-tick allowance. */
+  scanned: number;
+}
+
+/** The schedule's first instant not yet scanned: its cursor, or its boundary when later. */
+const startOf = (schedule: DurableSchedule): number =>
+  Math.max(schedule.scheduleCursor, schedule.effectiveFrom);
+
+const zonedOf = (spec: ScheduleSpec): ZonedCronOptions => ({
+  timezone: spec.timezone ?? 'UTC',
+  dstGap: spec.dstGap ?? 'shift',
+  dstOverlap: spec.dstOverlap ?? 'first',
+});
+
+const scheduleKey = (schedule: Pick<DurableSchedule, 'scope' | 'scheduleId'>): string =>
+  JSON.stringify([schedule.scope, schedule.scheduleId]);
+
+const namespaceOf = (scheduleId: string): string => `schedule:${scheduleId}`;
 
 function nonEmpty(value: unknown, name: string): string {
   if (typeof value !== 'string' || value === '')
@@ -189,16 +231,387 @@ export function createDurableScheduler(options: DurableSchedulerOptions): Durabl
   if (typeof options !== 'object' || options === null || typeof options.store !== 'object')
     throw new TypeError('createDurableScheduler needs a GoalRuntimeStore');
   const { store } = options;
-  checkLimit(options.graceMs, 'graceMs', DEFAULT_DURABLE_SCHEDULER.graceMs, 0);
-  checkLimit(
+  const graceMs = checkLimit(options.graceMs, 'graceMs', DEFAULT_DURABLE_SCHEDULER.graceMs, 0);
+  const maxDeliveries = checkLimit(
     options.maxDeliveriesPerTick,
     'maxDeliveriesPerTick',
     DEFAULT_DURABLE_SCHEDULER.maxDeliveriesPerTick,
     1,
   );
-  checkLimit(options.maxScanMinutes, 'maxScanMinutes', DEFAULT_DURABLE_SCHEDULER.maxScanMinutes, 1);
-  checkLimit(options.pollMs, 'pollMs', DEFAULT_DURABLE_SCHEDULER.pollMs, 1);
+  const maxScanMs =
+    checkLimit(
+      options.maxScanMinutes,
+      'maxScanMinutes',
+      DEFAULT_DURABLE_SCHEDULER.maxScanMinutes,
+      1,
+    ) * MINUTE;
+  const pollMs = checkLimit(options.pollMs, 'pollMs', DEFAULT_DURABLE_SCHEDULER.pollMs, 1);
   const deps = resolveDependencies(options.deps);
+  /** One advance writes at most this many occurrence records, skipped ones included. */
+  const recordCap = maxDeliveries;
+  /** An idle schedule moves its cursor up this often, so a later scan starts close by. */
+  const idleAdvanceMs = Math.max(MINUTE, Math.floor(maxScanMs / 2));
+
+  // ---------------------------------------------------------------------
+  // Planning a step (pure, apart from the next-due cache)
+  // ---------------------------------------------------------------------
+
+  /** The next occurrence after each schedule's start, by schedule, while that start holds. */
+  const dueCache = new Map<
+    string,
+    { revision: number; cursor: number; effectiveFrom: number; at: number }
+  >();
+
+  function nextAfter(schedule: DurableSchedule, after: number): number {
+    try {
+      return nextZonedOccurrence(schedule.spec.cron, after, zonedOf(schedule.spec));
+    } catch (error) {
+      if (error instanceof RangeError) return Infinity;
+      throw error;
+    }
+  }
+
+  function nextDue(schedule: DurableSchedule): number {
+    const key = scheduleKey(schedule);
+    const cached = dueCache.get(key);
+    if (
+      cached?.revision === schedule.revision &&
+      cached.cursor === schedule.scheduleCursor &&
+      cached.effectiveFrom === schedule.effectiveFrom
+    )
+      return cached.at;
+    const at = nextAfter(schedule, startOf(schedule));
+    dueCache.set(key, {
+      revision: schedule.revision,
+      cursor: schedule.scheduleCursor,
+      effectiveFrom: schedule.effectiveFrom,
+      at,
+    });
+    return at;
+  }
+
+  /** `'due'`: occurrences (or an unfinished window) wait; `'idle'`: only the cursor lags. */
+  function work(schedule: DurableSchedule, now: number): 'due' | 'idle' | undefined {
+    if (schedule.scanTo !== undefined || nextDue(schedule) <= now) return 'due';
+    return now - startOf(schedule) >= idleAdvanceMs ? 'idle' : undefined;
+  }
+
+  function planned(
+    schedule: DurableSchedule,
+    at: number,
+    disposition: PlannedOccurrence['disposition'],
+    reason?: PlannedOccurrence['reason'],
+  ): PlannedOccurrence {
+    return {
+      occurrenceId: `${schedule.scheduleId}@${at}`,
+      scheduleId: schedule.scheduleId,
+      scope: schedule.scope,
+      goalId: schedule.goalId,
+      at,
+      disposition,
+      ...(reason !== undefined ? { reason } : {}),
+    };
+  }
+
+  /**
+   * The next step of a schedule at `now`: at most `cap` deliveries, at most
+   * `scanLeft` ms of UTC time scanned, at most `recordCap` records. Undefined
+   * when there is nothing to do.
+   */
+  function plan(
+    schedule: DurableSchedule,
+    now: number,
+    cap: number,
+    scanLeft: number,
+  ): StepPlan | undefined {
+    const from = startOf(schedule);
+    const mode = schedule.spec.catchUp ?? 'latest';
+    let scanTo = schedule.scanTo;
+    // A window the boundary has overtaken (a change, a resume) is over.
+    if (scanTo !== undefined && scanTo <= from)
+      return { toCursor: from, occurrences: [], scanned: 0 };
+    if (scanTo === undefined) {
+      const first = nextDue(schedule);
+      if (first > now)
+        return now - from >= idleAdvanceMs
+          ? { toCursor: now, occurrences: [], scanned: 0 }
+          : undefined;
+      // An occurrence older than the grace was missed: catch up over a fixed
+      // window, so the deliveries do not depend on how many ticks it takes.
+      if (mode !== 'all' && first < now - graceMs) scanTo = now;
+    }
+    const windowEnd = scanTo ?? now;
+    let end = Math.min(from + scanLeft, windowEnd);
+    if (end <= from) return undefined;
+    let found = zonedOccurrencesBetween(
+      schedule.spec.cron,
+      from,
+      end,
+      zonedOf(schedule.spec),
+      recordCap + 1,
+    ).map((occurrence) => occurrence.at);
+    if (found.length > recordCap) {
+      found = found.slice(0, recordCap);
+      end = found[found.length - 1]!;
+    }
+    const scanned = end - from;
+
+    if (mode === 'latest' && scanTo !== undefined) {
+      // Only the newest occurrence of the window, and only once the window is
+      // scanned to its end (or nothing is left in it).
+      const final = end >= scanTo || nextAfter(schedule, end) > scanTo;
+      const last = found.length - 1;
+      return {
+        toCursor: final ? scanTo : end,
+        ...(final ? {} : { scanTo }),
+        scanned,
+        occurrences: found.map((at, index) =>
+          final && index === last
+            ? planned(schedule, at, 'delivered')
+            : planned(schedule, at, 'skipped', 'catch-up-latest'),
+        ),
+      };
+    }
+
+    // 'all', 'none', and 'latest' while on time: deliver up to `cap`, oldest
+    // first; the rest waits for the next step from the persistent cursor.
+    const reference = scanTo ?? now;
+    const occurrences: PlannedOccurrence[] = [];
+    let toCursor = end;
+    let delivered = 0;
+    for (const at of found) {
+      if (mode === 'none' && at < reference - graceMs) {
+        occurrences.push(planned(schedule, at, 'skipped', 'catch-up-none'));
+        continue;
+      }
+      if (delivered === cap) {
+        toCursor = occurrences[occurrences.length - 1]!.at;
+        break;
+      }
+      occurrences.push(planned(schedule, at, 'delivered'));
+      delivered += 1;
+    }
+    return {
+      toCursor,
+      ...(scanTo !== undefined && toCursor < scanTo ? { scanTo } : {}),
+      scanned: toCursor - from,
+      occurrences,
+    };
+  }
+
+  // ---------------------------------------------------------------------
+  // Committing a step
+  // ---------------------------------------------------------------------
+
+  async function deliveryOf(schedule: DurableSchedule, at: number): Promise<GoalInboxEnqueue> {
+    const occurrenceId = `${schedule.scheduleId}@${at}`;
+    const { scope, goalId } = schedule;
+    const event = goalEventFromOccurrence(
+      { id: schedule.scheduleId, at, key: occurrenceId },
+      {
+        scope,
+        goalId,
+        ...(schedule.event?.correlationId !== undefined
+          ? { correlationId: schedule.event.correlationId }
+          : {}),
+        ...(schedule.event?.expiresAfterMs !== undefined
+          ? { expiresAt: at + schedule.event.expiresAfterMs }
+          : {}),
+      },
+    );
+    return {
+      scope,
+      goalId,
+      namespace: namespaceOf(schedule.scheduleId),
+      deliveryId: occurrenceId,
+      event,
+      digest: await goalDeliveryDigest({ scope, goalId, event }),
+    };
+  }
+
+  type StepOutcome =
+    | { status: 'conflict'; schedule?: DurableSchedule }
+    | {
+        status: 'advanced';
+        schedule: DurableSchedule;
+        records: ScheduleOccurrenceRecord[];
+        delivered: number;
+        duplicates: number;
+        scanned: number;
+      };
+
+  async function step(
+    schedule: DurableSchedule,
+    now: number,
+    cap: number,
+    scanLeft: number,
+  ): Promise<StepOutcome | undefined> {
+    const next = plan(schedule, now, cap, scanLeft);
+    if (!next) return undefined;
+    const occurrences: ScheduleAdvance['occurrences'] = await Promise.all(
+      next.occurrences.map(async (occurrence) =>
+        occurrence.disposition === 'delivered'
+          ? { ...occurrence, delivery: await deliveryOf(schedule, occurrence.at) }
+          : occurrence,
+      ),
+    );
+    const result = await store.schedules.advance({
+      scope: schedule.scope,
+      scheduleId: schedule.scheduleId,
+      expectedRevision: schedule.revision,
+      fromCursor: schedule.scheduleCursor,
+      toCursor: next.toCursor,
+      ...(next.scanTo !== undefined ? { scanTo: next.scanTo } : {}),
+      occurrences,
+    });
+    if (result.status === 'conflict')
+      return { status: 'conflict', ...(result.schedule ? { schedule: result.schedule } : {}) };
+    const recordedAt = deps.clock.now();
+    const mode = schedule.spec.catchUp ?? 'latest';
+    const records = next.occurrences.map((occurrence): ScheduleOccurrenceRecord => {
+      const record: ScheduleOccurrenceRecord = { ...occurrence, recordedAt };
+      if (occurrence.disposition === 'delivered')
+        record.inboxEntryId = goalInboxKey(
+          schedule.scope,
+          namespaceOf(schedule.scheduleId),
+          occurrence.occurrenceId,
+        );
+      recordSpan(deps, DEUZ_SPAN.scheduleDelivery, {
+        [DEUZ_ATTR.scheduleId]: occurrence.scheduleId,
+        [DEUZ_ATTR.scheduleOccurrenceId]: occurrence.occurrenceId,
+        [DEUZ_ATTR.scheduleDisposition]: occurrence.disposition,
+        [DEUZ_ATTR.scheduleCatchUp]: mode,
+        [DEUZ_ATTR.goalId]: occurrence.goalId,
+        ...(occurrence.reason !== undefined ? { 'deuz.schedule.reason': occurrence.reason } : {}),
+      });
+      return record;
+    });
+    return {
+      status: 'advanced',
+      schedule: result.schedule,
+      records,
+      delivered: records.filter((record) => record.disposition === 'delivered').length,
+      duplicates: result.duplicates,
+      scanned: next.scanned,
+    };
+  }
+
+  // ---------------------------------------------------------------------
+  // The tick: every active schedule, in turn
+  // ---------------------------------------------------------------------
+
+  /** The schedule served last; the next tick starts after it (round-robin). */
+  let lastServed: string | undefined;
+
+  async function activeSchedules(signal: AbortSignal | undefined): Promise<DurableSchedule[]> {
+    const all: DurableSchedule[] = [];
+    let cursor: string | undefined;
+    do {
+      const page = await store.schedules.list({
+        statuses: ['active'],
+        limit: 1000,
+        ...(cursor !== undefined ? { cursor } : {}),
+      });
+      all.push(...page.schedules);
+      cursor = page.cursor;
+    } while (cursor !== undefined && !signal?.aborted);
+    const index = all.findIndex((schedule) => scheduleKey(schedule) === lastServed);
+    return index < 0 ? all : [...all.slice(index + 1), ...all.slice(0, index + 1)];
+  }
+
+  async function tickAt(
+    now: number,
+    signal: AbortSignal | undefined,
+  ): Promise<DurableSchedulerTickResult> {
+    if (typeof now !== 'number' || !Number.isFinite(now))
+      throw new TypeError('now must be a finite number of milliseconds');
+    const result: DurableSchedulerTickResult = {
+      occurrences: [],
+      duplicates: 0,
+      backlog: 0,
+      errors: [],
+    };
+    const scanLeft = new Map<string, number>();
+    const conflicts = new Map<string, number>();
+    const backlog = new Set<string>();
+    let budget = maxDeliveries;
+    let queue = await activeSchedules(signal);
+
+    const fail = (schedule: DurableSchedule, error: unknown) => {
+      result.errors.push({ scope: schedule.scope, scheduleId: schedule.scheduleId, error });
+      deps.logger.error('durable schedule step failed', {
+        scope: schedule.scope,
+        scheduleId: schedule.scheduleId,
+        error,
+      });
+    };
+
+    // Rounds: each schedule with work takes one step per round, with a fair
+    // share of the deliveries left, until the budget or the work runs out.
+    while (queue.length > 0 && budget > 0 && !signal?.aborted) {
+      const share = Math.max(1, Math.floor(budget / queue.length));
+      const again: DurableSchedule[] = [];
+      for (const schedule of queue) {
+        const key = scheduleKey(schedule);
+        if (budget <= 0 || signal?.aborted) {
+          again.push(schedule);
+          continue;
+        }
+        let outcome: StepOutcome | undefined;
+        try {
+          if (!work(schedule, now)) continue;
+          outcome = await step(
+            schedule,
+            now,
+            Math.min(share, budget),
+            scanLeft.get(key) ?? maxScanMs,
+          );
+        } catch (error) {
+          fail(schedule, error);
+          continue;
+        }
+        if (!outcome) {
+          // Due, but no scan left this tick.
+          backlog.add(key);
+          continue;
+        }
+        lastServed = key;
+        if (outcome.status === 'conflict') {
+          const count = (conflicts.get(key) ?? 0) + 1;
+          conflicts.set(key, count);
+          try {
+            const fresh =
+              outcome.schedule ?? (await store.schedules.get(schedule.scope, schedule.scheduleId));
+            if (fresh?.status === 'active' && count < MAX_CONFLICTS) again.push(fresh);
+          } catch (error) {
+            fail(schedule, error);
+          }
+          continue;
+        }
+        budget -= outcome.delivered;
+        result.duplicates += outcome.duplicates;
+        result.occurrences.push(...outcome.records);
+        const left = (scanLeft.get(key) ?? maxScanMs) - outcome.scanned;
+        scanLeft.set(key, left);
+        if (work(outcome.schedule, now) === 'due') {
+          if (left > 0) again.push(outcome.schedule);
+          else backlog.add(key);
+        }
+      }
+      queue = again;
+    }
+    for (const schedule of queue) {
+      try {
+        if (work(schedule, now) === 'due') backlog.add(scheduleKey(schedule));
+      } catch {
+        // Reported when the schedule steps.
+      }
+    }
+    result.backlog = backlog.size;
+    return result;
+  }
+
+  let running = false;
 
   /** The stored schedule, or `scope_mismatch` (a schedule of another scope reads as missing). */
   async function existing(scope: string, scheduleId: string): Promise<DurableSchedule> {
@@ -304,11 +717,51 @@ export function createDurableScheduler(options: DurableSchedulerOptions): Durabl
     get: (scope, scheduleId) => store.schedules.get(scope, scheduleId),
     list: (query) => store.schedules.list(query),
 
-    tick() {
-      return notImplemented('DurableScheduler.tick');
+    tick(tickOptions) {
+      return tickAt(tickOptions?.now ?? deps.clock.now(), tickOptions?.signal);
     },
-    start() {
-      return notImplemented('DurableScheduler.start');
+
+    start(startOptions) {
+      if (running) throw new Error('This durable scheduler is already started');
+      running = true;
+      const controller = new AbortController();
+      const outer = startOptions?.signal;
+      const forward = () => controller.abort();
+      if (outer?.aborted) controller.abort();
+      else outer?.addEventListener('abort', forward, { once: true });
+      let wake: (() => void) | undefined;
+      let cancelTimer: (() => void) | undefined;
+      controller.signal.addEventListener(
+        'abort',
+        () => {
+          cancelTimer?.();
+          wake?.();
+        },
+        { once: true },
+      );
+      const loop = (async () => {
+        while (!controller.signal.aborted) {
+          try {
+            await tickAt(deps.clock.now(), controller.signal);
+          } catch (error) {
+            deps.logger.error('durable scheduler tick failed', { error });
+          }
+          if (controller.signal.aborted) break;
+          await new Promise<void>((resolve) => {
+            wake = resolve;
+            cancelTimer = deps.clock.setTimeout(resolve, pollMs);
+          });
+        }
+      })().finally(() => {
+        outer?.removeEventListener('abort', forward);
+        running = false;
+      });
+      return {
+        async stop() {
+          controller.abort();
+          await loop;
+        },
+      };
     },
   };
 }

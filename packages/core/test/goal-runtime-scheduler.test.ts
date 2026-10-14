@@ -9,17 +9,29 @@ import { describe, expect, it } from 'vitest';
 import { GoalError, createGoal } from '../src/goal';
 import { createDurableScheduler } from '../src/goal/runtime/scheduler';
 import type { DurableSchedulerOptions } from '../src/goal/runtime/scheduler';
-import type { DurableScheduleInput } from '../src/goal/runtime/store-types';
+import { goalInboxKey } from '../src/goal/runtime/store';
+import type { DurableScheduleInput, GoalRuntimeStore } from '../src/goal/runtime/store-types';
 import type { ObserveEvent } from '../src/types/observe';
-import { createScheduleStoreDouble } from './fixtures/goal-runtime-double';
+import {
+  SimulatedCrash,
+  createScheduleStoreDouble,
+  withStoreFaults,
+  type ScheduleStoreDouble,
+} from './fixtures/goal-runtime-double';
 import { manualClock } from './fixtures/manual-clock';
 
 const T0 = Date.parse('2026-10-10T10:00:00Z');
 const MINUTE = 60_000;
 
-async function setup(options: Partial<DurableSchedulerOptions> = {}, start = T0) {
+type SetupOptions = Partial<DurableSchedulerOptions> & {
+  /** Wraps the store the scheduler sees (the test keeps the plain double). */
+  wrap?: (store: ScheduleStoreDouble) => GoalRuntimeStore;
+};
+
+async function setup({ wrap, ...options }: SetupOptions = {}, start = T0) {
   const time = manualClock(start);
   const events: ObserveEvent[] = [];
+  const logged: { message: string; fields?: Record<string, unknown> }[] = [];
   const store = createScheduleStoreDouble({ deps: { clock: time.clock } });
   for (const [goalId, scope] of [
     ['goal-1', 'tenant'],
@@ -28,17 +40,39 @@ async function setup(options: Partial<DurableSchedulerOptions> = {}, start = T0)
   ] as const)
     await store.save(createGoal({ goalId, scope, objective: `Do ${goalId}.` }, { now: start }));
   let ids = 0;
+  const log = (message: string, fields?: Record<string, unknown>) =>
+    void logged.push({ message, ...(fields ? { fields } : {}) });
   const scheduler = createDurableScheduler({
-    store,
+    store: wrap ? wrap(store) : store,
     deps: {
       clock: time.clock,
       generateId: () => `id-${++ids}`,
       observer: { emit: (event) => void events.push(event) },
+      logger: { debug: log, info: log, warn: log, error: log },
     },
     ...options,
   });
-  return { store, time, scheduler, events };
+  return { store, time, scheduler, events, logged };
 }
+
+/** The delivery ids of a goal's pending inbox entries, oldest first. */
+async function pending(store: GoalRuntimeStore, goalId = 'goal-1', scope = 'tenant') {
+  const ids: string[] = [];
+  let cursor: string | undefined;
+  do {
+    const page = await store.inbox.list({
+      scope,
+      goalId,
+      limit: 1000,
+      ...(cursor ? { cursor } : {}),
+    });
+    ids.push(...page.entries.map((entry) => entry.deliveryId));
+    cursor = page.cursor;
+  } while (cursor);
+  return ids;
+}
+
+const occurrence = (scheduleId: string, iso: string) => `${scheduleId}@${Date.parse(iso)}`;
 
 const input = (overrides: Partial<DurableScheduleInput> = {}): DurableScheduleInput => ({
   scheduleId: 's',
@@ -166,5 +200,142 @@ describe('createDurableScheduler: schedules', () => {
     const unknown = await refusal(scheduler.pause('tenant', 'nope'));
     expect((unknown as GoalError).code).toBe('scope_mismatch');
     expect(await refusal(scheduler.cancel('other', 's'))).toBeInstanceOf(GoalError);
+  });
+});
+
+describe('createDurableScheduler: tick', () => {
+  it('delivers an occurrence due within grace into the goal inbox, in the advance that moves the cursor', async () => {
+    const { scheduler, store, time } = await setup();
+    await scheduler.put(
+      input({
+        spec: { cron: '*/5 * * * *' },
+        event: { correlationId: 'wait-1', expiresAfterMs: 5 * MINUTE },
+      }),
+    );
+    await time.advance(5 * MINUTE + 10_000);
+    const result = await scheduler.tick();
+    const at = T0 + 5 * MINUTE;
+    const occurrenceId = `s@${at}`;
+    const entryId = goalInboxKey('tenant', 'schedule:s', occurrenceId);
+    expect(result).toEqual({
+      occurrences: [
+        {
+          occurrenceId,
+          scheduleId: 's',
+          scope: 'tenant',
+          goalId: 'goal-1',
+          at,
+          disposition: 'delivered',
+          inboxEntryId: entryId,
+          recordedAt: T0 + 5 * MINUTE + 10_000,
+        },
+      ],
+      duplicates: 0,
+      backlog: 0,
+      errors: [],
+    });
+    expect(await store.inbox.get('tenant', entryId)).toMatchObject({
+      namespace: 'schedule:s',
+      deliveryId: occurrenceId,
+      disposition: 'pending',
+      event: {
+        kind: 'deuz-goal-event',
+        id: occurrenceId,
+        key: occurrenceId,
+        source: { type: 'schedule', id: 's' },
+        scope: 'tenant',
+        goalId: 'goal-1',
+        at,
+        notBefore: at,
+        correlationId: 'wait-1',
+        expiresAt: at + 5 * MINUTE,
+      },
+    });
+    expect((await store.schedules.get('tenant', 's'))?.scheduleCursor).toBe(
+      T0 + 5 * MINUTE + 10_000,
+    );
+    // Nothing new until the next occurrence.
+    expect((await scheduler.tick()).occurrences).toEqual([]);
+    await time.advance(4 * MINUTE);
+    expect((await scheduler.tick()).occurrences).toEqual([]);
+    await time.advance(MINUTE);
+    expect((await scheduler.tick()).occurrences.map((o) => o.occurrenceId)).toEqual([
+      `s@${T0 + 10 * MINUTE}`,
+    ]);
+    expect(await pending(store)).toEqual([occurrenceId, `s@${T0 + 10 * MINUTE}`]);
+  });
+
+  it('never delivers an occurrence at or before the boundary of the schedule', async () => {
+    const { scheduler, store, time } = await setup();
+    // Put exactly at 10:00, when the cron matches: that run is not the schedule's.
+    await scheduler.put(input({ spec: { cron: '0 10 * * *' } }));
+    await time.advance(MINUTE);
+    expect((await scheduler.tick()).occurrences).toEqual([]);
+    expect(await pending(store)).toEqual([]);
+  });
+
+  it('takes the tick time from the caller when given', async () => {
+    const { scheduler, store } = await setup();
+    await scheduler.put(input({ spec: { cron: '*/5 * * * *' } }));
+    await scheduler.tick({ now: T0 + 5 * MINUTE });
+    expect(await pending(store)).toEqual([`s@${T0 + 5 * MINUTE}`]);
+  });
+
+  it('reports one deuz.schedule.delivery span per occurrence, with scalar ids only', async () => {
+    const { scheduler, time, events } = await setup();
+    await scheduler.put(input({ spec: { cron: '*/5 * * * *', catchUp: 'all' } }));
+    await time.advance(10 * MINUTE);
+    await scheduler.tick();
+    const spans = events.filter(
+      (event) =>
+        event.type === 'operation.completed' && event.operation === 'deuz.schedule.delivery',
+    );
+    expect(spans.map((span) => (span as { attributes?: unknown }).attributes)).toEqual(
+      [5, 10].map((minutes) => ({
+        'deuz.schedule.id': 's',
+        'deuz.schedule.occurrence_id': `s@${T0 + minutes * MINUTE}`,
+        'deuz.schedule.disposition': 'delivered',
+        'deuz.schedule.catch_up': 'all',
+        'deuz.goal.id': 'goal-1',
+      })),
+    );
+    for (const span of spans) expect(span).toMatchObject({ subsystem: 'schedule' });
+  });
+
+  it('lets two schedulers share a store without delivering an occurrence twice', async () => {
+    const { scheduler, store, time } = await setup();
+    const other = createDurableScheduler({ store, deps: { clock: time.clock } });
+    await scheduler.put(input({ spec: { cron: '* * * * *', catchUp: 'all' } }));
+    await scheduler.put(input({ scheduleId: 't', goalId: 'goal-2', spec: { cron: '* * * * *' } }));
+    for (let minute = 0; minute < 5; minute++) {
+      await time.advance(MINUTE);
+      const [left, right] = await Promise.all([scheduler.tick(), other.tick()]);
+      const delivered = [...left.occurrences, ...right.occurrences].filter(
+        (o) => o.disposition === 'delivered',
+      );
+      expect(delivered).toHaveLength(2);
+    }
+    expect(await pending(store)).toHaveLength(5);
+    expect(new Set(await pending(store)).size).toBe(5);
+    expect(await pending(store, 'goal-2')).toHaveLength(5);
+  });
+
+  it('isolates a failing schedule: the others still advance, and the failure is reported', async () => {
+    const { scheduler, store, time, logged } = await setup({
+      wrap: (double) =>
+        withStoreFaults(double, {
+          advance: (_call, advance) => (advance.scheduleId === 'bad' ? 'before' : undefined),
+        }),
+    });
+    await scheduler.put(input({ scheduleId: 'bad', spec: { cron: '* * * * *' } }));
+    await scheduler.put(input({ scheduleId: 'good', spec: { cron: '* * * * *' } }));
+    await time.advance(MINUTE);
+    const result = await scheduler.tick();
+    expect(result.occurrences.map((o) => o.scheduleId)).toEqual(['good']);
+    expect(result.errors).toEqual([
+      { scope: 'tenant', scheduleId: 'bad', error: expect.any(SimulatedCrash) },
+    ]);
+    expect(logged.some((entry) => entry.fields?.scheduleId === 'bad')).toBe(true);
+    expect(await pending(store)).toEqual([occurrence('good', '2026-10-10T10:01:00Z')]);
   });
 });
