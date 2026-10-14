@@ -90,6 +90,8 @@ export function bodyReader(response: Response): {
   text(): string;
   /** Waits for more bytes; resolves false once the body ended. */
   more(): Promise<boolean>;
+  /** Reads until the text received so far contains `fragment`. */
+  until(fragment: string): Promise<string>;
   /** Reads until the body ends. */
   rest(): Promise<string>;
   cancel(): Promise<void>;
@@ -111,6 +113,11 @@ export function bodyReader(response: Response): {
   return {
     text: () => received,
     more,
+    async until(fragment) {
+      while (!received.includes(fragment))
+        if (!(await more())) throw new Error(`the body ended before ${JSON.stringify(fragment)}`);
+      return received;
+    },
     async rest() {
       while (await more());
       return received;

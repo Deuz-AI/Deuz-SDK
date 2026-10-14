@@ -31,6 +31,8 @@ import type { Usage, FinishReason } from './types/usage';
 import type { Clock } from './types/deps';
 import type { StandardSchemaV1 } from './types/schema';
 import type { ToolApprovalRequest, ToolCallOutcome } from './types/tool';
+import type { DurableStreamOptions } from './types/stream-durable';
+import type { DurableJournal } from './internal/durable-journal';
 import type {
   AgentEvent,
   AgentPartialOutput,
@@ -855,10 +857,57 @@ export interface ToDeuzStreamOptions {
    * `start` part is NOT re-emitted.
    */
   store?: StreamStateStore;
-  /** Stream identity in `store`. Required when `store` is set. */
+  /** Stream identity in `store`. Required when `store` (or `durable`) is set. */
   streamId?: string;
-  /** Store append failures land here (default: silently dropped — best-effort). */
+  /**
+   * Store failures land here. In the legacy mode (`store`) a failure is
+   * best-effort: the frames still reach the client, the leg stops being
+   * journaled, and since 2.4 the client also gets a `stream-store-error`
+   * warning part (wire v2). In the durable mode the response fails closed
+   * and a thrown store or lease error lands here.
+   */
   onStoreError?: (error: unknown) => void;
+  /**
+   * Durable mode (2.4, preview): persist before publish. Every frame is
+   * committed to `durable.store` before it is sent, in batches (20 ms or
+   * 16 KiB, whichever first), by one producer fenced with its lease token
+   * (key `stream:<streamId>`). It fails closed instead of degrading: see
+   * {@link DurableStreamOptions}. Replay is unchanged
+   * (`resumeDeuzStreamResponse` over the same store). Pass the store here
+   * only; `store`, if set too, must be the same object. Off by default.
+   */
+  durable?: DurableStreamOptions;
+}
+
+/**
+ * Throws what a durable mode misconfiguration is, when the response is built
+ * (2.4): a stream id, one store, a lease provider, and sane numbers.
+ */
+function assertDurableOptions(
+  label: string,
+  durable: DurableStreamOptions,
+  options: ToDeuzStreamOptions,
+): void {
+  const fail = (message: string): never => {
+    throw new TypeError(`${label}: ${message}`);
+  };
+  if (!options.streamId) fail('`streamId` is required when `durable` is set.');
+  if (options.store && options.store !== durable.store)
+    fail('`durable.store` is the journal of a durable response; pass no other `store`.');
+  if (typeof durable.store?.open !== 'function' || typeof durable.store.commit !== 'function')
+    fail('`durable.store` must be a DurableStreamStateStore (open, commit).');
+  const provider = durable.lease?.provider;
+  if (typeof provider?.acquire !== 'function' || typeof provider.renew !== 'function')
+    fail('`durable.lease.provider` must be a LeaseProvider.');
+  const ttl = durable.lease.ttlMs;
+  if (ttl !== undefined && !(Number.isInteger(ttl) && ttl >= 3))
+    fail('`durable.lease.ttlMs` must be an integer of at least 3.');
+  const delay = durable.batch?.maxDelayMs;
+  if (delay !== undefined && !(Number.isFinite(delay) && delay >= 0))
+    fail('`durable.batch.maxDelayMs` must be a finite number of at least 0.');
+  const bytes = durable.batch?.maxBytes;
+  if (bytes !== undefined && !(Number.isFinite(bytes) && bytes > 0))
+    fail('`durable.batch.maxBytes` must be a positive number.');
 }
 
 /** Per-`send` framing options (internal; surfaced as {@link WriteDataOptions}). */
@@ -884,16 +933,19 @@ function deuzSSEResponse(
   produce: (
     send: (part: DeuzUIPart, sendOptions?: SendOptions) => void,
     nextSeq: () => number,
+    stopped: () => boolean,
   ) => Promise<void>,
   journaled?: () => Promise<boolean>,
 ): Response {
   const encoder = new TextEncoder();
   const version: DeuzWireVersion = options.wireVersion ?? 'v2';
-  const store = options.store;
+  const durable = options.durable;
+  const store = durable ? undefined : options.store;
   const streamId = options.streamId;
   if (store && !streamId) {
     throw new Error(`${label}: \`streamId\` is required when \`store\` is set.`);
   }
+  if (durable) assertDurableOptions(label, durable, options);
 
   // The client can vanish mid-stream (refresh, tab close, network drop) — the
   // response body dies, but the STORE must keep recording: resumability exists
@@ -902,12 +954,30 @@ function deuzSSEResponse(
   let clientGone = false;
   const body = new ReadableStream<Uint8Array>({
     async start(controller) {
-      const enqueue = (text: string): void => {
+      const enqueueBytes = (bytes: Uint8Array): void => {
         if (clientGone) return;
         try {
-          controller.enqueue(encoder.encode(text));
+          controller.enqueue(bytes);
         } catch {
           clientGone = true;
+        }
+      };
+      const enqueue = (text: string): void => {
+        if (!clientGone) enqueueBytes(encoder.encode(text));
+      };
+      // Durable mode fails closed (2.4): one redacted error frame, no event id,
+      // no [DONE], and the producer stops (`stopped`). The body closes at once.
+      let stopped = false;
+      const failClosed = (message: string): void => {
+        if (stopped) return;
+        stopped = true;
+        enqueue(`data: ${JSON.stringify({ type: 'error', message })}\n\n`);
+        if (clientGone) return;
+        clientGone = true;
+        try {
+          controller.close();
+        } catch {
+          /* cancelled meanwhile */
         }
       };
       // A store failure (2.4, H1/H2) is told to the client once, off-journal
@@ -927,14 +997,33 @@ function deuzSSEResponse(
           : undefined;
       // A detached leg (see `journaled`) carries no journal coordinates.
       let ids = version === 'v2';
-      if (writer && journaled && !(await journaled())) {
+      let journaling = Boolean((writer || durable) && streamId);
+      if (journaling && journaled && !(await journaled())) {
         writer = undefined;
+        journaling = false;
         ids = false;
       }
       let seq = 0;
       let resumed = false;
       let unreadable = false;
-      if (writer && store && streamId) {
+      let journal: DurableJournal | undefined;
+      if (journaling && durable && streamId) {
+        // Loaded on first use: a response without `durable` never fetches it.
+        const { openDurableJournal } = await import('./internal/durable-journal');
+        const opened = await openDurableJournal({
+          streamId,
+          options: durable,
+          enqueue: enqueueBytes,
+          onHalt: failClosed,
+          onStoreError: (error) => reportStoreError(options.onStoreError, error),
+        });
+        if (opened.status === 'refused') failClosed(opened.message);
+        else {
+          journal = opened.journal;
+          seq = opened.lastSeq + 1;
+          resumed = opened.lastSeq >= 0;
+        }
+      } else if (writer && store && streamId) {
         try {
           const last = await lastStoredSeq(store, streamId);
           if (last >= 0) {
@@ -953,6 +1042,8 @@ function deuzSSEResponse(
         }
       }
       const send = (part: DeuzUIPart, sendOptions?: SendOptions): void => {
+        // A response that failed closed sends nothing more.
+        if (stopped) return;
         // v2-only parts are dropped entirely for a negotiated-v1 client (the
         // store must mirror the wire seq-for-seq, so they skip both).
         if (version === 'v1' && isV2OnlyPart(part)) return;
@@ -980,7 +1071,17 @@ function deuzSSEResponse(
         // move forward over an unjournaled event. Do not "fix" that stickiness
         // and do not start stamping `id:` on transients.
         if (sendOptions?.transient) {
-          enqueue(`data: ${JSON.stringify(part)}\n\n`);
+          const transient = `data: ${JSON.stringify(part)}\n\n`;
+          // Durable: it keeps its place behind the frames still being committed.
+          if (journal) journal.push({ bytes: encoder.encode(transient) });
+          else enqueue(transient);
+          return;
+        }
+        const text = `${ids ? `id: ${seq}\n` : ''}data: ${JSON.stringify(part)}\n\n`;
+        if (journal) {
+          // Durable: queued, committed, and only then written (persist before publish).
+          journal.push({ record: { seq, part }, bytes: encoder.encode(text) });
+          seq++;
           return;
         }
         // The append is QUEUED before the enqueue, never awaited: the wire does
@@ -990,7 +1091,7 @@ function deuzSSEResponse(
         // flight during a disconnect still lands in the log even though its
         // enqueue never happens. Persist-before-publish is the durable mode.
         writer?.append(seq, part);
-        enqueue(`${ids ? `id: ${seq}\n` : ''}data: ${JSON.stringify(part)}\n\n`);
+        enqueue(text);
         seq++;
       };
       if (!resumed) {
@@ -998,14 +1099,27 @@ function deuzSSEResponse(
         send({ type: 'start', messageId });
       }
       if (unreadable) warnStoreFailure();
-      await produce(send, () => seq);
+      await produce(
+        send,
+        () => seq,
+        () => stopped,
+      );
       // Leg-end sentinel: appended for EVERY ended leg (complete, errored, or
       // suspended-for-approval). Replay treats it as terminal only when
       // nothing was appended after it, so a continued run stays reachable.
-      writer?.append(seq, { type: 'done' });
-      enqueue(`${ids ? `id: ${seq}\n` : ''}data: [DONE]\n\n`);
+      if (!stopped) {
+        const done = `${ids ? `id: ${seq}\n` : ''}data: [DONE]\n\n`;
+        if (journal)
+          journal.push({ record: { seq, part: { type: 'done' } }, bytes: encoder.encode(done) });
+        else {
+          writer?.append(seq, { type: 'done' });
+          enqueue(done);
+        }
+      }
       // Flush pending appends before closing so replay never misses the tail
       // (matters on serverless runtimes that freeze after the response ends).
+      // Durable: commit and publish the last batch, then give the lease back.
+      if (journal) await journal.end();
       if (writer) await writer.settled();
       if (!clientGone) {
         try {
@@ -1036,9 +1150,10 @@ export function toDeuzStreamResponse(
   result: StreamChatResult,
   options: ToDeuzStreamOptions = {},
 ): Response {
-  return deuzSSEResponse('toDeuzStreamResponse', options, async (send) => {
+  return deuzSSEResponse('toDeuzStreamResponse', options, async (send, _nextSeq, stopped) => {
     try {
       for await (const part of result.fullStream) {
+        if (stopped()) break;
         const ui = toUIPart(part);
         if (ui) send(ui);
       }
@@ -1059,9 +1174,10 @@ export function toDeuzObjectStreamResponse(
   result: StreamObjectResult<unknown>,
   options: ToDeuzStreamOptions = {},
 ): Response {
-  return deuzSSEResponse('toDeuzObjectStreamResponse', options, async (send) => {
+  return deuzSSEResponse('toDeuzObjectStreamResponse', options, async (send, _nextSeq, stopped) => {
     try {
       for await (const partial of result.partialObjectStream) {
+        if (stopped()) return;
         send({ type: 'object-delta', object: partial });
       }
       send({
@@ -1219,7 +1335,7 @@ export function toDeuzAgentStreamResponse<T>(
   return deuzSSEResponse(
     'toDeuzAgentStreamResponse',
     options,
-    async (send, nextSeq) => {
+    async (send, nextSeq, stopped) => {
       // Built right before its `send`, so the frame's `seq` is its own event id.
       const frame = (payload: DistributiveOmit<DeuzAgentFrame, 'seq'>): void => {
         const { kind, ...rest } = payload;
@@ -1244,6 +1360,11 @@ export function toDeuzAgentStreamResponse<T>(
         for (;;) {
           const step = await next();
           if (step.done) break;
+          if (stopped()) {
+            // A durable response failed closed: stop following the run's events.
+            await events.return?.().catch(() => undefined);
+            return;
+          }
           const event = step.value;
           switch (event.type) {
             case 'part': {
@@ -1483,7 +1604,7 @@ export function createDeuzStream(
     n?.();
   };
 
-  const response = deuzSSEResponse('createDeuzStream', options, async (send) => {
+  const response = deuzSSEResponse('createDeuzStream', options, async (send, _nextSeq, stopped) => {
     const sendData = async (item: DataItem): Promise<void> => {
       // One frame shape for both the validated and the raw path, so an
       // addressable part keeps its `id` when `dataSchemas` is in play too. Key
@@ -1522,6 +1643,7 @@ export function createDeuzStream(
     const model = (async () => {
       try {
         for await (const part of result.fullStream) {
+          if (stopped()) break;
           const ui = toUIPart(part);
           if (ui) send(ui);
         }
@@ -1531,8 +1653,8 @@ export function createDeuzStream(
     })();
     const data = (async () => {
       for (;;) {
-        while (queue.length > 0) await sendData(queue.shift()!);
-        if (closed) return;
+        while (queue.length > 0 && !stopped()) await sendData(queue.shift()!);
+        if (closed || stopped()) return;
         await new Promise<void>((resolve) => (notify = resolve));
       }
     })();
