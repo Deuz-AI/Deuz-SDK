@@ -4,18 +4,24 @@
  *
  * - the run's user-facing turns only: its 2.3 transcript without the turns the
  *   SDK wrote (`transcript.internal`), or, for a run without one, its history
- *   without the SDK's fixed finalization, output-repair and default verifier
- *   turns;
+ *   without any user turn after the caller's input (a native run writes none
+ *   of its own there: each is the SDK's finalization, output repair, verifier
+ *   feedback, compaction summary or context block) and without the SDK's
+ *   fixed turns an earlier run left in that input;
  * - no system message (host instructions, recall), no reasoning part (plain,
  *   encrypted or redacted), no provider metadata, no image, no compiled
  *   context block and no compaction summary;
  * - no raw tool result: a result is projected as `omitted` unless the host
  *   supplies a summary for its tool call.
  *
+ * A tool counts as used only for a call the run made itself (not one of its
+ * input) whose receipt records it completed, answered without an error.
+ *
  * Each kept piece is a numbered item (`S1`, `S2`, ...) that a method step can
- * cite: its message (`<runId>:<index>`, the index into the transcript or the
- * history), its tool call and model step when known, and the digest of its
- * projected content. Pure and edge-safe.
+ * cite: its message (the id it keeps in the run's chat projection, else
+ * `<runId>:<index>`, the index into the transcript or the history), its tool
+ * call and model step when known, and the digest of its projected content.
+ * Pure and edge-safe.
  */
 import type { AgentRunEnvelope, AgentToolReceipt } from '../../types/agent-run';
 import type { AgentRunEnvelopeV3 } from '../../types/agent-run-v3';
@@ -33,7 +39,12 @@ export interface ProjectedItem {
   kind: ProjectedItemKind;
   /** The projected content, exactly as the model reads it after the item's id. */
   content: string;
-  /** `<runId>:<index>`: the message's index in the transcript (or the history). */
+  /**
+   * The id the message keeps in the run's chat projection
+   * (`AgentRunChatState.messageIds`: an input message carried over from the
+   * stored chat keeps that chat's id); without one `<runId>:<index>`, its
+   * index in the transcript (or the history).
+   */
   messageId: string;
   toolCallId?: string;
   toolName?: string;
@@ -50,7 +61,11 @@ export interface SourceProjection {
   text: string;
   /** `sha256:<hex>` of `text`. */
   digest: Sha256Digest;
-  /** The tools the run used: called, and answered without an error. Sorted. */
+  /**
+   * The tools the run used: called by the run itself (never a call of its
+   * input), with a receipt that records the call completed, and answered
+   * without an error. Sorted.
+   */
   usedTools: string[];
 }
 
@@ -72,35 +87,99 @@ const DEFAULT_FEEDBACK = 'The output was rejected. Produce a corrected final ans
 
 type Run = AgentRunEnvelope | AgentRunEnvelopeV3;
 
+/** A turn to project: its index in the record it comes from, and its message id. */
+interface SourceTurn {
+  message: Message;
+  index: number;
+  /** One of the caller's input turns, not one the run wrote. */
+  input: boolean;
+  messageId: string;
+}
+
 /** The turns to project, by their index in the record they come from. */
-function sourceTurns(run: Run): { message: Message; index: number; input: boolean }[] {
+function sourceTurns(run: Run): SourceTurn[] {
   const transcript = run.transcript;
   if (transcript) {
     const internal = new Set(transcript.internal);
+    // The chat projection's ids follow the transcript index by index.
+    const chatIds = run.chat?.messageIds;
     return transcript.messages
-      .map((message, index) => ({ message, index, input: index < transcript.input }))
+      .map((message, index) => ({
+        message,
+        index,
+        input: index < transcript.input,
+        messageId: chatIds?.[index] ?? `${run.runId}:${index}`,
+      }))
       .filter(({ index }) => !internal.has(index));
   }
-  // Without a transcript the history is all there is: the input is what comes
-  // before the first assistant turn, and the SDK's own fixed turns are known.
-  const firstAssistant = run.messages.findIndex((message) => message.role === 'assistant');
+  // Without a transcript the history is all there is. Every user turn after
+  // the caller's input is the SDK's, so it is dropped; the input itself loses
+  // the SDK's fixed turns an earlier run's history may carry.
+  const input = historyInput(run);
   return run.messages
     .map((message, index) => ({
       message,
       index,
-      input: firstAssistant === -1 || index < firstAssistant,
+      input: index < input,
+      messageId: `${run.runId}:${index}`,
     }))
-    .filter(({ message }) => !sdkTurn(message));
+    .filter(({ message, input }) => message.role !== 'user' || (input && !sdkTurn(message)));
 }
 
-function sdkTurn(message: Message): boolean {
-  if (message.role !== 'user') return false;
+/**
+ * Where the caller's input ends in a history without a transcript. A native
+ * run appends no caller turn (a resume ignores new messages): every user turn
+ * after its input is the SDK's finalization, output repair, verifier feedback,
+ * compaction summary or compiled context block. All are known by their shape
+ * but a host verifier's own feedback, one turn per rejected candidate: on a
+ * run its verifier answered, every verdict before the last. Those are the
+ * last string turns after the run's first answer; the input ends after the
+ * last caller turn before them.
+ */
+function historyInput(run: Run): number {
+  const messages = run.messages;
+  const firstAnswer = messages.findIndex((message) => message.role === 'assistant');
+  if (firstAnswer === -1) return messages.length;
+  let feedback = Math.max(0, (run.verificationAttempts ?? 0) - 1);
+  for (let index = messages.length - 1; index >= 0; index--) {
+    const message = messages[index]!;
+    if (message.role !== 'user' || fixedSdkTurn(message)) continue;
+    if (feedback > 0 && index > firstAnswer && feedbackTurn(message)) {
+      feedback--;
+      continue;
+    }
+    if (callerTurn(message)) return index + 1;
+  }
+  return 0;
+}
+
+/** The SDK's finalization and output-repair turns. */
+function fixedSdkTurn(message: Message): boolean {
   const text = textOf(message).trim();
   return (
-    text === FINALIZE_PROMPT ||
-    text === DEFAULT_FEEDBACK ||
-    (text.startsWith(REPAIR_PREFIX) && text.endsWith(REPAIR_SUFFIX))
+    text === FINALIZE_PROMPT || (text.startsWith(REPAIR_PREFIX) && text.endsWith(REPAIR_SUFFIX))
   );
+}
+
+/** Shaped like the verifier feedback turn the SDK writes: a string, no summary, no context block. */
+function feedbackTurn(message: Message): boolean {
+  return (
+    typeof message.content === 'string' &&
+    !message.content.startsWith(SUMMARY_SENTINEL) &&
+    !isContextMessage(message)
+  );
+}
+
+/** A turn with caller content: more than a summary or a compiled context block. */
+function callerTurn(message: Message): boolean {
+  if (typeof message.content !== 'string' && message.content.some((part) => part.type !== 'text'))
+    return true;
+  return keptText(message) !== '';
+}
+
+/** A fixed SDK turn: finalization, output repair or the default verifier feedback. */
+function sdkTurn(message: Message): boolean {
+  return fixedSdkTurn(message) || textOf(message).trim() === DEFAULT_FEEDBACK;
 }
 
 function textOf(message: Message): string {
@@ -157,13 +236,12 @@ export async function projectRun(
   const summaries = options.toolSummaries ?? {};
   const receipts = receiptsById(run);
   const seen = new Map<string, number>();
-  /** The latest call of each id: its tool name and model step. */
-  const calls = new Map<string, { name: string; modelStep?: number }>();
+  /** The latest call of each id: its tool name, model step, and whether the input made it. */
+  const calls = new Map<string, { name: string; modelStep?: number; input: boolean }>();
   const used = new Set<string>();
   const drafts: Omit<ProjectedItem, 'id' | 'digest'>[] = [];
 
-  for (const { message, index, input } of sourceTurns(run)) {
-    const messageId = `${run.runId}:${index}`;
+  for (const { message, input, messageId } of sourceTurns(run)) {
     if (message.role === 'system') continue;
     if (message.role === 'user') {
       const text = keptText(message);
@@ -187,10 +265,19 @@ export async function projectRun(
       );
       let step: number | undefined;
       for (const part of toolUses) {
+        // A call of the input has no receipt of this run: no model step, never used.
+        if (input) {
+          calls.set(part.id, { name: part.name, input });
+          continue;
+        }
         const occurrence = seen.get(part.id) ?? 0;
         seen.set(part.id, occurrence + 1);
         const modelStep = receipts.get(part.id)?.[occurrence]?.modelStep;
-        calls.set(part.id, { name: part.name, ...(modelStep !== undefined ? { modelStep } : {}) });
+        calls.set(part.id, {
+          name: part.name,
+          input,
+          ...(modelStep !== undefined ? { modelStep } : {}),
+        });
         step ??= modelStep;
       }
       const text = keptText(message);
@@ -218,7 +305,17 @@ export async function projectRun(
       if (part.type !== 'tool_result') continue;
       const call = calls.get(part.toolUseId);
       const name = call?.name ?? 'unknown';
-      if (call && part.isError !== true) used.add(call.name);
+      // Used (spec §2.6): the run's own call, answered without an error, that
+      // a receipt of the run records as completed under the same tool name.
+      if (
+        call &&
+        !call.input &&
+        part.isError !== true &&
+        receipts
+          .get(part.toolUseId)
+          ?.some((receipt) => receipt.toolName === call.name && receipt.stage === 'completed')
+      )
+        used.add(call.name);
       const summary = summaries[part.toolUseId];
       const body = typeof summary === 'string' && summary.trim() ? summary.trim() : 'omitted';
       drafts.push({
