@@ -348,7 +348,18 @@
     "RAISED FOR 2.4 (W2 integration): the agent-run-v3-run optional chunk took the V3 package and store-check code that GA's S1-4 moved out of the eager graph, plus E2's retrieval-block redaction, +5%:",
     "  edge/agent-run-v3-run lazy: 57850 / 20150 -> 62850 / 21850 (measured 59856 / 20805)",
     "  native-agent/agent-run-v3-run lazy: 57500 / 20000 -> 62500 / 21750 (measured 59484 / 20688)",
-    "  native-swarm/agent-run-v3-run lazy: 60800 / 20950 -> 64450 / 22350 (measured 61334 / 21263)"
+    "  native-swarm/agent-run-v3-run lazy: 60800 / 20950 -> 64450 / 22350 (measured 61334 / 21263)",
+    "",
+    "RE-MEASURED FOR 2.4 (after the W2 review fix lanes HA, HB, HC): over-budget entries raised (+1% above 100 KB, +5% below); the eager edge and native-agent budgets tightened to 1% over the measurement:",
+    "  goal-runtime: 128850 / 39350 -> 132650 / 40600 (measured 131309 / 40175)",
+    "  goal-runtime (lazy): 340000 / 108800 -> 344100 / 110250 (measured 340660 / 109157)",
+    "  mcp-server (lazy): 357400 / 115500 -> 361500 / 117050 (measured 357911 / 115856)",
+    "  edge/native-memory lazy: 17300 / 6950 -> 18300 / 7300 (measured 17390 / 6905)",
+    "  native-agent/native-memory lazy: 17250 / 6950 -> 18300 / 7300 (measured 17390 / 6908)",
+    "  native-swarm/native-memory lazy: 17250 / 6950 -> 18300 / 7300 (measured 17390 / 6908)",
+    "  edge/durable-journal lazy: 5900 / 2350 -> 6350 / 2500 (measured 6010 / 2359)",
+    "  edge (tightened): 184350 / 57350 -> 183300 / 57000 (measured 181456 / 56419)",
+    "  native-agent (tightened): 267050 / 84000 -> 266150 / 83750 (measured 263470 / 82888)"
   ],
   "bundles": {
     "core": {
@@ -395,8 +406,8 @@
     "edge": {
       "from": "@deuz-sdk/core/edge",
       "exports": ["streamChat", "generateText", "generateObject", "createApprovalSigner"],
-      "maxRawBytes": 184350,
-      "maxGzipBytes": 57350,
+      "maxRawBytes": 183300,
+      "maxGzipBytes": 57000,
       "maxLazyRawBytes": 22500,
       "maxLazyGzipBytes": 8450,
       "legacyLazyEntryPoint": "resolve",
@@ -433,8 +444,8 @@
         },
         "native-memory": {
           "entryPoint": "native-memory",
-          "maxRawBytes": 17300,
-          "maxGzipBytes": 6950
+          "maxRawBytes": 18300,
+          "maxGzipBytes": 7300
         },
         "native-fallback": {
           "entryPoint": "native-fallback",
@@ -448,8 +459,8 @@
         },
         "durable-journal": {
           "entryPoint": "durable-journal",
-          "maxRawBytes": 5900,
-          "maxGzipBytes": 2350
+          "maxRawBytes": 6350,
+          "maxGzipBytes": 2500
         },
         "embed-accounting": {
           "entryPoint": "embed-accounting",
@@ -485,8 +496,8 @@
         "createInMemoryBudgetStore",
         "BudgetStoreError"
       ],
-      "maxRawBytes": 267050,
-      "maxGzipBytes": 84000,
+      "maxRawBytes": 266150,
+      "maxGzipBytes": 83750,
       "maxLazyRawBytes": 22500,
       "maxLazyGzipBytes": 8450,
       "legacyLazyEntryPoint": "resolve",
@@ -523,8 +534,8 @@
         },
         "native-memory": {
           "entryPoint": "native-memory",
-          "maxRawBytes": 17250,
-          "maxGzipBytes": 6950
+          "maxRawBytes": 18300,
+          "maxGzipBytes": 7300
         },
         "native-fallback": {
           "entryPoint": "native-fallback",
@@ -594,8 +605,8 @@
         },
         "native-memory": {
           "entryPoint": "native-memory",
-          "maxRawBytes": 17250,
-          "maxGzipBytes": 6950
+          "maxRawBytes": 18300,
+          "maxGzipBytes": 7300
         },
         "native-fallback": {
           "entryPoint": "native-fallback",
@@ -759,8 +770,8 @@
       "exports": ["createMcpServer"],
       "maxRawBytes": 18250,
       "maxGzipBytes": 6570,
-      "maxLazyRawBytes": 357400,
-      "maxLazyGzipBytes": 115500
+      "maxLazyRawBytes": 361500,
+      "maxLazyGzipBytes": 117050
     },
     "realtime": {
       "from": "@deuz-sdk/core/realtime",
@@ -881,10 +892,10 @@
         "createInMemoryGoalRuntimeStore",
         "verifyGoalAcceptance"
       ],
-      "maxRawBytes": 128850,
-      "maxGzipBytes": 39350,
-      "maxLazyRawBytes": 340000,
-      "maxLazyGzipBytes": 108800
+      "maxRawBytes": 132650,
+      "maxGzipBytes": 40600,
+      "maxLazyRawBytes": 344100,
+      "maxLazyGzipBytes": 110250
     },
     "skills-learning": {
       "from": "@deuz-sdk/core/skills/learning",
