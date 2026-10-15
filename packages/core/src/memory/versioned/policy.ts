@@ -11,8 +11,6 @@
  * user input, and a recall block or summary can carry external content. Edge-safe.
  */
 import type { MemoryScope } from '../../memory';
-import { isSummaryMessage } from '../../inference/compaction';
-import { isRecallMessage, toolSetChangeOf } from '../../internal/stable-prefix';
 import type { Message, Part, ToolResultPart } from '../../types/message';
 import { invalid, textDigest } from './shared';
 import type {
@@ -48,14 +46,36 @@ function resultText(result: unknown): string {
 }
 
 /**
- * A turn the SDK put into the transcript itself: a stable-prefix memory recall
- * block, a compaction summary (model-written from whatever the window held)
- * or a tool-set change notice. No fact about the user, under any policy.
+ * The markers of the SDK's own turns, read here without importing their
+ * builders (`internal/stable-prefix.ts` pulls the model registry,
+ * `inference/compaction.ts` the loop, and this entry stays small and
+ * edge-safe). They are persisted in transcripts, so they do not change; the
+ * extraction tests build their messages with the real builders.
+ */
+const SUMMARY_SENTINEL = '[Earlier conversation summarized]';
+
+/**
+ * A turn the SDK put into the transcript itself, no fact about the user under
+ * any policy: a stable-prefix memory recall block (`recallMessage`), a
+ * tool-set change notice (`toolSetChangeMessage`), both system messages
+ * marked in `providerMetadata.deuz`, or a compaction summary (model-written
+ * from whatever the window held), one user text part opening with the
+ * summary sentinel (`isSummaryMessage`).
  */
 function isSdkTurn(message: Message): boolean {
-  return (
-    isRecallMessage(message) || isSummaryMessage(message) || toolSetChangeOf(message) !== undefined
-  );
+  if (message.role === 'system') {
+    const deuz = message.providerMetadata?.deuz as
+      | { memoryRecall?: unknown; toolChanges?: { remove?: unknown; add?: unknown } }
+      | undefined;
+    const changes = deuz?.toolChanges;
+    return (
+      deuz?.memoryRecall === true || (Array.isArray(changes?.remove) && Array.isArray(changes?.add))
+    );
+  }
+  if (message.role !== 'user' || !Array.isArray(message.content) || message.content.length !== 1)
+    return false;
+  const part = message.content[0]!;
+  return part.type === 'text' && part.text.startsWith(SUMMARY_SENTINEL);
 }
 
 /**

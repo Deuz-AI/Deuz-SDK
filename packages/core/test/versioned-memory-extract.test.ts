@@ -9,7 +9,7 @@
 import { describe, expect, it } from 'vitest';
 import { InvalidRequestError, OperationConflictError } from '../src/errors';
 import { sha256Digest } from '../src/internal/digest';
-import { recallMessage } from '../src/internal/stable-prefix';
+import { recallMessage, toolSetChangeMessage } from '../src/internal/stable-prefix';
 import { SUMMARY_SENTINEL } from '../src/inference/compaction';
 import { createInMemoryVersionedMemoryStore, createMemorySession } from '../src/memory/versioned';
 import { readExtractionSources } from '../src/memory/versioned/policy';
@@ -223,14 +223,7 @@ describe('extract: untrusted-source policy', () => {
         ],
       },
     },
-    {
-      id: 'm3',
-      message: {
-        role: 'system',
-        content: [],
-        providerMetadata: { deuz: { toolChanges: { remove: ['browse'], add: [] } } },
-      },
-    },
+    { id: 'm3', message: toolSetChangeMessage({ remove: ['browse'], add: [] }) },
   ];
 
   it('skips SDK-injected recall, compaction-summary and tool-change messages', async () => {
