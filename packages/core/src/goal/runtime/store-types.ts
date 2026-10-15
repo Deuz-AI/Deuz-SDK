@@ -386,6 +386,12 @@ export interface GoalRunIntentInput {
   cause?: { inboxEntryId?: string; command?: string };
   /** Stored approval verdicts a retry passes back as `approvalResponses`. */
   approvalResponses?: ToolApprovalResponse[];
+  /**
+   * Results for a suspended run's client tool calls, kept with a resume
+   * intent (and its retries) so a crash before the launch loses none (2.4
+   * refinement, lane L4b). Stored as JSON like the rest of the intent.
+   */
+  clientToolResults?: readonly { toolCallId: string; output: unknown; isError?: boolean }[];
 }
 
 /** A recorded intent and where it stands. */

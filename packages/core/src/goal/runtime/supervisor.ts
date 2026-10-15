@@ -41,17 +41,28 @@ import type {
   GoalRuntimeState,
   GoalRuntimeStore,
 } from './store-types';
+import { createGoalDriver } from './supervisor-drive';
 import {
   createEventHub,
   goalAttributes,
+  goalLeaseKey,
   intentIdFor,
   mergePolicy,
   quietly,
+  reportGeneration,
   runIdFor,
 } from './supervisor-shared';
 
 /** How often a write that lost a revision race is decided again on fresh state. */
 const WRITE_ATTEMPTS = 5;
+
+/** A positive integer option (at least `min`), or its default. Throws a TypeError. */
+function positive(value: number | undefined, fallback: number, name: string, min = 1): number {
+  if (value === undefined) return fallback;
+  if (!Number.isSafeInteger(value) || value < min)
+    throw new TypeError(`Goal supervisor ${name} must be an integer of at least ${min}`);
+  return value;
+}
 
 /** The supervisor defaults (spec §3.1). */
 export const DEFAULT_GOAL_SUPERVISOR = {
@@ -63,10 +74,7 @@ export const DEFAULT_GOAL_SUPERVISOR = {
   pollMs: 1_000,
 } as const;
 
-/** The goal lease key (2.4): `goal:` and the JSON of `[scope, goalId]`. */
-export function goalLeaseKey(scope: string, goalId: string): string {
-  return `goal:${JSON.stringify([scope, goalId])}`;
-}
+export { goalLeaseKey };
 
 /** What the supervisor asks a launcher to start or resume. */
 export interface RunLaunchRequest {
@@ -221,6 +229,29 @@ export interface GoalSupervisorOptions {
   policy?: Partial<GoalRuntimePolicy>;
   /** Clock, ids, logger, observer (`deuz.goal.*` spans). */
   deps?: Dependencies;
+  /**
+   * The host's verification of a run that completed (2.4 refinement): the
+   * commands to apply, usually the `evaluate` command `verifyGoalAcceptance`
+   * returns. The supervisor applies them, then tries `complete`; a goal that
+   * stays active gets another automatic run (within `policy.maxRuns`).
+   * Without it a goal completes only on evidence and verdicts the host
+   * records through `command`.
+   */
+  verify?: (context: {
+    goal: GoalRecord;
+    runId: string;
+    result: AgentResult<unknown>;
+  }) =>
+    | GoalCommand
+    | readonly GoalCommand[]
+    | undefined
+    | Promise<GoalCommand | readonly GoalCommand[] | undefined>;
+  /**
+   * Whether a native run that a dependency wait names has finished (2.4
+   * refinement), for `goalDependencyEvents`. Without it only goal
+   * dependencies are reconciled.
+   */
+  runFinished?: (runId: string) => boolean | Promise<boolean>;
 }
 
 /**
@@ -302,18 +333,21 @@ export function createGoalSupervisor(options: GoalSupervisorOptions): GoalSuperv
     );
   }
 
-  /** Reports a new spec generation (the transition is pure, so its applier reports it). */
-  function reportGeneration(before: GoalRecord, after: GoalRecord): void {
-    if (after.specGeneration === undefined || after.specGeneration === before.specGeneration)
-      return;
-    recordSpan(deps, DEUZ_SPAN.goalGeneration, goalAttributes(after));
-    hub.emit({
-      type: 'generation-changed',
-      scope: after.scope,
-      goalId: after.goalId,
-      specGeneration: after.specGeneration,
-    });
-  }
+  const driver = createGoalDriver({
+    store,
+    launcher,
+    deps,
+    hub,
+    provider,
+    owner: options.lease.owner ?? `goal-supervisor:${deps.generateId()}`,
+    ttlMs: positive(options.lease.ttlMs, DEFAULT_GOAL_SUPERVISOR.leaseTtlMs, 'lease.ttlMs', 3),
+    scopes: options.scopes,
+    concurrency: positive(options.concurrency, DEFAULT_GOAL_SUPERVISOR.concurrency, 'concurrency'),
+    ...(options.verify ? { verify: options.verify } : {}),
+    ...(options.runFinished ? { runFinished: options.runFinished } : {}),
+  });
+  const pollMs = positive(options.pollMs, DEFAULT_GOAL_SUPERVISOR.pollMs, 'pollMs');
+  let started = false;
 
   /** A host command other than a cancel, saved with the runtime state as its fence. */
   async function applyCommand(
@@ -337,7 +371,7 @@ export function createGoalSupervisor(options: GoalSupervisorOptions): GoalSuperv
         : {}),
     };
     if ((await store.runtime.save(state, next)).status === 'conflict') return 'conflict';
-    reportGeneration(goal, next);
+    reportGeneration(deps, hub, goal, next);
     // A goal that ended under a working run: the run stops, its holder settles it.
     if (TERMINAL_STATUSES.includes(next.status) && runtime.activeRun !== undefined)
       await stopRun(runtime, undefined);
@@ -491,7 +525,60 @@ export function createGoalSupervisor(options: GoalSupervisorOptions): GoalSuperv
       }
     },
 
-    resume: () => notImplemented('createGoalSupervisor().resume'),
+    async resume(scope, goalId, input) {
+      for (let attempt = 1; ; attempt++) {
+        const { goal, runtime } = await supervised(scope, goalId);
+        const run = runtime.activeRun;
+        if (
+          run === undefined ||
+          runtime.phase !== 'idle' ||
+          runtime.cancel !== undefined ||
+          TERMINAL_STATUSES.includes(goal.status)
+        )
+          throw new GoalError('invalid_command', `Goal ${goalId} has no suspended run to resume.`);
+        const now = deps.clock.now();
+        const resumed =
+          goal.status === 'waiting' ? transitionGoal(goal, { type: 'resume' }, { now }) : undefined;
+        if (resumed?.outcome === 'rejected')
+          throw new GoalError(
+            'invalid_command',
+            `Goal ${goalId} cannot resume: ${resumed.reason ?? 'rejected'}.`,
+          );
+        const { retryAt: _retryAt, ...rest } = runtime;
+        const revision = runtime.revision + 1;
+        const intentId = intentIdFor(goalId, revision);
+        const written = await store.intents.record(
+          {
+            intentId,
+            scope,
+            goalId,
+            kind: 'resume',
+            runId: run.runId,
+            attempt: 1,
+            cause: { command: 'resume' },
+            ...(input?.approvalResponses !== undefined
+              ? { approvalResponses: input.approvalResponses }
+              : {}),
+            ...(input?.clientToolResults !== undefined
+              ? { clientToolResults: input.clientToolResults }
+              : {}),
+          },
+          {
+            runtime: {
+              ...rest,
+              revision,
+              updatedAt: Math.max(runtime.updatedAt, now),
+              phase: 'dispatching',
+              retries: 0,
+              activeRun: { intentId, runId: run.runId, attempt: 1, startedAt: now },
+            },
+            ...(resumed?.changed ? { goal: resumed.record } : {}),
+          },
+        );
+        if (written.status === 'committed') return;
+        if (attempt >= WRITE_ATTEMPTS) throw stale(goal, goal.revision);
+      }
+    },
 
     async updatePolicy(scope, goalId, policy, policyOptions) {
       const { runtime } = await supervised(scope, goalId);
@@ -516,9 +603,52 @@ export function createGoalSupervisor(options: GoalSupervisorOptions): GoalSuperv
     },
 
     events: (eventOptions) => hub.subscribe(eventOptions?.signal),
-    tick: () => notImplemented('createGoalSupervisor().tick'),
-    start: () => notImplemented('createGoalSupervisor().start'),
-    drain: () => notImplemented('createGoalSupervisor().drain'),
+    tick: (tickOptions) => driver.tick(tickOptions?.now ?? deps.clock.now(), tickOptions?.signal),
+
+    start(startOptions) {
+      if (started) throw new Error('This goal supervisor is already started');
+      started = true;
+      const controller = new AbortController();
+      const outer = startOptions?.signal;
+      const forward = () => controller.abort();
+      if (outer?.aborted) controller.abort();
+      else outer?.addEventListener('abort', forward, { once: true });
+      let wake: (() => void) | undefined;
+      let cancelTimer: (() => void) | undefined;
+      controller.signal.addEventListener(
+        'abort',
+        () => {
+          cancelTimer?.();
+          wake?.();
+        },
+        { once: true },
+      );
+      const loop = (async () => {
+        while (!controller.signal.aborted && !driver.draining) {
+          try {
+            await driver.tick(deps.clock.now(), controller.signal);
+          } catch (error) {
+            deps.logger.error('goal supervisor tick failed', { error });
+          }
+          if (controller.signal.aborted || driver.draining) break;
+          await new Promise<void>((resolve) => {
+            wake = resolve;
+            cancelTimer = deps.clock.setTimeout(resolve, pollMs);
+          });
+        }
+      })().finally(() => {
+        outer?.removeEventListener('abort', forward);
+        started = false;
+      });
+      return {
+        async stop() {
+          controller.abort();
+          await loop;
+        },
+      };
+    },
+
+    drain: () => driver.drain(),
   };
 }
 

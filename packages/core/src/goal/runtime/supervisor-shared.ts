@@ -3,12 +3,73 @@
  * checks, the ids it gives intents and runs, and the working memory
  * inheritance rule. Edge-safe.
  */
-import { DEUZ_ATTR } from '../../internal/telemetry';
+import type { WorkingMemorySnapshot } from '../../context/working-memory/types';
+import { DEUZ_ATTR, DEUZ_SPAN, recordSpan } from '../../internal/telemetry';
 import type { TelemetryAttributes } from '../../internal/telemetry';
-import type { Logger } from '../../types/deps';
+import type { Logger, ResolvedDependencies } from '../../types/deps';
 import type { GoalRecord } from '../types';
 import { DEFAULT_GOAL_RUNTIME_POLICY } from './store';
 import type { GoalRuntimePolicy } from './store-types';
+import type { GoalSupervisorEvent } from './supervisor';
+
+/** The goal lease key (2.4): `goal:` and the JSON of `[scope, goalId]`. */
+export function goalLeaseKey(scope: string, goalId: string): string {
+  return `goal:${JSON.stringify([scope, goalId])}`;
+}
+
+/**
+ * The working memory a goal's new run inherits (spec §2.5): the last
+ * snapshot, only when its scope and its `specGeneration` match the goal's,
+ * as it is (hypotheses keep their status). A snapshot of another goal is
+ * never handed over.
+ */
+export function inheritedWorkingMemory(
+  snapshot: WorkingMemorySnapshot | undefined,
+  goal: GoalRecord,
+): WorkingMemorySnapshot | undefined {
+  if (snapshot === undefined || snapshot.scope !== goal.scope) return undefined;
+  const ref = snapshot.goalRef;
+  if (ref !== undefined && ref.goalId !== goal.goalId) return undefined;
+  if (ref?.specGeneration !== goal.specGeneration) return undefined;
+  return snapshot;
+}
+
+/**
+ * A run's snapshot as the supervisor keeps it: named after the goal and the
+ * generation the run was launched under, when the run did not name them.
+ */
+export function stampWorkingMemory(
+  snapshot: WorkingMemorySnapshot,
+  launchedFor: GoalRecord,
+): WorkingMemorySnapshot {
+  if (snapshot.goalRef !== undefined) return snapshot;
+  return {
+    ...snapshot,
+    goalRef: {
+      goalId: launchedFor.goalId,
+      ...(launchedFor.specGeneration !== undefined
+        ? { specGeneration: launchedFor.specGeneration }
+        : {}),
+    },
+  };
+}
+
+/** Reports a new spec generation: the transition is pure, so whoever applies it reports it. */
+export function reportGeneration(
+  deps: ResolvedDependencies,
+  hub: EventHub<GoalSupervisorEvent>,
+  before: GoalRecord,
+  after: GoalRecord,
+): void {
+  if (after.specGeneration === undefined || after.specGeneration === before.specGeneration) return;
+  recordSpan(deps, DEUZ_SPAN.goalGeneration, goalAttributes(after));
+  hub.emit({
+    type: 'generation-changed',
+    scope: after.scope,
+    goalId: after.goalId,
+    specGeneration: after.specGeneration,
+  });
+}
 
 const POLICY_KEYS: readonly (keyof GoalRuntimePolicy)[] = [
   'maxRuns',
@@ -69,12 +130,12 @@ export function mergePolicy(
 
 /** Span attributes of a goal: ids and numbers only, never content. */
 export function goalAttributes(
-  goal: Pick<GoalRecord, 'goalId' | 'revision' | 'specGeneration'>,
+  goal: Pick<GoalRecord, 'goalId'> & Partial<Pick<GoalRecord, 'revision' | 'specGeneration'>>,
   run?: { runId: string; attempt?: number },
 ): TelemetryAttributes {
   return {
     [DEUZ_ATTR.goalId]: goal.goalId,
-    [DEUZ_ATTR.goalRevision]: goal.revision,
+    ...(goal.revision !== undefined ? { [DEUZ_ATTR.goalRevision]: goal.revision } : {}),
     ...(goal.specGeneration !== undefined
       ? { [DEUZ_ATTR.goalSpecGeneration]: goal.specGeneration }
       : {}),
