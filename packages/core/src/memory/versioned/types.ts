@@ -454,14 +454,21 @@ export interface VersionedMemoryStore {
 
 /**
  * Which sources automatic extraction may read (2.4): by default only user
- * messages, host input and the results of tools the host marked trusted.
- * External content (MCP, browser, web) and unmarked tool results only with
- * `allowExternal`, and then stored with source kind `'external'`.
+ * messages, host input and the results of the tools named in
+ * `trustedTools`. External content (MCP, browser, web) and the results of
+ * every other tool only with `allowExternal`, and then stored with source
+ * kind `'external'`.
  */
 export interface MemoryExtractionPolicy {
-  /** Tool names whose results count as trusted (as `memorySource: 'trusted'` on the tool). */
+  /**
+   * The names of the tools whose results count as trusted (source kind
+   * `'tool'`), matched against each result's tool name. This list is the
+   * only trust mark: a tool definition carries no trust flag of its own
+   * (spec §2.1's per-tool `memorySource: 'trusted'` is declared here, by
+   * name, instead).
+   */
   trustedTools?: readonly string[];
-  /** Read external and unmarked tool content too. Default false. */
+  /** Read external content and the results of tools not in `trustedTools` too. Default false. */
   allowExternal?: boolean;
   /** Read assistant turns too. Default false. */
   allowAssistant?: boolean;
