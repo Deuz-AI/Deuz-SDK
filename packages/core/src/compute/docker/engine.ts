@@ -349,8 +349,8 @@ export interface DockerEngine {
   inspectMany(ids: readonly string[]): Promise<ContainerInfo[]>;
   /** The labelled containers (`deuz.operation-id`), optionally of one scope. */
   listLabelled(scope?: string): Promise<string[]>;
-  /** The labelled volumes no container uses. */
-  listDanglingVolumes(): Promise<string[]>;
+  /** The labelled volumes no container uses, optionally of one scope. */
+  listDanglingVolumes(scope?: string): Promise<string[]>;
   /** The bounded stdout/stderr tails of `docker logs`. */
   logs(containerId: string): Promise<ProcessOutput>;
   /** The one detached start command (`docker start <id>`). */
@@ -607,13 +607,14 @@ export function createDockerEngine(options: ResolvedDockerOptions): DockerEngine
         .filter(Boolean);
     },
 
-    async listDanglingVolumes() {
+    async listDanglingVolumes(scope) {
       const result = await docker(cli, [
         'volume',
         'ls',
         '--quiet',
         '--filter',
         `label=${DEUZ_LABEL.operationId}`,
+        ...(scope !== undefined ? ['--filter', `label=${DEUZ_LABEL.scope}=${scope}`] : []),
         '--filter',
         'dangling=true',
       ]);

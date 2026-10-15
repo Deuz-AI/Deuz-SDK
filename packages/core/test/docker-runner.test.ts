@@ -650,6 +650,26 @@ describe('createDockerProcessRunner: reconcile', () => {
     expect((await runner.reconcile({ scope: 'tenant-b' })).matched).toEqual([]);
   });
 
+  it("removes only the reconciled scope's dangling volumes (R4-5)", async () => {
+    const fake = await fakeDocker(bundle);
+    const labels = (scope: string) => ({
+      'deuz.operation-id': 'x',
+      'deuz.scope': scope,
+      'deuz.kind': 'process',
+    });
+    fake.update((state) => {
+      state.volumes['deuz-other-ws'] = { labels: labels('tenant-b'), files: {} };
+      state.volumes['deuz-mine-ws'] = { labels: labels('tenant-a'), files: {} };
+    });
+    const { runner } = setup(fake);
+    const report = await runner.reconcile({ scope: 'tenant-a', removeOrphans: true });
+    expect(report.removed).toEqual(['deuz-mine-ws']);
+    expect(Object.keys(fake.state().volumes)).toEqual(['deuz-other-ws']);
+    // Without a scope, every scope's dangling volumes go.
+    expect((await runner.reconcile({ removeOrphans: true })).removed).toEqual(['deuz-other-ws']);
+    expect(fake.state().volumes).toEqual({});
+  });
+
   it('finishes what a crash left: an exit, a cancel, a container created but not recorded', async () => {
     const fake = await fakeDocker(bundle);
     const durable = createInMemoryProcessOperationStore();

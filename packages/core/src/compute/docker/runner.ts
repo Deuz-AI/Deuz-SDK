@@ -834,7 +834,8 @@ export function createDockerRunnerFromOptions(
             await engine.remove(orphan.containerId);
             report.removed.push(orphan.containerId);
           }
-          for (const volume of await engine.listDanglingVolumes()) {
+          // Only this reconcile's scope: another tenant's volumes are not ours to judge.
+          for (const volume of await engine.listDanglingVolumes(query.scope)) {
             await engine.removeVolume(volume);
             report.removed.push(volume);
           }
