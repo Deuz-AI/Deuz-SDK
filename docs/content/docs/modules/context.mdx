@@ -144,7 +144,8 @@ The defaults are exported as `DEFAULT_CONTEXT_BUDGET`. The added-context budget
 is `min(ratio × (inputTokens − usedTokens), maxTokens)`. The working memory takes
 up to `workingMemoryTokens` of it. The rest is split by kind, and a share a
 source leaves unused flows to the others (manifest reason `'reallocated'`).
-Within a share, candidates go by descending score, then by `recordId`.
+Within a share, candidates go by descending score, then by source order, then
+by `recordId` within a source.
 
 Mandatory content is never cut: the working memory's goal, constraints and
 active task, and mandatory candidates (skill bodies the model already loaded

@@ -187,6 +187,9 @@ response is built. How a durable response runs:
   `[DONE]`.
 - Transient `writeData` parts keep their order and are never journaled.
 - When the client leaves, the commits go on, so a reconnect finds the turn.
+  Do not tie a durable producer to the request's signal (`signal:
+  request.signal`): a client drop would then cut the committed turn short.
+  Cancel it explicitly instead, for example from a stop endpoint.
 
 It fails closed instead of degrading. When another producer holds the lease,
 a newer producer took over, the stored log moved past this producer, its lease
@@ -322,7 +325,7 @@ export async function POST(request: Request): Promise<Response> {
   const result = streamChat({
     model: createMockModel({ responses: [{ text: 'Hello, Ada.' }] }),
     messages: parsed.request.messages,
-    signal: request.signal,
+    // No request.signal: a durable producer keeps committing after the client leaves.
   });
   return toDeuzStreamResponse(result, {
     streamId: chatId,

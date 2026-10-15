@@ -67,7 +67,6 @@ console.log(Object.keys(tools));
 | `workdir` | `'/workspace'` (absolute; its parent must exist in the image) |
 | `readOnlyRootFilesystem`, `tmpfsBytes` | `false`; with `true`: `--read-only`, a tmpfs `/tmp` of 64 MiB and a writable workspace volume |
 | `maxStagingBytes`, `maxArtifactBytes`, `maxOutputBytes` | 256 MiB, 64 MiB, 1 MiB per stream (the tail is kept, `truncated` set) |
-| `runTimeoutMs` | 30 s for a sandbox run without `timeoutMs` (then `docker kill`) |
 | `interpreters` | `python3 -c`, `bash -c`, `sh -c`, `node -e` by language; the image must contain them |
 | `workspace`, `scope`, `labels`, `deps` | Staged into every container through a bounded tar; the `deuz.scope` label; extra labels (`deuz.*` keys are the SDK's: `TypeError`); clock, ids, logger, observer |
 
@@ -77,6 +76,7 @@ Every container gets `--cap-drop ALL`, `--security-opt no-new-privileges`, `--re
 
 - `runShell` runs `/bin/sh -c <command>`; `runCode` the interpreter prefix plus the code. An unknown language returns `exitCode: null` without starting anything.
 - `cwd` resolves inside the workspace; outside it is refused (`exitCode: null`, the reason in `stderr`), nothing runs.
+- A run without a per-call `timeoutMs` is killed with `docker kill` after 30 s (`DEFAULT_DOCKER_SANDBOX.runTimeoutMs`, a default, not an option).
 - What a run writes stays in its container: nothing is copied back to the host workspace.
 - An abort while a run is still preparing keeps the command from starting (`Aborted before start.`, `timedOut: true`).
 - Infrastructure failures reject with `DockerSandboxError` (`docker_unavailable`, `docker_failed`, `image_not_found`, `staging_too_large`, …); what the program does is the result.
