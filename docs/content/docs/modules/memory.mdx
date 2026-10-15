@@ -507,6 +507,8 @@ const llm = defineAccountedMemoryLLM(async ({ system, user }) => {
 console.log(llm.accounted); // true
 ```
 
+Pass the accounted LLM as `seams.accountedLlm`. `seams.llm` keeps the 2.3 `MemoryLLM` type and is still required; when `accountedLlm` is set, every memory LLM call goes to it and `llm` is never called.
+
 The built-in `memory` option charges these calls for you: a [native run](/docs/modules/native-agents#memory) charges them to the run's execution context unless `seams.execution` is set, and reports `embedding-mismatch` and `unaccounted-usage` as warning parts on its stream; `generateText` and `streamChat` put the same warnings in `warnings` and charge `options.execution` when the call has one.
 
 ## The MemoryStore seam
