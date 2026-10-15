@@ -427,7 +427,9 @@ async function execProcess(
       resolve({
         stdout: concat(outChunks),
         stderr: error ? `${concat(errChunks)}${error.message}` : concat(errChunks),
-        exitCode: code,
+        // A killed run has no exit code of its own, as before 2.4 (Node's
+        // emulated SIGKILL gave null); taskkill /F would report 1.
+        exitCode: timedOut ? null : code,
         ...(timedOut ? { timedOut: true } : {}),
         durationMs: Date.now() - start,
         ...(cut.stdout || cut.stderr ? { truncated: { ...cut } } : {}),

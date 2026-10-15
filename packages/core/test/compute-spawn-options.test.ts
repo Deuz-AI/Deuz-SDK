@@ -19,9 +19,13 @@ const spawned: Spawned[] = [];
 /**
  * What a sandbox child does: `clean` exits and closes at once; `exit-only`
  * exits but a program it started keeps the pipes open, so 'close' never
- * comes; `hang` does neither. A taskkill child always exits and closes.
+ * comes; `hang` does neither; `killable` hangs until taskkill ends it, then
+ * exits and closes with code 1, as a process taskkill /F ended does. A
+ * taskkill child always exits and closes.
  */
-let behaviour: 'clean' | 'exit-only' | 'hang' = 'clean';
+let behaviour: 'clean' | 'exit-only' | 'hang' | 'killable' = 'clean';
+/** Ends the last sandbox child the way taskkill /F does. */
+let endLastChild: (() => void) | undefined;
 
 vi.mock('node:child_process', () => ({
   spawn: (command: string, args: string[], options: Record<string, unknown>) => {
@@ -38,8 +42,17 @@ vi.mock('node:child_process', () => ({
       },
       kill: () => true,
     };
+    const emit = (event: string, code: number) => {
+      for (const listener of listeners[event] ?? []) listener(code, null);
+    };
+    if (!killer)
+      endLastChild = () => {
+        emit('exit', 1);
+        emit('close', 1);
+      };
+    else if (behaviour === 'killable') setTimeout(() => endLastChild?.(), 1);
     setTimeout(() => {
-      if (!killer && behaviour === 'hang') return;
+      if (!killer && (behaviour === 'hang' || behaviour === 'killable')) return;
       for (const listener of listeners.exit ?? []) listener(0, null);
       if (killer || behaviour === 'clean')
         for (const listener of listeners.close ?? []) listener(0, null);
@@ -105,6 +118,21 @@ describe('createNodeSandbox tree kill after the child exited (R4-8)', () => {
       const res = await createNodeSandbox().runShell!({ command: 'sleep 9 &', timeoutMs: 100 });
       expect(res.timedOut).toBe(true);
       expect(kill).toHaveBeenCalledWith(-4242, 'SIGKILL');
+    },
+  );
+});
+
+describe('createNodeSandbox exit code of a killed run', () => {
+  it.runIf(process.platform === 'win32')(
+    'is null, as before 2.4, even when the child taskkill ended closes within the grace',
+    async () => {
+      behaviour = 'killable';
+      const res = await createNodeSandbox().runShell!({
+        command: 'ping -t localhost',
+        timeoutMs: 100,
+      });
+      expect(killers()).toHaveLength(1);
+      expect(res).toMatchObject({ timedOut: true, exitCode: null });
     },
   );
 });
