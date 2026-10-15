@@ -11,9 +11,10 @@
  * the local Postgres and Redis when their variables are set). Every store of
  * a process sits behind a kill switch: once the process crashes, each later
  * store call of that process throws `HostCrashed`, so nothing it does after
- * the crash point lands, as when the process dies. A recovery opens fresh
- * instances on the same data after the crashed process settled and its
- * connections were closed, and moves the shared clock past the lease TTLs.
+ * the crash point lands, as when the process dies, and the client's open
+ * connections to it reset. A recovery opens fresh instances on the same data
+ * after the crashed process settled and its connections were closed, and
+ * moves the shared clock past the lease TTLs.
  *
  * The host's pieces are the ones an app would write: `publish_report` posts to
  * an external outbox once a human approves it (not idempotent: a repeat is a

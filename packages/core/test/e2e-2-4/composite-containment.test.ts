@@ -198,6 +198,28 @@ describe.each(flowBackends())('composite containment (%s)', (backend) => {
         expect((await p2.supervisor.get(scope, GOAL_ID))!.goal.status).toBe('waiting');
         expect(env.outbox).toHaveLength(1);
         await expectReplayedOnce(p2, wire);
+
+        // The host gives up on tonight's report: the cancel is recorded, then applied.
+        await p2.supervisor.command(scope, GOAL_ID, {
+          type: 'cancel',
+          reason: 'no report tonight',
+        });
+        expect(await p2.supervisor.tick()).toMatchObject({ cancelled: 1 });
+        const cancelled = (await p2.supervisor.get(scope, GOAL_ID))!;
+        expect(cancelled.goal.status).toBe('cancelled');
+        expect(cancelled.runtime).toMatchObject({
+          phase: 'done',
+          cancel: { appliedAt: expect.any(Number) },
+        });
+        const spans = env.observer
+          .events()
+          .flatMap((event) => (event.type === 'operation.completed' ? [event.operation] : []));
+        for (const name of [
+          'deuz.goal.cancel_requested',
+          'deuz.goal.cancel_applied',
+          'deuz.process.reconcile',
+        ])
+          expect(spans).toContain(name);
       }));
   }
 });
