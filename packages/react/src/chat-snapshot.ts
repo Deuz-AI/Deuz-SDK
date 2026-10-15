@@ -186,6 +186,39 @@ export function restoreUI(
 }
 
 /**
+ * A restored gate whose turn names the bubble it belongs to. The gate's turn
+ * is the chat's last assistant message: that message settled, then the chat
+ * paused on it, and whatever answers the gate folds into the bubble the
+ * turn's id addresses (the LAST one with that id, see `syncTurn`). The turn
+ * carries the id its message was stored under, but `restoreUI` keeps a
+ * repeated id only on its first message: a route without a `messageId` names
+ * every response 'deuz-msg', so the gate's bubble renders under a generated id
+ * while an earlier bubble keeps the stored one, and the answers would land
+ * there. So the turn takes the id its message renders under. A history whose
+ * last user or assistant message is not an assistant one has no bubble for
+ * the turn, and the gate is kept as it is.
+ */
+export function gateOnItsBubble(
+  gate: ChatSnapshotGateV1 | undefined,
+  messages: readonly Message[],
+  ui: readonly UIMessage[],
+): ChatSnapshotGateV1 | undefined {
+  const turn = gate?.turn;
+  if (!gate || !turn) return gate;
+  let views = 0;
+  let last: Message['role'] | undefined;
+  for (const message of messages) {
+    if (message.role !== 'user' && message.role !== 'assistant') continue;
+    views++;
+    last = message.role;
+  }
+  const bubble = ui[views - 1];
+  if (last !== 'assistant' || bubble?.role !== 'assistant' || bubble.id === turn.message.id)
+    return gate;
+  return { ...gate, turn: { ...turn, message: { ...turn.message, id: bubble.id } } };
+}
+
+/**
  * Pairs the user and assistant messages of `canonical` with the messages of
  * `ui` the way `uiFromMessages` builds them, and hands each pair to `pair`.
  * Stops at the first message whose counterpart is missing or has another

@@ -9,6 +9,7 @@ import { StrictMode, createElement, type ReactNode } from 'react';
 import { describe, expect, it, vi } from 'vitest';
 import { act, renderHook, waitFor } from '@testing-library/react';
 import type { Message } from '@deuz-sdk/core';
+import { applyUIPart, createAssistantTurn } from '@deuz-sdk/core/chat';
 import type { DeuzUIPart } from '@deuz-sdk/core/ui';
 import { useChat } from '../src/use-chat';
 import type { ChatSnapshotV1 } from '../src/index';
@@ -330,6 +331,65 @@ describe('useChat({ initialSnapshot }) — the turn in progress and the cursor',
     expect(result.current.messages).toHaveLength(2);
   });
 
+  it('settles a restored turn that already had its finish when the endpoint is caught up', async () => {
+    const wire = journal();
+    await wire.leg(PARIS_LEG);
+    // Persisted after `finish` was folded but before `[DONE]` arrived.
+    let turn = createAssistantTurn('m-0');
+    for (const part of PARIS_LEG) turn = applyUIPart(turn, part);
+    const snapshot: ChatSnapshotV1 = {
+      version: 1,
+      messages: [USER],
+      messageIds: ['u-1'],
+      cursor: String(PARIS_LEG.length - 1),
+      turn,
+    };
+    const { result } = renderHook(() =>
+      useChat({
+        api: '/api/chat',
+        fetch: noFetch,
+        resume: { endpoint: wire.endpoint, auto: true },
+        initialSnapshot: JSON.parse(JSON.stringify(snapshot)) as ChatSnapshotV1,
+      }),
+    );
+    await waitFor(() => expect(wire.cursors).toHaveLength(1));
+    await waitFor(() => expect(result.current.status).toBe('idle'));
+    expect(wire.cursors).toEqual([snapshot.cursor]);
+    expect(result.current.messages.map((m) => [m.id, m.content])).toEqual([
+      ['u-1', 'hi'],
+      ['m-1', 'Hello, Paris.'],
+    ]);
+    expect(result.current.history.canonical).toEqual([
+      USER,
+      { role: 'assistant', content: 'Hello, Paris.' },
+    ]);
+    const settled = result.current.exportSnapshot();
+    expect(settled.turn).toBeUndefined();
+    expect(settled.messageIds).toEqual(['u-1', 'm-1']);
+  });
+
+  it('keeps a restored turn without its finish unsettled when the endpoint is caught up', async () => {
+    const wire = journal();
+    const partial = PARIS_LEG.slice(0, 2);
+    await wire.leg(partial);
+    let turn = createAssistantTurn('m-0');
+    for (const part of partial) turn = applyUIPart(turn, part);
+    const { result } = renderHook(() =>
+      useChat({
+        api: '/api/chat',
+        fetch: noFetch,
+        resume: { endpoint: wire.endpoint },
+        initialSnapshot: { version: 1, messages: [USER], cursor: '1', turn },
+      }),
+    );
+    await act(async () => {
+      await result.current.reconnect();
+    });
+    expect(wire.cursors).toEqual(['1']);
+    expect(result.current.history.canonical).toEqual([USER]);
+    expect(result.current.exportSnapshot().turn?.message.content).toBe('Hel');
+  });
+
   it('seals the restored turn when nothing can continue it', async () => {
     const { snapshot } = await droppedChat(2);
     expect(snapshot.turn?.message.parts?.at(-1)).toMatchObject({
@@ -620,6 +680,142 @@ describe('useChat({ initialSnapshot }) — gates', () => {
     expect(second.bodies[0]).toMatchObject({
       runId: 'run-1',
       approvalResponses: [{ approvalId: 'ap1', approved: true }],
+      clientToolResults: [{ toolCallId: 'c1', output: 'a.txt' }],
+    });
+  });
+});
+
+/**
+ * A route without a `messageId` names every response 'deuz-msg'
+ * (`toDeuzStreamResponse`'s default), so a stored history repeats that id.
+ * Restoring keeps it on the FIRST message and gives the later ones fresh ids,
+ * while the gate's turn still carries the stored id: its answers must fold
+ * into its own bubble, never into the earlier one that kept the id.
+ */
+describe('useChat({ initialSnapshot }) — a gate under a repeated message id', () => {
+  it('folds a restored parked call’s result into its own bubble, not the earlier one', async () => {
+    const first = recordingFetch((round) =>
+      round === 1
+        ? postResponse([parts.start('deuz-msg'), parts.text('first answer'), parts.finish()])
+        : postResponse([
+            parts.start('deuz-msg'),
+            parts.toolCall('c1', 'pick', { what: 'file' }),
+            parts.finish(),
+          ]),
+    );
+    const live = renderHook(() => useChat({ api: '/api/chat', fetch: first.fetch }));
+    await act(async () => {
+      await live.result.current.sendMessage('q1');
+    });
+    await act(async () => {
+      await live.result.current.sendMessage('q2');
+    });
+    await waitFor(() => expect(live.result.current.pendingToolCalls).toHaveLength(1));
+    const snapshot = live.result.current.exportSnapshot();
+    expect(snapshot.messageIds?.[1]).toBe('deuz-msg');
+    expect(snapshot.messageIds?.[3]).toBe('deuz-msg');
+    expect(snapshot.gate?.turn?.message.id).toBe('deuz-msg');
+
+    const wire = recordingFetch(() =>
+      postResponse([parts.start('deuz-msg'), parts.text('done'), parts.finish()]),
+    );
+    const restored = renderHook(() =>
+      useChat({
+        api: '/api/chat',
+        fetch: wire.fetch,
+        initialSnapshot: JSON.parse(JSON.stringify(snapshot)) as ChatSnapshotV1,
+      }),
+    );
+    const parkedId = restored.result.current.messages[3]!.id;
+    expect(parkedId).not.toBe('deuz-msg');
+    // The gate a restored chat exports names the bubble it folds into.
+    expect(restored.result.current.exportSnapshot().gate?.turn?.message.id).toBe(parkedId);
+
+    await act(async () => {
+      await restored.result.current.addToolResult({ toolCallId: 'c1', output: 'a.txt' });
+    });
+    await waitFor(() => expect(restored.result.current.status).toBe('idle'));
+    const view = restored.result.current.messages;
+    expect(view.map((m) => [m.id, m.content, m.toolCalls?.map((call) => call.state)])).toEqual([
+      [snapshot.messageIds![0], 'q1', undefined],
+      ['deuz-msg', 'first answer', undefined],
+      [snapshot.messageIds![2], 'q2', undefined],
+      [parkedId, '', ['result']],
+      ['deuz-msg', 'done', undefined],
+    ]);
+    expect(wire.bodies).toHaveLength(1);
+    expect(wire.bodies[0]!.messages.at(-1)).toEqual({
+      role: 'tool',
+      content: [{ type: 'tool_result', toolUseId: 'c1', result: 'a.txt' }],
+    });
+  });
+
+  it('folds a restored native gate’s client results into its own bubble', async () => {
+    const approval = {
+      approvalId: 'ap1',
+      toolCallId: 'd1',
+      toolName: 'del',
+      input: { path: '/a' },
+    };
+    const agentFrame = (payload: Record<string, unknown>) =>
+      ({ type: 'data-agent', id: String(payload.kind), payload }) as unknown as DeuzUIPart;
+    const first = recordingFetch((round) =>
+      round === 1
+        ? postResponse([parts.start('deuz-msg'), parts.text('first answer'), parts.finish()])
+        : postResponse([
+            parts.start('deuz-msg'),
+            agentFrame({ kind: 'run', seq: 1, runId: 'run-1', status: 'running' }),
+            parts.toolCall('d1', 'del', { path: '/a' }),
+            parts.approval('ap1', 'd1', 'del', { path: '/a' }),
+            parts.toolCall('c1', 'pick', { what: 'file' }),
+            parts.finish(),
+            agentFrame({
+              kind: 'result',
+              seq: 6,
+              runId: 'run-1',
+              status: 'suspended',
+              pendingApprovals: [approval],
+              pendingClientCalls: [{ toolCallId: 'c1', toolName: 'pick', input: { what: 'file' } }],
+            }),
+          ]),
+    );
+    const live = renderHook(() => useChat({ api: '/api/agent', fetch: first.fetch }));
+    await act(async () => {
+      await live.result.current.sendMessage('q1');
+    });
+    await act(async () => {
+      await live.result.current.sendMessage('go');
+    });
+    await waitFor(() => expect(live.result.current.pendingApprovals).toHaveLength(1));
+    const gated = live.result.current.exportSnapshot();
+    expect(gated.gate?.turn?.message.id).toBe('deuz-msg');
+
+    // The verdict lands on a restored chat whose onToolCall answers the client call.
+    const wire = recordingFetch(() =>
+      postResponse([parts.start('deuz-msg'), parts.text('done'), parts.finish()]),
+    );
+    const restored = renderHook(() =>
+      useChat({
+        api: '/api/agent',
+        fetch: wire.fetch,
+        onToolCall: () => 'a.txt',
+        initialSnapshot: JSON.parse(JSON.stringify(gated)) as ChatSnapshotV1,
+      }),
+    );
+    const gateId = restored.result.current.messages[3]!.id;
+    expect(gateId).not.toBe('deuz-msg');
+    await act(async () => {
+      await restored.result.current.addToolApprovalResponse({ approvalId: 'ap1', approved: true });
+    });
+    await waitFor(() => expect(restored.result.current.status).toBe('idle'));
+    const view = restored.result.current.messages;
+    expect(view[1]).toMatchObject({ id: 'deuz-msg', content: 'first answer' });
+    expect(view[1]!.toolCalls).toBeUndefined();
+    expect(view[3]!.id).toBe(gateId);
+    expect(view[3]!.toolCalls?.find((call) => call.toolCallId === 'c1')?.state).toBe('result');
+    expect(view).toHaveLength(5);
+    expect(wire.bodies[0]).toMatchObject({
+      runId: 'run-1',
       clientToolResults: [{ toolCallId: 'c1', output: 'a.txt' }],
     });
   });
