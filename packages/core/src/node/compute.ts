@@ -367,6 +367,8 @@ async function execProcess(
     let settled = false;
     /** From 'exit', for a killed run that settles before 'close' comes. */
     let exitCode: number | null = null;
+    /** 'exit' came: Node has let go of the child's pid, which the OS may reuse. */
+    let exited = false;
     let graceTimer: ReturnType<typeof setTimeout> | undefined;
 
     const collect = (chunks: Uint8Array[], countRef: 'out' | 'err') => (chunk: Uint8Array) => {
@@ -398,7 +400,13 @@ async function execProcess(
     const kill = (): void => {
       if (settled || timedOut) return;
       timedOut = true;
-      killProcessTree(spawn, input.host, child);
+      // After 'exit' (a program the child started still holds the pipes) the
+      // child's pid is free: on Windows `taskkill /PID <pid> /T` could hit an
+      // unrelated process and its tree, and cannot walk a dead process's tree
+      // anyway, so only the grace and the pipe close remain. A POSIX process
+      // group id stays reserved while any member lives, and those members are
+      // what holds the pipes: the group signal still goes out.
+      if (!(exited && input.host.platform === 'win32')) killProcessTree(spawn, input.host, child);
       graceTimer = setTimeout(() => finish(exitCode), KILL_GRACE_MS);
     };
     const timer = setTimeout(kill, input.timeoutMs);
@@ -429,6 +437,7 @@ async function execProcess(
     child.on('error', (err) => finish(null, err));
     child.on('exit', (code) => {
       exitCode = code;
+      exited = true;
     });
     child.on('close', (code) => finish(code));
 
