@@ -308,6 +308,20 @@ describe('createDockerSandbox', () => {
     expect(error).toMatchObject({ code: 'docker_unavailable' });
   });
 
+  it('a program too long for the command line is docker_failed, not an unreachable daemon (R4-7)', async () => {
+    const fake = await fakeDocker(bundle);
+    const sandbox = createDockerSandbox({ image: FAKE_IMAGE, ...fake.cli });
+    // Past the whole command line on Windows (32 KiB), past one argument on Linux (128 KiB).
+    const size = process.platform === 'win32' ? 40_000 : 200_000;
+    const error = await sandbox
+      .runCode({ language: 'sh', code: `echo ${'x'.repeat(size)}` })
+      .catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(DockerSandboxError);
+    expect(error).toMatchObject({ code: 'docker_failed', command: 'create' });
+    expect((error as Error).message).toMatch(/too long/);
+    expect(fake.containers()).toEqual([]);
+  });
+
   it('takes custom limits, the writable-layer size and extra labels', async () => {
     const fake = await fakeDocker(bundle);
     const sandbox = createDockerSandbox({

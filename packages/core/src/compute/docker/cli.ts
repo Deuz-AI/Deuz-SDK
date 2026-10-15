@@ -133,9 +133,32 @@ export function dockerFailure(
 }
 
 /**
+ * The error for a CLI that could not be spawned: `docker_unavailable`, except
+ * an argv the operating system refuses as too long (E2BIG, ENAMETOOLONG: an
+ * inline program past the command-line limit), which no retry fixes and which
+ * says nothing about the daemon: `docker_failed`.
+ */
+function spawnFailure(cli: DockerCli, command: string, error: unknown): DockerSandboxError {
+  const code = (error as { code?: unknown } | undefined)?.code;
+  const message = error instanceof Error ? error.message : String(error);
+  if (code === 'E2BIG' || code === 'ENAMETOOLONG')
+    return new DockerSandboxError(
+      'docker_failed',
+      `docker ${command}: the command line is too long for the operating system (${code}); pass a long program as a workspace file instead of inline.`,
+      { command, cause: error },
+    );
+  return new DockerSandboxError(
+    'docker_unavailable',
+    `The Docker CLI (${cli.dockerPath}) could not be started: ${message}`,
+    { command, cause: error },
+  );
+}
+
+/**
  * Runs `docker <dockerArgs> <args>` and resolves with what it did; a non-zero
  * exit is not an error here. Throws `docker_unavailable` when the CLI cannot
- * be started or the timeout passes.
+ * be started or the timeout passes (`docker_failed` for an argv too long to
+ * spawn).
  */
 export async function execDocker(
   cli: DockerCli,
@@ -155,13 +178,7 @@ export async function execDocker(
         windowsHide: true,
       });
     } catch (error) {
-      reject(
-        new DockerSandboxError(
-          'docker_unavailable',
-          `The Docker CLI (${cli.dockerPath}) could not be started: ${(error as Error).message}`,
-          { command, cause: error },
-        ),
-      );
+      reject(spawnFailure(cli, command, error));
       return;
     }
     const stdout: Uint8Array[] = [];
@@ -220,13 +237,7 @@ export async function execDocker(
       clearTimeout(timer);
       options.signal?.removeEventListener('abort', onAbort);
       if (error) {
-        reject(
-          new DockerSandboxError(
-            'docker_unavailable',
-            `The Docker CLI (${cli.dockerPath}) could not be started: ${error.message}`,
-            { command, cause: error },
-          ),
-        );
+        reject(spawnFailure(cli, command, error));
         return;
       }
       if (timedOut) {
@@ -296,11 +307,7 @@ export async function startAttachedWithStdin(
       { stdio: ['pipe', 'ignore', 'ignore'], shell: false, windowsHide: true, detached: true },
     );
   } catch (error) {
-    throw new DockerSandboxError(
-      'docker_unavailable',
-      `The Docker CLI (${cli.dockerPath}) could not be started: ${(error as Error).message}`,
-      { command: 'start', cause: error },
-    );
+    throw spawnFailure(cli, 'start', error);
   }
   const exited = new Promise<number | null>((resolve) => {
     child.on('close', (code) => resolve(code));
