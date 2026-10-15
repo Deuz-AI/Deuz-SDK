@@ -232,6 +232,23 @@ export function transcriptIndexContracts(
       await done();
     });
 
+    it('finds the terms inside hosts, emails, versions and paths', async () => {
+      const { index, done } = await setup();
+      await index.index(
+        chatRecord('urls', [
+          user('Deploy to api.example.com and mail ops@acme.io about v2.4.1 at /srv/app'),
+          assistant('Edited src/index.ts, see https://docs.deuz.dev/guide?tab=api'),
+        ]),
+      );
+      const hits = async (term: string) =>
+        (await index.search({ userId: 'ada' }, term)).map((hit) => hit.messageId);
+      for (const term of ['deploy', 'example', 'acme', 'ops', 'v2', 'srv', 'app'])
+        expect({ term, hits: await hits(term) }).toEqual({ term, hits: ['urls:0'] });
+      for (const term of ['index', 'ts', 'docs', 'deuz', 'guide', 'tab'])
+        expect({ term, hits: await hits(term) }).toEqual({ term, hits: ['urls:1'] });
+      await done();
+    });
+
     it('answers an empty or punctuation-only query with nothing', async () => {
       const { index, done } = await setup();
       await index.index(chatRecord('c', [user('anything at all')]));

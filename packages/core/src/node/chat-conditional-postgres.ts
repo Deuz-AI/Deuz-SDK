@@ -13,9 +13,11 @@
  * tables and migrate versions are untouched.
  *
  * Lexical search uses the `'simple'` text search configuration (no stemming,
- * no stop words) over the folded text the shared transcript rules produce, so
- * case and diacritics fold as in SQLite FTS5; any query term matching is a
- * hit, ranked by `ts_rank`.
+ * no stop words) over the terms the shared transcript rules produce: `body`
+ * holds a message's folded terms joined by spaces, so case and diacritics
+ * fold as in SQLite FTS5, and the parser never keeps a host, an email, a path
+ * or a version as one token the query's terms cannot match. Any query term
+ * matching is a hit, ranked by `ts_rank`.
  */
 import type { ChatRecord } from '../chat';
 import { deserializeChatRecord } from '../chat';
@@ -36,6 +38,7 @@ import {
   queryTerms,
   resolveSearchOptions,
   scopeMatches,
+  textTerms,
   transcriptEntries,
   type ResolvedSearchOptions,
 } from '../internal/chat-transcript';
@@ -266,7 +269,9 @@ export function createPostgresConditionalChatStore(
           entry.messageId,
           entry.index,
           ...scope,
-          entry.text,
+          // The shared terms, not the text: Postgres's parser would keep
+          // `api.example.com` or `/srv/app` whole, out of reach of a query term.
+          textTerms(entry.text).join(' '),
           encodeMessage(entry.message),
           firstIndexed.get(entry.messageId) ?? now,
         );
