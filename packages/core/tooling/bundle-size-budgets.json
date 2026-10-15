@@ -316,13 +316,40 @@
     "  native-swarm/embed-accounting lazy: 1 / 1 -> 1300 / 750 (measured 1230 / 674)",
     "  native-swarm/memory-accounting lazy: 1 / 1 -> 1300 / 750 (measured 1232 / 697)",
     "  evolve/embed-accounting lazy: 1 / 1 -> 1300 / 750 (measured 1230 / 675)",
-    "  evolve/memory-accounting lazy: 1 / 1 -> 1300 / 750 (measured 1232 / 694)"
+    "  evolve/memory-accounting lazy: 1 / 1 -> 1300 / 750 (measured 1232 / 694)",
+    "",
+    "RAISED FOR 2.4 (W1b integration, pass 1): measured on feat/2.4 after W1b (V3 loop wiring, supervisor, skill learning) and fix lane FC; +5% headroom (lazy totals +10%). The edge/native-agent/native-swarm eager growth is the V3 wiring in the shared loop, flagged for the W1b review:",
+    "  edge: 178000 / 57900 -> 191650 / 57900 (measured 182477 / 56742)",
+    "  native-agent: 257500 / 80400 -> 277650 / 87350 (measured 264398 / 83160)",
+    "  native-swarm: 263500 / 82500 -> 280550 / 88100 (measured 267172 / 83863)",
+    "  mcp-server: 17150 / 6570 -> 18250 / 6570 (measured 17347 / 6497)",
+    "  mcp-server (lazy): 320800 / 103100 -> 389200 / 125750 (measured 353818 / 114312)",
+    "  goal-runtime: 80500 / 25250 -> 133950 / 40900 (measured 127527 / 38934)",
+    "  goal-runtime (lazy): - / - -> 370300 / 118500 (measured 336623 / 107686)",
+    "  skills-learning: 960 / 590 -> 19750 / 7450 (measured 18795 / 7090)",
+    "  skills-learning (lazy): - / - -> 119450 / 36300 (measured 108558 / 32958)",
+    "",
+    "RAISED FOR 2.4 (W1b integration, pass 2): the new agent-run-v3-run optional chunk sized from its first measurement, +5%:",
+    "  edge/agent-run-v3-run lazy: 1 / 1 -> 57850 / 20150 (measured 55093 / 19147)",
+    "  native-agent/agent-run-v3-run lazy: 1 / 1 -> 57500 / 20000 (measured 54721 / 19012)",
+    "  native-swarm/agent-run-v3-run lazy: 1 / 1 -> 60800 / 20950 (measured 57877 / 19950)",
+    "",
+    "TIGHTENED (W1b integration): bundles over 100 KB keep 1% headroom instead of 5%:",
+    "  core: 188500 / 58600 -> 188300 / 58600 (measured 186393 / 58222)",
+    "  edge: 191650 / 57900 -> 184350 / 57350 (measured 182477 / 56742)",
+    "  native-agent: 277650 / 87350 -> 267050 / 84000 (measured 264398 / 83160)",
+    "  native-swarm: 280550 / 88100 -> 269850 / 84750 (measured 267172 / 83863)",
+    "  evolve: 216000 / 68000 -> 214350 / 67550 (measured 212217 / 66871)",
+    "  mcp-server (lazy): 389200 / 125750 -> 357400 / 115500 (measured 353818 / 114312)",
+    "  goal-runtime: 133950 / 40900 -> 128850 / 39350 (measured 127527 / 38934)",
+    "  goal-runtime (lazy): 370300 / 118500 -> 340000 / 108800 (measured 336623 / 107686)",
+    "  skills-learning (lazy): 119450 / 36300 -> 109650 / 33300 (measured 108558 / 32958)"
   ],
   "bundles": {
     "core": {
       "from": "@deuz-sdk/core",
       "exports": ["streamChat", "generateText", "generateObject", "createClient"],
-      "maxRawBytes": 188500,
+      "maxRawBytes": 188300,
       "maxGzipBytes": 58600,
       "maxLazyRawBytes": 22500,
       "maxLazyGzipBytes": 8450,
@@ -363,8 +390,8 @@
     "edge": {
       "from": "@deuz-sdk/core/edge",
       "exports": ["streamChat", "generateText", "generateObject", "createApprovalSigner"],
-      "maxRawBytes": 178000,
-      "maxGzipBytes": 57900,
+      "maxRawBytes": 184350,
+      "maxGzipBytes": 57350,
       "maxLazyRawBytes": 22500,
       "maxLazyGzipBytes": 8450,
       "legacyLazyEntryPoint": "resolve",
@@ -428,6 +455,11 @@
           "entryPoint": "memory-accounting",
           "maxRawBytes": 1300,
           "maxGzipBytes": 750
+        },
+        "agent-run-v3-run": {
+          "entryPoint": "agent-run-v3-run",
+          "maxRawBytes": 57850,
+          "maxGzipBytes": 20150
         }
       }
     },
@@ -448,8 +480,8 @@
         "createInMemoryBudgetStore",
         "BudgetStoreError"
       ],
-      "maxRawBytes": 257500,
-      "maxGzipBytes": 80400,
+      "maxRawBytes": 267050,
+      "maxGzipBytes": 84000,
       "maxLazyRawBytes": 22500,
       "maxLazyGzipBytes": 8450,
       "legacyLazyEntryPoint": "resolve",
@@ -508,14 +540,19 @@
           "entryPoint": "memory-accounting",
           "maxRawBytes": 1300,
           "maxGzipBytes": 750
+        },
+        "agent-run-v3-run": {
+          "entryPoint": "agent-run-v3-run",
+          "maxRawBytes": 57500,
+          "maxGzipBytes": 20000
         }
       }
     },
     "native-swarm": {
       "from": "@deuz-sdk/core/swarm",
       "exports": ["createSwarm", "createInMemorySwarmStore", "SwarmConflictError"],
-      "maxRawBytes": 263500,
-      "maxGzipBytes": 82500,
+      "maxRawBytes": 269850,
+      "maxGzipBytes": 84750,
       "maxLazyRawBytes": 22500,
       "maxLazyGzipBytes": 8450,
       "legacyLazyEntryPoint": "resolve",
@@ -574,6 +611,11 @@
           "entryPoint": "memory-accounting",
           "maxRawBytes": 1300,
           "maxGzipBytes": 750
+        },
+        "agent-run-v3-run": {
+          "entryPoint": "agent-run-v3-run",
+          "maxRawBytes": 60800,
+          "maxGzipBytes": 20950
         }
       }
     },
@@ -606,8 +648,8 @@
         "applySearchReplace",
         "parseEvolveBlocks"
       ],
-      "maxRawBytes": 216000,
-      "maxGzipBytes": 68000,
+      "maxRawBytes": 214350,
+      "maxGzipBytes": 67550,
       "maxLazyRawBytes": 22500,
       "maxLazyGzipBytes": 8450,
       "legacyLazyEntryPoint": "resolve",
@@ -710,10 +752,10 @@
     "mcp-server": {
       "from": "@deuz-sdk/core/mcp/server",
       "exports": ["createMcpServer"],
-      "maxRawBytes": 17150,
+      "maxRawBytes": 18250,
       "maxGzipBytes": 6570,
-      "maxLazyRawBytes": 320800,
-      "maxLazyGzipBytes": 103100
+      "maxLazyRawBytes": 357400,
+      "maxLazyGzipBytes": 115500
     },
     "realtime": {
       "from": "@deuz-sdk/core/realtime",
@@ -834,14 +876,18 @@
         "createInMemoryGoalRuntimeStore",
         "verifyGoalAcceptance"
       ],
-      "maxRawBytes": 80500,
-      "maxGzipBytes": 25250
+      "maxRawBytes": 128850,
+      "maxGzipBytes": 39350,
+      "maxLazyRawBytes": 340000,
+      "maxLazyGzipBytes": 108800
     },
     "skills-learning": {
       "from": "@deuz-sdk/core/skills/learning",
       "exports": ["proposeSkillFromRun"],
-      "maxRawBytes": 960,
-      "maxGzipBytes": 590
+      "maxRawBytes": 19750,
+      "maxGzipBytes": 7450,
+      "maxLazyRawBytes": 109650,
+      "maxLazyGzipBytes": 33300
     }
   }
 }

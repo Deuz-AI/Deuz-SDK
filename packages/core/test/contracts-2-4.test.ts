@@ -29,15 +29,6 @@ import * as goalRuntimeSqlite from '../src/node/goal-runtime-sqlite';
 import * as goalRuntimePostgres from '../src/node/goal-runtime-postgres';
 import { createInMemoryAgentRunStoreV3 } from '../src/agent-run-v3-store';
 
-async function expectAsyncStub(name: string, call: () => Promise<unknown>): Promise<void> {
-  const error = await call().then(
-    () => undefined,
-    (reason: unknown) => reason,
-  );
-  expect(error, name).toBeInstanceOf(NotImplementedError);
-  expect((error as NotImplementedError).feature).toBe(name);
-}
-
 const any = {} as never;
 
 describe('/memory/versioned skeleton', () => {
@@ -179,8 +170,8 @@ describe('/goal/runtime skeleton', () => {
 });
 
 describe('/skills/learning skeleton', () => {
-  it('publishes proposeSkillFromRun as a stub and a typed refusal', async () => {
-    await expectAsyncStub('proposeSkillFromRun', () => learning.proposeSkillFromRun(any));
+  it('publishes proposeSkillFromRun (implemented by L8) and a typed refusal', async () => {
+    expect(typeof learning.proposeSkillFromRun).toBe('function');
     const error = new learning.SkillLearningError('source_too_large', 'too large');
     expect(errors.isDeuzError(error)).toBe(true);
     expect(error.code).toBe('source_too_large');

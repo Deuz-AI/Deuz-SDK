@@ -845,6 +845,24 @@ describe('Deuz UI wire v2 (resumable)', () => {
     }).rejects.toThrow(/no event ids/);
   });
 
+  it('reconnects after a drop that delivered only the id-less capabilities frame (2.4)', async () => {
+    // A 2.4 resume endpoint opens with the handshake frame (no id) when the client asks for
+    // it; a drop right after it delivered no content, so it must reconnect, not refuse.
+    const first = 'data: {"type":"capabilities","capabilities":["message-ids"]}\n\n';
+    const second = sseEvents([
+      { id: 0, data: { type: 'start', messageId: 'm1' } },
+      { id: 1, data: { type: 'text-delta', text: 'Hi' } },
+      { id: 2, data: '[DONE]' },
+    ]);
+    const responses = [first, second];
+    const parts: DeuzUIPart[] = [];
+    for await (const p of connectDeuzStream(() => sseResponse([responses.shift() ?? second]), {
+      clock: instantClock,
+    }))
+      parts.push(p);
+    expect(parts.map((p) => p.type)).toEqual(['capabilities', 'start', 'text-delta']);
+  });
+
   it('a failing store degrades the response, never kills it', async () => {
     const storeErrors: unknown[] = [];
     const broken = {

@@ -397,6 +397,7 @@
       "AgentRunPhase",
       "AgentRunRecall",
       "AgentRunReconcileOptions",
+      "AgentRunReconcileOptionsV3",
       "AgentRunReconciliation",
       "AgentRunRetry",
       "AgentRunSession",

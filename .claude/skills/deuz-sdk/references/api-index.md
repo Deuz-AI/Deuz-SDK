@@ -1,7 +1,7 @@
 <!-- GENERATED FILE — do not hand-edit.
      regenerate: node packages/core/tooling/skills/generate-api-index.mjs --date YYYY-MM-DD
      source: packages/core/{package.json exports, tsup.config.ts} + src walk (export * followed)
-     verified: 2026-10-15 against @deuz-sdk/core@2.3.0 · api-contract sha256:fb025f0c23e3 -->
+     verified: 2026-10-15 against @deuz-sdk/core@2.3.0 · api-contract sha256:03a491b97528 -->
 
 # API index — every subpath, every export
 
@@ -145,7 +145,7 @@ Native run/stream/resume/reconcile, validated outputs, execution policies, share
 
 **Values** (18): BudgetLedgerError, BudgetStoreError, createAgent, createBudgetLedger, createExecutionContext, createInMemoryAgentRunStore, createInMemoryAgentRunStoreV3, createInMemoryBudgetStore, ExecutionPersistenceError, ExecutionPolicyError, handoff, intersectExecutionPolicies, reconcileAgentRun, resumeAgent, resumeStreamAgent, runAgent, streamAgent, UnsupportedStoreError
 
-**Types** (103): AccountedEmbedder, AccountedEmbeddings, AccountedMemoryEmbedder, AccountedMemoryLLM, AccountedMemoryLLMResult, AccountedUsage, AgentArrayElement, AgentCallOptions, AgentDef, AgentEvent, AgentEventV3, AgentMcpCatalogChange, AgentMcpEntry, AgentMcpReplay, AgentObjectCallOptions, AgentOutput, AgentPartialOutput, AgentResult, AgentRunChatInvocation, AgentRunChatState, AgentRunContextStateV3, AgentRunContextStepV3, AgentRunEnvelope, AgentRunEnvelopeV3, AgentRunLeaseOptions, AgentRunListPage, AgentRunListQuery, AgentRunMemoryExtraction, AgentRunMemoryExtractionV3, AgentRunMemoryIntentV3, AgentRunMemoryState, AgentRunMemoryStateV3, AgentRunModelAttempt, AgentRunModelRef, AgentRunModelState, AgentRunOptions, AgentRunOptionsV3, AgentRunPhase, AgentRunRecall, AgentRunReconcileOptions, AgentRunReconciliation, AgentRunRetry, AgentRunSession, AgentRunSessionV3, AgentRunStore, AgentRunStoreV3, AgentRunSummary, AgentRunTranscript, AgentStream, AgentStreamV3, AgentTool, AgentToolContext, AgentToolReceipt, AgentToolSet, AgentValidation, AgentValidator, AgentVerification, AgentVerifyContext, BudgetAdmission, BudgetAdmissionRestore, BudgetAggregate, BudgetAmounts, BudgetCompaction, BudgetHold, BudgetHoldQuery, BudgetHoldResolution, BudgetLedger, BudgetLedgerOptions, BudgetLedgerSnapshot, BudgetLimits, BudgetPruneOptions, BudgetPruneResult, BudgetReservation, BudgetReservationInput, BudgetScope, BudgetScopeUsage, BudgetSettlement, BudgetStore, BudgetStoreErrorCode, BudgetStoreMaintenance, BudgetStoreReservation, BudgetStoreReserveInput, BudgetSweepOptions, BudgetSweepResult, BudgetTotals, BudgetUsage, BudgetUsageOptions, BudgetWarning, BudgetWindow, CallAccounting, ContextBlobRead, DeuzAgent, ExecutionChildOptions, ExecutionContextOptions, ExecutionContextRestoreOptions, ExecutionContextSnapshot, ExecutionPolicy, ExecutionReservationInput, HandoffAgentDef, HandoffOptions, NativeExecutionContext, PersistentBudgetScope, UnknownPricePolicy
+**Types** (104): AccountedEmbedder, AccountedEmbeddings, AccountedMemoryEmbedder, AccountedMemoryLLM, AccountedMemoryLLMResult, AccountedUsage, AgentArrayElement, AgentCallOptions, AgentDef, AgentEvent, AgentEventV3, AgentMcpCatalogChange, AgentMcpEntry, AgentMcpReplay, AgentObjectCallOptions, AgentOutput, AgentPartialOutput, AgentResult, AgentRunChatInvocation, AgentRunChatState, AgentRunContextStateV3, AgentRunContextStepV3, AgentRunEnvelope, AgentRunEnvelopeV3, AgentRunLeaseOptions, AgentRunListPage, AgentRunListQuery, AgentRunMemoryExtraction, AgentRunMemoryExtractionV3, AgentRunMemoryIntentV3, AgentRunMemoryState, AgentRunMemoryStateV3, AgentRunModelAttempt, AgentRunModelRef, AgentRunModelState, AgentRunOptions, AgentRunOptionsV3, AgentRunPhase, AgentRunRecall, AgentRunReconcileOptions, AgentRunReconcileOptionsV3, AgentRunReconciliation, AgentRunRetry, AgentRunSession, AgentRunSessionV3, AgentRunStore, AgentRunStoreV3, AgentRunSummary, AgentRunTranscript, AgentStream, AgentStreamV3, AgentTool, AgentToolContext, AgentToolReceipt, AgentToolSet, AgentValidation, AgentValidator, AgentVerification, AgentVerifyContext, BudgetAdmission, BudgetAdmissionRestore, BudgetAggregate, BudgetAmounts, BudgetCompaction, BudgetHold, BudgetHoldQuery, BudgetHoldResolution, BudgetLedger, BudgetLedgerOptions, BudgetLedgerSnapshot, BudgetLimits, BudgetPruneOptions, BudgetPruneResult, BudgetReservation, BudgetReservationInput, BudgetScope, BudgetScopeUsage, BudgetSettlement, BudgetStore, BudgetStoreErrorCode, BudgetStoreMaintenance, BudgetStoreReservation, BudgetStoreReserveInput, BudgetSweepOptions, BudgetSweepResult, BudgetTotals, BudgetUsage, BudgetUsageOptions, BudgetWarning, BudgetWindow, CallAccounting, ContextBlobRead, DeuzAgent, ExecutionChildOptions, ExecutionContextOptions, ExecutionContextRestoreOptions, ExecutionContextSnapshot, ExecutionPolicy, ExecutionReservationInput, HandoffAgentDef, HandoffOptions, NativeExecutionContext, PersistentBudgetScope, UnknownPricePolicy
 
 ## `@deuz-sdk/core/swarm`
 
@@ -629,7 +629,7 @@ The Deuz UI wire: SSE responses (native agent runs included), resumable streams,
 
 ## `@deuz-sdk/core/react`
 
-Legacy in-core React hooks, frozen at 2.2: no 2.3 verdict matching or resumed-turn settlement, drops approval tokens, and drops client calls without onToolCall. Prefer the @deuz-sdk/react package.
+Deprecated (2.4), removed in 3.0: legacy in-core React hooks, frozen at 2.2 (no 2.3 verdict matching or resumed-turn settlement, drops approval tokens, drops client calls without onToolCall). A development build warns once. Use @deuz-sdk/react.
 
 **Values** (3): createUseChat, useChat, useObject
 
@@ -657,7 +657,7 @@ React hooks and components: useChat, useObject, approval card, cost badge.
 
 **Values** (5): CostBadge, partsFromFiles, ToolApprovalCard, useChat, useObject
 
-**Types** (22): AssistantTurnState, ChatHistory, ChatInput, CostBadgeProps, DeuzUIPart, Message, ToolApprovalCardProps, ToolApprovalRequest, ToolApprovalResponse, UIMessage, UIMessagePart, UIToolCall, UseChatAgent, UseChatBudgetExceeded, UseChatCost, UseChatCursorStore, UseChatOptions, UseChatResult, UseChatResumeOptions, UseChatStopDetails, UseObjectOptions, UseObjectResult
+**Types** (24): AssistantTurnState, ChatHistory, ChatInput, ChatSnapshotGateV1, ChatSnapshotV1, CostBadgeProps, DeuzUIPart, Message, ToolApprovalCardProps, ToolApprovalRequest, ToolApprovalResponse, UIMessage, UIMessagePart, UIToolCall, UseChatAgent, UseChatBudgetExceeded, UseChatCost, UseChatCursorStore, UseChatOptions, UseChatResult, UseChatResumeOptions, UseChatStopDetails, UseObjectOptions, UseObjectResult
 
 ## Where a value lives (everything not exported from the root)
 

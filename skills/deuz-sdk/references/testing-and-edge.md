@@ -1,4 +1,4 @@
-<!-- verified: 2026-10-15 against @deuz-sdk/core@2.3.0 · api-contract sha256:fb025f0c23e3
+<!-- verified: 2026-10-15 against @deuz-sdk/core@2.3.0 · api-contract sha256:03a491b97528
      sources: packages/core/src/testing.ts, src/internal/eval-suite.ts, src/types/{config,deps,methods,stream,tool}.ts,
      src/internal/resolve-call.ts, src/core/resilience.ts, src/inference/tool-loop.ts, src/{openai,anthropic,edge}.ts,
      tooling/check-runtime-compat.mjs, packages/core/package.json (exports), packages/core/test/{testing,tool-loop}.test.ts,

@@ -165,7 +165,7 @@ export const SUBPATH_DESCRIPTIONS = {
   '@deuz-sdk/core/ui':
     'The Deuz UI wire: SSE responses (native agent runs included), resumable streams, and the client-side reader.',
   '@deuz-sdk/core/react':
-    'Legacy in-core React hooks, frozen at 2.2: no 2.3 verdict matching or resumed-turn settlement, drops approval tokens, and drops client calls without onToolCall. Prefer the @deuz-sdk/react package.',
+    'Deprecated (2.4), removed in 3.0: legacy in-core React hooks, frozen at 2.2 (no 2.3 verdict matching or resumed-turn settlement, drops approval tokens, drops client calls without onToolCall). A development build warns once. Use @deuz-sdk/react.',
   '@deuz-sdk/core/chat':
     'The pure chat state engine plus validateChatRequest — the gate in front of client history.',
   '@deuz-sdk/core/chat/node': 'File-backed chat store (Node only).',

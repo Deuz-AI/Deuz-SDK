@@ -1,4 +1,4 @@
-<!-- verified: 2026-10-15 against @deuz-sdk/core@2.3.0 · api-contract sha256:fb025f0c23e3
+<!-- verified: 2026-10-15 against @deuz-sdk/core@2.3.0 · api-contract sha256:03a491b97528
      sources: skills/migrate-from-ai-sdk/SKILL.md, skills/migrate-from-ai-sdk/rules/{imports,streaming,tools,ui,telemetry,providers}.md,
      docs/content/docs/migration/from-vercel-ai-sdk.mdx, docs/content/docs/reference/whats-new-2-0.mdx,
      packages/core/src/types/{config,guardrails,agent-run}.ts, packages/core/src/{autonomy,rag,memory,middleware,durable,runtime,pricing}.ts,

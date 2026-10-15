@@ -2048,7 +2048,6 @@ export async function* connectDeuzStream(
       const resumeCursor = parseSeq(lastEventId) ?? Number.NaN;
       for await (const ev of parseSSE(response.body)) {
         if (options.signal?.aborted) return;
-        delivered = true;
         if (ev.id !== undefined) sawId = true;
         if (ev.data === '[DONE]') return;
         let part: DeuzUIPart;
@@ -2057,8 +2056,16 @@ export async function* connectDeuzStream(
         } catch {
           // Malformed/truncated frame (e.g. a clean EOF mid-frame). Do NOT
           // advance the cursor past it — the reconnect must replay this seq.
+          delivered = true;
           continue;
         }
+        // 2.4: the id-less capability handshake frame carries no content, so a
+        // drop right after it must reconnect rather than count as a v1 stream.
+        if (ev.id === undefined && (part as { type?: string }).type === 'capabilities') {
+          yield part;
+          continue;
+        }
+        delivered = true;
         if (ev.id !== undefined) {
           const seq = Number(ev.id);
           if (!Number.isNaN(seq) && !Number.isNaN(resumeCursor) && seq <= resumeCursor) {
