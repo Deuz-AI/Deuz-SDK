@@ -82,6 +82,8 @@ export interface RecordingStoreV3 extends AgentRunStoreV3 {
   log: string[];
   /** Makes the `n`-th next save (1 = the next one) and every later one fail. */
   failFromSave(n: number): void;
+  /** Every save after the first one `predicate` accepts fails (the process died right after it). */
+  failAfter(predicate: (envelope: AgentRunEnvelopeV3) => boolean): void;
 }
 
 /** An in-memory V3 store that records what it is given. */
@@ -90,19 +92,25 @@ export function recordingStoreV3(inner: AgentRunStoreV3 = createInMemoryAgentRun
   const blobs: string[] = [];
   const log: string[] = [];
   let failAt: number | undefined;
+  let failAfter: ((envelope: AgentRunEnvelopeV3) => boolean) | undefined;
+  let dead = false;
   let seen = 0;
   const store: RecordingStoreV3 = {
     checkpointVersion: 3,
     saves,
     blobs,
     log,
+    failAfter(predicate) {
+      failAfter = predicate;
+    },
     failFromSave(n) {
       failAt = seen + n;
     },
     load: (runId) => inner.load(runId),
     async save(envelope) {
       seen += 1;
-      if (failAt !== undefined && seen >= failAt) throw new Error('process died');
+      if (dead || (failAt !== undefined && seen >= failAt)) throw new Error('process died');
+      if (failAfter?.(envelope)) dead = true;
       await inner.save(envelope);
       saves.push(structuredClone(envelope));
       log.push(`save:${envelope.revision}`);
@@ -137,8 +145,13 @@ export function fixedDeps(start = 10_000): Dependencies {
 }
 
 /** A context candidate whose digest is that of its text. */
-export function candidate(recordId: string, text: string, score = 1): ContextCandidate {
-  return { recordId, text, score, digest: sha256DigestSync(text) };
+export function candidate(
+  recordId: string,
+  text: string,
+  score = 1,
+  extra: Partial<ContextCandidate> = {},
+): ContextCandidate {
+  return { recordId, text, score, digest: sha256DigestSync(text), ...extra };
 }
 
 /** A context source answering from a fixed list, recording every request. */

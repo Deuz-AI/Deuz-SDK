@@ -10,6 +10,7 @@ import { assertAgentRunStoreV3 } from './agent-run-v3';
 import { contextPackageBlob, readContextPackage } from './agent-run-v3-context';
 import { createContextCompiler } from './context/compiler';
 import { estimateRequestOverhead } from './context/count';
+import { messageText } from './context/render';
 import { sha256DigestSync } from './context/sha256';
 import type {
   ContextCompiler,
@@ -201,6 +202,8 @@ export interface ContextHookInput {
   emit: (event: AgentEventV3Only) => void;
   capabilities?: Partial<ModelCapabilities>;
   logger: Logger;
+  /** The history lost redacted retrieval blocks on resume: the next compile is a `redacted` refresh. */
+  redacted?: boolean;
 }
 
 /**
@@ -223,6 +226,7 @@ export function createContextHook(input: ContextHookInput): LoopContextHook {
   const { compiler, store, runId } = input;
   const estimator = compiler.shared ?? createTokenEstimator();
   let calibrated = false;
+  let pendingRedaction = input.redacted === true;
   /** The step in flight: its number, input digest, package and request estimate. */
   let current: { step: number; input: string; pkg: ContextPackage; estimate: number } | undefined;
 
@@ -302,8 +306,10 @@ export function createContextHook(input: ContextHookInput): LoopContextHook {
       const digest = inputDigest(step.messages);
       const last = input.envelope().context?.steps.at(-1);
       let number = last ? last.step + 1 : 0;
-      let redacted = false;
-      if (last && last.input === digest) {
+      // Redacted blocks left the history on resume: the next compile retrieves anew.
+      let redacted = pendingRedaction;
+      pendingRedaction = false;
+      if (!redacted && last && last.input === digest) {
         // A reopened step: the same context, unless a forget redacted it.
         const read = await readContextPackage(store, last);
         if (read.status === 'found') return begin(step, last.step, digest, read.package);
@@ -353,4 +359,46 @@ export function createContextHook(input: ContextHookInput): LoopContextHook {
       calibrated = true;
     },
   };
+}
+
+/**
+ * Drops from a resumed V3 run's history the retrieval blocks of packages a
+ * `forget` redacted (spec §4.4), before the run makes its next request, so a
+ * forgotten record is never sent again. A block is found by the marker its
+ * package wrote (`<deuz_context pass="P" step="S">`), in the run's messages
+ * and in every checkpoint. The prompt cache prefix changes there, as a
+ * compaction boundary changes it: forget is the documented exception.
+ * Returns whether a block was dropped (the next compile then retrieves anew).
+ */
+export async function dropRedactedContext(
+  envelope: AgentRunEnvelopeV3,
+  store: AgentRunStoreV3,
+): Promise<boolean> {
+  const markers: string[] = [];
+  const seen = new Map<string, boolean>();
+  for (const step of envelope.context?.steps ?? []) {
+    if (!step.manifest.placement.append) continue;
+    let redacted = seen.get(step.blob.digest);
+    if (redacted === undefined) {
+      redacted = (await store.getBlob(step.blob.digest)).status === 'redacted';
+      seen.set(step.blob.digest, redacted);
+    }
+    if (redacted)
+      markers.push(`<deuz_context pass="${step.manifest.pass}" step="${step.manifest.step}">`);
+  }
+  if (markers.length === 0) return false;
+  let dropped = false;
+  const keep = (messages: Message[]): Message[] => {
+    const kept = messages.filter(
+      (message) =>
+        message.role !== 'user' ||
+        !markers.some((marker) => messageText(message).trimStart().startsWith(marker)),
+    );
+    if (kept.length !== messages.length) dropped = true;
+    return kept;
+  };
+  envelope.messages = keep(envelope.messages);
+  for (const checkpoint of Object.values(envelope.checkpoints))
+    checkpoint.messages = keep(checkpoint.messages);
+  return dropped;
 }

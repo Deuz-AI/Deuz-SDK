@@ -1553,6 +1553,11 @@ function makeAgentStream<T>(
           const snapshot = nativeV3.initialWorkingMemory(v3Options as AgentRunOptionsV3<unknown>);
           if (snapshot) record.workingMemory = snapshot;
         }
+        // A forget redacted packages while the run was down (spec §4.4): their
+        // retrieval blocks leave the history before the next request.
+        const redacted =
+          resume && (await nativeV3.dropRedactedContext(record, v3Options.session.store));
+        if (redacted) common.messages = envelope.messages;
         const compiler = nativeV3.createV3Compiler(
           v3Options as AgentRunOptionsV3<unknown>,
           record,
@@ -1568,6 +1573,7 @@ function makeAgentStream<T>(
             emit: (event) => eventsV3?.push(event),
             ...(options.capabilities ? { capabilities: options.capabilities } : {}),
             logger: resolveDependencies(options.deps).logger,
+            ...(redacted ? { redacted } : {}),
           });
       }
       admitted = true;
