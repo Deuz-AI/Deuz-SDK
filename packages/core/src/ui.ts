@@ -950,6 +950,11 @@ interface SendOptions {
  * is DETACHED: it goes out on this response only, with no `id:` lines, and
  * leaves the journal untouched (no record, no `done` sentinel). Its parts are
  * still numbered from 0 for `nextSeq`, so its frames fold on their own.
+ *
+ * `onRefused` (2.4) runs instead of `produce` when the leg never runs it (a
+ * durable open another producer refused): it lets go of what the producer
+ * already holds without reading its source, such as a run's event
+ * subscription that would otherwise queue every event of the run.
  */
 function deuzSSEResponse(
   label: string,
@@ -960,6 +965,7 @@ function deuzSSEResponse(
     stopped: () => boolean,
   ) => Promise<void>,
   journaled?: () => Promise<boolean>,
+  onRefused?: () => void | Promise<void>,
 ): Response {
   const encoder = new TextEncoder();
   const version: DeuzWireVersion = options.wireVersion ?? 'v2';
@@ -1140,6 +1146,16 @@ function deuzSSEResponse(
             () => seq,
             () => stopped,
           );
+        else {
+          // It still lets go of what its producer holds (T3-2). Cleanup only:
+          // the refusal already went out, and a throw here must not error the
+          // body before the client read it.
+          try {
+            await onRefused?.();
+          } catch {
+            /* nothing more to release */
+          }
+        }
       } catch (error) {
         // Durable: a producer that throws still ends its journal (what is
         // queued is committed and sent, the lease renewal stops and the lease
@@ -1449,6 +1465,12 @@ export function toDeuzAgentStreamResponse<T>(
       }
     },
     journaled,
+    // A refused durable leg never reads on: the run, started by the
+    // subscription, goes on, and its events must not queue up for nobody.
+    async () => {
+      ahead = undefined;
+      await events.return?.();
+    },
   );
 }
 
@@ -1648,7 +1670,7 @@ export function createDeuzStream(
     n?.();
   };
 
-  const response = deuzSSEResponse('createDeuzStream', options, async (send, _nextSeq, stopped) => {
+  const produce: Parameters<typeof deuzSSEResponse>[2] = async (send, _nextSeq, stopped) => {
     const sendData = async (item: DataItem): Promise<void> => {
       // One frame shape for both the validated and the raw path, so an
       // addressable part keeps its `id` when `dataSchemas` is in play too. Key
@@ -1706,6 +1728,13 @@ export function createDeuzStream(
     closed = true; // model stream ended — drain what's queued, then stop
     wake();
     await data;
+  };
+  const response = deuzSSEResponse('createDeuzStream', options, produce, undefined, () => {
+    // A refused durable leg (2.4) never sends data: drop what is queued, and
+    // every later write, as after the stream ended.
+    closed = true;
+    queue.length = 0;
+    wake();
   });
 
   return {

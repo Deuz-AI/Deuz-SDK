@@ -19,6 +19,8 @@ import {
 } from '../src/ui';
 import { createInMemoryLeaseProvider } from '../src/ops';
 import { createMemoryObserver } from '../src/observe';
+import { streamAgent } from '../src/agent-run';
+import { createMockModel } from '../src/testing';
 import type { AgentStream } from '../src/types/agent-run';
 import type { Dependencies } from '../src/types/deps';
 import type { LeaseProvider } from '../src/types/lease';
@@ -454,6 +456,80 @@ describe('durable mode: one producer, fenced', () => {
     await settle();
     // The refused producer never read its source, so a lazy run never started.
     expect(reads).toBe(0);
+  });
+
+  it('a refused agent response lets go of the run events it subscribed to (T3-2)', async () => {
+    const { durable, provider } = setup();
+    expect(
+      await provider.acquire({ key: 'stream:s', owner: 'producer-b', ttlMs: 30_000 }),
+    ).toBeTruthy();
+    const real = streamAgent({
+      model: createMockModel({
+        responses: [{ toolCalls: [{ toolName: 'deploy', id: 'd', args: {} }] }, { text: 'done' }],
+      }),
+      prompt: 'go',
+      tools: {
+        deploy: { parameters: { type: 'object', properties: {} }, execute: () => 'deployed' },
+      },
+    });
+    let nexts = 0;
+    let returns = 0;
+    const stream = {
+      events: {
+        [Symbol.asyncIterator]() {
+          const inner = real.events[Symbol.asyncIterator]();
+          const iterator: AsyncIterableIterator<unknown> = {
+            next: () => (nexts++, inner.next()),
+            return: () => (returns++, inner.return!()),
+            [Symbol.asyncIterator]: () => iterator,
+          };
+          return iterator;
+        },
+      },
+      get result() {
+        return real.result;
+      },
+    } as unknown as AgentStream<unknown>;
+    const body = await toDeuzAgentStreamResponse(stream, {
+      durable,
+      streamId: 's',
+      messageId: 'm',
+    }).text();
+    expect(body).toBe(
+      `data: ${JSON.stringify({ type: 'error', message: 'Durable stream: another producer holds this stream.' })}\n\n`,
+    );
+    // The run started with the subscription and goes on; the refused response
+    // read only the first event (whether to journal the leg), then returned
+    // the subscription instead of queueing every later event of the run.
+    expect((await real.result).status).toBe('completed');
+    expect({ nexts, returns }).toEqual({ nexts: 1, returns: 1 });
+  });
+
+  it('a refused createDeuzStream drops data written after the refusal (T3-2)', async () => {
+    const { durable, provider } = setup();
+    expect(
+      await provider.acquire({ key: 'stream:s', owner: 'producer-b', ttlMs: 30_000 }),
+    ).toBeTruthy();
+    const manual = manualResult();
+    const writer = createDeuzStream(manual.result, { durable, streamId: 's', messageId: 'm' });
+    expect(await writer.response.text()).toBe(
+      `data: ${JSON.stringify({ type: 'error', message: 'Durable stream: another producer holds this stream.' })}\n\n`,
+    );
+    // A write is queued only while the stream takes data, and reading its
+    // options is part of queueing it; a dropped write reads nothing.
+    let read = 0;
+    const options = {
+      get id() {
+        read++;
+        return 'chart';
+      },
+      get transient() {
+        read++;
+        return false;
+      },
+    };
+    writer.writeData('chart', { big: 'x'.repeat(1_000) }, options);
+    expect(read).toBe(0);
   });
 
   it('fails closed when the lease is lost, and stops committing', async () => {

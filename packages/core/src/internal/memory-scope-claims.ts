@@ -83,20 +83,66 @@ export function claimMemoryScope(
   return claimMemoryScopes(execution, [scope]);
 }
 
+/** A built-in context source's pinned scope, and how a request scope narrows it. */
+interface PinnedScope {
+  scope: MemoryScope;
+  /**
+   * The scope the source reads for a request scope, for a source that
+   * narrows its pinned scope by the request's (a store-backed memory source,
+   * a transcript source). It throws on a conflict, as the source's query does.
+   */
+  narrow?: (requested: MemoryScope) => MemoryScope;
+}
+
 /**
  * The scope a built-in context source was pinned to (2.4): a memory source's
  * session or store scope, a transcript source's scope. The V3 run claims it
  * like its other memory scopes; a host-written source has none.
  */
-const pinnedScopes = new WeakMap<object, MemoryScope>();
+const pinnedScopes = new WeakMap<object, PinnedScope>();
 
-/** Records the scope `source` reads within. Returns `source`. */
-export function pinSourceScope<T extends object>(source: T, scope: MemoryScope): T {
-  pinnedScopes.set(source, scope);
+/**
+ * Records the scope `source` reads within, and with `narrow` how a request
+ * scope narrows it. Returns `source`.
+ */
+export function pinSourceScope<T extends object>(
+  source: T,
+  scope: MemoryScope,
+  narrow?: (requested: MemoryScope) => MemoryScope,
+): T {
+  pinnedScopes.set(source, narrow ? { scope, narrow } : { scope });
   return source;
 }
 
-/** The scope a built-in context source reads within, if it is one. */
-export function sourceScope(source: object): MemoryScope | undefined {
-  return pinnedScopes.get(source);
+/**
+ * The scope a built-in context source reads within, if it is one. With
+ * `requested`, the scope its compiler hands every query (2.4, T2-4): a source
+ * that narrows its pinned scope by the request's reads only within that
+ * narrowing, so that is its scope. One whose narrowing conflicts reads
+ * nothing (its query throws) and keeps its pinned scope. A memory session
+ * source's scope is fixed.
+ */
+export function sourceScope(source: object, requested?: MemoryScope): MemoryScope | undefined {
+  const pinned = pinnedScopes.get(source);
+  if (!pinned) return undefined;
+  if (!requested || !pinned.narrow) return pinned.scope;
+  try {
+    return pinned.narrow(requested);
+  } catch {
+    return pinned.scope;
+  }
+}
+
+/** The `scope` each context compiler instance hands its sources (2.4). */
+const compilerScopes = new WeakMap<object, MemoryScope>();
+
+/** Records the scope `compiler` hands every source query, when it has one. Returns `compiler`. */
+export function pinCompilerScope<T extends object>(compiler: T, scope: MemoryScope | undefined): T {
+  if (scope) compilerScopes.set(compiler, scope);
+  return compiler;
+}
+
+/** The scope a context compiler instance hands every source query, if it has one. */
+export function compilerScope(compiler: object): MemoryScope | undefined {
+  return compilerScopes.get(compiler);
 }

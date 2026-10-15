@@ -39,7 +39,11 @@ export type MemoryContextSourceOptions = ContextSourceOptions &
         store: MemoryStore;
         scope: MemoryScope;
         embedder?: Embedder;
-        /** Reads TTL expiry when the request has no `recordedAsOf`. Default: the host clock. */
+        /**
+         * The clock a record's TTL expiry is read against, unless the request
+         * sets `recordedAsOf`: the one the memory module stamps `expiresAt`
+         * with (its seams' clock). Default: the host clock.
+         */
         clock?: Clock;
       }
   );
@@ -109,18 +113,21 @@ function source(
 
 /**
  * Memory as a context source (2.4): `session.recall` (versioned, with
- * provenance labels and `recordedAsOf` for restarts) or a legacy store's
- * `search`. With this source the loop's legacy automatic recall is off, and
- * configuring both is refused at configuration time.
+ * provenance labels, at the request's `recordedAsOf` when one is set) or a
+ * legacy store's `search`. With this source the loop's legacy automatic
+ * recall is off, and configuring both is refused at configuration time.
  *
  * A session's scope is fixed: a request scope it is not within is refused.
  * The legacy adapter reads `store.search` within its narrowed scope (with the
  * query embedded by `embedder`, action `'search'`, when one is given), and
- * leaves out records invalidated, or expired at `request.recordedAsOf` (the
- * compiler's clock; else `clock`). Legacy records carry no revision or origin.
+ * leaves out records invalidated, or expired at `request.recordedAsOf` (when
+ * set; the compiler sets none) or else `clock`. Legacy records carry no
+ * revision or origin.
  */
 export function createMemoryContextSource(options: MemoryContextSourceOptions): ContextSource {
-  // A V3 run claims each source's pinned scope, so a nested run may only narrow it.
+  // A V3 run claims the scope each source reads (its pinned scope, narrowed by
+  // the compiler's `scope` where the source narrows), so a nested run may only
+  // narrow its parent's.
   if ('session' in options) {
     const { session } = options;
     const recalled = source('memory', options, async (request) => {
@@ -187,7 +194,9 @@ export function createMemoryContextSource(options: MemoryContextSourceOptions): 
       ),
     );
   });
-  return pinSourceScope(searched, options.scope);
+  return pinSourceScope(searched, options.scope, (requested) =>
+    narrowScope(options.scope, requested),
+  );
 }
 
 /**
@@ -296,7 +305,9 @@ export function createTranscriptContextSource(
       .filter((candidate): candidate is ContextCandidate => candidate !== undefined)
       .slice(0, request.limit);
   });
-  return pinSourceScope(transcript, options.scope);
+  return pinSourceScope(transcript, options.scope, (requested) =>
+    narrowScope(options.scope, requested),
+  );
 }
 
 /**

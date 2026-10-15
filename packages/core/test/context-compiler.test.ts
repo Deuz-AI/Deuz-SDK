@@ -17,6 +17,8 @@ import {
   contextWarnings,
 } from '../src/context/compiler';
 import { sha256DigestSync } from '../src/context/sha256';
+import { createMemoryContextSource } from '../src/context/sources';
+import { createInMemoryVersionedMemoryStore, createMemorySession } from '../src/memory/versioned';
 import type {
   ContextCandidate,
   ContextPackage,
@@ -130,7 +132,6 @@ describe('createContextCompiler refresh policy', () => {
         scope: { userId: 'u1' },
         limit: 20,
         budgetTokens: expect.any(Number),
-        recordedAsOf: 1_000,
       },
     ]);
     expect(pkg.manifest).toMatchObject({ refresh: 'initial', pass: 1, step: 1 });
@@ -263,6 +264,36 @@ describe('createContextCompiler refresh policy', () => {
       }),
     );
     expect(memory.requests.map((request) => request.text)).toEqual(['question', 'question']);
+  });
+
+  it('reads versioned memory as it is now, whatever the two clocks say (T4-2)', async () => {
+    // The memory store stamps a revision with its own clock; the compiler's
+    // clock (a V3 run's deps) is another domain. A current read must not cut
+    // the store's records at the compiler's time.
+    const scope = { userId: 'ada' };
+    const placed = async (storeClock: number, compilerClock?: number) => {
+      const store = createInMemoryVersionedMemoryStore({
+        deps: { clock: { now: () => storeClock, setTimeout: () => () => {} } },
+      });
+      const memory = createMemorySession({ store, scope });
+      await memory.remember({ text: 'Ada deploys billing only on Tuesdays' });
+      const [hit] = await memory.recall({ text: 'billing deploy Tuesdays' });
+      const compiler = createContextCompiler({
+        sources: [createMemoryContextSource({ session: memory })],
+        scope,
+        ...(compilerClock !== undefined
+          ? { deps: { clock: { now: () => compilerClock, setTimeout: () => () => {} } } }
+          : {}),
+      });
+      const pkg = await compiler.beforeModelCall(
+        step(0, [{ role: 'user', content: 'When can I do the billing deploy? Tuesdays?' }]),
+      );
+      return pkg.manifest.entries.map((entry) => entry.recordId).includes(hit!.record.id);
+    };
+    // The store's clock an hour ahead of the host's (the compiler's default).
+    expect(await placed(Date.now() + 3_600_000)).toBe(true);
+    // A run with a fixed clock reading a store on the host's.
+    expect(await placed(Date.now(), 1_000)).toBe(true);
   });
 });
 

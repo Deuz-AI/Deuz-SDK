@@ -13,7 +13,11 @@ import { describe, expect, it, vi } from 'vitest';
 import { reconcileAgentRun, resumeAgent, runAgent, streamAgent } from '../src/agent-run';
 import { createInMemoryAgentRunStoreV3 } from '../src/agent-run-v3-store';
 import { createInMemoryConditionalChatStore, createInMemoryTranscriptIndex } from '../src/chat';
-import { createMemoryContextSource } from '../src/context';
+import {
+  createContextCompiler,
+  createMemoryContextSource,
+  createTranscriptContextSource,
+} from '../src/context';
 import { createExecutionContext } from '../src/execution-policy';
 import { createInMemoryMemoryStore, type MemorySeams, type MemoryStore } from '../src/memory';
 import { createInMemoryVersionedMemoryStore, createMemorySession } from '../src/memory/versioned';
@@ -423,6 +427,90 @@ describe('a nested V3 run may only narrow its parent run memory scope (S1-2)', (
     );
     expect(told).toBe('completed');
     expect(await narrow.recall({ text: 'user-wide' })).toHaveLength(1);
+  });
+
+  it("claims a user-wide store or transcript source as the compiler's scope narrows it (T2-4)", async () => {
+    const parent = () => ({
+      memory: { seams: seams(), scope: planner, extract: false, recall: false },
+      checkpointVersion: 3 as const,
+      session: { store: createInMemoryAgentRunStoreV3(), runId: 'planner', scope: 'eval' },
+    });
+    const searched: unknown[] = [];
+    const base = createInMemoryMemoryStore();
+    const store: MemoryStore = new Proxy(base, {
+      get(target, key, receiver) {
+        if (key === 'search')
+          return (query: Parameters<MemoryStore['search']>[0]) => {
+            searched.push(query.scope);
+            return target.search(query);
+          };
+        return Reflect.get(target, key, receiver) as unknown;
+      },
+    });
+    const userWide = { userId: 'ada' };
+    const child =
+      (runId: string, context: unknown) => (call: { execution?: NativeExecutionContext }) => ({
+        model: scriptedModel([{ text: 'child done' }]).model,
+        prompt: 'look it up',
+        execution: call.execution!,
+        checkpointVersion: 3,
+        session: { store: createInMemoryAgentRunStoreV3(), runId, scope: 'eval' },
+        context,
+      });
+    // Built once per user, narrowed per run by the compiler's scope.
+    const byStore = await nested(
+      parent(),
+      child('helper-1', {
+        scope: planner,
+        sources: [createMemoryContextSource({ store, scope: userWide })],
+      }),
+    );
+    const byTranscript = await nested(
+      parent(),
+      child('helper-2', {
+        scope: planner,
+        sources: [
+          createTranscriptContextSource({
+            index: createInMemoryTranscriptIndex(),
+            scope: userWide,
+          }),
+        ],
+      }),
+    );
+    const byCompiler = await nested(
+      parent(),
+      child(
+        'helper-3',
+        createContextCompiler({
+          scope: planner,
+          sources: [createMemoryContextSource({ store, scope: userWide })],
+        }),
+      ),
+    );
+    expect({ byStore, byTranscript, byCompiler }).toEqual({
+      byStore: 'completed',
+      byTranscript: 'completed',
+      byCompiler: 'completed',
+    });
+    // Every read stayed within the parent's scope.
+    expect(searched.length).toBeGreaterThan(0);
+    for (const scope of searched) expect(scope).toEqual(planner);
+
+    // Without a narrowing scope the source reads user-wide, and a compiler
+    // built with a wider scope hands it to every source: both still widen.
+    const unnarrowed = await nested(
+      parent(),
+      child(
+        'helper-4',
+        createContextCompiler({ sources: [createMemoryContextSource({ store, scope: userWide })] }),
+      ),
+    );
+    expect(unnarrowed).toMatch(/widens/);
+    const wideCompiler = await nested(
+      parent(),
+      child('helper-5', createContextCompiler({ sources: [], scope: userWide })),
+    );
+    expect(wideCompiler).toMatch(/widens/);
   });
 });
 

@@ -133,7 +133,9 @@ const sum = (values: readonly number[]): number => values.reduce((total, n) => t
 /**
  * Shares `total` tokens among the source kinds by `shares`, then lets what a
  * kind leaves unused flow to the kinds that still have candidates. A kind
- * fills its quota by rank, skipping a candidate too large for what is left.
+ * fills its quota by descending score, an equal score by source order and
+ * then by rank within the source (`byRank`), skipping a candidate too large
+ * for what is left.
  */
 function allocate(
   eligible: readonly Work[],
@@ -194,10 +196,11 @@ function allocate(
  * 2. The rest is shared by source kind (memory 2 : rag 2 : skills 1, plus
  *    transcript 1 when present); a share a source leaves unused flows to the
  *    others (`'reallocated'`).
- * 3. Within a share, candidates go by descending score, then `recordId`; an
- *    entry in `placed` at the same revision (or digest) is `'already-placed'`
- *    and not written again, a digest seen from another source is
- *    `'duplicate'`, and mandatory candidates come first.
+ * 3. Within a share, candidates go by descending score; an equal score goes
+ *    by source order (the order of `results`), then by `recordId` within one
+ *    source. An entry in `placed` at the same revision (or digest) is
+ *    `'already-placed'` and not written again, a digest seen from another
+ *    source is `'duplicate'`, and mandatory candidates come first.
  * 4. Selected retrieval forms one `'append'` block (only what is new), the
  *    working memory one `'ephemeral-tail'` block; content is labelled as data
  *    with its origin and source kinds.

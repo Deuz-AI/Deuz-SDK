@@ -6,6 +6,7 @@
  */
 import { canonicalJson, digestJson, sha256Digest, type Sha256Digest } from '../internal/digest';
 import { createTokenEstimator } from '../internal/estimate-tokens';
+import { pinCompilerScope } from '../internal/memory-scope-claims';
 import { resolveDependencies } from '../internal/resolve-deps';
 import { telemetryParentOf } from '../internal/native-context';
 import { DEUZ_ATTR, DEUZ_SPAN, observeSpan, type TelemetryAttributes } from '../internal/telemetry';
@@ -194,8 +195,10 @@ interface StepMemory {
  *   compiler's own blocks skipped), at most 2000 characters; it is rewritten
  *   only by `refresh.rewriteQuery`. With an empty query every source is
  *   `'skipped'` and the refresh stays due, spending no pass. Each source
- *   gets `scope`, `candidatesPerSource`, a token hint of its share and
- *   `recordedAsOf` (the clock at the pass).
+ *   gets `scope`, `candidatesPerSource` and a token hint of its share, and
+ *   reads what it holds now: the compiler sends no `recordedAsOf`, since its
+ *   clock is not a memory store's. A restarted step does not ask again: the
+ *   V3 run sends the step's stored package.
  * - Automatic refreshes (an active-task change) wait `minSteps` model steps
  *   after the last retrieval; host requests (`requestRefresh()`,
  *   `input.refresh`) do not. A due refresh past `maxPasses` is consumed with
@@ -299,7 +302,8 @@ export function createContextCompiler(options: CreateContextCompilerOptions): Co
     usedTokens: number,
   ): Promise<ContextSourceResult[]> {
     const hints = budgetHints(inputTokens, usedTokens);
-    const recordedAsOf = deps.clock.now();
+    // No `recordedAsOf`: a current read needs none, and the compiler's clock
+    // (a V3 run's) is not the clock a memory store stamps its revisions with.
     const settled = await Promise.allSettled(
       list.map(async (source) => {
         const answer = await source.query({
@@ -307,7 +311,6 @@ export function createContextCompiler(options: CreateContextCompilerOptions): Co
           ...(options.scope ? { scope: options.scope } : {}),
           limit,
           budgetTokens: hints.get(source.id) ?? 0,
-          recordedAsOf,
           ...(input.signal ? { signal: input.signal } : {}),
         });
         if (!Array.isArray(answer))
@@ -668,15 +671,19 @@ export function createContextCompiler(options: CreateContextCompilerOptions): Co
     );
   }
 
-  return {
-    sources,
-    beforeModelCall,
-    onOverflow,
-    requestRefresh() {
-      state = { ...state, refreshRequested: true };
+  // A V3 run given this instance claims its `scope` as it claims the options' one.
+  return pinCompilerScope(
+    {
+      sources,
+      beforeModelCall,
+      onOverflow,
+      requestRefresh() {
+        state = { ...state, refreshRequested: true };
+      },
+      state() {
+        return JSON.parse(JSON.stringify(state)) as ContextCompilerState;
+      },
     },
-    state() {
-      return JSON.parse(JSON.stringify(state)) as ContextCompilerState;
-    },
-  };
+    options.scope,
+  );
 }
