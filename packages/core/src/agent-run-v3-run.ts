@@ -46,7 +46,7 @@ import type {
   AgentRunSessionV3,
   AgentRunStoreV3,
 } from './types/agent-run-v3';
-import type { Clock, Logger } from './types/deps';
+import type { Clock, Logger, ResolvedDependencies } from './types/deps';
 import type { CallWarning } from './types/methods';
 import type { Message } from './types/message';
 import type { Usage } from './types/usage';
@@ -637,4 +637,122 @@ export async function dropRedactedContext(
   for (const checkpoint of Object.values(envelope.checkpoints))
     checkpoint.messages = keep(checkpoint.messages);
   return dropped;
+}
+
+/** What a V3 leg needs from the executor before its first save. */
+export interface V3LegInput {
+  options: AgentRunOptionsV3<unknown>;
+  /** The live record (the executor's envelope). */
+  envelope: () => AgentRunEnvelopeV3;
+  resume: boolean;
+  persist: () => Promise<void>;
+  emit: (event: AgentEventV3Only) => void;
+  /** The run's warnings (a compiler's `context-source-failed`). */
+  warn: (warning: CallWarning) => void;
+  deps: ResolvedDependencies;
+}
+
+/**
+ * Prepares a V3 leg right before its first save (spec §2.3, §2.5, §4.4): a
+ * new run starts its working memory; a resumed run keeps the stored one and
+ * drops the retrieval blocks of packages a `forget` redacted while it was
+ * down; the compiler continues from its stored state and the loop gets its
+ * context hook. `redacted` says whether the history lost blocks.
+ */
+export async function prepareV3Leg(
+  input: V3LegInput,
+): Promise<{ hook?: LoopContextHook; redacted: boolean }> {
+  const { options, deps } = input;
+  const record = input.envelope();
+  if (!input.resume) {
+    const snapshot = initialWorkingMemory(options, deps.clock.now());
+    if (snapshot) record.workingMemory = snapshot;
+  }
+  const redacted = input.resume && (await dropRedactedContext(record, options.session.store));
+  const compiler = createV3Compiler(options, record, input.warn);
+  if (!compiler) return { redacted };
+  return {
+    redacted,
+    hook: createContextHook({
+      compiler,
+      store: options.session.store,
+      runId: record.runId,
+      envelope: input.envelope,
+      persist: input.persist,
+      emit: input.emit,
+      ...(options.capabilities ? { capabilities: options.capabilities } : {}),
+      logger: deps.logger,
+      ...(redacted ? { redacted } : {}),
+    }),
+  };
+}
+
+/** The extraction intent a V3 run has not acknowledged yet, if any. */
+function pendingExtraction(envelope: AgentRunEnvelopeV3): AgentRunMemoryIntentV3 | undefined {
+  return envelope.memoryIntents?.find(
+    (intent) => intent.extraction !== undefined && intent.status !== 'acknowledged',
+  );
+}
+
+/**
+ * Runs a completed V3 run's versioned extraction after its outcome (spec
+ * §4.1), under the intent its terminal commit recorded. Never throws: a
+ * failure is reported through `fail`, and the intent stays where it was for
+ * `reconcileAgentRun`.
+ */
+export async function settleVersionedExtraction(
+  envelope: AgentRunEnvelopeV3,
+  session: MemorySession,
+  save: () => Promise<boolean>,
+  emit: (event: AgentEventV3Only) => void,
+  fail: (message: string, error: unknown) => void,
+): Promise<void> {
+  const intent = pendingExtraction(envelope);
+  if (!intent || !envelope.transcript) return;
+  try {
+    await runVersionedExtraction(
+      session,
+      intent,
+      { ...intent.extraction, messages: extractionMessages(envelope.transcript, envelope.runId) },
+      save,
+      emit,
+    );
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    fail(
+      `The versioned memory extraction of run ${envelope.runId} failed (${reason}); the run's outcome stands, and reconcileAgentRun settles it.`,
+      error,
+    );
+  }
+}
+
+/**
+ * Settles a V3 run's versioned extractions whose acknowledgment was lost, or
+ * that never ran (spec §4.1, `reconcileAgentRun`): the session answers an
+ * operation it holds from its receipt and applies nothing again; one it does
+ * not hold, it commits now. Returns the settled operation ids.
+ */
+export async function reconcileVersionedIntents(
+  envelope: AgentRunEnvelopeV3,
+  session: MemorySession,
+  save: () => Promise<void>,
+  assertHeld: () => void,
+): Promise<string[]> {
+  const settled: string[] = [];
+  if (!envelope.transcript) return settled;
+  for (const intent of envelope.memoryIntents ?? []) {
+    if (intent.extraction === undefined || intent.status === 'acknowledged') continue;
+    assertHeld();
+    await runVersionedExtraction(
+      session,
+      intent,
+      { ...intent.extraction, messages: extractionMessages(envelope.transcript, envelope.runId) },
+      async () => {
+        await save();
+        return true;
+      },
+    );
+    settled.push(intent.operationId);
+  }
+  return settled;
 }

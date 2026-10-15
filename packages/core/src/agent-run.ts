@@ -653,25 +653,16 @@ export async function reconcileAgentRun(
     // that never ran: the session answers an operation it holds from its
     // receipt and applies nothing again; one it does not hold, it commits now.
     const versioned = (input as AgentRunReconcileOptionsV3).versionedMemory;
-    if (v3 && versioned && envelope.transcript) {
-      const native = await import('./agent-run-v3-run');
-      const record = envelope as unknown as AgentRunEnvelopeV3;
-      const settledIntents: string[] = [];
-      for (const intent of record.memoryIntents ?? []) {
-        if (intent.extraction === undefined || intent.status === 'acknowledged') continue;
-        lease?.assertHeld();
-        await native.runVersionedExtraction(
-          versioned.session,
-          intent,
-          { ...intent.extraction, messages: native.extractionMessages(envelope.transcript, runId) },
-          async () => {
-            await save();
-            return true;
-          },
-        );
-        settledIntents.push(intent.operationId);
-      }
-      if (settledIntents.length > 0) outcome.memoryIntents = settledIntents;
+    if (v3 && versioned) {
+      const settled = await (
+        await import('./agent-run-v3-run')
+      ).reconcileVersionedIntents(
+        envelope as unknown as AgentRunEnvelopeV3,
+        versioned.session,
+        save,
+        () => lease?.assertHeld(),
+      );
+      if (settled.length > 0) outcome.memoryIntents = settled;
     }
     return outcome;
   } catch (error) {
@@ -991,30 +982,14 @@ function makeAgentStream<T>(
     // A V3 run's versioned extraction (2.4): its intent is durable with the
     // terminal commit; the plan is saved, the session commits it with its
     // receipt, and the acknowledgment records the receipt.
-    const record = envelope as unknown as AgentRunEnvelopeV3;
-    const intent = record.memoryIntents?.find(
-      (entry) => entry.extraction !== undefined && entry.status !== 'acknowledged',
-    );
-    if (extractVersioned && intent && envelope.transcript && nativeV3) {
-      try {
-        await nativeV3.runVersionedExtraction(
-          v3Options.versionedMemory!.session,
-          intent,
-          {
-            ...intent.extraction,
-            messages: nativeV3.extractionMessages(envelope.transcript, envelope.runId),
-          },
-          saveBookkeeping,
-          (event) => eventsV3?.push(event),
-        );
-      } catch (error) {
-        warnRecords(
-          'memory',
-          `The versioned memory extraction of run ${envelope.runId} failed (${errorData(error).message}); the run's outcome stands, and reconcileAgentRun settles it.`,
-          error,
-        );
-      }
-    }
+    if (extractVersioned && nativeV3)
+      await nativeV3.settleVersionedExtraction(
+        envelope as unknown as AgentRunEnvelopeV3,
+        v3Options.versionedMemory!.session,
+        saveBookkeeping,
+        (event) => eventsV3?.push(event),
+        (message, error) => warnRecords('memory', message, error),
+      );
   }
 
   function base() {
@@ -1668,36 +1643,18 @@ function makeAgentStream<T>(
       // first save; a resumed run keeps the stored one, so the active task
       // survives a restart. The compiler continues from its stored state.
       if (nativeV3) {
-        const record = envelope as unknown as AgentRunEnvelopeV3;
-        if (!resume) {
-          const snapshot = nativeV3.initialWorkingMemory(
-            v3Options as AgentRunOptionsV3<unknown>,
-            resolveDependencies(options.deps).clock.now(),
-          );
-          if (snapshot) record.workingMemory = snapshot;
-        }
-        // A forget redacted packages while the run was down (spec §4.4): their
-        // retrieval blocks leave the history before the next request.
-        const redacted =
-          resume && (await nativeV3.dropRedactedContext(record, v3Options.session.store));
-        if (redacted) common.messages = envelope.messages;
-        const compiler = nativeV3.createV3Compiler(
-          v3Options as AgentRunOptionsV3<unknown>,
-          record,
-          (warning) => runWarnings.add(warning),
-        );
-        if (compiler)
-          contextHook = nativeV3.createContextHook({
-            compiler,
-            store: v3Options.session.store,
-            runId: envelope.runId,
-            envelope: () => envelope as unknown as AgentRunEnvelopeV3,
-            persist,
-            emit: (event) => eventsV3?.push(event),
-            ...(options.capabilities ? { capabilities: options.capabilities } : {}),
-            logger: resolveDependencies(options.deps).logger,
-            ...(redacted ? { redacted } : {}),
-          });
+        const leg = await nativeV3.prepareV3Leg({
+          options: v3Options as AgentRunOptionsV3<unknown>,
+          envelope: () => envelope as unknown as AgentRunEnvelopeV3,
+          resume,
+          persist,
+          emit: (event) => eventsV3?.push(event),
+          warn: (warning) => runWarnings.add(warning),
+          deps: resolveDependencies(options.deps),
+        });
+        // Redacted retrieval blocks left the history (spec §4.4).
+        if (leg.redacted) common.messages = envelope.messages;
+        contextHook = leg.hook;
       }
       admitted = true;
       if (options.execution && options.session) {
