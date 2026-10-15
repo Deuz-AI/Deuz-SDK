@@ -5,9 +5,14 @@
  * the host marked trusted; external content (unmarked tools: MCP, browser,
  * web) only with `allowExternal`, stored with source kind `'external'`;
  * assistant turns only with `allowAssistant`. The kind comes from the message
- * and the host's policy, never from the model. Edge-safe.
+ * and the host's policy, never from the model. The SDK's own turns in a run
+ * or chat transcript (a memory recall block, a compaction summary, a tool-set
+ * change notice) are never read under any policy: they are neither host nor
+ * user input, and a recall block or summary can carry external content. Edge-safe.
  */
 import type { MemoryScope } from '../../memory';
+import { isSummaryMessage } from '../../inference/compaction';
+import { isRecallMessage, toolSetChangeOf } from '../../internal/stable-prefix';
 import type { Message, Part, ToolResultPart } from '../../types/message';
 import { invalid, textDigest } from './shared';
 import type {
@@ -43,8 +48,20 @@ function resultText(result: unknown): string {
 }
 
 /**
+ * A turn the SDK put into the transcript itself: a stable-prefix memory recall
+ * block, a compaction summary (model-written from whatever the window held)
+ * or a tool-set change notice. No fact about the user, under any policy.
+ */
+function isSdkTurn(message: Message): boolean {
+  return (
+    isRecallMessage(message) || isSummaryMessage(message) || toolSetChangeOf(message) !== undefined
+  );
+}
+
+/**
  * The sources `messages` offer under `policy`, in message order. A message is
- * skipped, never read, when the policy does not allow it.
+ * skipped, never read, when the policy does not allow it, and always when the
+ * SDK injected it (see {@link isSdkTurn}).
  */
 export async function readExtractionSources(
   messages: MemoryExtractionInput['messages'],
@@ -92,6 +109,7 @@ export async function readExtractionSources(
     const message = entry.message;
     if (message === null || typeof message !== 'object' || message.content === undefined)
       throw invalid(`Extraction message ${index} needs a message.`);
+    if (isSdkTurn(message)) continue;
     const text = textParts(message.content);
     if (message.role === 'user') await add('user', 'user', text, entry);
     else if (message.role === 'system') await add('host', 'host', text, entry);

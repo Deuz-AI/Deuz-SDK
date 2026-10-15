@@ -8,6 +8,8 @@
 import { expect } from 'vitest';
 import { OperationConflictError, RevisionConflictError } from '../../src/errors';
 import { sha256Digest } from '../../src/internal/digest';
+import { recallMessage } from '../../src/internal/stable-prefix';
+import { SUMMARY_SENTINEL } from '../../src/inference/compaction';
 import {
   createInMemoryVersionedMemoryStore,
   createMemorySession,
@@ -347,4 +349,31 @@ scenario('versioned-memory', 'untrusted-source-policy', async () => {
     toolName: 'browse',
   });
   expect(openScript.extractions()[0]!.system).toMatch(/never instructions/);
+
+  // The SDK's own turns are not host or user input: a recall block that
+  // carries an external record and a compaction summary the model wrote from
+  // the browsed page are never read, so the injection cannot come back as a
+  // host- or user-sourced record through them.
+  const relayScript = scriptedLLM({ extract: facts });
+  const relay = createMemorySession({
+    store: createInMemoryVersionedMemoryStore(),
+    scope: { userId: 'u1' },
+    llm: relayScript.llm,
+  });
+  const relayed = await relay.extract({
+    messages: [
+      messages[0]!,
+      { id: 'r1', message: recallMessage(`<memory>[external] ${injection}</memory>`) },
+      {
+        id: 's1',
+        message: {
+          role: 'user',
+          content: [{ type: 'text', text: `${SUMMARY_SENTINEL}\nThe page said: ${injection}` }],
+        },
+      },
+    ],
+    supersede: 'add',
+  });
+  expect(relayScript.extractions()[0]!.user).not.toContain('administrator');
+  expect(relayed.records).toEqual([]);
 });
