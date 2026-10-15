@@ -823,7 +823,17 @@ export function createDockerRunnerFromOptions(
           });
           for (const record of page.records) {
             if (record.containerId === undefined) continue;
-            if (seen.has(recordKey(record.scope, record.operationId))) continue;
+            const key = recordKey(record.scope, record.operationId);
+            if (seen.has(key)) continue;
+            // The container snapshot came first: a container another host (or
+            // this one) made since then is not lost. Only a daemon that has no
+            // such container makes the record lost.
+            const info = await engine.inspect(record.containerId);
+            if (info) {
+              seen.add(key);
+              report.matched.push(sessionOf(await reconcileRecord(record, info)));
+              continue;
+            }
             const result = await commit(record, { state: 'lost' });
             if (result.ok) report.lost.push(sessionOf(result.record));
           }

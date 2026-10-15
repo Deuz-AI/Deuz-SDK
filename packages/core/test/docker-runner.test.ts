@@ -650,6 +650,41 @@ describe('createDockerProcessRunner: reconcile', () => {
     expect((await runner.reconcile({ scope: 'tenant-b' })).matched).toEqual([]);
   });
 
+  it('a start that lands between the container snapshot and the record listing is not lost (R4-3)', async () => {
+    const fake = await fakeDocker(bundle);
+    const inner = createInMemoryProcessOperationStore();
+    const other = setup(fake, { store: inner });
+    let fired = false;
+    const store: ProcessOperationStore = {
+      ...inner,
+      create: (r) => inner.create(r),
+      get: (s, id) => inner.get(s, id),
+      update: (s, id, c, o) => inner.update(s, id, c, o),
+      prune: (o) => inner.prune(o),
+      async list(query) {
+        if (!fired) {
+          fired = true;
+          // Another host starts an operation after `docker ps` ran.
+          await other.runner.start(request({ operationId: 'fresh' }));
+        }
+        return inner.list(query);
+      },
+    };
+    const { runner } = setup(fake, { store });
+    const report = await runner.reconcile();
+    const record = await inner.get('tenant-a', 'fresh');
+    expect(report.lost).toEqual([]);
+    expect(report.matched.map((s) => [s.operationId, s.state])).toEqual([['fresh', 'running']]);
+    expect(record!.state).toBe('running');
+    expect(fake.container(record!.containerId!)?.state).toBe('running');
+    expect((await other.runner.poll('tenant-a', 'fresh')).state).toBe('running');
+    // A record whose container really is gone is still lost.
+    fake.update((state) => {
+      delete state.containers[record!.containerId!];
+    });
+    expect((await runner.reconcile()).lost.map((s) => s.operationId)).toEqual(['fresh']);
+  });
+
   it("removes only the reconciled scope's dangling volumes (R4-5)", async () => {
     const fake = await fakeDocker(bundle);
     const labels = (scope: string) => ({
