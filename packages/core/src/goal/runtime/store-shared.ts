@@ -983,29 +983,52 @@ export function scheduleNamespace(scheduleId: string): string {
   return `schedule:${scheduleId}`;
 }
 
-/** A checked schedule as the host defines it, as a JSON copy. Throws a TypeError. */
+/**
+ * A checked schedule as the host defines it: a copy of its definition fields
+ * only (id, scope, goal, spec, event). Anything else a caller passes, such as
+ * a whole stored schedule's status, cursor, `scanTo` or times, is never
+ * taken: only the store sets those. Throws a TypeError.
+ */
 export function checkScheduleInput(value: unknown): DurableScheduleInput {
   const check = new RuntimeChecker('durable schedule');
   const input = check.object(value, 'schedule');
-  check.string(input.scheduleId, 'scheduleId');
-  check.string(input.scope, 'scope');
-  check.string(input.goalId, 'goalId');
+  const scheduleId = check.string(input.scheduleId, 'scheduleId');
+  const scope = check.string(input.scope, 'scope');
+  const goalId = check.string(input.goalId, 'goalId');
   const spec = check.object(input.spec, 'spec');
-  check.string(spec.cron, 'spec.cron');
-  if (spec.timezone !== undefined) check.string(spec.timezone, 'spec.timezone');
-  if (spec.dstGap !== undefined) check.oneOf(spec.dstGap, ['shift', 'skip'], 'spec.dstGap');
+  const checked: DurableScheduleInput = {
+    scheduleId,
+    scope,
+    goalId,
+    spec: { cron: check.string(spec.cron, 'spec.cron') },
+  };
+  if (spec.timezone !== undefined)
+    checked.spec.timezone = check.string(spec.timezone, 'spec.timezone');
+  if (spec.dstGap !== undefined)
+    checked.spec.dstGap = check.oneOf(spec.dstGap, ['shift', 'skip'] as const, 'spec.dstGap');
   if (spec.dstOverlap !== undefined)
-    check.oneOf(spec.dstOverlap, ['first', 'both'], 'spec.dstOverlap');
+    checked.spec.dstOverlap = check.oneOf(
+      spec.dstOverlap,
+      ['first', 'both'] as const,
+      'spec.dstOverlap',
+    );
   if (spec.catchUp !== undefined)
-    check.oneOf(spec.catchUp, ['latest', 'all', 'none'], 'spec.catchUp');
+    checked.spec.catchUp = check.oneOf(
+      spec.catchUp,
+      ['latest', 'all', 'none'] as const,
+      'spec.catchUp',
+    );
   if (input.event !== undefined) {
     const event = check.object(input.event, 'event');
     check.optionalString(event.correlationId, 'event.correlationId');
+    checked.event = {};
+    if (event.correlationId !== undefined)
+      checked.event.correlationId = event.correlationId as string;
     if (event.expiresAfterMs !== undefined)
-      check.amount(event.expiresAfterMs, 'event.expiresAfterMs');
+      checked.event.expiresAfterMs = check.amount(event.expiresAfterMs, 'event.expiresAfterMs');
   }
   check.json(input, '');
-  return jsonCopy(input as unknown as DurableScheduleInput);
+  return checked;
 }
 
 /** Checks the options of a schedule change. Throws a TypeError. */

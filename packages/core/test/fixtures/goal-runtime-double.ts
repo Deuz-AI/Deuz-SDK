@@ -219,8 +219,13 @@ export function createScheduleStoreDouble(
         const now = clock.now();
         if (options.expectedRevision === 0) {
           if (existing) return { status: 'conflict' };
+          // Only the definition is taken from the input, never its status, cursor or times.
           const schedule: DurableSchedule = {
-            ...copy(input),
+            scheduleId: input.scheduleId,
+            scope: input.scope,
+            goalId: input.goalId,
+            spec: copy(input.spec),
+            ...(input.event ? { event: copy(input.event) } : {}),
             status: 'active',
             revision: 1,
             effectiveFrom: options.effectiveFrom,
