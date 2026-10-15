@@ -27,8 +27,8 @@ Nothing in 2.4 was run against a model provider. Model calls are tested
 against scripted models, as in 2.3. The new SQLite, PostgreSQL and Redis
 stores run against real SQLite, a real PostgreSQL 16 and a real Redis 7 when
 the test environment provides them, and the Docker runner against a scripted
-Docker CLI and a real Docker Engine (Docker Desktop 29.8 on Windows 11, Linux
-containers). The pgvector path of the versioned PostgreSQL store was checked
+Docker CLI and a real Docker Engine (Engine 29.8 under Docker Desktop on
+Windows 11, Linux containers). The pgvector path of the versioned PostgreSQL store was checked
 only against an emulated `vector` type. Where this page or a module page says
 **not live-verified**, make one real call before you depend on it.
 </Callout>
@@ -44,7 +44,9 @@ and later. Chat snapshots work against any route; the features that need the
 server (replay by message id, `messageIds` in request bodies, resuming a dropped
 read) wait until a route announces them (see
 [the capability handshake](#the-capability-handshake-in-routes)). No runtime
-dependency and no peer is added.
+dependency and no peer is added. [Compatibility](/docs/reference/compatibility#what-changed-in-24)
+lists what each new subpath needs, and
+[Edge & Runtimes](/docs/advanced/edge#the-24-subpaths) what runs at the edge.
 
 | Entry                                  | New surface                                                                                                                                                                                                                                           | Runtime   |
 | -------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------- |
@@ -514,10 +516,11 @@ and small enums under `deuz.<subsystem>.*` keys, never content.
 | Versioned memory  | `deuz.memory.op` (remember, extract, revise, retract, forget, reembed and import, and the SQL stores' prunes)                                |
 | Goal supervisor   | `deuz.goal.claim`, `deuz.goal.dispatch`, `deuz.goal.retry`, `deuz.goal.cancel_requested`, `deuz.goal.cancel_applied`, `deuz.goal.drain`, `deuz.goal.generation` |
 | Durable scheduler | `deuz.schedule.delivery`                                                                                                                    |
-| Process runner    | `deuz.process.start`, `deuz.process.poll`, `deuz.process.cancel`, `deuz.process.exit`, `deuz.process.reconcile`                              |
+| Docker runner     | `deuz.process.start`, `deuz.process.poll`, `deuz.process.cancel`, `deuz.process.exit`, `deuz.process.reconcile` (the sandbox: start and exit) |
 | Durable streams   | `deuz.stream.batch`, `deuz.stream.fenced`                                                                                                   |
 
-Chat writes and transcript searches report no span.
+Chat writes and transcript searches report no span. The attribute keys of
+each subsystem are listed in [Observation events](/docs/reference/observe-events#24-spans).
 
 ## Retention
 
@@ -721,6 +724,8 @@ export function GET(request: Request): Response {
   `Access-Control-Expose-Headers`; otherwise the hook reads the first frame.
 - A stored chat restores as
   `useChat({ initialSnapshot: { version: 1, messages: record.messages, messageIds: record.messageIds } })`.
+- The header values, the first frame and what each capability promises are
+  in [the stream protocol](/docs/reference/stream-protocol#the-capability-handshake-24).
 
 ### Behaviour changes
 
@@ -834,9 +839,10 @@ Calling code is unaffected. The new members are optional:
 `BudgetAggregate.unaccounted`, and the five `GoalEvidence` fields. A store or
 sandbox of your own keeps working; set them to give your callers the 2.4
 behaviour. No 2.3 interface gains a required member. Where a 2.4 store
-interface builds on a 2.3 one, it extends it: a `ConditionalChatStore` is a
-`ChatStore`, a `DurableStreamStateStore` a `StreamStateStore`, and a
-`GoalRuntimeStore` a `GoalStore`.
+interface builds on a 2.3 one, it has every member of it, so it goes wherever
+the 2.3 one goes: a `ConditionalChatStore` is a `ChatStore`, a
+`DurableStreamStateStore` a `StreamStateStore`, and a `GoalRuntimeStore` a
+`GoalStore`.
 
 ## Known limits
 

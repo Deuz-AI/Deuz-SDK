@@ -43,7 +43,35 @@ Every event extends `ObserveEventBase`:
 | `compaction.skipped` | `layer`, `reason` (e.g. a throwing summarizer — never fails the run) |
 | `subagent.started/completed/suspended/failed` | `agentName`, `depth`, `parentToolCallId`, `childRunId?` (durable store key), child `usage` (already folded into the parent — never sum twice) |
 | `cost.calculated` | Async `priceProvider` resolution; may arrive after the terminal event |
-| `operation.started/completed/failed` | Aux subsystems (`image`, `midjourney`); `operation` strings like `image.generate` |
+| `operation.started/completed/failed` | `subsystem`, `operation`, `itemCount?`; on completion `durationMs`, `resultCount?`, `usage?`; on failure `error`. Aux subsystems (`image`, `midjourney`, …) use `operation` strings like `image.generate`; the 2.4 subsystems name the operation by its span and add `attributes?` (see [2.4 spans](#24-spans)) |
+
+## 2.4 spans
+
+The 2.4 subsystems report each unit of work as an `operation.started` event followed by `operation.completed` or `operation.failed`. The `operation` is the span name, and `createOtelObserver` opens a span of that name. `ObservedSubsystem` gains `'context'`, `'goal'`, `'schedule'`, `'process'` and `'stream'`; versioned memory reports under the existing `'memory'`. Work inside a run leg shares the leg's `runId` and `executionId` and hangs under the step or run span; work outside one (a supervisor tick, a scheduler pass, a process runner call) is reported as a leg of its own. Without an observer or tracer, no event is built.
+
+| Span | Subsystem | Reported for |
+| --- | --- | --- |
+| `deuz.context.compile` | `context` | A context package compiled for a model step, or compiled again on overflow; a child of the step's span in a native run |
+| `deuz.memory.op` | `memory` | A versioned memory remember, extract, revise, retract, forget, reembed or import, and the SQL stores' prunes |
+| `deuz.goal.claim`, `deuz.goal.dispatch`, `deuz.goal.retry` | `goal` | The supervisor took a goal's lease; started or resumed its run; retried the run after a retryable failure |
+| `deuz.goal.cancel_requested`, `deuz.goal.cancel_applied` | `goal` | A cancel was recorded; it took effect on the goal's run |
+| `deuz.goal.drain`, `deuz.goal.generation` | `goal` | The supervisor drained; a goal moved to a new spec generation |
+| `deuz.schedule.delivery` | `schedule` | A schedule occurrence was delivered to a goal inbox, or disposed of |
+| `deuz.process.start`, `deuz.process.poll`, `deuz.process.cancel`, `deuz.process.exit`, `deuz.process.reconcile` | `process` | The Docker process runner's calls; the Docker sandbox reports `deuz.process.start` and `deuz.process.exit` for each run |
+| `deuz.stream.batch`, `deuz.stream.fenced` | `stream` | A durable stream batch committed before it is sent; a stale producer's write refused |
+
+Each event can carry `attributes`: scalar values under `deuz.<subsystem>.*` keys, never content (no memory text, transcript, tool output or retrieved text). `operation.started` carries what is known up front, and `operation.completed` or `operation.failed` adds what the work found out. The OpenTelemetry observer copies them onto the span next to `deuz.subsystem` and `deuz.operation`.
+
+| Subsystem | Attribute keys |
+| --- | --- |
+| `context` | `deuz.context.selected`, `.excluded`, `.tokens`, `.estimator`, `.refresh_reason`, `.fallback`, `.cache_prefix_changed`, `.manifest_digest`, and per source `deuz.context.source.<source>.selected`, `.excluded` and `.tokens` |
+| `memory` | `deuz.memory.operation`, `.record_count`, `.conflict_retries`, `.embedding_generation` |
+| `goal` | `deuz.goal.id`, `.revision`, `.spec_generation`, `.run_id`, `.attempt` |
+| `schedule` | `deuz.schedule.id`, `.occurrence_id`, `.disposition`, `.catch_up`, `.reason` |
+| `process` | `deuz.process.operation_id`, `.state`, `.replayed`, `.exit_code`, `.truncated`, `.reconcile_result`, `.orphans`, `.matched`, `.lost`, `.removed` |
+| `stream` | `deuz.stream.batch_frames`, `.batch_bytes`, `.commit_ms`, `.fencing_token` |
+
+Chat writes, transcript searches and webhook deliveries report no span.
 
 ## ObservedError
 
