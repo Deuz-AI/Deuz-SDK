@@ -23,7 +23,7 @@ import type {
 } from './types/agent-run-v3';
 import type { ChatStore } from './chat';
 import type { CommonCallOptions } from './types/config';
-import type { StopDetails } from './types/methods';
+import type { CallWarning, StopDetails } from './types/methods';
 import type { Message } from './types/message';
 import type { LanguageModel } from './types/model';
 import type { StopCondition, ToolSet } from './types/tool';
@@ -889,6 +889,14 @@ function makeAgentStream<T>(
    */
   async function settleRecords(): Promise<void> {
     const deps = resolveDependencies(options.deps);
+    const warned = new Set<string>();
+    const warnOnce = (warning: CallWarning): void => {
+      const key = JSON.stringify([warning.type, warning.message]);
+      if (warned.has(key)) return;
+      warned.add(key);
+      deps.logger.warn(warning.message, { runId: envelope.runId, warning: warning.type });
+      emitPart({ type: 'warning', warning }, 'finalizing');
+    };
     if (options.chat && envelope.transcript && nativeChat) {
       if (admitted || nativeChat.projectionBehind(envelope.transcript, envelope.chat)) {
         // A leg that did not run (a terminal or still-suspended resume) only
@@ -940,6 +948,9 @@ function makeAgentStream<T>(
             if (!(await saveBookkeeping()))
               throw new Error('its progress could not be saved, so it wrote nothing more');
           },
+          // Its 2.4 warnings go out on the stream, once each, and its calls are
+          // charged to the run's ledger.
+          { onWarning: warnOnce, ...(common?.execution ? { execution: common.execution } : {}) },
         );
         envelope.memory!.extraction = {
           ...envelope.memory!.extraction!,
@@ -1636,10 +1647,12 @@ function makeAgentStream<T>(
         const input = envelope.messages.length;
         const internal: number[] = [];
         if (options.memory) {
+          // Its 2.4 warnings reach the run's, and its calls the run's ledger.
           const { recall, message } = await nativeMemory!.recallOnce(
             options.memory,
             envelope.messages,
             resolveDependencies(options.deps).logger,
+            { onWarning: (warning) => runWarnings.add(warning), execution: common.execution },
           );
           if (message) {
             recall.index = envelope.messages.length;

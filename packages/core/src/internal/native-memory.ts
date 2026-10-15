@@ -92,6 +92,25 @@ export function claimMemoryScope(
   };
 }
 
+/**
+ * Where a native run's memory calls report (2.4): their warnings
+ * (`embedding-mismatch`, `unaccounted-usage`) go to the run's warnings, and
+ * the memory LLM and embedder are charged to the run's execution context.
+ */
+export interface NativeMemoryCalls {
+  onWarning?: (warning: CallWarning) => void;
+  execution?: NativeExecutionContext;
+}
+
+/**
+ * The seams a native run's memory calls use: the host's, charged to the
+ * run's execution context (2.4) unless the host set one itself.
+ */
+function chargedSeams(memory: MemoryCallOptions, calls: NativeMemoryCalls | undefined) {
+  const execution = memory.seams.execution ?? calls?.execution;
+  return execution ? { ...memory.seams, execution } : memory.seams;
+}
+
 /** The index of the last user message, or -1. */
 function lastUserIndex(messages: readonly Message[]): number {
   for (let index = messages.length - 1; index >= 0; index--)
@@ -119,6 +138,7 @@ export async function recallOnce(
   memory: MemoryCallOptions,
   messages: readonly Message[],
   logger: Logger,
+  calls?: NativeMemoryCalls,
 ): Promise<{ recall: AgentRunRecall; message?: Message }> {
   if (memory.recall === false) return { recall: { status: 'skipped' } };
   const lastUser = lastUserIndex(messages);
@@ -132,10 +152,11 @@ export async function recallOnce(
     const scorer = options.scorer === 'default' ? defaultMemoryScorer : options.scorer;
     const hits = await recall(
       { scope: memory.scope, text, topK: options.topK ?? 5 },
-      memory.seams,
+      chargedSeams(memory, calls),
       {
         ...(scorer ? { scorer } : {}),
         ...(options.expandLinks !== undefined ? { expandLinks: options.expandLinks } : {}),
+        ...(calls?.onWarning ? { onWarning: calls.onWarning } : {}),
       },
     );
     const block = formatMemoriesForPrompt(hits, {
@@ -242,14 +263,16 @@ export async function runExtraction(
   clock: Clock,
   logger: Logger,
   checkpoint: (progress: ExtractionProgress) => Promise<void>,
+  calls?: NativeMemoryCalls,
 ): Promise<number> {
   const { remember, applyMutations, sweepExpired } = await import('./memory-pipeline');
   const deuz = { runId, operationId: extraction.operationId };
   const plan = (
-    await remember(turns, memory.scope, memory.seams, {
+    await remember(turns, memory.scope, chargedSeams(memory, calls), {
       infer: extraction.infer,
       metadata: { deuz },
       apply: false,
+      ...(calls?.onWarning ? { onWarning: calls.onWarning } : {}),
     })
   ).map((mutation) => stamped(mutation, deuz));
   await checkpoint({ planned: plan.length });

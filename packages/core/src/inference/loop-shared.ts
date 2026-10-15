@@ -38,7 +38,7 @@ import {
   DEFAULT_MAX_HANDOFFS,
   type HandoffTargetMeta,
 } from './handoff';
-import type { MemoryMutation, MemoryScorer } from '../memory';
+import type { MemoryMutation, MemoryScorer, MemorySeams } from '../memory';
 import { EMPTY_USAGE, withTotal } from '../core/metering';
 import {
   applyCompaction,
@@ -3703,6 +3703,16 @@ function contentText(content: Message['content']): string {
 }
 
 /**
+ * The memory seams a loop's memory calls use (2.4): the host's, charged to
+ * the call's execution context when it has one and the host set none.
+ */
+function memorySeamsOf(options: CommonCallOptions): MemorySeams {
+  const seams = options.memory!.seams;
+  const execution = seams.execution ?? options.execution;
+  return execution ? { ...seams, execution } : seams;
+}
+
+/**
  * Memory recall (1.7, D1): fetch relevant memories for the LAST user message
  * and format them as a system-context block. Returns `undefined` when there is
  * nothing to inject. The block is spliced in AT THE MODEL-CALL SITE only
@@ -3719,6 +3729,8 @@ export async function computeRecallBlock(
   deps: ResolvedDependencies,
   messages: Message[],
   ob?: ExecuteExtras['observe'],
+  /** Where its 2.4 warnings go (`embedding-mismatch`, `unaccounted-usage`): the run's sink. */
+  warn?: (warning: CallWarning) => void,
 ): Promise<string | undefined> {
   const memory = options.memory;
   if (!memory || memory.recall === false) return undefined;
@@ -3751,10 +3763,11 @@ export async function computeRecallBlock(
       recallOpts.scorer === 'default' ? defaultMemoryScorer : recallOpts.scorer;
     const hits = await recall(
       { scope: memory.scope, text, topK: recallOpts.topK ?? 5 },
-      memory.seams,
+      memorySeamsOf(options),
       {
         ...(scorer ? { scorer } : {}),
         ...(recallOpts.expandLinks !== undefined ? { expandLinks: recallOpts.expandLinks } : {}),
+        ...(warn ? { onWarning: warn } : {}),
       },
     );
     if (ob && span) {
@@ -3851,6 +3864,8 @@ export async function planRecall(
   ob?: ExecuteExtras['observe'],
   /** The leg resumes a durable run from its checkpoint. */
   resumed = false,
+  /** Where the recall's 2.4 warnings go: the run's sink. */
+  warn?: (warning: CallWarning) => void,
 ): Promise<RecallPlan> {
   const stable = bindsThinkingToPrefix(model);
   if (
@@ -3860,7 +3875,7 @@ export async function planRecall(
   ) {
     return {};
   }
-  const block = await computeRecallBlock(options, deps, messages, ob);
+  const block = await computeRecallBlock(options, deps, messages, ob, warn);
   if (!block) return {};
   if (!stable) return { splice: block };
   return { message: recallMessage(block) };
@@ -3898,6 +3913,8 @@ export function startMemoryExtract(
   deps: ResolvedDependencies,
   newTurns: Message[],
   ob?: ExecuteExtras['observe'],
+  /** Where the pass's 2.4 warnings go: the run's sink (it may settle after the run). */
+  warn?: (warning: CallWarning) => void,
 ): Promise<MemoryMutation[]> | undefined {
   const memory = options.memory;
   if (!memory || memory.extract === false) return undefined;
@@ -3927,7 +3944,12 @@ export function startMemoryExtract(
   }
   const extract = import('../internal/memory-pipeline');
   const settled = extract
-    .then(({ remember }) => remember(turns, memory.scope, memory.seams, { infer }))
+    .then(({ remember }) =>
+      remember(turns, memory.scope, memorySeamsOf(options), {
+        infer,
+        ...(warn ? { onWarning: warn } : {}),
+      }),
+    )
     .then(
       (mutations) => {
         if (ob && span) {

@@ -374,7 +374,7 @@ export function runStreamToolLoop(
     const settleMemory = (extract: boolean): void => {
       if (!memoryDeferred) return;
       const extraction = extract
-        ? startMemoryExtract(options, deps, appended, memoryObserve)
+        ? startMemoryExtract(options, deps, appended, memoryObserve, warn)
         : undefined;
       if (extraction) void extraction.then((mutations) => memoryDeferred.resolve(mutations));
       else memoryDeferred.resolve([]);
@@ -950,6 +950,7 @@ export function runStreamToolLoop(
         options.model,
         observeCtx,
         resumeFrom !== undefined,
+        warn,
       );
       const recallBlock = recall.splice;
       // Recall overhead (2.0): a spliced block never enters `messages`, but the

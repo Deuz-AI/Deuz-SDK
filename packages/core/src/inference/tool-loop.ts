@@ -360,6 +360,7 @@ export async function runToolLoop(
           deps,
           appended,
           lo ? { rt: lo.rt, parentSpanId: lo.runSpanId } : undefined,
+          warn,
         );
     if (memoryPromise) result.memory = memoryPromise;
     // Settlement (1.6.1): the cost enrichment was registered synchronously
@@ -520,6 +521,7 @@ export async function runToolLoop(
       options.model,
       observeCtx,
       internal?.resumeFrom !== undefined,
+      warn,
     );
     const recallBlock = recall.splice;
     // Recall overhead (2.0): a spliced block never enters `messages`, but the
