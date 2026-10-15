@@ -276,6 +276,40 @@ export function conditionalChatStoreContracts(
       await done();
     });
 
+    it('writes a chat holding U+0000 or a huge tool result, as every backend does', async () => {
+      const { store, transcript, done } = await setup();
+      const nul = chat('nul', ['binary \u0000 tail']);
+      expect(committed(await store.writeChat(nul, { expectedRevision: 0 }))).toEqual({
+        ...nul,
+        revision: 1,
+      });
+      expect(await store.loadChat('nul')).toEqual({ ...nul, revision: 1 });
+      const lines: string[] = [];
+      for (let i = 0; i < 80_000; i++) lines.push(`req id${i}x${(i * 7919) % 100_003} ok`);
+      const big: ChatRecord = {
+        ...chat('big', ['show me the log']),
+        messages: [
+          { role: 'user', content: 'show me the log' },
+          {
+            role: 'tool',
+            content: [{ type: 'tool_result', toolUseId: 't1', result: lines.join('\n') }],
+          },
+        ],
+      };
+      expect(committed(await store.writeChat(big, { expectedRevision: 0 })).revision).toBe(1);
+      await store.saveChat(big);
+      expect(await store.readChat('big')).toMatchObject({
+        status: 'found',
+        record: { revision: 2 },
+      });
+      const scope = { userId: 'ada' };
+      expect((await transcript.search(scope, 'tail')).map((hit) => hit.chatId)).toEqual(['nul']);
+      expect((await transcript.search(scope, 'id3x23757')).map((hit) => hit.chatId)).toEqual([
+        'big',
+      ]);
+      await done();
+    });
+
     it('refuses an expected revision that is not a non-negative integer', async () => {
       const { store, done } = await setup();
       for (const expectedRevision of [-1, 1.5, Number.NaN]) {

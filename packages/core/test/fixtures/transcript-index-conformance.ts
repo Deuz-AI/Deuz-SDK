@@ -249,6 +249,35 @@ export function transcriptIndexContracts(
       await done();
     });
 
+    it('indexes a message holding U+0000, and finds its terms', async () => {
+      const { index, done } = await setup();
+      await index.index(chatRecord('nul', [user('binary \u0000 tail\u0000end')]));
+      const hits = async (term: string) =>
+        (await index.search({ userId: 'ada' }, term)).map((hit) => hit.messageId);
+      expect(await hits('binary')).toEqual(['nul:0']);
+      expect(await hits('tail')).toEqual(['nul:0']);
+      expect(await hits('end')).toEqual(['nul:0']);
+      await done();
+    });
+
+    it('indexes a huge message with many distinct terms, its first terms searchable', async () => {
+      const { index, done } = await setup();
+      const lines: string[] = [];
+      // ~1.6 MB: as a tsvector, past Postgres's 1 MB limit.
+      for (let i = 0; i < 80_000; i++) lines.push(`req id${i}x${(i * 7919) % 100_003} ok`);
+      await index.index(chatRecord('big', [user(`log dump\n${lines.join('\n')}`), user('small')]));
+      expect((await index.search({ userId: 'ada' }, 'dump')).map((hit) => hit.messageId)).toEqual([
+        'big:0',
+      ]);
+      expect((await index.search({ userId: 'ada' }, 'id7x55433')).map((hit) => hit.chatId)).toEqual(
+        ['big'],
+      );
+      expect((await index.search({ userId: 'ada' }, 'small')).map((hit) => hit.messageId)).toEqual([
+        'big:1',
+      ]);
+      await done();
+    });
+
     it('answers an empty or punctuation-only query with nothing', async () => {
       const { index, done } = await setup();
       await index.index(chatRecord('c', [user('anything at all')]));
