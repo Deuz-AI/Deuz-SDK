@@ -30,3 +30,6 @@ superpowers/
 .superpowers/
 .tmp/
 .cursor/
+
+# Scratch tests written by review agents (never part of a release)
+packages/*/test/zz-*
