@@ -30,7 +30,7 @@ export type ScenarioArea = keyof typeof SCENARIO_MINIMUMS;
  * Turned on by the integrator once every lane that owns scenarios has landed
  * (wave W2): from then on each area must reach its minimum.
  */
-export const ENFORCE_SCENARIO_MINIMUMS = false;
+export const ENFORCE_SCENARIO_MINIMUMS = true;
 
 export interface ScenarioOptions {
   /** A crash/recovery scenario: three clean runs, no retry. */
