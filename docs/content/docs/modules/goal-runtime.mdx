@@ -91,7 +91,7 @@ flight; starting a running supervisor throws. A tick that fails is logged
 | `lease.provider` | required | The `LeaseProvider` for goal leases (`goalLeaseKey(scope, goalId)`) |
 | `lease.owner` | a generated id | This supervisor's lease owner |
 | `lease.ttlMs` | `30000` | The goal lease, renewed every `ttlMs / 3`; an integer of at least 3 |
-| `scopes` | every scope | Only goals of these scopes |
+| `scopes` | every scope | Only goals of these scopes. An unscoped supervisor learns scopes from the goals it sees; pass `scopes` to cover every tenant deterministically |
 | `concurrency` | `1` | Goals driven at once; each goal has one executor at a time |
 | `pollMs` | `1000` | How often `start()` ticks |
 | `policy` | `DEFAULT_GOAL_RUNTIME_POLICY` | Limits for new goals (below) |
@@ -121,22 +121,26 @@ throws `GoalError('revision_conflict')`.
 | `runtime` field | Meaning |
 | --- | --- |
 | `phase` | `idle`, `dispatching`, `running`, `retrying`, `draining` or `done` |
-| `activeRun` | The intent, run id, attempt and start time of the run the supervisor drives now |
+| `activeRun` | The intent, run id, attempt and start time of the run the supervisor drives now, and `specGeneration`: the goal's generation when that run first launched |
 | `runs`, `retries` | Automatic runs started; retries of the current failure |
 | `retryAt` | When a failed run is due again |
 | `cancel` | `{ requestedAt, reason?, appliedAt? }`: a cancel request and when it took effect |
-| `maintenance` | `{ status, runId }` while a completed run's memory extraction is still pending |
+| `maintenance` | `{ status, runId }`: the oldest run whose memory extraction is still pending, until none is; then the last one that settled |
+| `maintenanceRuns` | The runs whose maintenance is still pending; each is followed until it settles |
 | `workingMemory` | The last run's working memory snapshot, for the next run |
 | `policy`, `revision` | The goal's limits; the state's own revision (the fence for `updatePolicy`) |
 
 ### What a tick does
 
-A tick finds the goals with work (unfinished, or with open intents) and drives
-each under its goal lease. A drive takes one step at a time on freshly read
-state, each step one checked write, in this order:
+A tick finds the goals with work (unfinished, with open intents, or with due
+inbox entries, an ended goal's included) and drives each under its goal lease.
+A drive takes one step at a time on freshly read state, each step one checked
+write, in this order:
 
 1. Apply a recorded cancel.
-2. Close what an ended goal left open, and follow its maintenance.
+2. For an ended goal, settle its queued inbox entries as `'terminal'`. Then
+   follow the pending maintenance of the goal's runs (once per drive, for any
+   goal), and for an ended goal close what it left open.
 3. Apply time: a passed deadline fails the goal, a due wakeup ends its wait.
 4. Reconcile a dependency wait with dependencies that already finished.
 5. Settle the oldest due inbox entry, with the run intent it implies, in one write.
@@ -157,6 +161,7 @@ How a run's leg ends decides the next step:
 | Completed | Applies the `verify` hook's commands, then tries `complete`. A goal that stays active gets another automatic run, up to `maxRuns` |
 | Suspended (approval or client tools) | The goal waits with reason `'user'` and note `'approval'` or `'client-tools'`; answer with `resume` |
 | Stopped, drained | Resumable; the phase goes back to `dispatching` |
+| Held elsewhere (`heldElsewhere`: another executor still holds the run) | The intent and the active run stay; the phase goes back to `dispatching`, no retry is spent, and a later claim resumes the same run |
 | Stopped, cancelled | The cancel is applied |
 | Stopped, other reason | The goal waits with reason `'user'` and note `'run-stopped:<reason>'` |
 | Failed and retryable, or the launch threw | The same run is retried after `retryDelaysMs`, up to `maxRetries`; then the goal stays in phase `retrying` and a `policy-limit` event (`limit: 'retries'`) is reported |
@@ -186,7 +191,9 @@ for example the command `verifyGoalAcceptance` returns, and
 
 `command(scope, goalId, command, { expectedRevision? })` applies a
 `transitionGoal` command and saves the goal with its runtime state in one
-write. A stale `expectedRevision` throws `GoalError('revision_conflict')`.
+write. A stale `expectedRevision` throws `GoalError('revision_conflict')`. A
+host `complete` or `fail` on a goal whose run is suspended or waiting for its
+retry settles the runtime at once: phase `done` and no active run.
 
 A cancel is recorded, not applied on the spot. The request is written to the
 runtime state first, then the supervisor asks `launcher.cancel` to stop the
@@ -248,7 +255,16 @@ token, so a claim with a higher token fences out an earlier holder.
 A supervisor loses the goal lease when a renewal answers `held: false`, or when
 renewals fail for a whole `ttlMs`. It then drains the run it started, writes
 nothing more and starts nothing; the next holder takes the intent over with a
-higher token and resumes the run, never starting it a second time.
+higher token and resumes the run, never starting it a second time. While the
+old executor still holds the run, the new holder's leg is reported as held
+elsewhere and tried again each tick until the old executor has drained (up to
+`ttlMs / 3` plus the time to reach a safe checkpoint).
+
+After a lease provider restart or prune, its tokens start again, so an intent
+can stay claimed under a higher token than the current holder's. A holder
+whose own renewal confirms its lease takes such an intent over: it applies a
+recorded cancel, or resumes the run under a fresh intent. A durable lease
+provider is still the better choice.
 
 ### Accounting and maintenance
 
@@ -261,16 +277,20 @@ never charged. A charge that arrives after the goal completed raises `spent`
 and does not reopen it.
 
 A verified goal completes without waiting for its run's optional memory
-extraction. While that is `'pending'`, the intent stays `launched` and
-`runtime.maintenance` says so; each tick asks `launcher.maintenance`, charges
-late amounts and closes the intent once the status is `'complete'` or
-`'failed'`.
+extraction. Every completed run whose maintenance is `'pending'` keeps its
+intent `launched` and is listed in `runtime.maintenanceRuns`, also when its
+goal stayed active and a later run completed it. Each drive asks
+`launcher.maintenance` for those runs, charges late amounts and closes a run's
+intent once its status is `'complete'` or `'failed'`.
 
 ### Working memory hand-over
 
 The supervisor keeps each leg's [working memory](/docs/modules/context#working-memory)
 snapshot in `runtime.workingMemory`, stamped with `goalRef: { goalId,
-specGeneration }` when the run did not name them. A new run (`'start'`)
+specGeneration }` when the run did not name them. The stamped generation is
+the one the run first launched under (`activeRun.specGeneration`), also after
+a resume or retry that follows a `revise`, so a run of a later generation never
+inherits it. A new run (`'start'`)
 receives it only when its scope and `goalRef.specGeneration` match the goal's;
 a resumed run keeps its own. Hypotheses and decisions keep their status: a
 hypothesis a model proposed is still only proposed in the next run.
@@ -304,10 +324,22 @@ stored one, so a repeated launch never starts a run twice; only a `'retry'` of a
 run whose envelope records a transient failure resumes with `retryFailed`. The
 inherited working memory goes to new runs only.
 
-`cancel` and `drain` signal the native run's lease (`agentRunLeaseKey`). Give
-the launcher `lease` (the native run's own lease, apart from the goal lease) for
-them to reach a working run; without it, or while no executor holds the run,
-they answer `false` and the supervisor keeps the cancel for the next claim.
+`cancel` and `drain` signal the native run's lease (`agentRunLeaseKey`), the
+native run's own lease, apart from the goal lease. A launcher created without
+`lease` takes the lease provider and TTL of the first supervisor it is given
+to, so a drain, a cancel during a leg and a takeover reach its runs; only a
+launcher used on its own has no lease. Without one, or while no executor holds
+the run, they answer `false` and the supervisor keeps the cancel for the next
+claim.
+
+A run with the 2.3 `memory` option returns its leg once its outcome is
+committed, with maintenance `'pending'` while the extraction finishes. A run
+that only has `versionedMemory.extract` still makes the leg wait for its
+extraction. A leg that another executor of the run refused (`lease_held`,
+`lease_lost`, or an executor in the same process) is reported as
+`heldElsewhere`: the supervisor keeps the intent and the active run, goes back
+to `dispatching` without spending a retry, and a later claim resumes the same
+run.
 `accounting` reads the ledger of the run's last checkpoint; `maintenance` reads
 its memory extraction status (`'completed'` maps to `'complete'`, `'partial'`
 and `'failed'` to `'failed'`).
@@ -319,7 +351,9 @@ The supervisor calls `launch` only for a `'start'` intent not yet launched, and
 `runId` (the same on every attempt), `attempt`, `kind` (`'start'`, `'resume'`
 or `'retry'`), `goal`, and when they apply `workingMemory`,
 `approvalResponses`, `clientToolResults` and `signal`. A `RunLaunchResult`
-answers `{ runId, result, retryable?, workingMemory?, maintenance? }`.
+answers `{ runId, result, retryable?, heldElsewhere?, workingMemory?,
+maintenance? }`; set `heldElsewhere` when another executor holds the run and
+this leg did nothing to it.
 `cancel` and `drain` answer `false` when no executor holds the run.
 
 ## Goal runtime stores
@@ -366,7 +400,9 @@ reason }`, and a conflict writes nothing. The reasons are `goal-revision`,
 | `watermarks` | How much of each run's ledger is charged to its goal |
 
 Inbox dispositions are `pending`, `applied`, `duplicate`, `unmatched`, `stale`,
-`expired`, `terminal` and `cancelled`.
+`expired`, `terminal` and `cancelled`. An entry queued for a goal that has
+already ended, such as a webhook delivery or a schedule occurrence, is settled
+as `terminal`, so its payload ages out through `prunePayloads` like any other.
 
 ## Durable scheduler
 
@@ -838,8 +874,9 @@ for example on a durable schedule of its own.
 | `store.pruneOccurrences({ before, scope? })` | Occurrence records, by `recordedAt` |
 | `store.pruneIntents({ before, scope? })` | Completed, failed and cancelled intents, by `updatedAt` |
 
-Each returns how many it touched. See [Retention](/docs/modules/retention) for
-every 2.4 store.
+Each returns how many it touched. Entries queued for an ended goal settle as
+`'terminal'`, so `prunePayloads` reaches them too. See
+[Retention](/docs/modules/retention) for every 2.4 store.
 
 ## Telemetry
 

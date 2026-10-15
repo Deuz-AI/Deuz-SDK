@@ -29,6 +29,7 @@ function resumeDeuzChatResponse(options: ResumeDeuzChatOptions): Response;
 | `wireVersion` | `'v1' \| 'v2'` | `'v2'` | Serve v2 — the client needs event ids to resume. |
 | `clock` | timer seam | global `setTimeout` | Deterministic tests. |
 | `onStoreError` | `(error: unknown) => void` | — | Wire-log append failures on the continuation leg. |
+| `durable` | `DurableStreamOptions` | — | 2.4, preview: run the continuation leg in [durable mode](/docs/modules/chat-durability#durable-streams-preview); `durable.store` must be `streamStateStore`. |
 
 ## How the two phases work
 
@@ -45,6 +46,8 @@ This is why the F5-mid-tool-loop story works end to end:
 ## At-most-one resumer
 
 Run **at most one continuation resumer per `runId`**. Two clients hitting the resume endpoint after a crash would both pass the liveness probe and start two continuation legs — doubling the model call and interleaving seqs in the log. Guard it with an app-level lock (a Redis `SET NX`, a Postgres advisory lock, a row-level claim) around the resume route, or route resumes for a given `runId` to one worker. Tailing clients (phase 1) are unlimited — the lock is only needed for the leg that *continues the run*. A refreshed tab whose original producer is still draining server-side never triggers a continuation; only a killed process does.
+
+With `durable` (2.4), the producer lease replaces that lock: a second leg, or a leg that meets a producer that only went quiet past `liveProbeMs`, is refused before its run starts (no model call, no tool, no checkpoint), and reconnecting tails the stream.
 
 ## The complete Next.js route pair
 

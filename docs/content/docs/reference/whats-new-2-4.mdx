@@ -496,8 +496,12 @@ draft's `status` is always `'proposed'` and its `evaluation`
 `'not-evaluated'`: the run's verification describes the task, not the skill.
 The model reads a numbered projection of the run's user-facing turns, never the
 raw transcript or raw tool results, and every method step must cite items of
-it. The suggested `allowedTools` must be a subset of the tools the run used,
-and the `SKILL.md` text must pass `parseSkill`. The call needs a `budget` and is
+it. The suggested `allowedTools` must be a subset of the tools the run itself
+called, with a receipt recording the call completed; a tool call only in the
+input history never counts. The `SKILL.md` text must pass `parseSkill`. A
+source reference's `messageId` is the id the message keeps in the run's chat
+projection (an input message carried over from the stored chat keeps that
+chat's id), otherwise `<runId>:<index>`. The call needs a `budget` and is
 charged to a ledger of its own. The helper writes no file, changes no registry,
 and never evaluates or activates the skill.
 
