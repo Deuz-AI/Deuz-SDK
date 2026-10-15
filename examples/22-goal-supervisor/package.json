@@ -1,0 +1,17 @@
+{
+  "name": "@deuz-examples/22-goal-supervisor",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "A durable schedule fills a goal's inbox, the goal supervisor runs a V3 native run for it across a host restart and an approval, and host verification completes the goal; everything in one SQLite file.",
+  "scripts": {
+    "dev": "node --experimental-strip-types index.ts",
+    "start": "node --experimental-strip-types index.ts"
+  },
+  "dependencies": {
+    "@deuz-sdk/core": "^2.3.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0"
+  }
+}
