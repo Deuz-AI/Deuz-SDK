@@ -78,13 +78,13 @@ await chats.close();
 | `saveChat(record)` | The legacy write: last writer wins at the stored revision plus one, never over a tombstone (`RevisionConflictError`) |
 | `loadChat(chatId)` | The record with its revision, or `undefined` for a missing or deleted chat |
 | `listChats(scope?)` | Live chats only, most recently updated first, then by `chatId` |
-| `pruneTombstones(before)` | Deletes tombstones with `deletedAt < before` and returns the count; the id can be reused after that |
+| `pruneTombstones(before)` | Deletes tombstones with `deletedAt < before` (exclusive: one deleted exactly at `before` stays) and returns the count; the id can be reused after that. A `before` that is not a finite number throws `InvalidRequestError` before anything is deleted |
 
 A tombstone is final: `writeChat` and `tombstoneChat` conflict, `saveChat`
 throws, and `deleteChat` does nothing. Deleting or tombstoning
 (`expectedRevision: 0`) a chat that was never written also leaves a tombstone,
 with an empty scope, so a first write that arrives late cannot create it. The
-SDK never prunes tombstones on its own.
+SDK never calls `pruneTombstones` on its own.
 
 `updateConditionalChat(store, chatId, merge, { attempts = 3 })` calls
 `merge(current, attempt)` with the chat as stored now; `merge` returns the record
@@ -196,6 +196,10 @@ over this stream.`, `…the stored stream moved past this producer.`, `…this
 producer lost its lease.` or `…the stream store failed.`. A thrown store or
 lease error goes to `onStoreError` only, never to the client.
 
+A 2.4 `useChat` that reads such a response ends in `status: 'error'`: an error
+frame followed by a clean close is not a drop. Only a transport drop, a read
+that breaks off before the stream ends, continues from `resume.endpoint`.
+
 ### Durable stores
 
 | Factory | Import | Notes |
@@ -229,12 +233,13 @@ plus `{<prefix>:streams}:ix` and `:schema`.
 `prune({ terminalBefore })` deletes finished streams (their last record is the
 `done` sentinel) whose last open, commit or append is older than the cutoff, on
 the store's clock (the injected clock for memory and SQLite, `clock_timestamp()`
-for PostgreSQL, the server `TIME` for Redis), and returns the count. A stream
-opened again for a new leg counts as active. A pruned stream forgets its fence,
-so prune only streams no producer will continue. Nothing is deleted in the
-background; 24 hours (`terminalBefore: now - 86_400_000`) on a
-[durable scheduler](/docs/modules/goal-runtime#durable-scheduler) is a good
-default.
+for PostgreSQL, the server `TIME` for Redis), and returns the count. The cutoff
+is exclusive. A stream opened again for a new leg counts as active. A pruned
+stream forgets its fence, so prune only streams no producer will continue.
+Nothing is deleted in the background. The default window is
+`DEFAULT_DURABLE_STREAM_RETAIN_MS` (24 hours, from `@deuz-sdk/core/ui`):
+`terminalBefore: now - DEFAULT_DURABLE_STREAM_RETAIN_MS` on a
+[durable scheduler](/docs/modules/goal-runtime#durable-scheduler).
 
 ### The legacy store, when it fails
 
@@ -392,6 +397,11 @@ Without `resume`, the restored turn is sealed. A malformed snapshot (a `version`
 other than 1, or a non-array `messages`, `messageIds`, `pendingApprovals`,
 `pendingToolCalls` or `capabilities`) throws a `TypeError`. `setHistory` still
 drops the gates and the cursor.
+
+A snapshot you build yourself for a native run paused on approvals must set
+`gate.turn` (the paused turn) as well as `gate.runId`. With `gate.runId` alone,
+`useChat` drops the run id, and the verdict POST carries no `runId`.
+`exportSnapshot()` writes both.
 
 A stored chat restores as `{ version: 1, messages: record.messages, messageIds:
 record.messageIds }`. This works next to a 2.3 core too: the hook applies the
