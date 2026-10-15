@@ -28,6 +28,11 @@ The supervisor does not add an agent loop. Each run is an ordinary
 its own checkpoints, lease and recovery; the supervisor decides when a run
 starts, resumes or stops, and what its result means for the goal.
 
+[`examples/22-goal-supervisor`](https://github.com/Deuz-AI/Deuz-SDK/tree/main/examples/22-goal-supervisor)
+runs it on one SQLite file without a key: a goal woken by a Berlin-time
+schedule that a restarted host catches up, a V3 run that suspends for an
+approval and resumes, and completion on a host verifier's verdict.
+
 ## A supervised goal
 
 ```ts
@@ -161,6 +166,19 @@ evidence and verdicts you record through `command`, and an active goal keeps
 getting automatic runs until `maxRuns`. A goal that should wait between runs,
 such as a recurring job, can return a `wait` command from `verify` (see the
 [scheduler example](#durable-scheduler)).
+
+A run that stops with `tool-reconciliation-required` (it cannot know whether a
+non-idempotent tool call took effect) parks the goal like any other stop: it
+waits with reason `'user'` and note
+`'run-stopped:tool-reconciliation-required'`, and the runtime state drops its
+`activeRun`. `supervisor.resume` then throws `GoalError('invalid_command')`,
+and a goal `resume` command would start a new automatic run that may call the
+tool again. Reconcile the native run yourself instead: check whether the
+effect happened, resume that run with `resumeAgent` or `resumeStreamAgent`
+(with `checkpointVersion: 3`, its V3 session and `reconciledToolResults`),
+then record the acceptance with `supervisor.command(scope, goalId, evaluate)`,
+for example the command `verifyGoalAcceptance` returns, and
+`supervisor.command(scope, goalId, { type: 'complete' })`.
 
 ### Commands, cancel and drain
 
@@ -495,6 +513,11 @@ whose `effectiveFrom` is the time of the call: an explicit UTC boundary.
 Scanning resumes at the later of the cursor and the boundary, so nothing of
 either revision before the boundary is delivered, nor an occurrence exactly at
 it. Tick before a change if the old revision's due occurrences matter.
+
+A `put` of the stored goal, spec and event is no change: it returns the stored
+schedule and writes nothing, so a host can put its schedules at every boot
+without moving the boundary, dropping occurrences missed while it was down or
+ending an open catch-up window. A stale `expectedRevision` still throws.
 
 `pause` stops new scans; occurrences that fall inside a pause are neither
 delivered nor recorded. `resume` starts again from its own boundary. `cancel`
