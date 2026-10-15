@@ -11,7 +11,15 @@ import { describe, expect, it } from 'vitest';
 
 const src = (file: string): string => fileURLToPath(new URL(`../src/${file}`, import.meta.url));
 
-async function browserBundle(entry: string): Promise<{ inputs: string[]; text: string }> {
+/**
+ * Every module an entry bundles (`inputs`, `text`, lazy chunks included) and
+ * the ones it loads statically (`eager`: its entry chunk and every chunk it
+ * reaches through import statements). A dynamic `import()` (the supervisor's
+ * native launcher) is a chunk of its own, loaded only when it runs (2.4, L4b).
+ */
+async function browserBundle(
+  entry: string,
+): Promise<{ inputs: string[]; eager: string[]; text: string }> {
   const result = await build({
     entryPoints: [src(entry)],
     bundle: true,
@@ -23,8 +31,23 @@ async function browserBundle(entry: string): Promise<{ inputs: string[]; text: s
     outdir: 'boundary-check',
     write: false,
   });
+  const metafile = result.metafile as Metafile;
+  const outputs = metafile.outputs;
+  // Lazy chunks are entry points of their own: start from this entry's chunk alone.
+  const queue = Object.keys(outputs).filter((path) =>
+    (outputs[path]!.entryPoint ?? '').replaceAll('\\', '/').endsWith(`src/${entry}`),
+  );
+  const chunks = new Set<string>();
+  while (queue.length > 0) {
+    const path = queue.pop()!;
+    if (chunks.has(path)) continue;
+    chunks.add(path);
+    for (const imported of outputs[path]!.imports)
+      if (imported.kind === 'import-statement' && outputs[imported.path]) queue.push(imported.path);
+  }
   return {
-    inputs: Object.keys((result.metafile as Metafile).inputs),
+    inputs: Object.keys(metafile.inputs),
+    eager: [...new Set([...chunks].flatMap((path) => Object.keys(outputs[path]!.inputs)))],
     text: result.outputFiles.map((file) => file.text).join('\n'),
   };
 }
@@ -41,8 +64,9 @@ describe('the 2.4 edge-safe entries', () => {
   ])(
     '%s reaches no node: builtin and no native executor module',
     async (entry) => {
-      const { inputs, text } = await browserBundle(entry);
-      expect(inputs.filter((input) => EXECUTOR.test(input))).toEqual([]);
+      const { inputs, eager, text } = await browserBundle(entry);
+      // Never statically: the native launcher loads the executor with import().
+      expect(eager.filter((input) => EXECUTOR.test(input))).toEqual([]);
       expect(inputs.filter((input) => /[\/]node[\/]/.test(input))).toEqual([]);
       expect(NODE_IMPORT.test(text)).toBe(false);
     },
