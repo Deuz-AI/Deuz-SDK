@@ -319,6 +319,29 @@ describe.skipIf(!liveUrl)('Postgres V3 run store (live server)', () => {
     }
   });
 
+  it('keeps a package whose put races a prune, for the run that saves it next', async () => {
+    const schema = await freshSchema();
+    const writer = createPostgresAgentRunStoreV3({ pool, schema });
+    const pruner = createPostgresAgentRunStoreV3({ pool, schema });
+    await writer.migrate();
+    await pruner.migrate();
+    for (let round = 0; round < 6; round++) {
+      const blob = await contextPackageBlob(contextPackage(0, `prune-race-${round}`));
+      await writer.putBlob(blob);
+      await writer.save(withBlobs(`old-${round}`, 1, [blob], { phase: 'terminal' }));
+      await wait(5);
+      const cut = await databaseNow(pool);
+      await wait(5);
+      const [, pruned] = await Promise.all([
+        writer.putBlob(blob),
+        pruner.prune({ terminalBefore: cut + 50 }),
+      ]);
+      expect(pruned).toBe(1);
+      await writer.save(withBlobs(`new-${round}`, 1, [blob]));
+      expect((await writer.getBlob(blob.digest)).status, `round ${round}`).toBe('found');
+    }
+  });
+
   it('opens and ends its own pool from a connection string', async () => {
     const schema = await freshSchema();
     const store = createPostgresAgentRunStoreV3({ connectionString: liveUrl!, schema });

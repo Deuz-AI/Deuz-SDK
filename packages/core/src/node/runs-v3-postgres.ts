@@ -8,8 +8,14 @@
  * configured schema. Times are the DATABASE clock, as for the 2.3 ops store.
  * The store needs a pool: every write is one transaction on one pinned
  * connection (`withPgTransaction`), at SERIALIZABLE, so a package put that
- * races a forget, or a save that races a prune, is retried instead of
- * leaving a forgotten record unredacted or a step without its package.
+ * races a forget is retried instead of leaving a forgotten record
+ * unredacted. A put of a stored package refreshes its `created_at`, and
+ * `prune` keeps a package put again after the last save of every run that
+ * pointed to it, so a run that writes a package an old run also used keeps
+ * it when a prune comes between its put and its save (a put that races the
+ * prune is retried). Only a put made before such a run's last save is not
+ * protected: if the writer saves after the prune, its reopened step finds
+ * the package missing and compiles that step again.
  */
 import {
   agentRunV3BlobDigests,
@@ -90,11 +96,20 @@ export function createPostgresAgentRunStoreV3(
   const forgottenRecord = `EXISTS (SELECT 1 FROM ${forgotten} t
     WHERE t.record_id = r.record_id
       AND (r.revision = ${NO_REVISION} OR t.revision = ${NO_REVISION} OR t.revision = r.revision))`;
-  /** The blobs a pruned run points to and no kept run does; `$1` is the cutoff. */
-  const doomed = `SELECT f.digest FROM ${refs} f JOIN ${runs} u ON u.run_id = f.run_id
-      WHERE u.phase = 'terminal' AND u.updated_at < $1::bigint
-    EXCEPT SELECT f.digest FROM ${refs} f JOIN ${runs} u ON u.run_id = f.run_id
-      WHERE NOT (u.phase = 'terminal' AND u.updated_at < $1::bigint)`;
+  /**
+   * The blobs a pruned run points to and no kept run does, except one put
+   * again after the last save of every run pointing to it (a run that has
+   * not saved yet is using it); `$1` is the cutoff.
+   */
+  const doomed = `SELECT d.digest FROM (
+      SELECT f.digest FROM ${refs} f JOIN ${runs} u ON u.run_id = f.run_id
+        WHERE u.phase = 'terminal' AND u.updated_at < $1::bigint
+      EXCEPT SELECT f.digest FROM ${refs} f JOIN ${runs} u ON u.run_id = f.run_id
+        WHERE NOT (u.phase = 'terminal' AND u.updated_at < $1::bigint)
+    ) d
+    WHERE NOT EXISTS (SELECT 1 FROM ${blobs} b WHERE b.digest = d.digest AND b.created_at > (
+      SELECT max(u.updated_at) FROM ${refs} f JOIN ${runs} u ON u.run_id = f.run_id
+        WHERE f.digest = d.digest))`;
 
   let owned: Promise<PgPoolLike> | undefined;
   let ready: Promise<void> | undefined;
@@ -290,9 +305,11 @@ export function createPostgresAgentRunStoreV3(
       await withPgTransaction(
         await use(),
         async (tx) => {
+          // A put of a stored package refreshes its time, which prune reads.
           await tx.query(
-            `INSERT INTO ${blobs} (digest, content, bytes, redacted, created_at)
-             VALUES ($1, $2, $3, false, ${NOW}) ON CONFLICT (digest) DO NOTHING`,
+            `INSERT INTO ${blobs} AS b (digest, content, bytes, redacted, created_at)
+             VALUES ($1, $2, $3, false, ${NOW})
+             ON CONFLICT (digest) DO UPDATE SET created_at = GREATEST(b.created_at, EXCLUDED.created_at)`,
             [blob.digest, blob.content, bytes],
           );
           if (blob.records.length > 0)
@@ -358,8 +375,10 @@ export function createPostgresAgentRunStoreV3(
       return withPgTransaction(
         await use(),
         async (tx) => {
-          await tx.query(`DELETE FROM ${records} WHERE digest IN (${doomed})`, [cutoff]);
+          // Blob rows before record rows, the order putBlob locks them in, so
+          // a put racing the prune waits for it instead of deadlocking.
           await tx.query(`DELETE FROM ${blobs} WHERE digest IN (${doomed})`, [cutoff]);
+          await tx.query(`DELETE FROM ${records} WHERE digest IN (${doomed})`, [cutoff]);
           await tx.query(
             `DELETE FROM ${refs} WHERE run_id IN (
                SELECT run_id FROM ${runs} WHERE phase = 'terminal' AND updated_at < $1::bigint)`,

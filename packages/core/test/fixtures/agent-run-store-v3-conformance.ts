@@ -17,7 +17,11 @@
  */
 import { describe, expect, it } from 'vitest';
 import { assertAgentRunStoreV3 } from '../../src/agent-run-v3';
-import { contextPackageBlob, type ContextPackageBlob } from '../../src/agent-run-v3-context';
+import {
+  contextPackageBlob,
+  readContextPackage,
+  type ContextPackageBlob,
+} from '../../src/agent-run-v3-context';
 import { RevisionConflictError } from '../../src/errors';
 import { sha256Digest } from '../../src/internal/digest';
 import type { AgentResult } from '../../src/types/agent-run';
@@ -342,6 +346,33 @@ export function agentRunStoreV3Contracts(
           TypeError,
         );
         await expect(rejects(() => store.prune(undefined as never))).rejects.toThrow(TypeError);
+      }),
+    );
+
+    it(
+      'keeps a package put again after the last save of the runs that used it',
+      withHarness(async ({ store, advance, now }) => {
+        // An old run used the package and ended.
+        const shared = await contextPackageBlob(contextPackage(0, 'shared'));
+        await store.putBlob(shared);
+        await store.save(withBlobs('old', 1, [shared], { phase: 'terminal' }));
+        await advance(30);
+        // A new run compiles the same package: the put finds it stored, and a
+        // prune of everything older than now comes before the run's save.
+        await store.putBlob(shared);
+        await advance(30);
+        const cut = await now();
+        expect(await store.prune({ terminalBefore: cut })).toBe(1);
+        await store.save(withBlobs('new', 1, [shared]));
+        const loaded = await store.load('new');
+        expect(await readContextPackage(store, loaded!.context!.steps[0]!)).toMatchObject({
+          status: 'found',
+        });
+        // Once the new run is pruned as well, nothing keeps the package.
+        await store.save(withBlobs('new', 2, [shared], { phase: 'terminal' }));
+        await advance(30);
+        expect(await store.prune({ terminalBefore: await now() })).toBe(1);
+        expect(await store.getBlob(shared.digest)).toEqual({ status: 'missing' });
       }),
     );
   });

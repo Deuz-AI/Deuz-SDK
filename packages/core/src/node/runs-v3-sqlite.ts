@@ -7,7 +7,9 @@
  * Tables, all prefixed `deuz_runs_v3`:
  * - `deuz_runs_v3`: one row per run, the encoded envelope with its revision,
  *   phase, result status and last save time (the store clock) as columns;
- * - `_blobs`: context packages by digest, `content` NULL once redacted;
+ * - `_blobs`: context packages by digest, `content` NULL once redacted,
+ *   `created_at` the time of the last put (a put of a stored package
+ *   refreshes it);
  * - `_blob_records`: the memory record revisions each blob holds (`-1`: none);
  * - `_blob_refs`: which runs point to which blobs, for retention;
  * - `_forgotten`: forget tombstones (ids only, `-1`: every revision), so a
@@ -105,13 +107,23 @@ const FORGOTTEN_RECORD = `EXISTS (SELECT 1 FROM deuz_runs_v3_forgotten t
 /** Runs `prune` deletes: terminal, last saved before `?`. */
 const PRUNED = `phase = 'terminal' AND updated_at < ?`;
 
-/** The blobs a pruned run points to and no kept run does (the cutoff bound twice). */
-const DOOMED = `SELECT f.digest FROM deuz_runs_v3_blob_refs f
-  JOIN deuz_runs_v3 u ON u.run_id = f.run_id
-  WHERE u.phase = 'terminal' AND u.updated_at < ?
-  EXCEPT SELECT f.digest FROM deuz_runs_v3_blob_refs f
-  JOIN deuz_runs_v3 u ON u.run_id = f.run_id
-  WHERE NOT (u.phase = 'terminal' AND u.updated_at < ?)`;
+/**
+ * The blobs a pruned run points to and no kept run does (the cutoff bound
+ * twice), except one put again after the last save of every run pointing to
+ * it: a run that has not saved yet is using it.
+ */
+const DOOMED = `SELECT d.digest FROM (
+    SELECT f.digest FROM deuz_runs_v3_blob_refs f
+    JOIN deuz_runs_v3 u ON u.run_id = f.run_id
+    WHERE u.phase = 'terminal' AND u.updated_at < ?
+    EXCEPT SELECT f.digest FROM deuz_runs_v3_blob_refs f
+    JOIN deuz_runs_v3 u ON u.run_id = f.run_id
+    WHERE NOT (u.phase = 'terminal' AND u.updated_at < ?)
+  ) d
+  WHERE NOT EXISTS (SELECT 1 FROM deuz_runs_v3_blobs b
+    WHERE b.digest = d.digest AND b.created_at > (
+      SELECT MAX(u.updated_at) FROM deuz_runs_v3_blob_refs f
+      JOIN deuz_runs_v3 u ON u.run_id = f.run_id WHERE f.digest = d.digest))`;
 
 type SqlValue = string | number | null;
 
@@ -265,7 +277,8 @@ export function createSqliteAgentRunStoreV3(
           run(
             s,
             `INSERT INTO deuz_runs_v3_blobs (digest, content, bytes, redacted, created_at)
-             VALUES (?, ?, ?, 0, ?) ON CONFLICT (digest) DO NOTHING`,
+             VALUES (?, ?, ?, 0, ?)
+             ON CONFLICT (digest) DO UPDATE SET created_at = MAX(created_at, excluded.created_at)`,
             [blob.digest, blob.content, bytes, clock.now()],
           );
           for (const record of blob.records)
