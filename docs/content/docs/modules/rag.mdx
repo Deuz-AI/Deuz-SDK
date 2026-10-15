@@ -406,6 +406,8 @@ unless you give `usd`. Then:
 
 - an accounted embedder (`accounted: true`, answering `{ vectors, usage,
   modelId }`) settles the reservation with the usage it reports;
+  `defineAccountedEmbedder({ embed, dims })` from `@deuz-sdk/core/rag` marks
+  one (a `TypeError` without `embed` or `dims`);
 - a plain embedder (bare vectors) leaves the reservation `unknown` at its
   estimate and reports one `unaccounted-usage` warning through `onWarning`;
 - a failed call is marked `unknown` (it may have been billed) and the error is

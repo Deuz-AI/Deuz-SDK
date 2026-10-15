@@ -955,12 +955,15 @@ carry the stored revision plus one, otherwise it throws `RevisionConflictError`
 stored revision). `list(query)` pages like `AgentRunStore.list`. Each compiled
 context package is stored once as a content-addressed blob (`putBlob`,
 `getBlob`), keyed by the `sha256:` of its blocks' canonical JSON; content that
-does not match its digest is rejected. `inspectRun` from
+does not match its digest is rejected. `getBlob(digest)` answers
+`{ status: 'found', content }`, `{ status: 'redacted' }` or
+`{ status: 'missing' }`. `inspectRun` from
 [`@deuz-sdk/core/headless`](/docs/modules/headless) reads a V3 store too.
 
 Redis has no V3 store in 2.4. A Redis `AgentRunStore` with
 `checkpointVersion: 3` is refused at configuration time with
-`UnsupportedStoreError` (`code: 'unsupported_store'`). Version 1 and 2 records
+`UnsupportedStoreError` (`code: 'unsupported_store'`, `backend: 'redis'`,
+`feature: 'agent-run-v3'`). Version 1 and 2 records
 are never converted: existing runs finish on the 2.3 path.
 
 ### What a V3 run refuses
@@ -1083,7 +1086,7 @@ const result = await runAgent({
 const record = await runs.load('tea-1');
 console.log(result.status, record?.memoryIntents?.map((i) => i.status)); // completed [ 'acknowledged' ]
 const [hit] = await memory.recall({ text: 'tea' });
-console.log(hit?.record.origin, hit?.record.sources[0]?.messageId); // inferred tea-1#0
+console.log(hit?.record.origin, hit?.record.sources[0]?.messageId); // inferred tea-1:0
 
 // For a run whose acknowledgment was lost; a settled run reports its state.
 console.log(await reconcileAgentRun({ checkpointVersion: 3, session, versionedMemory: { session: memory } }));

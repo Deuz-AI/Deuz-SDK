@@ -156,8 +156,9 @@ the request leaves (`inputTokens − usedTokens`). When it does not,
 budget has left after it. A failed required source in the results is refused
 with `InvalidRequestError`, so the call stops instead of compiling without it.
 
-`compileContext` is pure and deterministic: no I/O, no clock, no randomness, and
-the same input gives the same package byte for byte.
+`compileContext` is pure, deterministic and synchronous: it returns the package,
+not a Promise, with no I/O, no clock and no randomness, and the same input
+gives the same package byte for byte.
 
 ## Selection and the manifest
 
@@ -219,7 +220,10 @@ intact:
 `createContextCompiler(options)` (preview) implements the loop hooks
 `beforeModelCall(input)` and `onOverflow(input)`, plus `requestRefresh()` and
 `state()`. It queries the sources when a refresh is due and compiles with
-`compileContext`.
+`compileContext`. Its options are `sources`, `budget`, `refresh`, `scope`,
+`estimator` (a shared `createTokenEstimator`), `estimatorKind`, `state`, `deps`
+(clock, observer) and `onWarning`; the `refresh` defaults are exported as
+`DEFAULT_CONTEXT_REFRESH`.
 
 | Setting (`refresh`) | Default | Meaning |
 | --- | --- | --- |
@@ -278,8 +282,16 @@ error. Two sources with the same id throw a `TypeError`.
 used, the last refresh step and active task, every placed entry and the last
 package's blob. A compiler created with that `state` compiles the same context.
 An entry whose append block a compaction removed is placed again from what the
-same compiler instance retrieved; after a restart it waits for the next
-refresh.
+same compiler instance retrieved. After a restart an optional entry waits for
+the next refresh, while a mandatory one (a loaded skill body) is asked of its
+source again at once, past `minSteps` and `maxPasses` and without spending a
+pass. Only a record's latest placement comes back, never an older revision
+after a newer one.
+
+`redacted: true` on the step input forces a fresh retrieval (refresh
+`'redacted'`, `manifest.redacted: true`) past `minSteps` and `maxPasses`. Pass
+it when the stored package of the step you compile again was redacted by a
+`forget`; a V3 run does this itself.
 
 `onOverflow(input)` recompiles the step's package from the same retrieval under
 the smaller `inputTokens` of an overflow (refresh `'overflow-retry'`), replacing
@@ -327,7 +339,10 @@ corrects itself from real usage, or wraps your own tokenizer. Through it:
 `ANTHROPIC_TOOL_FRAMING_TOKENS` (346) is added only for provider `'anthropic'`
 when tools are present; `framingTokens` replaces it. These are estimates, and a
 provider's real count can differ; the manifest's `estimator` says what the
-counts rest on (`{ kind: 'heuristic', calibrated: false }` by default). `/rag`
+counts rest on (`{ kind: 'heuristic', calibrated: false }` by default). Set it
+with the compiler's `estimatorKind`, or per step with `estimatorKind` on the
+step input; a V3 run with `context.estimator` reports `calibrated: true` once
+the loop has calibrated the estimator with real usage. `/rag`
 keeps its own 4 characters per token so chunk boundaries do not move; see
 [RAG](/docs/modules/rag#token-counting-and-accounting-24).
 
@@ -424,7 +439,10 @@ console.log(confirmed.snapshot.revision, confirmed.snapshot.hypotheses[0]?.statu
 
 A malformed patch, snapshot or options object throws a `TypeError`. Generated
 item ids are `<list>-<revision>-<index>`, constraint ids from
-`createWorkingMemory` are `constraints-0-<i>`.
+`createWorkingMemory` are `constraints-0-<i>`. Its `tasks` input is
+`{ list, activeTaskId? }` and starts at `listRevision` 1. `set-tasks` raises
+`listRevision` and keeps the previous active task when the new list still has
+it; `set-active-task` takes a task id, or `null` to clear it.
 
 After the critical fields, the compiler fills the working memory share in this
 order: the task list, decisions (accepted, then proposed, then reverted),
@@ -436,7 +454,9 @@ rejected), observations. Ties go to the newest revision, then the id.
 
 `workingMemoryTools({ memory, prefix?, agentPath? })` gives the model
 `working_memory_read`, `working_memory_add` and `working_memory_update` over a
-`WorkingMemoryHandle` (`current()` and `apply(patch)`).
+`WorkingMemoryHandle` (`current()` and `apply(patch)`). `prefix` (default
+`'working_memory'`) names the tools `<prefix>_read`, `<prefix>_add` and
+`<prefix>_update`; `agentPath` defaults to `[]`.
 
 - `working_memory_add` takes `{ items }`, 1 to 16 entries of `{ kind, text,
   rationale?, outcome?, detail?, evidence? }`, where `kind` is `observation`,
