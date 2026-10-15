@@ -11,11 +11,11 @@
  * intent its state no longer names; launch the intent the state names
  * (claimed with the lease token, which fences out every earlier holder);
  * record a due retry; resume a run the host made active again; start an
- * automatic run. Every intent is recorded with a runtime state
- * whose `activeRun` names it, so every crash between two steps leaves a
- * state the next drive continues from. Fencing is the store's revision CAS:
- * the lease is liveness only. A drive that loses its lease drains the run it
- * started and writes nothing more.
+ * automatic run. Every intent is recorded with a runtime state whose
+ * `activeRun` names it, so every crash between two steps leaves a state the
+ * next drive continues from. Fencing is the store's revision CAS: the lease
+ * is liveness only. A drive that loses its lease drains the run it started
+ * and writes nothing more.
  *
  * Edge-safe.
  */
@@ -46,6 +46,7 @@ import type {
   RunLauncher,
 } from './supervisor';
 import {
+  carriedRun,
   goalAttributes,
   goalLeaseKey,
   inheritedWorkingMemory,
@@ -53,7 +54,6 @@ import {
   quietly,
   reportGeneration,
   runIdFor,
-  carriedRun,
   stampWorkingMemory,
   withoutRun,
   type EventHub,
