@@ -26,6 +26,7 @@ import type {
   AgentRunMemoryExtraction,
   AgentRunMemoryState,
   AgentRunOptions,
+  AgentRunReconcileOptions,
   AgentStream,
 } from './agent-run';
 
@@ -190,3 +191,18 @@ export type AgentEventV3<T = string> =
 export interface AgentStreamV3<T = string> extends AgentStream<T> {
   readonly eventsV3: AsyncIterable<AgentEventV3<T>>;
 }
+
+/**
+ * What `reconcileAgentRun` settles for a V3 run (2.4): the 2.3 options with
+ * `checkpointVersion: 3` and the V3 session. With `versionedMemory`, the
+ * run's versioned-memory intents whose acknowledgment was lost are settled
+ * from the session's receipts (an operation that committed is replayed,
+ * never applied again). The answer is the 2.3 `AgentRunReconciliation`; a V3
+ * extraction the stored record holds as `'partial'` is reported there as
+ * `'failed'` with its `memory-extraction-partial` warning, as for 2.3 runs.
+ */
+export type AgentRunReconcileOptionsV3 = Omit<AgentRunReconcileOptions, 'session'> & {
+  checkpointVersion: 3;
+  session: AgentRunSessionV3;
+  versionedMemory?: { session: MemorySession };
+};

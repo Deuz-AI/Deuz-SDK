@@ -13,6 +13,12 @@ import type {
   AgentToolReceipt,
   AgentValidation,
 } from './types/agent-run';
+import type {
+  AgentEventV3,
+  AgentRunOptionsV3,
+  AgentRunReconcileOptionsV3,
+  AgentStreamV3,
+} from './types/agent-run-v3';
 import type { ChatStore } from './chat';
 import type { CommonCallOptions } from './types/config';
 import type { StopDetails } from './types/methods';
@@ -97,7 +103,43 @@ export type * from './types/agent-run';
 // This coordinates one JavaScript process. When multiple processes or distinct
 // store wrappers share a store, the `lease` option (2.3) claims the run across
 // them; the store's revision check stays the fence against a stale writer.
-const activeNativeRuns = new WeakMap<AgentRunStore, Set<string>>();
+// Keyed by the store object: a 2.3 `AgentRunStore` or (2.4) an `AgentRunStoreV3`.
+const activeNativeRuns = new WeakMap<object, Set<string>>();
+
+/** The options only a V3 run takes (2.4); a 2.3 run that passes one is refused. */
+const V3_ONLY_OPTIONS = ['context', 'workingMemory', 'versionedMemory'] as const;
+
+/**
+ * Whether a run takes the V3 path (2.4): `checkpointVersion: 3`. Any other
+ * value is refused before anything is read or written.
+ */
+function checkpointVersionOf(options: object): 3 | undefined {
+  const version = (options as { checkpointVersion?: unknown }).checkpointVersion;
+  if (version === undefined) return undefined;
+  if (version !== 3)
+    throw new TypeError(
+      `checkpointVersion must be 3 (the V3 run path); got ${JSON.stringify(version)}.`,
+    );
+  return 3;
+}
+
+/** A 2.3 run given a V3 option or a V3 store is a configuration mistake (2.4). */
+function assertNoV3Options(options: object, store: unknown): void {
+  for (const key of V3_ONLY_OPTIONS)
+    if ((options as Record<string, unknown>)[key] !== undefined)
+      throw new TypeError(
+        `${key} needs a V3 run: pass checkpointVersion: 3 with a V3 session (an AgentRunStoreV3).`,
+      );
+  if ((store as { checkpointVersion?: unknown } | undefined)?.checkpointVersion === 3)
+    throw new TypeError(
+      'This run store keeps V3 runs only: pass checkpointVersion: 3, or use a 2.3 AgentRunStore.',
+    );
+}
+
+/** Whether this path reads a stored `version`: 3 on the V3 path, 1 or 2 otherwise. */
+function readsVersion(version: unknown, v3: boolean): boolean {
+  return v3 ? version === 3 : version === 1 || version === 2;
+}
 
 function errorData(error: unknown): { name: string; message: string; code?: string } {
   if (error instanceof Error) {
@@ -261,6 +303,16 @@ function envelopeVersion(envelope: AgentRunEnvelope): 1 | 2 {
     openTurnMisreadBy22(envelope)
     ? 2
     : 1;
+}
+
+/**
+ * Stamps the version a save writes: always 3 on the V3 path (2.4: a V3 record
+ * is never written back as 1 or 2, terminal and bookkeeping saves included),
+ * else {@link envelopeVersion}.
+ */
+function stampVersion(envelope: AgentRunEnvelope, v3: boolean): void {
+  if (v3) (envelope as { version: number }).version = 3;
+  else envelope.version = envelopeVersion(envelope);
 }
 
 /**
@@ -457,8 +509,14 @@ export function createInMemoryAgentRunStore(
  * one holds it (an executor keeps its lease until its extraction is saved).
  */
 export async function reconcileAgentRun(
-  options: AgentRunReconcileOptions,
+  input: AgentRunReconcileOptions | AgentRunReconcileOptionsV3,
 ): Promise<AgentRunReconciliation> {
+  // One executor for both paths (2.4): a V3 run is read from its V3 store and
+  // saved back as version 3, never as 1 or 2.
+  const v3 = checkpointVersionOf(input) === 3;
+  const options = input as AgentRunReconcileOptions;
+  if (v3) (await import('./agent-run-v3-run')).assertV3Session(input.session as never);
+  else assertNoV3Options({}, options.session?.store);
   const { store, runId, scope } = options.session ?? ({} as Partial<AgentRunSession>);
   if (!store || !runId || !scope)
     throw new TypeError('reconcileAgentRun requires a session with a store, runId and scope.');
@@ -484,7 +542,7 @@ export async function reconcileAgentRun(
     if (!saved) throw new TypeError(`Unknown native run: ${runId}`);
     if (
       saved.kind !== 'deuz-agent-run' ||
-      (saved.version !== 1 && saved.version !== 2) ||
+      !readsVersion(saved.version, v3) ||
       saved.runId !== runId ||
       saved.scope !== scope
     )
@@ -504,7 +562,7 @@ export async function reconcileAgentRun(
     const save = async (): Promise<void> => {
       // A call that lost the lease saves nothing more to the run.
       lease?.assertHeld();
-      envelope.version = envelopeVersion(envelope);
+      stampVersion(envelope, v3);
       envelope.revision = (envelope.revision ?? 0) + 1;
       await store.save(structuredClone(envelope));
     };
@@ -589,28 +647,65 @@ export async function reconcileAgentRun(
   }
 }
 
-export function runAgent<T = string>(options: AgentRunOptions<T>): Promise<AgentResult<T>> {
-  return streamAgent(options).result;
+/**
+ * Run a native agent. With `checkpointVersion: 3` (2.4) the run takes the V3
+ * path: a V3 session and store, compiled context, working memory and
+ * versioned memory, on the same executor.
+ */
+export function runAgent<T = string>(options: AgentRunOptionsV3<T>): Promise<AgentResult<T>>;
+export function runAgent<T = string>(options: AgentRunOptions<T>): Promise<AgentResult<T>>;
+export function runAgent<T = string>(
+  options: AgentRunOptions<T> | AgentRunOptionsV3<T>,
+): Promise<AgentResult<T>> {
+  return makeAgentStream(options, false).result;
 }
 
+export function resumeAgent<T = string>(options: AgentRunOptionsV3<T>): Promise<AgentResult<T>>;
 export function resumeAgent<T = string>(
   options: AgentRunOptions<T> & { session: AgentRunSession },
+): Promise<AgentResult<T>>;
+export function resumeAgent<T = string>(
+  options: (AgentRunOptions<T> & { session: AgentRunSession }) | AgentRunOptionsV3<T>,
 ): Promise<AgentResult<T>> {
-  return resumeStreamAgent(options).result;
+  return makeAgentStream(options, true).result;
 }
 
-export function streamAgent<T = string>(options: AgentRunOptions<T>): AgentStream<T> {
+export function streamAgent<T = string>(options: AgentRunOptionsV3<T>): AgentStreamV3<T>;
+export function streamAgent<T = string>(options: AgentRunOptions<T>): AgentStream<T>;
+export function streamAgent<T = string>(
+  options: AgentRunOptions<T> | AgentRunOptionsV3<T>,
+): AgentStream<T> | AgentStreamV3<T> {
   return makeAgentStream(options, false);
 }
 
+export function resumeStreamAgent<T = string>(options: AgentRunOptionsV3<T>): AgentStreamV3<T>;
 export function resumeStreamAgent<T = string>(
   options: AgentRunOptions<T> & { session: AgentRunSession },
-): AgentStream<T> {
+): AgentStream<T>;
+export function resumeStreamAgent<T = string>(
+  options: (AgentRunOptions<T> & { session: AgentRunSession }) | AgentRunOptionsV3<T>,
+): AgentStream<T> | AgentStreamV3<T> {
   return makeAgentStream(options, true);
 }
 
-function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): AgentStream<T> {
+function makeAgentStream<T>(
+  input: AgentRunOptions<T> | AgentRunOptionsV3<T>,
+  resume: boolean,
+): AgentStream<T> & Partial<Pick<AgentStreamV3<T>, 'eventsV3'>> {
+  // One executor for both paths (2.4). The V3 options are those of a 2.3 run
+  // plus the V3 ones, which only the V3 branches below read.
+  const options = input as AgentRunOptions<T>;
+  const v3Options = input as AgentRunOptionsV3<T>;
+  /** The run takes the V3 path; checked (with the rest) at the start of the pump. */
+  const v3 = (input as { checkpointVersion?: unknown }).checkpointVersion === 3;
   const events = createBroadcaster<AgentEvent<T>>();
+  /** The V3 view of the events (2.4): every 2.3 event, plus the V3 ones. */
+  const eventsV3 = v3 ? createBroadcaster<AgentEventV3<T>>() : undefined;
+  /** Every run event goes to both views, in one order. */
+  const pushEvent = (event: AgentEvent<T>): void => {
+    events.push(event);
+    eventsV3?.push(event);
+  };
   const text = createBroadcaster<string>();
   const partial = createBroadcaster<{ attempt: number; value: unknown }>();
   type Element = T extends readonly (infer E)[] ? E : never;
@@ -647,6 +742,8 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
   /** Chat and memory support (2.3), loaded when the run uses them. */
   let nativeChat: typeof import('./internal/native-chat') | undefined;
   let nativeMemory: typeof import('./internal/native-memory') | undefined;
+  /** The V3 runtime (2.4), loaded when the run takes the V3 path. */
+  let nativeV3: typeof import('./agent-run-v3-run') | undefined;
   /** Model fail-over (2.3): the routing of every model call, once `fallbackModels` is set. */
   let router: import('./internal/native-fallback').ModelRouter | undefined;
   /** The run's memory scope is claimed for its execution until the executor ends (2.3). */
@@ -685,7 +782,7 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
     if (common?.execution) envelope.execution = executionSnapshot(common.execution);
     if (!options.session || !admitted) return Promise.resolve();
     persistedLedger = ledgerKey(envelope.execution);
-    envelope.version = envelopeVersion(envelope);
+    stampVersion(envelope, v3);
     // Every actual save advances the fence durable stores check (2.2).
     envelope.revision = (envelope.revision ?? 0) + 1;
     const snapshot = structuredClone(envelope);
@@ -714,7 +811,7 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
     if (!options.session) return true;
     if (persistFailed) return false;
     const snapshot = structuredClone(envelope);
-    snapshot.version = envelopeVersion(snapshot);
+    stampVersion(snapshot, v3);
     snapshot.revision = (envelope.revision ?? 0) + 1;
     const write = writeTail.then(() => {
       lease?.assertHeld();
@@ -861,7 +958,7 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
   /** A drain reached this executor's lease (2.3). A cancel or abort outranks it. */
   const drainDue = (): boolean => lease !== undefined && lease.draining && !lease.signal.aborted;
   function emitPart(part: StreamPart, phase: 'running' | 'finalizing'): void {
-    events.push({ type: 'part', part, phase });
+    pushEvent({ type: 'part', part, phase });
     if (part.type === 'text-delta') text.push(part.text);
   }
 
@@ -900,6 +997,12 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
         throw new TypeError("onCatalogChange must be 'stop' or 'accept'.");
       if (options.retryFailed !== undefined && typeof options.retryFailed !== 'boolean')
         throw new TypeError('retryFailed must be a boolean.');
+      // The V3 path (2.4) is chosen explicitly and checked before anything is
+      // read or written: a V3 session and store, and the V3 options only there.
+      if (checkpointVersionOf(input) === 3) {
+        nativeV3 = await import('./agent-run-v3-run');
+        nativeV3.assertV3Session(v3Options.session);
+      } else assertNoV3Options(input, options.session?.store);
       if (options.session && (!options.session.runId || !options.session.scope)) {
         throw new TypeError('Native sessions require non-empty runId and scope.');
       }
@@ -970,7 +1073,7 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
         if (!saved) throw new TypeError(`Unknown native run: ${options.session.runId}`);
         if (
           saved.kind !== 'deuz-agent-run' ||
-          (saved.version !== 1 && saved.version !== 2) ||
+          !readsVersion(saved.version, v3) ||
           saved.runId !== options.session.runId ||
           saved.scope !== options.session.scope
         )
@@ -1025,6 +1128,11 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
           chat: undefined,
           memory: undefined,
           fallbackModels: undefined,
+          // Nor the V3 options (2.4): the run hands its loop what they build.
+          checkpointVersion: undefined,
+          context: undefined,
+          workingMemory: undefined,
+          versionedMemory: undefined,
           messages: resume ? envelope.messages : options.messages,
           prompt: resume ? undefined : options.prompt,
           instructions: resume ? undefined : options.instructions,
@@ -1091,7 +1199,7 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
         (options.clientToolResults ?? []).map((item) => [item.toolCallId, item]),
       );
       const onToolOutput = (output: NativeToolOutput): void => {
-        events.push({ type: 'tool-output', ...output });
+        pushEvent({ type: 'tool-output', ...output });
       };
       /**
        * Save `messages`, the history of the step in flight, as the run's
@@ -1717,7 +1825,7 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
             drained();
             return;
           }
-          events.push({ type: 'phase', phase: 'running' });
+          pushEvent({ type: 'phase', phase: 'running' });
           // A leg whose model call failed over (2.3) runs again from the run's
           // last checkpoint, so only that call is repeated; without one, from
           // the history the first leg started with.
@@ -1922,7 +2030,7 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
       }
 
       envelope.phase = 'finalizing';
-      events.push({ type: 'phase', phase: 'finalizing' });
+      pushEvent({ type: 'phase', phase: 'finalizing' });
       await persist();
       // A handoff (2.0) gives its target every following step, finalization
       // included (2.3): the target's model answers, with the target's tools on
@@ -2064,7 +2172,7 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
                 lastDraft = encoded;
                 const value = { attempt, value: draft.value };
                 partial.push(value);
-                events.push({ type: 'partial-output', ...value });
+                pushEvent({ type: 'partial-output', ...value });
               }
             }
             if (output.element) {
@@ -2079,7 +2187,7 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
                     complete[index],
                   );
                   elements.push({ attempt, index, value });
-                  events.push({ type: 'array-element', attempt, index, value });
+                  pushEvent({ type: 'array-element', attempt, index, value });
                 } catch {
                   /* rejected element stays absent from the validated stream */
                 }
@@ -2359,10 +2467,11 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
       await lease?.release(terminalSaved);
       releaseRun?.();
       if (settledOutcome) {
-        events.push({ type: 'result', result: settledOutcome });
+        pushEvent({ type: 'result', result: settledOutcome });
         result.resolve(settledOutcome);
       }
       events.close();
+      eventsV3?.close();
       text.close();
       partial.close();
       elements.close();
@@ -2385,6 +2494,7 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
   }
   return {
     events: stream(events),
+    ...(eventsV3 ? { eventsV3: stream(eventsV3) } : {}),
     textStream: stream(text),
     partialOutputStream: stream(partial),
     elementStream: stream(elements),
