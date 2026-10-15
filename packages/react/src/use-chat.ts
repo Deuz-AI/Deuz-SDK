@@ -82,6 +82,7 @@ import type { DeuzStreamSource, DeuzUIPart } from '@deuz-sdk/core/ui';
 import { connectDeuzStream, readDeuzStream } from '@deuz-sdk/core/ui';
 import {
   CAPABILITIES_HEADER,
+  CAPABILITY,
   CLIENT_CAPABILITIES,
   assertChatSnapshot,
   capabilitiesFromHeader,
@@ -1201,6 +1202,41 @@ export function useChat(options: UseChatOptions): UseChatResult {
     [handshake, commit],
   );
 
+  /**
+   * `messageIds` aligned with `history` (2.4). A message with no id yet (a
+   * tool result, a message `setHistory` could not pair) gets a generated one
+   * here and keeps it, so every export names it the same.
+   */
+  const idsFor = useCallback(
+    (history: readonly Message[]): string[] =>
+      history.map((message) => {
+        let id = messageIds.get(message);
+        if (id === undefined) {
+          id = genId();
+          messageIds.set(message, id);
+        }
+        return id;
+      }),
+    [messageIds, options.generateId],
+  );
+
+  /** Whether the server announced `capability` (2.4); never while the handshake is off. */
+  const serverHas = useCallback(
+    (capability: string): boolean =>
+      handshake && (snapshotRef.current.capabilities?.includes(capability) ?? false),
+    [handshake],
+  );
+
+  /** The ids of the messages the canonical history holds (2.4): settled messages. */
+  const settledIds = useCallback((): Set<string> => {
+    const held = new Set<string>();
+    for (const message of snapshotRef.current.history.canonical) {
+      const id = messageIds.get(message);
+      if (id !== undefined) held.add(id);
+    }
+    return held;
+  }, [messageIds]);
+
   /** Drop every parked gate — the turn they belonged to is no longer current. */
   const clearGates = useCallback((): void => {
     gateGenerationRef.current++;
@@ -1261,6 +1297,12 @@ export function useChat(options: UseChatOptions): UseChatResult {
   const stop = useCallback((): void => {
     abortRef.current?.abort();
   }, []);
+
+  /**
+   * The resume read, for `run` (2.4: a dropped durable read continues there).
+   * A ref because `runResume` is defined after `run` and calls it.
+   */
+  const runResumeRef = useRef<((silent: boolean) => Promise<void>) | undefined>(undefined);
 
   /**
    * Run or park the client calls a settled turn waits for. ONE path for a
@@ -1477,6 +1519,10 @@ export function useChat(options: UseChatOptions): UseChatResult {
       setStatus('streaming');
       setError(undefined);
       let continuation = initial;
+      // A durable stream (2.4): set while a POST read whose response announced
+      // `durable-stream` is in progress, so a drop can continue from the
+      // resume endpoint instead of failing.
+      let durableRead = false;
       try {
         if (gate) {
           // A native gate's client calls (2.3) run as this round's first step,
@@ -1499,6 +1545,10 @@ export function useChat(options: UseChatOptions): UseChatResult {
             },
             body: JSON.stringify({
               messages: snapshotRef.current.history.canonical,
+              // The server takes the ids the UI renders (2.4, `chat-snapshot-v1`).
+              ...(serverHas(CAPABILITY.chatSnapshot)
+                ? { messageIds: idsFor(snapshotRef.current.history.canonical) }
+                : {}),
               ...(options.chatId !== undefined ? { chatId: options.chatId } : {}),
               ...(continuation?.approvalResponses?.length
                 ? { approvalResponses: continuation.approvalResponses }
@@ -1514,7 +1564,9 @@ export function useChat(options: UseChatOptions): UseChatResult {
           });
           continuation = undefined; // consumed by this round only
           // What the route announces (2.4); its first frame says it again.
-          announce(capabilitiesFromHeader(res.headers?.get(CAPABILITIES_HEADER)));
+          const heard = capabilitiesFromHeader(res.headers?.get(CAPABILITIES_HEADER));
+          announce(heard);
+          durableRead = handshake && (heard?.includes(CAPABILITY.durableStream) ?? false);
 
           let turn = createAssistantTurn(genId());
           turnRef.current = turn;
@@ -1550,6 +1602,7 @@ export function useChat(options: UseChatOptions): UseChatResult {
             const announced = capabilitiesOf(part);
             if (announced) {
               announce(announced);
+              durableRead = handshake && announced.includes(CAPABILITY.durableStream);
               continue;
             }
             if (resume) recordPart(ledger, turn, part);
@@ -1565,6 +1618,7 @@ export function useChat(options: UseChatOptions): UseChatResult {
           // leaves the tail text/reasoning part 'streaming' by design — that
           // boundary belongs to the binding, so close it here. Returns the SAME
           // object when there is nothing to seal, hence no wasted render.
+          durableRead = false; // the read ended: what follows is no drop
           const sealed = sealAssistantTurn(turn);
           if (sealed !== turn) {
             turn = sealed;
@@ -1594,6 +1648,21 @@ export function useChat(options: UseChatOptions): UseChatResult {
           }
           return;
         }
+        // The read of a durable stream dropped (2.4, `durable-stream`): the
+        // server committed every frame before sending it and keeps producing
+        // without this client, so the turn continues from the resume endpoint
+        // after what this read delivered, every frame once. Only when the read
+        // moved the cursor, so the continuation addresses this turn; a failed
+        // continuation reports its own error.
+        if (
+          durableRead &&
+          options.resume &&
+          turnRef.current !== undefined &&
+          cursorTurnRef.current === turnRef.current
+        ) {
+          await runResumeRef.current?.(false);
+          return;
+        }
         const e = err instanceof Error ? err : new Error(String(err));
         setError(e);
         setStatus('error');
@@ -1621,6 +1690,8 @@ export function useChat(options: UseChatOptions): UseChatResult {
       fold,
       flush,
       handshake,
+      idsFor,
+      serverHas,
       settleClientCalls,
       settleTurn,
       syncTurn,
@@ -1897,6 +1968,9 @@ export function useChat(options: UseChatOptions): UseChatResult {
           ...(transport ? { fetch: transport } : {}),
           ...(headers ? { headers } : {}),
         });
+        // Dedupe by message id (2.4, `message-ids`): set while the read
+        // re-delivers a message the history already holds.
+        let skipping = false;
         for await (const part of parts) {
           // The handshake's frame (2.4): the hook's, never a part of the turn,
           // and never content (a caught-up read that sends only it is a no-op).
@@ -1905,6 +1979,19 @@ export function useChat(options: UseChatOptions): UseChatResult {
             announce(announced);
             continue;
           }
+          // A message is every frame from its `start` to the next one. When
+          // the server's ids are stable and unique (`message-ids`), a message
+          // whose id the history already holds was settled before: its frames
+          // are skipped, so a replay that starts over (a lost cursor) renders,
+          // appends and runs nothing twice. Text never counts: two messages
+          // with the same text and their own ids are both kept. Without the
+          // announcement ids may repeat (2.3 routes can name every message
+          // the same), so nothing is skipped. An error frame is the read's
+          // own and is never skipped.
+          if (part.type === 'start')
+            skipping = serverHas(CAPABILITY.messageIds) && settledIds().has(part.messageId);
+          if (skipping && part.type !== 'error') continue;
+          skipping = false;
           folded++;
           recordPart(ledger, turn, part);
           turn = fold(turn, part);
@@ -1970,6 +2057,8 @@ export function useChat(options: UseChatOptions): UseChatResult {
       options.onError,
       announce,
       handshake,
+      serverHas,
+      settledIds,
       fold,
       flush,
       run,
@@ -1978,6 +2067,7 @@ export function useChat(options: UseChatOptions): UseChatResult {
     ],
   );
 
+  runResumeRef.current = runResume;
   const reconnect = useCallback((): Promise<void> => runResume(false), [runResume]);
 
   /**
@@ -1992,24 +2082,6 @@ export function useChat(options: UseChatOptions): UseChatResult {
     autoResumedRef.current = true;
     void runResume(true);
   }, [options.resume?.auto, runResume]);
-
-  /**
-   * `messageIds` aligned with `history` (2.4). A message with no id yet (a
-   * tool result, a message `setHistory` could not pair) gets a generated one
-   * here and keeps it, so every export names it the same.
-   */
-  const idsFor = useCallback(
-    (history: readonly Message[]): string[] =>
-      history.map((message) => {
-        let id = messageIds.get(message);
-        if (id === undefined) {
-          id = genId();
-          messageIds.set(message, id);
-        }
-        return id;
-      }),
-    [messageIds, options.generateId],
-  );
 
   const exportSnapshot = useCallback((): ChatSnapshotV1 => {
     const canonical = snapshotRef.current.history.canonical;

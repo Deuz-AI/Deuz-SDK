@@ -21,8 +21,11 @@ import {
   resumeDeuzStreamResponse,
   toDeuzStreamResponse,
 } from '@deuz-sdk/core/ui';
+import type { DeuzUIPart } from '@deuz-sdk/core/ui';
 import { useChat } from '../src/use-chat';
 import type { UseChatOptions } from '../src/use-chat';
+import type { ChatSnapshotV1 } from '../src/index';
+import { journal, parts } from './wire';
 
 const HEADER = 'x-deuz-capabilities';
 const ADVERTISED = 'chat-snapshot-v1, durable-stream, message-ids';
@@ -237,5 +240,238 @@ describe('useChat — the capability handshake', () => {
     });
     await send(cleared.result, 'hi');
     expect(cleared.result.current.capabilities).toEqual([]);
+  });
+});
+
+/** `response` with the handshake's response header set to `value`. */
+function announcing(response: Response, value: string): Response {
+  const headers = new Headers(response.headers);
+  headers.set(HEADER, value);
+  return new Response(response.body, { status: response.status, headers });
+}
+
+describe('useChat — features used only when the server announced them', () => {
+  describe('message-ids: a replay is deduplicated by message id', () => {
+    /** A journal with one settled leg (m-1) and, optionally, a later message's leg. */
+    async function replayFixture(laterLeg?: DeuzUIPart[]) {
+      const wire = journal();
+      await wire.leg([parts.start('m-1'), parts.text('Hi there.'), parts.finish()]);
+      if (laterLeg) await wire.leg(laterLeg);
+      return wire;
+    }
+
+    /** The chat after that settled leg, restored with no cursor (a lost one): a replay starts over. */
+    function settled(capabilities?: string[]): ChatSnapshotV1 {
+      return {
+        version: 1,
+        messages: [
+          { role: 'user', content: 'hi' },
+          { role: 'assistant', content: 'Hi there.' },
+        ],
+        messageIds: ['u-1', 'm-1'],
+        ...(capabilities ? { capabilities } : {}),
+      };
+    }
+
+    function restoredChat(
+      wire: Awaited<ReturnType<typeof replayFixture>>,
+      snapshot: ChatSnapshotV1,
+    ) {
+      return renderHook(() =>
+        useChat({
+          api: '/api/chat',
+          resume: { endpoint: wire.endpoint },
+          initialSnapshot: snapshot,
+        }),
+      );
+    }
+
+    it('announced: a message the history holds is not rendered or appended again', async () => {
+      const wire = await replayFixture();
+      const { result } = restoredChat(wire, settled(['message-ids']));
+      const before = result.current.history;
+      await act(async () => {
+        await result.current.reconnect();
+      });
+      expect(wire.cursors).toEqual([undefined]);
+      expect(result.current.history).toBe(before);
+      expect(result.current.messages.map((m) => [m.id, m.content])).toEqual([
+        ['u-1', 'hi'],
+        ['m-1', 'Hi there.'],
+      ]);
+    });
+
+    it('not announced (a 2.3 server): the replay renders it again, as 2.3 did', async () => {
+      const wire = await replayFixture();
+      const { result } = restoredChat(wire, settled());
+      await act(async () => {
+        await result.current.reconnect();
+      });
+      expect(result.current.messages.map((m) => [m.id, m.content])).toEqual([
+        ['u-1', 'hi'],
+        ['m-1', 'Hi there.'],
+        ['m-1', 'Hi there.'],
+      ]);
+      expect(result.current.history.canonical).toHaveLength(3);
+    });
+
+    it('announced: a later message in the same replay is kept, even with the same text', async () => {
+      const wire = await replayFixture([
+        parts.start('m-2'),
+        parts.text('Hi there.'),
+        parts.finish(),
+      ]);
+      const { result } = restoredChat(wire, settled(['message-ids']));
+      await act(async () => {
+        await result.current.reconnect();
+      });
+      expect(result.current.messages.map((m) => [m.id, m.content])).toEqual([
+        ['u-1', 'hi'],
+        ['m-1', 'Hi there.'],
+        ['m-2', 'Hi there.'],
+      ]);
+      expect(result.current.history.canonical.map((m) => m.content)).toEqual([
+        'hi',
+        'Hi there.',
+        'Hi there.',
+      ]);
+      expect(result.current.exportSnapshot().messageIds).toEqual(['u-1', 'm-1', 'm-2']);
+    });
+
+    it('announced: an error frame of the read itself is never skipped', async () => {
+      const wire = journal();
+      await wire.leg([
+        parts.start('m-1'),
+        parts.text('Hi there.'),
+        { type: 'error', message: 'store failed' },
+      ]);
+      const errors: string[] = [];
+      const { result } = renderHook(() =>
+        useChat({
+          api: '/api/chat',
+          resume: { endpoint: wire.endpoint },
+          initialSnapshot: settled(['message-ids']),
+          onError: (error) => errors.push(error.message),
+        }),
+      );
+      await act(async () => {
+        await result.current.reconnect();
+      });
+      expect(result.current.status).toBe('error');
+      expect(errors).toEqual(['store failed']);
+    });
+  });
+
+  describe('chat-snapshot-v1: the request body carries the message ids', () => {
+    it('announced: every request after the announcement sends messageIds aligned with messages', async () => {
+      const route = chatRoute({ announce: ['chat-snapshot-v1'] });
+      const { result } = chat(route);
+      await send(result, 'hi');
+      await send(result, 'again');
+      const bodies = route.requests.filter((r) => r.body).map((r) => r.body!);
+      // The first request went out before anything was announced.
+      expect(Object.keys(bodies[0]!)).toEqual(['messages']);
+      const ids = result.current.messages.map((m) => m.id);
+      expect(bodies[1]).toEqual({
+        messages: [
+          { role: 'user', content: 'hi' },
+          { role: 'assistant', content: 'Hi there.' },
+          { role: 'user', content: 'again' },
+        ],
+        messageIds: [ids[0], 'm-1', ids[2]],
+      });
+    });
+
+    it('not announced: the body is the 2.3 body', async () => {
+      const route = chatRoute({ announce: ['message-ids'] });
+      const { result } = chat(route);
+      await send(result, 'hi');
+      await send(result, 'again');
+      for (const request of route.requests.filter((r) => r.body))
+        expect(Object.keys(request.body!)).toEqual(['messages']);
+    });
+  });
+
+  describe('durable-stream: a dropped POST read continues from the resume endpoint', () => {
+    const LEG = [
+      parts.start('m-1'),
+      parts.text('Hel'),
+      parts.text('lo, '),
+      parts.text('Paris.'),
+      parts.finish(),
+    ];
+
+    function droppingChat(announce: string | undefined, resume = true) {
+      const wire = journal();
+      const errors: string[] = [];
+      const fetchMock: typeof fetch = async () => {
+        const response = await wire.respondDropping(LEG, 2);
+        return announce === undefined ? response : announcing(response, announce);
+      };
+      const hook = renderHook(() =>
+        useChat({
+          api: '/api/chat',
+          fetch: fetchMock,
+          ...(resume ? { resume: { endpoint: wire.endpoint } } : {}),
+          onError: (error) => errors.push(error.message),
+        }),
+      );
+      return { ...hook, wire, errors };
+    }
+
+    it('announced: the turn completes without an error', async () => {
+      const { result, wire, errors } = droppingChat('durable-stream');
+      await act(async () => {
+        await result.current.sendMessage('hi');
+      });
+      await waitFor(() => expect(result.current.status).toBe('idle'));
+      expect(wire.cursors).toEqual(['1']);
+      expect(errors).toEqual([]);
+      expect(result.current.error).toBeUndefined();
+      expect(result.current.messages.map((m) => [m.id, m.content])).toEqual([
+        [expect.any(String), 'hi'],
+        ['m-1', 'Hello, Paris.'],
+      ]);
+      expect(result.current.history.canonical).toHaveLength(2);
+    });
+
+    it('not announced (a 2.3 server): the drop is an error, as in 2.3', async () => {
+      const { result, wire, errors } = droppingChat(undefined);
+      await act(async () => {
+        await result.current.sendMessage('hi');
+      });
+      await waitFor(() => expect(result.current.status).toBe('error'));
+      expect(wire.cursors).toEqual([]);
+      expect(errors).toHaveLength(1);
+      expect(result.current.messages.at(-1)?.content).toBe('Hel');
+    });
+
+    it('announced but with no resume endpoint: the drop is an error', async () => {
+      const { result, errors } = droppingChat('durable-stream', false);
+      await act(async () => {
+        await result.current.sendMessage('hi');
+      });
+      await waitFor(() => expect(result.current.status).toBe('error'));
+      expect(errors).toHaveLength(1);
+    });
+
+    it('with capabilityHandshake: false, an announcement is ignored', async () => {
+      const wire = journal();
+      const fetchMock: typeof fetch = async () =>
+        announcing(await wire.respondDropping(LEG, 2), 'durable-stream');
+      const { result } = renderHook(() =>
+        useChat({
+          api: '/api/chat',
+          fetch: fetchMock,
+          resume: { endpoint: wire.endpoint },
+          capabilityHandshake: false,
+        }),
+      );
+      await act(async () => {
+        await result.current.sendMessage('hi');
+      });
+      await waitFor(() => expect(result.current.status).toBe('error'));
+      expect(wire.cursors).toEqual([]);
+    });
   });
 });
