@@ -9,12 +9,18 @@ import type { TelemetryAttributes } from '../../internal/telemetry';
 import type { Logger, ResolvedDependencies } from '../../types/deps';
 import type { GoalRecord } from '../types';
 import { DEFAULT_GOAL_RUNTIME_POLICY } from './store';
-import type { GoalRuntimePolicy } from './store-types';
+import type { GoalRuntimePolicy, GoalRuntimeState } from './store-types';
 import type { GoalSupervisorEvent } from './supervisor';
 
 /** The goal lease key (2.4): `goal:` and the JSON of `[scope, goalId]`. */
 export function goalLeaseKey(scope: string, goalId: string): string {
   return `goal:${JSON.stringify([scope, goalId])}`;
+}
+
+/** The runtime state without its active run (and that run's retry time). */
+export function withoutRun(runtime: GoalRuntimeState): GoalRuntimeState {
+  const { activeRun: _activeRun, retryAt: _retryAt, ...rest } = runtime;
+  return rest;
 }
 
 /**

@@ -52,6 +52,7 @@ import {
   quietly,
   reportGeneration,
   runIdFor,
+  withoutRun,
 } from './supervisor-shared';
 
 /** How often a write that lost a revision race is decided again on fresh state. */
@@ -360,9 +361,13 @@ export function createGoalSupervisor(options: GoalSupervisorOptions): GoalSuperv
     const transition = transitionGoal(goal, command, { now });
     if (!transition.changed) return transition;
     const next = transition.record;
-    const ended = TERMINAL_STATUSES.includes(next.status) && runtime.activeRun === undefined;
+    const terminal = TERMINAL_STATUSES.includes(next.status);
+    // A run with an open intent has a holder that settles the goal's end; a
+    // run no one holds (suspended, or failed and waiting for its retry) has
+    // none, so the end settles here. The runtime revision fences the read.
+    const ended = terminal && (runtime.activeRun === undefined || !(await hasOpenIntent(runtime)));
     const state: GoalRuntimeState = {
-      ...runtime,
+      ...(ended ? withoutRun(runtime) : runtime),
       revision: runtime.revision + 1,
       updatedAt: Math.max(runtime.updatedAt, now),
       ...(ended ? { phase: 'done' as const } : {}),
@@ -377,6 +382,17 @@ export function createGoalSupervisor(options: GoalSupervisorOptions): GoalSuperv
     if (TERMINAL_STATUSES.includes(next.status) && runtime.activeRun !== undefined)
       await stopRun(runtime, undefined);
     return transition;
+  }
+
+  /** Whether an intent of the goal is still open: a drive holds or will hold its run. */
+  async function hasOpenIntent(runtime: GoalRuntimeState): Promise<boolean> {
+    const page = await store.intents.list({
+      scope: runtime.scope,
+      goalId: runtime.goalId,
+      statuses: ['pending', 'claimed', 'launched'],
+      limit: 1,
+    });
+    return page.intents.length > 0;
   }
 
   /** Asks the active run, and whoever holds the goal, to stop. Best effort. */

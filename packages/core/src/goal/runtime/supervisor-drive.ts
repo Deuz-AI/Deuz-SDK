@@ -52,6 +52,7 @@ import {
   reportGeneration,
   runIdFor,
   stampWorkingMemory,
+  withoutRun,
   type EventHub,
 } from './supervisor-shared';
 
@@ -124,12 +125,6 @@ const isTerminal = (goal: GoalRecord): boolean => TERMINAL_STATUSES.includes(goa
 function answerable(goal: GoalRecord) {
   const wait = goal.status === 'waiting' ? goal.waiting : undefined;
   return wait?.reason === 'budget' ? wait.interrupted : wait;
-}
-
-/** The runtime state without its active run. */
-function withoutRun(runtime: GoalRuntimeState): GoalRuntimeState {
-  const { activeRun: _activeRun, retryAt: _retryAt, ...rest } = runtime;
-  return rest;
 }
 
 /** The next runtime revision, stamped at `now`. */
