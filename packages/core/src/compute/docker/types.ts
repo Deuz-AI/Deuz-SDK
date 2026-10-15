@@ -174,8 +174,9 @@ export interface ProcessReconcileReport {
   /**
    * Labelled containers with no record: reported, removed only with
    * `removeOrphans`. A sandbox run's container or a staging helper never has
-   * a record; it is reported only once no run can still be using it (30 min
-   * after its create or exit, or past its labelled run timeout while it runs).
+   * a record; it is reported only once no run can still be using it: 30 min
+   * after its create (never started) or its exit; while it runs, 30 min past
+   * its start plus its `deuz.run-timeout-ms` label (never without the label).
    */
   orphans: { containerId: string; operationId?: string; scope?: string }[];
   /** Records whose container is gone: marked `'lost'`, never recreated. */
