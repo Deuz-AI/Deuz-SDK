@@ -514,7 +514,8 @@ Several calls of 2.3 never reached a budget ledger. In 2.4:
   a versioned memory session (`execution`), are reserved before they run. A
   callback marked as accounted settles the usage it reports
   (`defineAccountedMemoryLLM`, or an embedder object with `accounted: true`
-  whose `embed` returns the usage with the vectors). An unmarked one is held at
+  whose `embed` returns the usage with the vectors). In `MemorySeams` the
+  accounted LLM goes in `seams.accountedLlm`; `seams.llm` keeps the 2.3 type. An unmarked one is held at
   its estimate as unaccounted, never treated as free, and reports one
   `unaccounted-usage` warning. A budget with `unknownPrice: 'reject'` refuses
   an unaccounted call with `BudgetLedgerError` code `'unaccounted_call'`.
@@ -866,7 +867,7 @@ types (`AgentRunEnvelopeV3`, `AgentEventV3`).
 
 Calling code is unaffected. The new members are optional:
 `AgentRunMemoryExtraction.planned`, `AgentRunReconciliation.warnings`,
-`CodeExecutionResult.truncated`, `MemorySeams.execution`,
+`CodeExecutionResult.truncated`, `MemorySeams.execution` and `accountedLlm`,
 `MemoryQuery.embeddingModelId` and `onEmbeddingMismatch`,
 `BudgetReservation.unaccounted`, `BudgetTotals.unaccounted` and
 `BudgetAggregate.unaccounted`, and the five `GoalEvidence` fields. A store or

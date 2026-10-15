@@ -172,7 +172,8 @@ console.log((await runs.getBlob(blob.digest)).status); // redacted
 - `getBlob(digest)` then answers `{ status: 'redacted' }`, and the step
   manifests that point to it load with `redacted: true`.
 - The forget's `redaction` is `'failed'` when a listener threw. The forget
-  itself is never undone; call `runs.redactForgotten(event)` again with the
+  itself is never undone; call `forget` again, which reruns every listener
+  with `alreadyForgotten: true`, or call `runs.redactForgotten(event)` with the
   event the result carries.
 
 A redacted package changes one rule of V3 recovery. A step reopened after a

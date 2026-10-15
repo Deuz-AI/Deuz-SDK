@@ -99,7 +99,7 @@ scope holds is a conflict that does not reveal the other record.
 | `extraction` | trusted sources only | What `extract` may read; see [Extraction](#extraction-and-the-untrusted-source-policy) |
 | `onForget` | none | Listeners called after a forget committed, in order |
 | `execution` | none | Charges memory LLM and embedding calls to this execution context; see [Accounting](#accounting-and-spans) |
-| `llmModelId`, `embedderModelId` | `'memory-llm'`; the active generation's model, else `'memory-embedder'` | The model ids named on ledger reservations |
+| `llmModelId`, `embedderModelId` | `'memory-llm'`; the active generation's model, else `'memory-embedder'` | The model ids named on ledger reservations. `embedderModelId` counts only until the store has an active generation; after that, reservations name the generation's model |
 | `deps` | host clock and ids | Clock, ids, logger and observer |
 
 ## Records and provenance
@@ -343,14 +343,19 @@ A forget keeps a content-free tombstone of the id, so a later create or revise
 of that id conflicts and a redelivered operation can never bring the record
 back. The receipts of the operations that wrote it stay, marked
 `redacted: true`, and the forget writes a content-free receipt of its own.
-Repeating a forget with the same `operationId` returns `revisions: []`.
+Every forget commits as an operation and raises the scope revision by one,
+even when it deleted nothing. Repeating a forget, with the same `operationId`
+or a new one, deletes nothing more and returns `revisions: []` with
+`alreadyForgotten: true` (the empty list then stands for every revision).
 
 After the store committed a forget, the session awaits every `onForget`
 listener in order with `{ scope, recordId, revisions, operationId }`. The result
 adds `redaction`: `'complete'` when every listener succeeded, `'failed'` when
 one threw (the error is logged, later listeners still run, the forget is never
-undone; run the redaction again from the event), and `'none'` when no listener
-ran (none configured, or nothing was deleted). A V3 run store subscribes here
+undone), and `'none'` when no listener ran (none configured, or the scope never
+had the record). A repeated forget calls the listeners again with
+`alreadyForgotten: true`, so after `'failed'`, calling `forget` again finishes
+the redaction; running it yourself from the event works too. A V3 run store subscribes here
 to redact the compiled context packages that hold the record; see
 [Retention and forget](/docs/modules/retention#forget-and-v3-context-packages).
 
@@ -424,8 +429,10 @@ is on the store for hosts that run the job themselves; `activate` returns
 
 `createVersionedMemoryTools(session, { include?, prefix? })` returns native
 agent tools bound to the session's scope: `memory_remember`, `memory_recall`,
-`memory_revise` and `memory_retract` (`prefix` defaults to `'memory'`). There is
-no forget tool; forgetting is a host decision.
+`memory_revise` and `memory_retract` (`prefix` defaults to `'memory'`). `include`
+picks a subset of `'remember'`, `'recall'`, `'revise'` and `'retract'` (all four
+by default; an unknown name throws), for example `['recall']` for a read-only
+model. There is no forget tool; forgetting is a host decision.
 
 - Every write is `'inferred'` and cites the tool call as an `assistant`
   source (`toolCallId`, `toolName`, the session's `chatId`).

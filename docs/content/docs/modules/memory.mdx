@@ -426,6 +426,7 @@ Note that the reconciliation pass is scoped too: facts extracted in one scope ar
 | --- | --- | --- | --- |
 | `store` | `MemoryStore` | yes | The only stateful seam — vector store, markdown vault, or a DB. |
 | `llm` | `MemoryLLM` | yes | `(prompt: { system, user }) => Promise<string>`. Used for extraction + reconciliation. |
+| `accountedLlm` | `AccountedMemoryLLM` | no | 2.4: built with `defineAccountedMemoryLLM`. When set, every memory LLM call goes to it and `llm` is never called. |
 | `clock` | `Clock` | yes | `{ now, setTimeout }`. Time source for timestamps / TTL. |
 | `generateId` | `() => string` | yes | New record ids. |
 | `embedder` | `Embedder` | no | Needed only when a vector store searches by embedding and the query has none. 2.4 also accepts an accounted embedder. |
