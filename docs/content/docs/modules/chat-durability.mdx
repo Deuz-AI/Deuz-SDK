@@ -270,7 +270,7 @@ every 2.3 client, gets a response byte-identical to 2.3's.
 
 | Capability (`DEUZ_CAPABILITY`) | Announced when | What a 2.4 `useChat` does with it |
 | --- | --- | --- |
-| `'message-ids'` (`messageIds`) | You announce it | A resume read that delivers a message the history already holds skips it, so a replay renders, appends and runs nothing twice |
+| `'message-ids'` (`messageIds`) | You announce it | A resume read that delivers a message the history already holds skips it, so a replay renders, appends and runs nothing twice. A leg that continued the run on the same stream without a `start` (an approval continuation, say) is skipped only while the history holds a later assistant message for it; otherwise it renders and settles as its own message |
 | `'chat-snapshot-v1'` (`chatSnapshot`) | You announce it | POST bodies gain `messageIds` aligned with `messages` |
 | `'durable-stream'` (`durableStream`) | Automatically, for a durable response or on a resume endpoint over a durable store | A POST read that drops before it ends continues from `resume.endpoint` instead of ending in `status: 'error'` |
 | `'conditional-chat'` (`conditionalChat`) | You announce it | Nothing yet; the client does not ask for it |
