@@ -201,10 +201,13 @@ interface StepMemory {
  *   `fallback: 'pass-limit'`. `input.redacted` always retrieves again.
  * - Between refreshes (`refresh: 'reused'`) nothing new is retrieved. An
  *   entry whose `'append'` block left the messages (a compaction) is placed
- *   again from what this compiler instance retrieved; after a restart it
- *   waits for the next refresh. Only a record's latest placement comes back:
- *   an older revision (or digest) a later pass superseded is never appended
- *   after the newer one.
+ *   again from what this compiler instance retrieved. After a restart an
+ *   optional entry waits for the next refresh, and a mandatory one (a loaded
+ *   skill body) is asked of its source again with the step's query, even an
+ *   empty one, past `minSteps` and `maxPasses` and without spending a pass;
+ *   only that record is taken from the answer. Only a record's latest
+ *   placement comes back: an older revision (or digest) a later pass
+ *   superseded is never appended after the newer one.
  * - `cachePrefixChanged` is true when the messages no longer start with the
  *   previous request's messages and its `'append'` block (placed right after
  *   them).
@@ -283,10 +286,21 @@ export function createContextCompiler(options: CreateContextCompilerOptions): Co
     if (query !== '' && options.refresh?.rewriteQuery)
       query = (await options.refresh.rewriteQuery(query, input.signal)).slice(0, QUERY_MAX_CHARS);
     if (query.trim() === '') return undefined;
+    return ask(sources, query, input, inputTokens, usedTokens);
+  }
+
+  /** Asks `list` for `query`: a required source's failure is thrown, an optional one's recorded. */
+  async function ask(
+    list: readonly ContextSource[],
+    query: string,
+    input: ContextStepInput,
+    inputTokens: number,
+    usedTokens: number,
+  ): Promise<ContextSourceResult[]> {
     const hints = budgetHints(inputTokens, usedTokens);
     const recordedAsOf = deps.clock.now();
     const settled = await Promise.allSettled(
-      sources.map(async (source) => {
+      list.map(async (source) => {
         const answer = await source.query({
           text: query,
           ...(options.scope ? { scope: options.scope } : {}),
@@ -303,13 +317,13 @@ export function createContextCompiler(options: CreateContextCompilerOptions): Co
       }),
     );
     settled.forEach((outcome, index) => {
-      if (outcome.status === 'rejected' && sources[index]!.required) throw outcome.reason;
+      if (outcome.status === 'rejected' && list[index]!.required) throw outcome.reason;
     });
     return settled.map((outcome, index) =>
       outcome.status === 'fulfilled'
-        ? { source: describe(sources[index]!), status: 'ok', candidates: outcome.value }
+        ? { source: describe(list[index]!), status: 'ok', candidates: outcome.value }
         : {
-            source: describe(sources[index]!),
+            source: describe(list[index]!),
             status: 'failed',
             candidates: [],
             error: errorSummary(outcome.reason),
@@ -321,20 +335,56 @@ export function createContextCompiler(options: CreateContextCompilerOptions): Co
     return { id: source.id, kind: source.kind, ...(source.required ? { required: true } : {}) };
   }
 
-  /** The candidates to place again: those whose block a compaction removed. */
-  function replacements(dropped: readonly ContextPlacedEntry[]): ContextSourceResult[] {
+  /** Keeps a retrieved candidate, to place it again after a compaction. */
+  function remember(source: ContextSourceResult['source'], candidate: ContextCandidate): void {
+    known.set(
+      placedKey({ source: source.id, recordId: candidate.recordId, digest: candidate.digest }),
+      { source, candidate },
+    );
+  }
+
+  /**
+   * The candidates to place again: those whose block a compaction removed,
+   * from what this instance retrieved. A mandatory entry it did not retrieve
+   * (a restored compiler) is asked of its source again, whatever `minSteps`
+   * and `maxPasses` say and with no pass spent: only those records are taken
+   * from the answer, none when the source no longer offers them. A failing
+   * source answers for the step: optional, it is recorded as failed (its
+   * other entries wait for the next refresh); required, it stops the call.
+   */
+  async function replacements(
+    dropped: readonly ContextPlacedEntry[],
+    input: ContextStepInput,
+    inputTokens: number,
+    usedTokens: number,
+  ): Promise<ContextSourceResult[]> {
     const bySource = new Map<string, ContextSourceResult>();
+    const take = (source: ContextSourceResult['source'], candidate?: ContextCandidate) => {
+      const result = bySource.get(source.id) ?? { source, status: 'ok' as const, candidates: [] };
+      if (candidate) (result.candidates as ContextCandidate[]).push(candidate);
+      bySource.set(source.id, result);
+    };
+    const missing = new Map<string, Set<string>>();
     for (const entry of dropped) {
       const found = known.get(placedKey(entry));
-      if (!found) continue;
-      const result = bySource.get(found.source.id) ?? {
-        source: found.source,
-        status: 'ok' as const,
-        candidates: [],
-      };
-      (result.candidates as ContextCandidate[]).push(found.candidate);
-      bySource.set(found.source.id, result);
+      if (found) take(found.source, found.candidate);
+      else if (entry.mandatory)
+        missing.set(entry.source, (missing.get(entry.source) ?? new Set()).add(entry.recordId));
     }
+    const owners = sources.filter((source) => missing.has(source.id));
+    if (owners.length > 0)
+      for (const result of await ask(owners, buildQuery(input), input, inputTokens, usedTokens)) {
+        if (result.status !== 'ok') {
+          bySource.set(result.source.id, result);
+          continue;
+        }
+        take(result.source);
+        for (const candidate of result.candidates)
+          if (missing.get(result.source.id)!.has(String(candidate.recordId))) {
+            remember(result.source, candidate);
+            take(result.source, candidate);
+          }
+      }
     return sources.flatMap((source) => bySource.get(source.id) ?? []);
   }
 
@@ -344,15 +394,21 @@ export function createContextCompiler(options: CreateContextCompilerOptions): Co
    * Only a record's latest placement (in `placed`, oldest first) comes back:
    * one a later revision or digest superseded leaves the state instead.
    */
-  function reuse(
+  async function reuse(
     dropped: readonly ContextPlacedEntry[],
     placed: readonly ContextPlacedEntry[],
     skipped: boolean,
-  ): ContextSourceResult[] {
+    input: ContextStepInput,
+    inputTokens: number,
+    usedTokens: number,
+  ): Promise<ContextSourceResult[]> {
     const latest = new Map<string, ContextPlacedEntry>();
     for (const entry of placed) latest.set(`${entry.source}\u0000${entry.recordId}`, entry);
-    const again = replacements(
+    const again = await replacements(
       dropped.filter((entry) => latest.get(`${entry.source}\u0000${entry.recordId}`) === entry),
+      input,
+      inputTokens,
+      usedTokens,
     );
     if (!skipped) return again;
     return sources.map(
@@ -381,6 +437,7 @@ export function createContextCompiler(options: CreateContextCompilerOptions): Co
         digest: entry.digest,
         pass: pkg.manifest.pass,
         step: pkg.manifest.step,
+        ...(entry.reason === 'mandatory' ? { mandatory: true } : {}),
       };
     });
     const digests = [...input.messages, ...(append?.messages ?? [])].map(messageDigest);
@@ -485,18 +542,19 @@ export function createContextCompiler(options: CreateContextCompilerOptions): Co
         results = answered;
         pass = state.passes + 1;
         refresh = due!;
-        if (results.some((result) => result.status === 'failed')) fallback = 'source-failed';
       } else if (due !== undefined && !limited) {
         // Nothing to ask yet (no user text, no task): the refresh stays due.
-        results = reuse(dropped, placedAtStart, true);
+        results = await reuse(dropped, placedAtStart, true, input, inputTokens, usedTokens);
         pass = state.passes;
         refresh = 'reused';
       } else {
-        results = reuse(dropped, placedAtStart, false);
+        results = await reuse(dropped, placedAtStart, false, input, inputTokens, usedTokens);
         pass = state.passes;
         refresh = 'reused';
         if (limited) fallback = 'pass-limit';
       }
+      if (!fallback && results.some((result) => result.status === 'failed'))
+        fallback = 'source-failed';
 
       const pkg = compileContext({
         step: input.step,
@@ -529,15 +587,7 @@ export function createContextCompiler(options: CreateContextCompilerOptions): Co
       }
       if (answered)
         for (const result of results)
-          for (const candidate of result.candidates)
-            known.set(
-              placedKey({
-                source: result.source.id,
-                recordId: candidate.recordId,
-                digest: candidate.digest,
-              }),
-              { source: result.source, candidate },
-            );
+          for (const candidate of result.candidates) remember(result.source, candidate);
       lastStep = {
         step: input.step,
         placedAtStart,
@@ -569,7 +619,17 @@ export function createContextCompiler(options: CreateContextCompilerOptions): Co
       // otherwise what the compactions removed is placed again.
       const results = memory?.fresh
         ? memory.results
-        : reuse(dropped, placedAtStart, memory?.skipped === true);
+        : await reuse(
+            dropped,
+            placedAtStart,
+            memory?.skipped === true,
+            input,
+            inputTokens,
+            usedTokens,
+          );
+      const fallback =
+        memory?.fallback ??
+        (results.some((result) => result.status === 'failed') ? 'source-failed' : undefined);
       const pkg = compileContext({
         step: input.step,
         results,
@@ -580,12 +640,15 @@ export function createContextCompiler(options: CreateContextCompilerOptions): Co
         placed: kept,
         refresh: 'overflow-retry',
         pass: memory?.pass ?? state.passes,
-        ...(memory?.fallback ? { fallback: memory.fallback } : {}),
+        ...(fallback ? { fallback } : {}),
         cachePrefixChanged: memory?.cachePrefixChanged ?? prefixChanged(input.messages),
         phase: 'overflow-retry',
         estimator,
         estimatorKind: estimatorKind(input),
       });
+      // A fresh step's failures were reported when it compiled; these are the retry's own.
+      if (!memory?.fresh)
+        for (const warning of contextWarnings(pkg.manifest)) options.onWarning?.(warning);
       return finish(input, pkg, kept, annotate);
     });
   }

@@ -594,6 +594,93 @@ describe('createContextCompiler state, overflow and compaction', () => {
     expect(restored.state().placed).toEqual([expect.objectContaining({ recordId: 'm1', pass: 1 })]);
   });
 
+  it('asks again for a mandatory entry a compaction removed after a restart, past the pass limit', async () => {
+    // R2-4: the restored compiler never retrieved the body itself.
+    const body = 'SKILL BODY: always cite the page';
+    const skillsSource = () =>
+      fake('skills', 'skills', [
+        candidate('pdf/SKILL.md', body, 0, { mandatory: true }),
+        candidate('pdf', 'pdf (pdf): read PDF files', 0.5),
+      ]);
+    const user: Message = { role: 'user', content: 'summarise the pdf' };
+    const original = createContextCompiler({
+      sources: [skillsSource().source],
+      refresh: { maxPasses: 1 },
+    });
+    const first = await original.beforeModelCall(step(1, [system, user]));
+    expect(first.blocks[0]!.messages[0]!.content).toContain(body);
+    const skills = skillsSource();
+    const restored = createContextCompiler({
+      sources: [skills.source],
+      refresh: { maxPasses: 1 },
+      state: JSON.parse(JSON.stringify(original.state())),
+    });
+    const compacted: Message[] = [system, { role: 'user', content: 'Summary: earlier' }, user];
+    const pkg = await restored.beforeModelCall(step(2, compacted));
+    expect(skills.requests).toHaveLength(1);
+    expect(pkg.manifest).toMatchObject({ refresh: 'reused', pass: 1 });
+    // Only the mandatory record comes back; the catalog line waits for a refresh.
+    expect(pkg.manifest.entries).toEqual([
+      expect.objectContaining({ recordId: 'pdf/SKILL.md', selected: true, reason: 'mandatory' }),
+    ]);
+    expect(pkg.blocks[0]!.messages[0]!.content).toContain(body);
+    expect(restored.state()).toMatchObject({
+      passes: 1,
+      placed: [{ recordId: 'pdf/SKILL.md', pass: 1, step: 2, mandatory: true }],
+    });
+    // Placed again from what it now retrieved: no second question.
+    const later = await restored.beforeModelCall(step(3, compacted));
+    expect(later.blocks[0]!.messages[0]!.content).toContain(body);
+    expect(skills.requests).toHaveLength(1);
+  });
+
+  it('lets a mandatory entry go once its source stops offering it, and reports a failing source', async () => {
+    const original = createContextCompiler({
+      sources: [
+        fake('skills', 'skills', [candidate('pdf/SKILL.md', 'body', 0, { mandatory: true })])
+          .source,
+      ],
+    });
+    const user: Message = { role: 'user', content: 'go' };
+    await original.beforeModelCall(step(1, [system, user]));
+    const saved = original.state();
+    const compacted: Message[] = [system, { role: 'user', content: 'Summary' }, user];
+
+    const unloaded = fake('skills', 'skills', []);
+    const restored = createContextCompiler({ sources: [unloaded.source], state: saved });
+    const gone = await restored.beforeModelCall(step(2, compacted));
+    expect(unloaded.requests).toHaveLength(1);
+    expect(gone.blocks).toEqual([]);
+    expect(restored.state().placed).toEqual([]);
+
+    const warnings: CallWarning[] = [];
+    const failing = fake('skills', 'skills', async () => {
+      throw new Error('registry down');
+    });
+    const warned = createContextCompiler({
+      sources: [failing.source],
+      state: saved,
+      onWarning: (warning) => warnings.push(warning),
+    });
+    const failed = await warned.beforeModelCall(step(2, compacted));
+    expect(failed.manifest.sources).toEqual([
+      expect.objectContaining({ source: 'skills', status: 'failed' }),
+    ]);
+    expect(failed.manifest.fallback).toBe('source-failed');
+    expect(warnings).toEqual([expect.objectContaining({ type: 'context-source-failed' })]);
+
+    const required = fake(
+      'skills',
+      'skills',
+      async () => {
+        throw new Error('registry down');
+      },
+      true,
+    );
+    const strict = createContextCompiler({ sources: [required.source], state: saved });
+    await expect(strict.beforeModelCall(step(2, compacted))).rejects.toThrow('registry down');
+  });
+
   it('places again what a compaction removed, and notes the prefix change', async () => {
     const memory = fake('memory', 'memory', [candidate('m1', 'Prefers aisle seats', 0.9)]);
     const compiler = createContextCompiler({ sources: [memory.source] });

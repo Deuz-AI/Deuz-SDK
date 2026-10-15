@@ -317,6 +317,13 @@ export interface ContextPlacedEntry {
    * current pass. Without it, any block of the pass counts.
    */
   step?: number;
+  /**
+   * Placed as mandatory content (2.4), such as a loaded skill body. When a
+   * compaction removes its block and the compiler did not retrieve it itself
+   * (it was restored from a checkpoint), it asks the source again instead of
+   * waiting for the next refresh.
+   */
+  mandatory?: boolean;
 }
 
 // ===================================================================
