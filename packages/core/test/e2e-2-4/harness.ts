@@ -638,6 +638,14 @@ export interface HostProcess {
     post(body: RouteBody, headers?: HeadersInit): Promise<Response>;
     resume(ctx: { lastEventId?: string; capabilities?: string }): Response;
   };
+  /**
+   * The host settles unknown effects itself (2.3 reconciliation): it resumes
+   * the run with the results it found in the external system, streamed as a
+   * new producer leg of the run's journal.
+   */
+  reconcileRun(results: { toolCallId: string; output: unknown }[]): Promise<void>;
+  /** The host's acceptance check of a run: the `evaluate` command for the goal. */
+  verifyGoal(goal: GoalRecord, runId: string): Promise<GoalCommand>;
   /** Dies at `point` the next time the flow reaches it. */
   arm(point: CrashPoint): void;
   /** Whether the process died at `point`. */
@@ -1073,6 +1081,19 @@ export function openProcess(env: FlowEnv, name: string): HostProcess {
     runOptions,
     durable,
     route,
+    async reconcileRun(results: { toolCallId: string; output: unknown }[]) {
+      const stream = resumeStreamAgent({
+        ...runOptions(RUN_ID),
+        checkpointVersion: 3,
+        session: { store: runs, runId: RUN_ID, scope: env.scope },
+        reconciledToolResults: results,
+      });
+      await drain(
+        toDeuzAgentStreamResponse(stream, { runId: RUN_ID, streamId: RUN_ID, durable: durable() }),
+      );
+      await stream.result;
+    },
+    verifyGoal: (goal: GoalRecord, runId: string) => verifyGoal({ goal, runId }),
     arm(point: CrashPoint) {
       armed = point;
       dispatched = false;
@@ -1385,4 +1406,32 @@ export async function runMainFlow(env: FlowEnv, client: FlowClient): Promise<Mai
     reconcile,
     last: p4,
   };
+}
+
+/**
+ * The start of a flow without a crash: seed, goal, schedule, the occurrence
+ * delivered, and the supervisor's run up to its gated publish.
+ */
+export async function startToApproval(
+  env: FlowEnv,
+  name: string,
+): Promise<{ proc: HostProcess; pending: ToolApprovalRequest[] }> {
+  const proc = openProcess(env, name);
+  await seedMemory(proc);
+  await submitGoal(proc);
+  await putSchedule(proc);
+  env.clock.advance(OCCURRENCE_AT + 30_000 - env.clock.now());
+  await proc.scheduler.tick();
+  await proc.supervisor.tick();
+  const envelope = await proc.runs.load(RUN_ID);
+  const pending = envelope?.result?.status === 'suspended' ? envelope.result.pendingApprovals : [];
+  return { proc, pending };
+}
+
+/** Waits for a crashed (or finished) process, closes it, expires the leases, opens the next one. */
+export async function recoverProcess(dead: HostProcess, name: string): Promise<HostProcess> {
+  await dead.settle();
+  await dead.close();
+  dead.env.clock.advance(LEASE_TTL_MS + 1_000);
+  return openProcess(dead.env, name);
 }
