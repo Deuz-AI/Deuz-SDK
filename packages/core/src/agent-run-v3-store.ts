@@ -17,6 +17,7 @@ import {
   forgetTombstones,
   isForgotten,
   markRedactedSteps,
+  redactedPayload,
   type ContextBlobRecord,
 } from './agent-run-v3-context';
 import {
@@ -50,7 +51,9 @@ interface StoredBlob {
 /**
  * The in-memory `AgentRunStoreV3` (2.4): a valid V3 store for tests and one
  * process. Copies in and out, saves at the stored revision plus one, blobs
- * deduplicated by digest and redacted on `redactForgotten`. Runs are listed
+ * deduplicated by digest and redacted on `redactForgotten`, together with
+ * the runs' stored copies of their retrieval blocks (history, checkpoints,
+ * result messages; also on every later save of such a run). Runs are listed
  * and pruned by the time of their last save on `deps.clock` (default: the
  * host clock). `prune` keeps a blob put again after the last save of every
  * run that pointed to it: another run is about to save it.
@@ -65,6 +68,14 @@ export function createInMemoryAgentRunStoreV3(
   const tombstones: ContextBlobRecord[] = [];
   const forgotten = (records: readonly ContextBlobRecord[], among = tombstones) =>
     records.some((record) => among.some((tombstone) => isForgotten(record, tombstone)));
+  /** The redacted blobs among `digests`. */
+  const redactedAmong = (digests: readonly Sha256Digest[]): Set<Sha256Digest> =>
+    new Set(
+      digests.filter((digest) => {
+        const blob = blobs.get(digest);
+        return blob !== undefined && blob.content === undefined;
+      }),
+    );
 
   return {
     checkpointVersion: 3,
@@ -83,11 +94,13 @@ export function createInMemoryAgentRunStoreV3(
       const payload = encodeAgentRunEnvelopeV3(envelope);
       const stored = runs.get(envelope.runId);
       assertEnvelopeRevisionV3(stored && { revision: stored.summary.revision }, envelope);
+      const digests = agentRunV3BlobDigests(envelope);
       runs.set(envelope.runId, {
-        payload,
+        // A leg that ran through a forget still holds the block: stored redacted.
+        payload: redactedPayload(payload, redactedAmong(digests)),
         summary: summarizeAgentRunEnvelopeV3(envelope, clock.now()),
         // Every blob the run ever pointed to, as the SQL stores' refs keep them.
-        blobs: [...new Set([...(stored?.blobs ?? []), ...agentRunV3BlobDigests(envelope)])],
+        blobs: [...new Set([...(stored?.blobs ?? []), ...digests])],
       });
     },
     async list(query) {
@@ -147,6 +160,16 @@ export function createInMemoryAgentRunStoreV3(
           stored.content = undefined;
           redacted++;
         }
+      // The runs' stored copies of those blocks go too, in place: same
+      // revision and last-save time (a retry finds nothing left to change).
+      const covered = new Set(
+        [...blobs.entries()]
+          .filter(([, stored]) => stored.content === undefined && forgotten(stored.records, added))
+          .map(([digest]) => digest),
+      );
+      for (const run of runs.values())
+        if (run.blobs.some((digest) => covered.has(digest)))
+          run.payload = redactedPayload(run.payload, redactedAmong(run.blobs));
       return redacted;
     },
     async prune(options) {
