@@ -13,7 +13,7 @@
  * Edge-safe (Web APIs only). NOT LIVE-VERIFIED: the wire protocols were
  * derived from the providers' official SDK types (`openai` 7.32,
  * `@google/genai` 2.28) and tested against a scripted fake socket. WebRTC is
- * not covered (planned for 2.4).
+ * not covered; it moved from the 2.4 plan to the 2.5 targets.
  */
 export { createRealtimeSession } from './session';
 export { createOpenAIRealtime, createGeminiLive } from './models';
