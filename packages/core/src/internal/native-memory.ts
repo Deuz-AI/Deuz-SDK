@@ -337,3 +337,35 @@ export async function settleInterrupted(
     warning,
   };
 }
+
+/**
+ * The V3 form of a settled extraction (2.4): a pass that wrote part of its
+ * plan is `'partial'` there (v1 and v2 records keep `'failed'` with the
+ * `memory-extraction-partial` code, since their status union is closed).
+ * Typed as the shared record, which carries it in a V3 envelope only.
+ */
+export function asV3Extraction(extraction: AgentRunMemoryExtraction): AgentRunMemoryExtraction {
+  if (extraction.status !== 'failed' || extraction.error?.code !== PARTIAL) return extraction;
+  return { ...extraction, status: 'partial' as AgentRunMemoryExtraction['status'] };
+}
+
+/**
+ * Settles a V3 run's pass right after it failed (2.4): from what its record
+ * planned and the store holds, as `reconcileAgentRun` would. A pass that
+ * wrote part of its plan is `'partial'`, with its warning; one that wrote all
+ * of it is completed. `undefined` when it planned nothing yet, wrote nothing,
+ * or the store cannot be read: the pass stays `'failed'`.
+ */
+export async function settlePartialV3(
+  memory: MemoryCallOptions,
+  extraction: AgentRunMemoryExtraction,
+  runId: string,
+): Promise<{ extraction: AgentRunMemoryExtraction; warning?: CallWarning } | undefined> {
+  if (extraction.planned === undefined) return undefined;
+  try {
+    const settled = await settleInterrupted(memory, extraction, runId);
+    return settled && { ...settled, extraction: asV3Extraction(settled.extraction) };
+  } catch {
+    return undefined;
+  }
+}

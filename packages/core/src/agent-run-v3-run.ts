@@ -35,9 +35,12 @@ import type {
 import { createTokenEstimator, type TokenEstimator } from './internal/estimate-tokens';
 import { withTelemetryParent } from './internal/native-context';
 import type { MemoryCallOptions } from './memory';
+import { createVersionedMemoryTools } from './memory/versioned/tools';
+import type { MemoryExtractionInput, MemorySession } from './memory/versioned/types';
 import type {
   AgentEventV3,
   AgentRunContextStepV3,
+  AgentRunMemoryIntentV3,
   AgentRunEnvelopeV3,
   AgentRunOptionsV3,
   AgentRunSessionV3,
@@ -47,7 +50,12 @@ import type { Clock, Logger } from './types/deps';
 import type { CallWarning } from './types/methods';
 import type { Message } from './types/message';
 import type { Usage } from './types/usage';
-import type { AgentEvent, AgentToolSet } from './types/agent-run';
+import type {
+  AgentEvent,
+  AgentRunTranscript,
+  AgentToolReceipt,
+  AgentToolSet,
+} from './types/agent-run';
 
 /** The events only a V3 run emits (2.4), beside every 2.3 one. */
 export type AgentEventV3Only = Exclude<AgentEventV3, AgentEvent>;
@@ -160,24 +168,179 @@ export function workingMemoryHandle(
   };
 }
 
+/** The tools a V3 run adds to the host's, and which of them write versioned memory. */
+export interface V3ToolSet {
+  tools: AgentToolSet;
+  /** The versioned-memory write tools (remember, revise, retract), by name. */
+  memoryWrites: ReadonlySet<string>;
+}
+
+/** The versioned-memory tools that write (recall only reads). */
+const MEMORY_WRITES = ['remember', 'revise', 'retract'] as const;
+
 /**
- * The tools a V3 run adds to the host's (spec §2.5): the working memory
- * tools with `workingMemory.tools`. A host tool with one of their names is
- * refused at configuration time.
+ * The tools a V3 run adds to the host's (spec §2.5, §4.1): the working
+ * memory tools with `workingMemory.tools`, and the session's versioned
+ * memory tools with `versionedMemory.tools`. A host tool with one of their
+ * names is refused at configuration time.
  */
 export function v3Tools(
   options: AgentRunOptionsV3<unknown>,
   memory: WorkingMemoryHandle,
-): AgentToolSet {
+): V3ToolSet {
   const tools: AgentToolSet = {};
+  const memoryWrites = new Set<string>();
   if (options.workingMemory?.tools)
     Object.assign(tools, workingMemoryTools({ memory, agentPath: options.agentPath ?? [] }));
+  const versioned = options.versionedMemory;
+  if (versioned?.tools) {
+    const memoryTools = createVersionedMemoryTools(versioned.session);
+    for (const name of Object.keys(memoryTools)) {
+      if (Object.hasOwn(tools, name))
+        throw new TypeError(`The V3 run's tool name ${name} is offered twice.`);
+      if (MEMORY_WRITES.some((write) => name.endsWith(`_${write}`))) memoryWrites.add(name);
+    }
+    Object.assign(tools, memoryTools);
+  }
   for (const name of Object.keys(tools))
     if (options.tools && Object.hasOwn(options.tools, name))
       throw new TypeError(
         `The tool name ${name} belongs to this V3 run's own tools; rename the host tool.`,
       );
-  return tools;
+  return { tools, memoryWrites };
+}
+
+/**
+ * The operation id a versioned memory tool commits under: its name, the
+ * execution scope, the model step and the tool call id, as
+ * `createVersionedMemoryTools` derives it, so a replayed call reads the same
+ * receipt.
+ */
+export function memoryToolOperationId(
+  toolName: string,
+  scopeId: string | undefined,
+  modelStep: number | undefined,
+  toolCallId: string,
+): string {
+  return JSON.stringify(['memory-tool', toolName, scopeId ?? null, modelStep ?? null, toolCallId]);
+}
+
+/** The intent stage a memory tool call's receipt stage records. */
+const INTENT_OF: Partial<Record<AgentToolReceipt['stage'], AgentRunMemoryIntentV3['status']>> = {
+  executing: 'intended',
+  executed: 'committed',
+  completed: 'acknowledged',
+  'validation-failed': 'acknowledged',
+  'projection-failed': 'acknowledged',
+};
+
+/**
+ * Records a versioned-memory tool write in the run's intents (spec §4.1)
+ * as its receipt moves, before the save that persists the receipt, so each
+ * stage is durable with it: the intent with the `executing` receipt, before
+ * the memory call; `committed` with the `executed` receipt (the memory store
+ * committed it and kept its receipt); `acknowledged` with the `completed`
+ * receipt, the run's own record of the outcome. A call that threw wrote
+ * nothing, and its intent is dropped.
+ */
+export function trackMemoryIntent(
+  envelope: AgentRunEnvelopeV3,
+  receipt: AgentToolReceipt,
+  scopeId: string | undefined,
+  memoryWrites: ReadonlySet<string>,
+  emit: (event: AgentEventV3Only) => void,
+): void {
+  if (!memoryWrites.has(receipt.toolName)) return;
+  const operationId = memoryToolOperationId(
+    receipt.toolName,
+    scopeId,
+    receipt.modelStep,
+    receipt.toolCallId,
+  );
+  const intents = envelope.memoryIntents ?? [];
+  const index = intents.findIndex((intent) => intent.operationId === operationId);
+  if (receipt.stage === 'failed') {
+    if (index >= 0) envelope.memoryIntents = intents.filter((_, at) => at !== index);
+    return;
+  }
+  const status = INTENT_OF[receipt.stage];
+  if (!status || intents[index]?.status === status) return;
+  const intent: AgentRunMemoryIntentV3 = {
+    ...intents[index],
+    operationId,
+    status,
+    ...(receipt.modelStep !== undefined ? { modelStep: receipt.modelStep } : {}),
+    toolCallId: receipt.toolCallId,
+  };
+  envelope.memoryIntents =
+    index >= 0 ? intents.map((other, at) => (at === index ? intent : other)) : [...intents, intent];
+  emit({ type: 'memory-intent', operationId, status });
+}
+
+/** The extraction a V3 run's versioned memory asks for (`versionedMemory.extract`), or none. */
+export function versionedExtraction(
+  options: AgentRunOptionsV3<unknown>,
+): Omit<MemoryExtractionInput, 'messages'> | undefined {
+  const extract = options.versionedMemory?.extract;
+  if (!extract) return undefined;
+  return extract === true ? {} : extract;
+}
+
+/**
+ * What a versioned extraction reads (spec §2.2): the input's last user turn
+ * and the run's own turns, each with a stable id (`<runId>#<index>` in the
+ * run's transcript); the SDK's turns and system messages are left out, and
+ * the session's extraction policy decides which of the rest it may read.
+ */
+export function extractionMessages(
+  transcript: AgentRunTranscript,
+  runId: string,
+): MemoryExtractionInput['messages'] {
+  const internal = new Set(transcript.internal);
+  const entries: MemoryExtractionInput['messages'][number][] = [];
+  let lastUser = -1;
+  for (let index = 0; index < transcript.input; index++)
+    if (transcript.messages[index]!.role === 'user') lastUser = index;
+  const take = (index: number) =>
+    entries.push({ id: `${runId}#${index}`, message: transcript.messages[index]!, runId });
+  if (lastUser >= 0) take(lastUser);
+  for (let index = transcript.input; index < transcript.messages.length; index++)
+    if (!internal.has(index) && transcript.messages[index]!.role !== 'system') take(index);
+  return entries;
+}
+
+/**
+ * Runs a run's versioned extraction under its intent (spec §4.1): the
+ * prepared plan is saved first (`planned`), then the session commits it
+ * atomically with its receipt under the intent's operation id, and the
+ * acknowledgment records the receipt (`acknowledged`). A session that already
+ * holds the operation (its acknowledgment was lost) answers from its receipt
+ * and applies nothing again. Returns false when a save failed (the intent
+ * stays where it was, for `reconcileAgentRun`); throws when the session does.
+ */
+export async function runVersionedExtraction(
+  session: MemorySession,
+  intent: AgentRunMemoryIntentV3,
+  input: MemoryExtractionInput,
+  save: () => Promise<boolean>,
+  emit?: (event: AgentEventV3Only) => void,
+): Promise<boolean> {
+  if (intent.status === 'intended') {
+    intent.status = 'planned';
+    if (!(await save())) return false;
+    emit?.({ type: 'memory-intent', operationId: intent.operationId, status: 'planned' });
+  }
+  const result = await session.extract(input, { operationId: intent.operationId });
+  intent.status = 'acknowledged';
+  intent.requestDigest = result.receipt.requestDigest;
+  intent.planned = result.receipt.entries.length;
+  intent.receipt = {
+    scopeRevision: result.receipt.scopeRevision,
+    committedAt: result.receipt.committedAt,
+  };
+  if (!(await save())) return false;
+  emit?.({ type: 'memory-intent', operationId: intent.operationId, status: 'acknowledged' });
+  return true;
 }
 
 /** What `createV3Compiler` built: the compiler, and the estimator the loop calibrates. */

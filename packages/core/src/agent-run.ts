@@ -601,8 +601,10 @@ export async function reconcileAgentRun(
             });
             outcome.warnings = [settled.warning];
           }
-          if (settled.extraction !== extraction) {
-            envelope.memory!.extraction = settled.extraction;
+          // A V3 record (2.4) holds a partial pass as 'partial'.
+          const next = v3 ? nativeMemory.asV3Extraction(settled.extraction) : settled.extraction;
+          if (next !== extraction) {
+            envelope.memory!.extraction = next;
             await save();
           }
         } else {
@@ -626,7 +628,15 @@ export async function reconcileAgentRun(
               mutations,
             };
           } catch (error) {
-            envelope.memory!.extraction = {
+            const partial = v3
+              ? await nativeMemory.settlePartialV3(
+                  options.memory,
+                  envelope.memory!.extraction!,
+                  runId,
+                )
+              : undefined;
+            if (partial?.warning) outcome.warnings = [partial.warning];
+            envelope.memory!.extraction = partial?.extraction ?? {
               ...envelope.memory!.extraction!,
               status: 'failed',
               error: errorData(error),
@@ -635,7 +645,33 @@ export async function reconcileAgentRun(
           await save();
         }
       }
-      outcome.memory = envelope.memory!.extraction!.status;
+      // The 2.3 answer shape: a V3 record's 'partial' is reported 'failed', with its warning.
+      const status = envelope.memory!.extraction!.status as string;
+      outcome.memory = status === 'partial' ? 'failed' : envelope.memory!.extraction!.status;
+    }
+    // A V3 run's versioned extraction (2.4) whose acknowledgment was lost, or
+    // that never ran: the session answers an operation it holds from its
+    // receipt and applies nothing again; one it does not hold, it commits now.
+    const versioned = (input as AgentRunReconcileOptionsV3).versionedMemory;
+    if (v3 && versioned && envelope.transcript) {
+      const native = await import('./agent-run-v3-run');
+      const record = envelope as unknown as AgentRunEnvelopeV3;
+      const settledIntents: string[] = [];
+      for (const intent of record.memoryIntents ?? []) {
+        if (intent.extraction === undefined || intent.status === 'acknowledged') continue;
+        lease?.assertHeld();
+        await native.runVersionedExtraction(
+          versioned.session,
+          intent,
+          { ...intent.extraction, messages: native.extractionMessages(envelope.transcript, runId) },
+          async () => {
+            await save();
+            return true;
+          },
+        );
+        settledIntents.push(intent.operationId);
+      }
+      if (settledIntents.length > 0) outcome.memoryIntents = settledIntents;
     }
     return outcome;
   } catch (error) {
@@ -760,6 +796,8 @@ function makeAgentStream<T>(
   let repairable = false;
   /** This leg completed the run, so it extracts (2.3); a terminal resume never does. */
   let extractNow = false;
+  /** This leg completed a V3 run with a versioned extraction (2.4): it extracts after the outcome. */
+  let extractVersioned = false;
   /**
    * This resume re-enters a run that failed in transit (2.3, `retryFailed`):
    * until its first write it writes nothing, the stored run stays failed.
@@ -909,18 +947,62 @@ function makeAgentStream<T>(
           mutations,
         };
       } catch (error) {
-        envelope.memory!.extraction = {
-          ...envelope.memory!.extraction!,
-          status: 'failed',
-          error: errorData(error),
-        };
+        // A V3 run (2.4) settles what the failed pass left at once: a pass
+        // that wrote part of its plan is 'partial', reported, never run again.
+        const partial = v3
+          ? await native.settlePartialV3(
+              options.memory,
+              envelope.memory!.extraction!,
+              envelope.runId,
+            )
+          : undefined;
+        if (partial) {
+          envelope.memory!.extraction = partial.extraction;
+          if (partial.warning) {
+            deps.logger.error(partial.warning.message, { runId: envelope.runId, error });
+            emitPart({ type: 'warning', warning: partial.warning }, 'finalizing');
+          }
+        } else {
+          envelope.memory!.extraction = {
+            ...envelope.memory!.extraction!,
+            status: 'failed',
+            error: errorData(error),
+          };
+          warnRecords(
+            'memory',
+            `The memory extraction of run ${envelope.runId} failed (${errorData(error).message}); the run's outcome stands.`,
+            error,
+          );
+        }
+      }
+      await saveBookkeeping();
+    }
+    // A V3 run's versioned extraction (2.4): its intent is durable with the
+    // terminal commit; the plan is saved, the session commits it with its
+    // receipt, and the acknowledgment records the receipt.
+    const record = envelope as unknown as AgentRunEnvelopeV3;
+    const intent = record.memoryIntents?.find(
+      (entry) => entry.extraction !== undefined && entry.status !== 'acknowledged',
+    );
+    if (extractVersioned && intent && envelope.transcript && nativeV3) {
+      try {
+        await nativeV3.runVersionedExtraction(
+          v3Options.versionedMemory!.session,
+          intent,
+          {
+            ...intent.extraction,
+            messages: nativeV3.extractionMessages(envelope.transcript, envelope.runId),
+          },
+          saveBookkeeping,
+          (event) => eventsV3?.push(event),
+        );
+      } catch (error) {
         warnRecords(
           'memory',
-          `The memory extraction of run ${envelope.runId} failed (${errorData(error).message}); the run's outcome stands.`,
+          `The versioned memory extraction of run ${envelope.runId} failed (${errorData(error).message}); the run's outcome stands, and reconcileAgentRun settles it.`,
           error,
         );
       }
-      await saveBookkeeping();
     }
   }
 
@@ -1070,7 +1152,11 @@ function makeAgentStream<T>(
         nativeMemory = await import('./internal/native-memory');
         nativeMemory.assertMemoryOptions(options.memory);
       }
-      if (options.chat !== undefined || options.memory !== undefined)
+      // A V3 versioned extraction (2.4) reads the run's transcript too.
+      const versionedExtract = nativeV3?.versionedExtraction(
+        v3Options as AgentRunOptionsV3<unknown>,
+      );
+      if (options.chat !== undefined || options.memory !== undefined || versionedExtract)
         nativeChat = await import('./internal/native-chat');
       if (resume) {
         if (!options.session) throw new TypeError('resumeAgent requires a native session.');
@@ -1235,6 +1321,17 @@ function makeAgentStream<T>(
         };
         await persist();
       };
+      // A V3 run's own tools (2.4): the working memory and versioned memory
+      // tools, through the same receipts as the host's, so a patch and a
+      // memory intent are durable with their call's receipt.
+      const v3Set = nativeV3?.v3Tools(
+        v3Options as AgentRunOptionsV3<unknown>,
+        nativeV3.workingMemoryHandle(
+          () => envelope as unknown as AgentRunEnvelopeV3,
+          resolveDependencies(options.deps).clock,
+          (event) => eventsV3?.push(event),
+        ),
+      );
       // One receipt boundary for every tool the run can execute: local, handoff
       // targets and (2.3, F01) MCP tools, refreshed catalogs included.
       const receipts: NativeToolReceipts = {
@@ -1245,26 +1342,21 @@ function makeAgentStream<T>(
           envelope.toolResults ??= {};
           receipt.modelStep ??= envelope.modelSteps;
           envelope.toolResults[JSON.stringify([receipt.modelStep, receipt.toolCallId])] = receipt;
+          // A versioned-memory write's intent moves with its receipt (2.4).
+          if (v3Set?.memoryWrites.size)
+            nativeV3!.trackMemoryIntent(
+              envelope as unknown as AgentRunEnvelopeV3,
+              receipt,
+              ctx.execution?.scopeId,
+              v3Set.memoryWrites,
+              (event) => eventsV3?.push(event),
+            );
           // Persist the in-flight tool-call history as well as its receipt so
           // canonical resume can settle that exact ID without another model call.
           await saveInFlight(ctx.messages);
         },
       };
-      // A V3 run's own tools (2.4): the working memory tools, through the same
-      // receipts as the host's, so a patch is durable with its call's receipt.
-      const runTools = nativeV3
-        ? {
-            ...options.tools,
-            ...nativeV3.v3Tools(
-              v3Options as AgentRunOptionsV3<unknown>,
-              nativeV3.workingMemoryHandle(
-                () => envelope as unknown as AgentRunEnvelopeV3,
-                resolveDependencies(options.deps).clock,
-                (event) => eventsV3?.push(event),
-              ),
-            ),
-          }
-        : options.tools;
+      const runTools = v3Set ? { ...options.tools, ...v3Set.tools } : options.tools;
       common.tools = await prepareAgentTools(
         runTools,
         options.toolsContext,
@@ -1540,7 +1632,7 @@ function makeAgentStream<T>(
       // step and every resume sends. The transcript starts with the input; every
       // later save of the history folds in its new turns first, so the stored
       // transcript never lags the stored history.
-      if (!resume && (options.memory || options.chat)) {
+      if (!resume && (options.memory || options.chat || versionedExtract)) {
         const input = envelope.messages.length;
         const internal: number[] = [];
         if (options.memory) {
@@ -2482,6 +2574,18 @@ function makeAgentStream<T>(
             infer: nativeMemory!.infers(options.memory),
           };
           extractNow = true;
+        }
+        // A V3 run's versioned extraction (2.4) is a durable intent in the
+        // same terminal commit, under its operation id and options.
+        if (versionedExtract && envelope.transcript) {
+          const record = envelope as unknown as AgentRunEnvelopeV3;
+          const operationId = resolveDependencies(options.deps).generateId();
+          record.memoryIntents = [
+            ...(record.memoryIntents ?? []),
+            { operationId, status: 'intended', extraction: versionedExtract },
+          ];
+          eventsV3?.push({ type: 'memory-intent', operationId, status: 'intended' });
+          extractVersioned = true;
         }
         await finish({ ...base(), status: 'completed', output: accepted });
         return;

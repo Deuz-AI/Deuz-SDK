@@ -799,4 +799,10 @@ export interface AgentRunReconciliation {
    * only part of what it planned. Absent when there is nothing to report.
    */
   warnings?: CallWarning[];
+  /**
+   * V3 runs (2.4): the operation ids of the versioned-memory writes whose
+   * acknowledgment the call settled from the session's receipts. Absent when
+   * there were none.
+   */
+  memoryIntents?: string[];
 }
