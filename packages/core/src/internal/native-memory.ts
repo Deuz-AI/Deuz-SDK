@@ -92,6 +92,25 @@ export function claimMemoryScope(
   };
 }
 
+/**
+ * Where a native run's memory calls report (2.4): their warnings
+ * (`embedding-mismatch`, `unaccounted-usage`) go to the run's warnings, and
+ * the memory LLM and embedder are charged to the run's execution context.
+ */
+export interface NativeMemoryCalls {
+  onWarning?: (warning: CallWarning) => void;
+  execution?: NativeExecutionContext;
+}
+
+/**
+ * The seams a native run's memory calls use: the host's, charged to the
+ * run's execution context (2.4) unless the host set one itself.
+ */
+function chargedSeams(memory: MemoryCallOptions, calls: NativeMemoryCalls | undefined) {
+  const execution = memory.seams.execution ?? calls?.execution;
+  return execution ? { ...memory.seams, execution } : memory.seams;
+}
+
 /** The index of the last user message, or -1. */
 function lastUserIndex(messages: readonly Message[]): number {
   for (let index = messages.length - 1; index >= 0; index--)
@@ -119,6 +138,7 @@ export async function recallOnce(
   memory: MemoryCallOptions,
   messages: readonly Message[],
   logger: Logger,
+  calls?: NativeMemoryCalls,
 ): Promise<{ recall: AgentRunRecall; message?: Message }> {
   if (memory.recall === false) return { recall: { status: 'skipped' } };
   const lastUser = lastUserIndex(messages);
@@ -132,10 +152,11 @@ export async function recallOnce(
     const scorer = options.scorer === 'default' ? defaultMemoryScorer : options.scorer;
     const hits = await recall(
       { scope: memory.scope, text, topK: options.topK ?? 5 },
-      memory.seams,
+      chargedSeams(memory, calls),
       {
         ...(scorer ? { scorer } : {}),
         ...(options.expandLinks !== undefined ? { expandLinks: options.expandLinks } : {}),
+        ...(calls?.onWarning ? { onWarning: calls.onWarning } : {}),
       },
     );
     const block = formatMemoriesForPrompt(hits, {
@@ -242,14 +263,16 @@ export async function runExtraction(
   clock: Clock,
   logger: Logger,
   checkpoint: (progress: ExtractionProgress) => Promise<void>,
+  calls?: NativeMemoryCalls,
 ): Promise<number> {
   const { remember, applyMutations, sweepExpired } = await import('./memory-pipeline');
   const deuz = { runId, operationId: extraction.operationId };
   const plan = (
-    await remember(turns, memory.scope, memory.seams, {
+    await remember(turns, memory.scope, chargedSeams(memory, calls), {
       infer: extraction.infer,
       metadata: { deuz },
       apply: false,
+      ...(calls?.onWarning ? { onWarning: calls.onWarning } : {}),
     })
   ).map((mutation) => stamped(mutation, deuz));
   await checkpoint({ planned: plan.length });
@@ -336,4 +359,36 @@ export async function settleInterrupted(
     },
     warning,
   };
+}
+
+/**
+ * The V3 form of a settled extraction (2.4): a pass that wrote part of its
+ * plan is `'partial'` there (v1 and v2 records keep `'failed'` with the
+ * `memory-extraction-partial` code, since their status union is closed).
+ * Typed as the shared record, which carries it in a V3 envelope only.
+ */
+export function asV3Extraction(extraction: AgentRunMemoryExtraction): AgentRunMemoryExtraction {
+  if (extraction.status !== 'failed' || extraction.error?.code !== PARTIAL) return extraction;
+  return { ...extraction, status: 'partial' as AgentRunMemoryExtraction['status'] };
+}
+
+/**
+ * Settles a V3 run's pass right after it failed (2.4): from what its record
+ * planned and the store holds, as `reconcileAgentRun` would. A pass that
+ * wrote part of its plan is `'partial'`, with its warning; one that wrote all
+ * of it is completed. `undefined` when it planned nothing yet, wrote nothing,
+ * or the store cannot be read: the pass stays `'failed'`.
+ */
+export async function settlePartialV3(
+  memory: MemoryCallOptions,
+  extraction: AgentRunMemoryExtraction,
+  runId: string,
+): Promise<{ extraction: AgentRunMemoryExtraction; warning?: CallWarning } | undefined> {
+  if (extraction.planned === undefined) return undefined;
+  try {
+    const settled = await settleInterrupted(memory, extraction, runId);
+    return settled && { ...settled, extraction: asV3Extraction(settled.extraction) };
+  } catch {
+    return undefined;
+  }
 }

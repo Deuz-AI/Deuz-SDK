@@ -7,6 +7,7 @@
 import { canonicalJson, digestJson, sha256Digest, type Sha256Digest } from '../internal/digest';
 import { createTokenEstimator } from '../internal/estimate-tokens';
 import { resolveDependencies } from '../internal/resolve-deps';
+import { telemetryParentOf } from '../internal/native-context';
 import { DEUZ_ATTR, DEUZ_SPAN, observeSpan, type TelemetryAttributes } from '../internal/telemetry';
 import type { Message } from '../types/message';
 import type { CallWarning } from '../types/methods';
@@ -406,7 +407,7 @@ export function createContextCompiler(options: CreateContextCompilerOptions): Co
   }
 
   async function beforeModelCall(input: ContextStepInput): Promise<ContextPackage> {
-    return observeSpan(deps, DEUZ_SPAN.contextCompile, undefined, async (annotate) => {
+    const compile = async (annotate: (more: TelemetryAttributes) => void) => {
       const { inputTokens, usedTokens } = checkStep(input);
       const { kept, dropped } = stillPlaced(state.placed, input.messages);
       const cachePrefixChanged = prefixChanged(input.messages);
@@ -504,13 +505,20 @@ export function createContextCompiler(options: CreateContextCompilerOptions): Co
       };
       for (const warning of contextWarnings(pkg.manifest)) options.onWarning?.(warning);
       return finish(input, pkg, kept, annotate);
-    });
+    };
+    return observeSpan(
+      deps,
+      DEUZ_SPAN.contextCompile,
+      undefined,
+      compile,
+      telemetryParentOf(input),
+    );
   }
 
   async function onOverflow(
     input: ContextStepInput & { inputTokens: number },
   ): Promise<ContextPackage> {
-    return observeSpan(deps, DEUZ_SPAN.contextCompile, undefined, async (annotate) => {
+    const compile = async (annotate: (more: TelemetryAttributes) => void) => {
       const { usedTokens } = checkStep(input);
       const inputTokens = finite(input.inputTokens, 0, 'inputTokens');
       const memory = lastStep?.step === input.step ? lastStep : undefined;
@@ -532,7 +540,14 @@ export function createContextCompiler(options: CreateContextCompilerOptions): Co
         estimatorKind: estimatorKind(input),
       });
       return finish(input, pkg, kept, annotate);
-    });
+    };
+    return observeSpan(
+      deps,
+      DEUZ_SPAN.contextCompile,
+      undefined,
+      compile,
+      telemetryParentOf(input),
+    );
   }
 
   return {

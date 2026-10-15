@@ -13,9 +13,17 @@ import type {
   AgentToolReceipt,
   AgentValidation,
 } from './types/agent-run';
+import { placeContext, type LoopContextHook } from './inference/loop-context';
+import type {
+  AgentEventV3,
+  AgentRunEnvelopeV3,
+  AgentRunOptionsV3,
+  AgentRunReconcileOptionsV3,
+  AgentStreamV3,
+} from './types/agent-run-v3';
 import type { ChatStore } from './chat';
 import type { CommonCallOptions } from './types/config';
-import type { StopDetails } from './types/methods';
+import type { CallWarning, StopDetails } from './types/methods';
 import type { Message } from './types/message';
 import type { LanguageModel } from './types/model';
 import type { StopCondition, ToolSet } from './types/tool';
@@ -97,7 +105,43 @@ export type * from './types/agent-run';
 // This coordinates one JavaScript process. When multiple processes or distinct
 // store wrappers share a store, the `lease` option (2.3) claims the run across
 // them; the store's revision check stays the fence against a stale writer.
-const activeNativeRuns = new WeakMap<AgentRunStore, Set<string>>();
+// Keyed by the store object: a 2.3 `AgentRunStore` or (2.4) an `AgentRunStoreV3`.
+const activeNativeRuns = new WeakMap<object, Set<string>>();
+
+/** The options only a V3 run takes (2.4); a 2.3 run that passes one is refused. */
+const V3_ONLY_OPTIONS = ['context', 'workingMemory', 'versionedMemory'] as const;
+
+/**
+ * Whether a run takes the V3 path (2.4): `checkpointVersion: 3`. Any other
+ * value is refused before anything is read or written.
+ */
+function checkpointVersionOf(options: object): 3 | undefined {
+  const version = (options as { checkpointVersion?: unknown }).checkpointVersion;
+  if (version === undefined) return undefined;
+  if (version !== 3)
+    throw new TypeError(
+      `checkpointVersion must be 3 (the V3 run path); got ${JSON.stringify(version)}.`,
+    );
+  return 3;
+}
+
+/** A 2.3 run given a V3 option or a V3 store is a configuration mistake (2.4). */
+function assertNoV3Options(options: object, store: unknown): void {
+  for (const key of V3_ONLY_OPTIONS)
+    if ((options as Record<string, unknown>)[key] !== undefined)
+      throw new TypeError(
+        `${key} needs a V3 run: pass checkpointVersion: 3 with a V3 session (an AgentRunStoreV3).`,
+      );
+  if ((store as { checkpointVersion?: unknown } | undefined)?.checkpointVersion === 3)
+    throw new TypeError(
+      'This run store keeps V3 runs only: pass checkpointVersion: 3, or use a 2.3 AgentRunStore.',
+    );
+}
+
+/** Whether this path reads a stored `version`: 3 on the V3 path, 1 or 2 otherwise. */
+function readsVersion(version: unknown, v3: boolean): boolean {
+  return v3 ? version === 3 : version === 1 || version === 2;
+}
 
 function errorData(error: unknown): { name: string; message: string; code?: string } {
   if (error instanceof Error) {
@@ -261,6 +305,16 @@ function envelopeVersion(envelope: AgentRunEnvelope): 1 | 2 {
     openTurnMisreadBy22(envelope)
     ? 2
     : 1;
+}
+
+/**
+ * Stamps the version a save writes: always 3 on the V3 path (2.4: a V3 record
+ * is never written back as 1 or 2, terminal and bookkeeping saves included),
+ * else {@link envelopeVersion}.
+ */
+function stampVersion(envelope: AgentRunEnvelope, v3: boolean): void {
+  if (v3) (envelope as { version: number }).version = 3;
+  else envelope.version = envelopeVersion(envelope);
 }
 
 /**
@@ -457,8 +511,14 @@ export function createInMemoryAgentRunStore(
  * one holds it (an executor keeps its lease until its extraction is saved).
  */
 export async function reconcileAgentRun(
-  options: AgentRunReconcileOptions,
+  input: AgentRunReconcileOptions | AgentRunReconcileOptionsV3,
 ): Promise<AgentRunReconciliation> {
+  // One executor for both paths (2.4): a V3 run is read from its V3 store and
+  // saved back as version 3, never as 1 or 2.
+  const v3 = checkpointVersionOf(input) === 3;
+  const options = input as AgentRunReconcileOptions;
+  if (v3) (await import('./agent-run-v3-run')).assertV3Session(input.session as never);
+  else assertNoV3Options({}, options.session?.store);
   const { store, runId, scope } = options.session ?? ({} as Partial<AgentRunSession>);
   if (!store || !runId || !scope)
     throw new TypeError('reconcileAgentRun requires a session with a store, runId and scope.');
@@ -484,7 +544,7 @@ export async function reconcileAgentRun(
     if (!saved) throw new TypeError(`Unknown native run: ${runId}`);
     if (
       saved.kind !== 'deuz-agent-run' ||
-      (saved.version !== 1 && saved.version !== 2) ||
+      !readsVersion(saved.version, v3) ||
       saved.runId !== runId ||
       saved.scope !== scope
     )
@@ -504,7 +564,7 @@ export async function reconcileAgentRun(
     const save = async (): Promise<void> => {
       // A call that lost the lease saves nothing more to the run.
       lease?.assertHeld();
-      envelope.version = envelopeVersion(envelope);
+      stampVersion(envelope, v3);
       envelope.revision = (envelope.revision ?? 0) + 1;
       await store.save(structuredClone(envelope));
     };
@@ -541,8 +601,10 @@ export async function reconcileAgentRun(
             });
             outcome.warnings = [settled.warning];
           }
-          if (settled.extraction !== extraction) {
-            envelope.memory!.extraction = settled.extraction;
+          // A V3 record (2.4) holds a partial pass as 'partial'.
+          const next = v3 ? nativeMemory.asV3Extraction(settled.extraction) : settled.extraction;
+          if (next !== extraction) {
+            envelope.memory!.extraction = next;
             await save();
           }
         } else {
@@ -566,7 +628,15 @@ export async function reconcileAgentRun(
               mutations,
             };
           } catch (error) {
-            envelope.memory!.extraction = {
+            const partial = v3
+              ? await nativeMemory.settlePartialV3(
+                  options.memory,
+                  envelope.memory!.extraction!,
+                  runId,
+                )
+              : undefined;
+            if (partial?.warning) outcome.warnings = [partial.warning];
+            envelope.memory!.extraction = partial?.extraction ?? {
               ...envelope.memory!.extraction!,
               status: 'failed',
               error: errorData(error),
@@ -575,7 +645,24 @@ export async function reconcileAgentRun(
           await save();
         }
       }
-      outcome.memory = envelope.memory!.extraction!.status;
+      // The 2.3 answer shape: a V3 record's 'partial' is reported 'failed', with its warning.
+      const status = envelope.memory!.extraction!.status as string;
+      outcome.memory = status === 'partial' ? 'failed' : envelope.memory!.extraction!.status;
+    }
+    // A V3 run's versioned extraction (2.4) whose acknowledgment was lost, or
+    // that never ran: the session answers an operation it holds from its
+    // receipt and applies nothing again; one it does not hold, it commits now.
+    const versioned = (input as AgentRunReconcileOptionsV3).versionedMemory;
+    if (v3 && versioned) {
+      const settled = await (
+        await import('./agent-run-v3-run')
+      ).reconcileVersionedIntents(
+        envelope as unknown as AgentRunEnvelopeV3,
+        versioned.session,
+        save,
+        () => lease?.assertHeld(),
+      );
+      if (settled.length > 0) outcome.memoryIntents = settled;
     }
     return outcome;
   } catch (error) {
@@ -589,28 +676,65 @@ export async function reconcileAgentRun(
   }
 }
 
-export function runAgent<T = string>(options: AgentRunOptions<T>): Promise<AgentResult<T>> {
-  return streamAgent(options).result;
+/**
+ * Run a native agent. With `checkpointVersion: 3` (2.4) the run takes the V3
+ * path: a V3 session and store, compiled context, working memory and
+ * versioned memory, on the same executor.
+ */
+export function runAgent<T = string>(options: AgentRunOptionsV3<T>): Promise<AgentResult<T>>;
+export function runAgent<T = string>(options: AgentRunOptions<T>): Promise<AgentResult<T>>;
+export function runAgent<T = string>(
+  options: AgentRunOptions<T> | AgentRunOptionsV3<T>,
+): Promise<AgentResult<T>> {
+  return makeAgentStream(options, false).result;
 }
 
+export function resumeAgent<T = string>(options: AgentRunOptionsV3<T>): Promise<AgentResult<T>>;
 export function resumeAgent<T = string>(
   options: AgentRunOptions<T> & { session: AgentRunSession },
+): Promise<AgentResult<T>>;
+export function resumeAgent<T = string>(
+  options: (AgentRunOptions<T> & { session: AgentRunSession }) | AgentRunOptionsV3<T>,
 ): Promise<AgentResult<T>> {
-  return resumeStreamAgent(options).result;
+  return makeAgentStream(options, true).result;
 }
 
-export function streamAgent<T = string>(options: AgentRunOptions<T>): AgentStream<T> {
+export function streamAgent<T = string>(options: AgentRunOptionsV3<T>): AgentStreamV3<T>;
+export function streamAgent<T = string>(options: AgentRunOptions<T>): AgentStream<T>;
+export function streamAgent<T = string>(
+  options: AgentRunOptions<T> | AgentRunOptionsV3<T>,
+): AgentStream<T> | AgentStreamV3<T> {
   return makeAgentStream(options, false);
 }
 
+export function resumeStreamAgent<T = string>(options: AgentRunOptionsV3<T>): AgentStreamV3<T>;
 export function resumeStreamAgent<T = string>(
   options: AgentRunOptions<T> & { session: AgentRunSession },
-): AgentStream<T> {
+): AgentStream<T>;
+export function resumeStreamAgent<T = string>(
+  options: (AgentRunOptions<T> & { session: AgentRunSession }) | AgentRunOptionsV3<T>,
+): AgentStream<T> | AgentStreamV3<T> {
   return makeAgentStream(options, true);
 }
 
-function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): AgentStream<T> {
+function makeAgentStream<T>(
+  input: AgentRunOptions<T> | AgentRunOptionsV3<T>,
+  resume: boolean,
+): AgentStream<T> & Partial<Pick<AgentStreamV3<T>, 'eventsV3'>> {
+  // One executor for both paths (2.4). The V3 options are those of a 2.3 run
+  // plus the V3 ones, which only the V3 branches below read.
+  const options = input as AgentRunOptions<T>;
+  const v3Options = input as AgentRunOptionsV3<T>;
+  /** The run takes the V3 path; checked (with the rest) at the start of the pump. */
+  const v3 = (input as { checkpointVersion?: unknown }).checkpointVersion === 3;
   const events = createBroadcaster<AgentEvent<T>>();
+  /** The V3 view of the events (2.4): every 2.3 event, plus the V3 ones. */
+  const eventsV3 = v3 ? createBroadcaster<AgentEventV3<T>>() : undefined;
+  /** Every run event goes to both views, in one order. */
+  const pushEvent = (event: AgentEvent<T>): void => {
+    events.push(event);
+    eventsV3?.push(event);
+  };
   const text = createBroadcaster<string>();
   const partial = createBroadcaster<{ attempt: number; value: unknown }>();
   type Element = T extends readonly (infer E)[] ? E : never;
@@ -647,6 +771,17 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
   /** Chat and memory support (2.3), loaded when the run uses them. */
   let nativeChat: typeof import('./internal/native-chat') | undefined;
   let nativeMemory: typeof import('./internal/native-memory') | undefined;
+  /** The V3 runtime (2.4), loaded when the run takes the V3 path. */
+  let nativeV3: typeof import('./agent-run-v3-run') | undefined;
+  /** The V3 run's context hook (2.4), handed to its loop. */
+  let contextHook: LoopContextHook | undefined;
+  /**
+   * The history as the run's transcript reads it (2.4): a V3 run's compiled
+   * context blocks are SDK data, never a turn, so they never reach the
+   * transcript, the chat projection or a memory extraction.
+   */
+  const transcriptHistory = (): Message[] =>
+    nativeV3 && contextHook ? nativeV3.withoutContext(envelope.messages) : envelope.messages;
   /** Model fail-over (2.3): the routing of every model call, once `fallbackModels` is set. */
   let router: import('./internal/native-fallback').ModelRouter | undefined;
   /** The run's memory scope is claimed for its execution until the executor ends (2.3). */
@@ -659,6 +794,8 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
   let repairable = false;
   /** This leg completed the run, so it extracts (2.3); a terminal resume never does. */
   let extractNow = false;
+  /** This leg completed a V3 run with a versioned extraction (2.4): it extracts after the outcome. */
+  let extractVersioned = false;
   /**
    * This resume re-enters a run that failed in transit (2.3, `retryFailed`):
    * until its first write it writes nothing, the stored run stays failed.
@@ -685,7 +822,7 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
     if (common?.execution) envelope.execution = executionSnapshot(common.execution);
     if (!options.session || !admitted) return Promise.resolve();
     persistedLedger = ledgerKey(envelope.execution);
-    envelope.version = envelopeVersion(envelope);
+    stampVersion(envelope, v3);
     // Every actual save advances the fence durable stores check (2.2).
     envelope.revision = (envelope.revision ?? 0) + 1;
     const snapshot = structuredClone(envelope);
@@ -714,7 +851,7 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
     if (!options.session) return true;
     if (persistFailed) return false;
     const snapshot = structuredClone(envelope);
-    snapshot.version = envelopeVersion(snapshot);
+    stampVersion(snapshot, v3);
     snapshot.revision = (envelope.revision ?? 0) + 1;
     const write = writeTail.then(() => {
       lease?.assertHeld();
@@ -750,6 +887,14 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
    */
   async function settleRecords(): Promise<void> {
     const deps = resolveDependencies(options.deps);
+    const warned = new Set<string>();
+    const warnOnce = (warning: CallWarning): void => {
+      const key = JSON.stringify([warning.type, warning.message]);
+      if (warned.has(key)) return;
+      warned.add(key);
+      deps.logger.warn(warning.message, { runId: envelope.runId, warning: warning.type });
+      emitPart({ type: 'warning', warning }, 'finalizing');
+    };
     if (options.chat && envelope.transcript && nativeChat) {
       if (admitted || nativeChat.projectionBehind(envelope.transcript, envelope.chat)) {
         // A leg that did not run (a terminal or still-suspended resume) only
@@ -801,6 +946,9 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
             if (!(await saveBookkeeping()))
               throw new Error('its progress could not be saved, so it wrote nothing more');
           },
+          // Its 2.4 warnings go out on the stream, once each, and its calls are
+          // charged to the run's ledger.
+          { onWarning: warnOnce, ...(common?.execution ? { execution: common.execution } : {}) },
         );
         envelope.memory!.extraction = {
           ...envelope.memory!.extraction!,
@@ -808,19 +956,47 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
           mutations,
         };
       } catch (error) {
-        envelope.memory!.extraction = {
-          ...envelope.memory!.extraction!,
-          status: 'failed',
-          error: errorData(error),
-        };
-        warnRecords(
-          'memory',
-          `The memory extraction of run ${envelope.runId} failed (${errorData(error).message}); the run's outcome stands.`,
-          error,
-        );
+        // A V3 run (2.4) settles what the failed pass left at once: a pass
+        // that wrote part of its plan is 'partial', reported, never run again.
+        const partial = v3
+          ? await native.settlePartialV3(
+              options.memory,
+              envelope.memory!.extraction!,
+              envelope.runId,
+            )
+          : undefined;
+        if (partial) {
+          envelope.memory!.extraction = partial.extraction;
+          if (partial.warning) {
+            deps.logger.error(partial.warning.message, { runId: envelope.runId, error });
+            emitPart({ type: 'warning', warning: partial.warning }, 'finalizing');
+          }
+        } else {
+          envelope.memory!.extraction = {
+            ...envelope.memory!.extraction!,
+            status: 'failed',
+            error: errorData(error),
+          };
+          warnRecords(
+            'memory',
+            `The memory extraction of run ${envelope.runId} failed (${errorData(error).message}); the run's outcome stands.`,
+            error,
+          );
+        }
       }
       await saveBookkeeping();
     }
+    // A V3 run's versioned extraction (2.4): its intent is durable with the
+    // terminal commit; the plan is saved, the session commits it with its
+    // receipt, and the acknowledgment records the receipt.
+    if (extractVersioned && nativeV3)
+      await nativeV3.settleVersionedExtraction(
+        envelope as unknown as AgentRunEnvelopeV3,
+        v3Options.versionedMemory!.session,
+        saveBookkeeping,
+        (event) => eventsV3?.push(event),
+        (message, error) => warnRecords('memory', message, error),
+      );
   }
 
   function base() {
@@ -861,7 +1037,7 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
   /** A drain reached this executor's lease (2.3). A cancel or abort outranks it. */
   const drainDue = (): boolean => lease !== undefined && lease.draining && !lease.signal.aborted;
   function emitPart(part: StreamPart, phase: 'running' | 'finalizing'): void {
-    events.push({ type: 'part', part, phase });
+    pushEvent({ type: 'part', part, phase });
     if (part.type === 'text-delta') text.push(part.text);
   }
 
@@ -900,6 +1076,13 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
         throw new TypeError("onCatalogChange must be 'stop' or 'accept'.");
       if (options.retryFailed !== undefined && typeof options.retryFailed !== 'boolean')
         throw new TypeError('retryFailed must be a boolean.');
+      // The V3 path (2.4) is chosen explicitly and checked before anything is
+      // read or written: a V3 session and store, and the V3 options only there.
+      if (checkpointVersionOf(input) === 3) {
+        nativeV3 = await import('./agent-run-v3-run');
+        nativeV3.assertV3Session(v3Options.session);
+        nativeV3.assertV3Options(v3Options as AgentRunOptionsV3<unknown>);
+      } else assertNoV3Options(input, options.session?.store);
       if (options.session && (!options.session.runId || !options.session.scope)) {
         throw new TypeError('Native sessions require non-empty runId and scope.');
       }
@@ -962,7 +1145,11 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
         nativeMemory = await import('./internal/native-memory');
         nativeMemory.assertMemoryOptions(options.memory);
       }
-      if (options.chat !== undefined || options.memory !== undefined)
+      // A V3 versioned extraction (2.4) reads the run's transcript too.
+      const versionedExtract = nativeV3?.versionedExtraction(
+        v3Options as AgentRunOptionsV3<unknown>,
+      );
+      if (options.chat !== undefined || options.memory !== undefined || versionedExtract)
         nativeChat = await import('./internal/native-chat');
       if (resume) {
         if (!options.session) throw new TypeError('resumeAgent requires a native session.');
@@ -970,7 +1157,7 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
         if (!saved) throw new TypeError(`Unknown native run: ${options.session.runId}`);
         if (
           saved.kind !== 'deuz-agent-run' ||
-          (saved.version !== 1 && saved.version !== 2) ||
+          !readsVersion(saved.version, v3) ||
           saved.runId !== options.session.runId ||
           saved.scope !== options.session.scope
         )
@@ -1025,6 +1212,11 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
           chat: undefined,
           memory: undefined,
           fallbackModels: undefined,
+          // Nor the V3 options (2.4): the run hands its loop what they build.
+          checkpointVersion: undefined,
+          context: undefined,
+          workingMemory: undefined,
+          versionedMemory: undefined,
           messages: resume ? envelope.messages : options.messages,
           prompt: resume ? undefined : options.prompt,
           instructions: resume ? undefined : options.instructions,
@@ -1091,7 +1283,7 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
         (options.clientToolResults ?? []).map((item) => [item.toolCallId, item]),
       );
       const onToolOutput = (output: NativeToolOutput): void => {
-        events.push({ type: 'tool-output', ...output });
+        pushEvent({ type: 'tool-output', ...output });
       };
       /**
        * Save `messages`, the history of the step in flight, as the run's
@@ -1103,7 +1295,7 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
         handoff = envelope.checkpoints[envelope.runId]?.handoff,
       ): Promise<void> => {
         envelope.messages = [...messages];
-        if (envelope.transcript) nativeChat!.foldHistory(envelope.transcript, envelope.messages);
+        if (envelope.transcript) nativeChat!.foldHistory(envelope.transcript, transcriptHistory());
         const previous = envelope.checkpoints[envelope.runId];
         envelope.checkpoints[envelope.runId] = {
           version: 1,
@@ -1122,6 +1314,17 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
         };
         await persist();
       };
+      // A V3 run's own tools (2.4): the working memory and versioned memory
+      // tools, through the same receipts as the host's, so a patch and a
+      // memory intent are durable with their call's receipt.
+      const v3Set = nativeV3?.v3Tools(
+        v3Options as AgentRunOptionsV3<unknown>,
+        nativeV3.workingMemoryHandle(
+          () => envelope as unknown as AgentRunEnvelopeV3,
+          resolveDependencies(options.deps).clock,
+          (event) => eventsV3?.push(event),
+        ),
+      );
       // One receipt boundary for every tool the run can execute: local, handoff
       // targets and (2.3, F01) MCP tools, refreshed catalogs included.
       const receipts: NativeToolReceipts = {
@@ -1132,13 +1335,23 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
           envelope.toolResults ??= {};
           receipt.modelStep ??= envelope.modelSteps;
           envelope.toolResults[JSON.stringify([receipt.modelStep, receipt.toolCallId])] = receipt;
+          // A versioned-memory write's intent moves with its receipt (2.4).
+          if (v3Set?.memoryWrites.size)
+            nativeV3!.trackMemoryIntent(
+              envelope as unknown as AgentRunEnvelopeV3,
+              receipt,
+              ctx.execution?.scopeId,
+              v3Set.memoryWrites,
+              (event) => eventsV3?.push(event),
+            );
           // Persist the in-flight tool-call history as well as its receipt so
           // canonical resume can settle that exact ID without another model call.
           await saveInFlight(ctx.messages);
         },
       };
+      const runTools = v3Set ? { ...options.tools, ...v3Set.tools } : options.tools;
       common.tools = await prepareAgentTools(
-        options.tools,
+        runTools,
         options.toolsContext,
         onToolOutput,
         receipts,
@@ -1412,14 +1625,16 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
       // step and every resume sends. The transcript starts with the input; every
       // later save of the history folds in its new turns first, so the stored
       // transcript never lags the stored history.
-      if (!resume && (options.memory || options.chat)) {
+      if (!resume && (options.memory || options.chat || versionedExtract)) {
         const input = envelope.messages.length;
         const internal: number[] = [];
         if (options.memory) {
+          // Its 2.4 warnings reach the run's, and its calls the run's ledger.
           const { recall, message } = await nativeMemory!.recallOnce(
             options.memory,
             envelope.messages,
             resolveDependencies(options.deps).logger,
+            { onWarning: (warning) => runWarnings.add(warning), execution: common.execution },
           );
           if (message) {
             recall.index = envelope.messages.length;
@@ -1430,6 +1645,23 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
           envelope.memory = { scope: structuredClone(options.memory.scope), recall };
         }
         envelope.transcript = nativeChat!.createTranscript(envelope.messages, input, internal);
+      }
+      // The V3 state (2.4): a new run starts its working memory here, before its
+      // first save; a resumed run keeps the stored one, so the active task
+      // survives a restart. The compiler continues from its stored state.
+      if (nativeV3) {
+        const leg = await nativeV3.prepareV3Leg({
+          options: v3Options as AgentRunOptionsV3<unknown>,
+          envelope: () => envelope as unknown as AgentRunEnvelopeV3,
+          resume,
+          persist,
+          emit: (event) => eventsV3?.push(event),
+          warn: (warning) => runWarnings.add(warning),
+          deps: resolveDependencies(options.deps),
+        });
+        // Redacted retrieval blocks left the history (spec §4.4).
+        if (leg.redacted) common.messages = envelope.messages;
+        contextHook = leg.hook;
       }
       admitted = true;
       if (options.execution && options.session) {
@@ -1501,7 +1733,7 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
             envelope.messages = checkpoint.messages;
             envelope.usage = checkpoint.usage;
             if (envelope.transcript)
-              nativeChat!.foldHistory(envelope.transcript, envelope.messages);
+              nativeChat!.foldHistory(envelope.transcript, transcriptHistory());
           }
           await persist();
         },
@@ -1670,7 +1902,7 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
               }),
               saveChat: (record) => {
                 envelope.transcript!.messages = [...record.messages];
-                envelope.transcript!.synced = nativeChat!.syncPoint(envelope.messages);
+                envelope.transcript!.synced = nativeChat!.syncPoint(transcriptHistory());
               },
             } satisfies ChatStore,
           }
@@ -1717,7 +1949,7 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
             drained();
             return;
           }
-          events.push({ type: 'phase', phase: 'running' });
+          pushEvent({ type: 'phase', phase: 'running' });
           // A leg whose model call failed over (2.3) runs again from the run's
           // last checkpoint, so only that call is repeated; without one, from
           // the history the first leg started with.
@@ -1828,6 +2060,8 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
                 },
                 // Client calls answered from a supplied or recorded result (2.3).
                 ...(settleTools ? { settleTools } : {}),
+                // The V3 context compiler (2.4), placed by the loop before each call.
+                ...(contextHook ? { context: contextHook } : {}),
               },
             );
             for await (const part of inner.fullStream) {
@@ -1918,11 +2152,11 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
         envelope.messages = input.messages;
         // A guardrail may have rewritten the history: the transcript keeps the raw input.
         if (envelope.transcript)
-          envelope.transcript.synced = nativeChat!.syncPoint(envelope.messages);
+          envelope.transcript.synced = nativeChat!.syncPoint(transcriptHistory());
       }
 
       envelope.phase = 'finalizing';
-      events.push({ type: 'phase', phase: 'finalizing' });
+      pushEvent({ type: 'phase', phase: 'finalizing' });
       await persist();
       // A handoff (2.0) gives its target every following step, finalization
       // included (2.3): the target's model answers, with the target's tools on
@@ -1993,7 +2227,7 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
             const prompt: Message = { role: 'user', content: FINALIZE_PROMPT };
             envelope.messages = [...envelope.messages, prompt];
             if (envelope.transcript)
-              nativeChat!.appendTurn(envelope.transcript, prompt, envelope.messages, true);
+              nativeChat!.appendTurn(envelope.transcript, prompt, transcriptHistory(), true);
           }
           const attempt = envelope.finalizationAttempts++;
           envelope.outputAttempts = (envelope.outputAttempts ?? 0) + 1;
@@ -2012,13 +2246,22 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
               )
             : undefined;
           const toolRequest = await finalizeToolRequest();
+          // A V3 run's final answer call (2.4) carries its compiled context as a
+          // loop step does: recorded before the call, the output schema counted.
+          const placement = await contextHook?.beforeModelCall({
+            stepIndex: envelope.modelSteps - 1,
+            messages: envelope.messages,
+            model: callModel,
+            ...(toolRequest ? { wire: toolRequest } : {}),
+            ...(outputSchema ? { outputSchema } : {}),
+          });
           const spentBefore = common.execution!.ledger.totals(common.execution!.scopeId).spent.usd;
           const attemptRequests = ledgerRequests();
           const inner = runStream(
             {
               ...common,
               model: callModel,
-              messages: envelope.messages,
+              messages: placeContext(envelope.messages, placement),
               prompt: undefined,
               instructions: undefined,
               tools: undefined,
@@ -2064,7 +2307,7 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
                 lastDraft = encoded;
                 const value = { attempt, value: draft.value };
                 partial.push(value);
-                events.push({ type: 'partial-output', ...value });
+                pushEvent({ type: 'partial-output', ...value });
               }
             }
             if (output.element) {
@@ -2079,7 +2322,7 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
                     complete[index],
                   );
                   elements.push({ attempt, index, value });
-                  events.push({ type: 'array-element', attempt, index, value });
+                  pushEvent({ type: 'array-element', attempt, index, value });
                 } catch {
                   /* rejected element stays absent from the validated stream */
                 }
@@ -2167,6 +2410,13 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
           }
           envelope.candidateText = buffer;
           currentText = buffer;
+          // The answer stands (2.4): its retrieval block joins the history
+          // before it, once; the working memory tail never does.
+          if (placement) {
+            contextHook?.afterModelCall?.(await inner.usage);
+            if (placement.append.length > 0)
+              envelope.messages = [...envelope.messages, ...placement.append];
+          }
           // The whole answer turn is kept: reasoning included, so the transcript
           // stays append-only. A forced `json_output` call (tool strategy) is
           // recorded as its JSON text, as before: a stored call would need an
@@ -2180,7 +2430,7 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
           if (!isBlankTurn(answer)) {
             envelope.messages = [...envelope.messages, answer];
             if (envelope.transcript)
-              nativeChat!.appendTurn(envelope.transcript, answer, envelope.messages);
+              nativeChat!.appendTurn(envelope.transcript, answer, transcriptHistory());
           }
           await persist();
         }
@@ -2201,7 +2451,7 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
           };
           envelope.messages.push(repair);
           if (envelope.transcript)
-            nativeChat!.appendTurn(envelope.transcript, repair, envelope.messages, true);
+            nativeChat!.appendTurn(envelope.transcript, repair, transcriptHistory(), true);
           delete envelope.candidateText;
           await persist();
           continue;
@@ -2227,13 +2477,13 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
               nativeChat!.replaceLastTurn(
                 envelope.transcript,
                 isBlankTurn(rewritten) ? undefined : rewritten,
-                envelope.messages,
+                transcriptHistory(),
               );
           } else if (currentText) {
             const answer: Message = { role: 'assistant', content: currentText };
             envelope.messages = [...envelope.messages, answer];
             if (envelope.transcript)
-              nativeChat!.appendTurn(envelope.transcript, answer, envelope.messages);
+              nativeChat!.appendTurn(envelope.transcript, answer, transcriptHistory());
           }
           envelope.candidateText = currentText;
         }
@@ -2298,7 +2548,7 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
             };
             envelope.messages.push(feedback);
             if (envelope.transcript)
-              nativeChat!.appendTurn(envelope.transcript, feedback, envelope.messages, true);
+              nativeChat!.appendTurn(envelope.transcript, feedback, transcriptHistory(), true);
             delete envelope.candidateText;
             // Repair budget applies to each verifier candidate, while modelSteps
             // and verificationAttempts remain cumulative and strictly bounded.
@@ -2317,6 +2567,18 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
             infer: nativeMemory!.infers(options.memory),
           };
           extractNow = true;
+        }
+        // A V3 run's versioned extraction (2.4) is a durable intent in the
+        // same terminal commit, under its operation id and options.
+        if (versionedExtract && envelope.transcript) {
+          const record = envelope as unknown as AgentRunEnvelopeV3;
+          const operationId = resolveDependencies(options.deps).generateId();
+          record.memoryIntents = [
+            ...(record.memoryIntents ?? []),
+            { operationId, status: 'intended', extraction: versionedExtract },
+          ];
+          eventsV3?.push({ type: 'memory-intent', operationId, status: 'intended' });
+          extractVersioned = true;
         }
         await finish({ ...base(), status: 'completed', output: accepted });
         return;
@@ -2359,10 +2621,11 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
       await lease?.release(terminalSaved);
       releaseRun?.();
       if (settledOutcome) {
-        events.push({ type: 'result', result: settledOutcome });
+        pushEvent({ type: 'result', result: settledOutcome });
         result.resolve(settledOutcome);
       }
       events.close();
+      eventsV3?.close();
       text.close();
       partial.close();
       elements.close();
@@ -2385,6 +2648,7 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
   }
   return {
     events: stream(events),
+    ...(eventsV3 ? { eventsV3: stream(eventsV3) } : {}),
     textStream: stream(text),
     partialOutputStream: stream(partial),
     elementStream: stream(elements),

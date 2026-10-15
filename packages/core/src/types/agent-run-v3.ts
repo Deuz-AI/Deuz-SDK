@@ -17,7 +17,11 @@ import type {
   WorkingMemorySnapshot,
 } from '../context/working-memory/types';
 import type { Sha256Digest } from '../internal/digest';
-import type { MemoryForgetEvent, MemorySession } from '../memory/versioned/types';
+import type {
+  MemoryExtractionInput,
+  MemoryForgetEvent,
+  MemorySession,
+} from '../memory/versioned/types';
 import type {
   AgentEvent,
   AgentRunEnvelope,
@@ -26,6 +30,7 @@ import type {
   AgentRunMemoryExtraction,
   AgentRunMemoryState,
   AgentRunOptions,
+  AgentRunReconcileOptions,
   AgentStream,
 } from './agent-run';
 
@@ -65,6 +70,12 @@ export interface AgentRunMemoryIntentV3 {
   /** The tool call that asked for it, when a model tool did. */
   modelStep?: number;
   toolCallId?: string;
+  /**
+   * The extraction options of the run's versioned extraction (2.4), kept with
+   * its intent so a later `reconcileAgentRun` asks the session for exactly the
+   * same operation. Absent for a model tool's write.
+   */
+  extraction?: Omit<MemoryExtractionInput, 'messages'>;
 }
 
 /** The compiled context of one model step: its manifest and its package blob. */
@@ -73,6 +84,12 @@ export interface AgentRunContextStepV3 {
   manifest: ContextManifest;
   /** The content-addressed package; written once, reused when unchanged. */
   blob: ContextBlobRef;
+  /**
+   * The digest of the messages the step was compiled for (2.4). A step whose
+   * answer was never saved is reopened with the same messages after a
+   * restart, and then uses this package again instead of compiling anew.
+   */
+  input?: string;
 }
 
 /** A V3 run's context state: the compiler's state and every step's package reference. */
@@ -168,8 +185,19 @@ export type AgentRunOptionsV3<T = string> = Omit<AgentRunOptions<T>, 'session'> 
     create?: CreateWorkingMemoryInput;
     tools?: boolean;
   };
-  /** Versioned memory: writes go through the intent → plan → commit → ack protocol. */
-  versionedMemory?: { session: MemorySession; tools?: boolean };
+  /**
+   * Versioned memory: writes go through the intent → plan → commit → ack
+   * protocol. `tools` offers the model the session's memory tools (remember,
+   * recall, revise, retract), each write recorded as an intent with the
+   * session's operation id. `extract` (off by default) extracts what the
+   * completed run's turns hold into the session after the outcome is durable,
+   * under an operation id the terminal commit records first.
+   */
+  versionedMemory?: {
+    session: MemorySession;
+    tools?: boolean;
+    extract?: boolean | Omit<MemoryExtractionInput, 'messages'>;
+  };
 };
 
 /** The events of a V3 run: every `AgentEvent`, plus the V3 ones. `AgentEvent` stays closed. */
@@ -190,3 +218,18 @@ export type AgentEventV3<T = string> =
 export interface AgentStreamV3<T = string> extends AgentStream<T> {
   readonly eventsV3: AsyncIterable<AgentEventV3<T>>;
 }
+
+/**
+ * What `reconcileAgentRun` settles for a V3 run (2.4): the 2.3 options with
+ * `checkpointVersion: 3` and the V3 session. With `versionedMemory`, the
+ * run's versioned-memory intents whose acknowledgment was lost are settled
+ * from the session's receipts (an operation that committed is replayed,
+ * never applied again). The answer is the 2.3 `AgentRunReconciliation`; a V3
+ * extraction the stored record holds as `'partial'` is reported there as
+ * `'failed'` with its `memory-extraction-partial` warning, as for 2.3 runs.
+ */
+export type AgentRunReconcileOptionsV3 = Omit<AgentRunReconcileOptions, 'session'> & {
+  checkpointVersion: 3;
+  session: AgentRunSessionV3;
+  versionedMemory?: { session: MemorySession };
+};
