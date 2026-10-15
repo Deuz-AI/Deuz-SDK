@@ -29,18 +29,6 @@ import * as goalRuntimeSqlite from '../src/node/goal-runtime-sqlite';
 import * as goalRuntimePostgres from '../src/node/goal-runtime-postgres';
 import { createInMemoryAgentRunStoreV3 } from '../src/agent-run-v3-store';
 
-function expectStub(name: string, call: () => unknown): void {
-  let thrown: unknown;
-  try {
-    call();
-  } catch (error) {
-    thrown = error;
-  }
-  expect(thrown, name).toBeInstanceOf(NotImplementedError);
-  expect((thrown as NotImplementedError).feature).toBe(name);
-  expect((thrown as NotImplementedError).code).toBe('not_implemented');
-}
-
 async function expectAsyncStub(name: string, call: () => Promise<unknown>): Promise<void> {
   const error = await call().then(
     () => undefined,
