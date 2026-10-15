@@ -775,6 +775,13 @@ function makeAgentStream<T>(
   let nativeV3: typeof import('./agent-run-v3-run') | undefined;
   /** The V3 run's context hook (2.4), handed to its loop. */
   let contextHook: LoopContextHook | undefined;
+  /**
+   * The history as the run's transcript reads it (2.4): a V3 run's compiled
+   * context blocks are SDK data, never a turn, so they never reach the
+   * transcript, the chat projection or a memory extraction.
+   */
+  const transcriptHistory = (): Message[] =>
+    nativeV3 && contextHook ? nativeV3.withoutContext(envelope.messages) : envelope.messages;
   /** Model fail-over (2.3): the routing of every model call, once `fallbackModels` is set. */
   let router: import('./internal/native-fallback').ModelRouter | undefined;
   /** The run's memory scope is claimed for its execution until the executor ends (2.3). */
@@ -1288,7 +1295,7 @@ function makeAgentStream<T>(
         handoff = envelope.checkpoints[envelope.runId]?.handoff,
       ): Promise<void> => {
         envelope.messages = [...messages];
-        if (envelope.transcript) nativeChat!.foldHistory(envelope.transcript, envelope.messages);
+        if (envelope.transcript) nativeChat!.foldHistory(envelope.transcript, transcriptHistory());
         const previous = envelope.checkpoints[envelope.runId];
         envelope.checkpoints[envelope.runId] = {
           version: 1,
@@ -1726,7 +1733,7 @@ function makeAgentStream<T>(
             envelope.messages = checkpoint.messages;
             envelope.usage = checkpoint.usage;
             if (envelope.transcript)
-              nativeChat!.foldHistory(envelope.transcript, envelope.messages);
+              nativeChat!.foldHistory(envelope.transcript, transcriptHistory());
           }
           await persist();
         },
@@ -1895,7 +1902,7 @@ function makeAgentStream<T>(
               }),
               saveChat: (record) => {
                 envelope.transcript!.messages = [...record.messages];
-                envelope.transcript!.synced = nativeChat!.syncPoint(envelope.messages);
+                envelope.transcript!.synced = nativeChat!.syncPoint(transcriptHistory());
               },
             } satisfies ChatStore,
           }
@@ -2145,7 +2152,7 @@ function makeAgentStream<T>(
         envelope.messages = input.messages;
         // A guardrail may have rewritten the history: the transcript keeps the raw input.
         if (envelope.transcript)
-          envelope.transcript.synced = nativeChat!.syncPoint(envelope.messages);
+          envelope.transcript.synced = nativeChat!.syncPoint(transcriptHistory());
       }
 
       envelope.phase = 'finalizing';
@@ -2220,7 +2227,7 @@ function makeAgentStream<T>(
             const prompt: Message = { role: 'user', content: FINALIZE_PROMPT };
             envelope.messages = [...envelope.messages, prompt];
             if (envelope.transcript)
-              nativeChat!.appendTurn(envelope.transcript, prompt, envelope.messages, true);
+              nativeChat!.appendTurn(envelope.transcript, prompt, transcriptHistory(), true);
           }
           const attempt = envelope.finalizationAttempts++;
           envelope.outputAttempts = (envelope.outputAttempts ?? 0) + 1;
@@ -2423,7 +2430,7 @@ function makeAgentStream<T>(
           if (!isBlankTurn(answer)) {
             envelope.messages = [...envelope.messages, answer];
             if (envelope.transcript)
-              nativeChat!.appendTurn(envelope.transcript, answer, envelope.messages);
+              nativeChat!.appendTurn(envelope.transcript, answer, transcriptHistory());
           }
           await persist();
         }
@@ -2444,7 +2451,7 @@ function makeAgentStream<T>(
           };
           envelope.messages.push(repair);
           if (envelope.transcript)
-            nativeChat!.appendTurn(envelope.transcript, repair, envelope.messages, true);
+            nativeChat!.appendTurn(envelope.transcript, repair, transcriptHistory(), true);
           delete envelope.candidateText;
           await persist();
           continue;
@@ -2470,13 +2477,13 @@ function makeAgentStream<T>(
               nativeChat!.replaceLastTurn(
                 envelope.transcript,
                 isBlankTurn(rewritten) ? undefined : rewritten,
-                envelope.messages,
+                transcriptHistory(),
               );
           } else if (currentText) {
             const answer: Message = { role: 'assistant', content: currentText };
             envelope.messages = [...envelope.messages, answer];
             if (envelope.transcript)
-              nativeChat!.appendTurn(envelope.transcript, answer, envelope.messages);
+              nativeChat!.appendTurn(envelope.transcript, answer, transcriptHistory());
           }
           envelope.candidateText = currentText;
         }
@@ -2541,7 +2548,7 @@ function makeAgentStream<T>(
             };
             envelope.messages.push(feedback);
             if (envelope.transcript)
-              nativeChat!.appendTurn(envelope.transcript, feedback, envelope.messages, true);
+              nativeChat!.appendTurn(envelope.transcript, feedback, transcriptHistory(), true);
             delete envelope.candidateText;
             // Repair budget applies to each verifier candidate, while modelSteps
             // and verificationAttempts remain cumulative and strictly bounded.

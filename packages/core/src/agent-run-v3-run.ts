@@ -10,7 +10,7 @@ import { assertAgentRunStoreV3 } from './agent-run-v3';
 import { contextPackageBlob, readContextPackage } from './agent-run-v3-context';
 import { createContextCompiler } from './context/compiler';
 import { estimateRequestOverhead } from './context/count';
-import { messageText } from './context/render';
+import { isContextMessage, messageText } from './context/render';
 import { sha256DigestSync } from './context/sha256';
 import type {
   ContextCompiler,
@@ -755,4 +755,11 @@ export async function reconcileVersionedIntents(
     settled.push(intent.operationId);
   }
   return settled;
+}
+
+/** A history without the compiler's blocks: what the run's transcript reads (spec §2.3). */
+export function withoutContext(messages: Message[]): Message[] {
+  return messages.some(isContextMessage)
+    ? messages.filter((message) => !isContextMessage(message))
+    : messages;
 }
