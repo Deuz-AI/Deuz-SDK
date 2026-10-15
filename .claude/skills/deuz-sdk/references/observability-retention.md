@@ -56,7 +56,7 @@ console.log(deliveries); // [] until a schedule has a due occurrence
 | V3 runs | `prune({ terminalBefore })` | Terminal runs and blobs only they used | Running and suspended runs; a blob put again since |
 | Conditional chats | `pruneTombstones(before)` | Old tombstones (the id can be reused) | Live chats |
 
-Each returns how many it removed; times are epoch ms on the store's clock (the injected clock for in-memory and SQLite, the database clock for the PostgreSQL V3 run and stream stores, the server `TIME` for Redis, the `clock` option for the other PostgreSQL stores). The only SDK default window is `DEFAULT_GOAL_RUNTIME_POLICY.retainPayloadMs` (7 days). Suggested starting points: finished durable streams 24 h; terminal process records a few days; V3 runs and memory history your audit window; keep memory receipts and inbox ids longer than any retry or redelivery (pruning them trades dedupe for space).
+Each returns how many it removed; times are epoch ms on the store's clock (the injected clock for in-memory and SQLite, the database clock for the PostgreSQL V3 run and stream stores, the server `TIME` for Redis, the `clock` option for the other PostgreSQL stores). Every cutoff is exclusive (a record stamped exactly at it stays). A malformed cutoff is refused before anything is deleted: `ProcessOperationStore.prune` throws `TypeError`, `pruneTombstones` throws `InvalidRequestError`. Every versioned memory store (in-memory, SQLite, PostgreSQL) logs the same `pruneOperations` warning with `{ count, olderThan }` through its logger (silent by default). `prunePayloads` cuts per store or per scope, not per goal: with differing per-goal `retainPayloadMs`, pass the largest window in the scope. Two windows are SDK defaults: `DEFAULT_GOAL_RUNTIME_POLICY.retainPayloadMs` (7 days) and `DEFAULT_DURABLE_STREAM_RETAIN_MS` (24 h, from `/ui`) for finished durable streams. Suggested starting points: terminal process records a few days; V3 runs and memory history your audit window; keep memory receipts and inbox ids longer than any retry or redelivery (pruning them trades dedupe for space).
 
 ```ts
 import { createInMemoryAgentRunStoreV3 } from '@deuz-sdk/core/agent';
@@ -64,7 +64,7 @@ import { createInMemoryConditionalChatStore } from '@deuz-sdk/core/chat';
 import { createInMemoryProcessOperationStore } from '@deuz-sdk/core/compute/docker';
 import { DEFAULT_GOAL_RUNTIME_POLICY, createInMemoryGoalRuntimeStore } from '@deuz-sdk/core/goal/runtime';
 import { createInMemoryVersionedMemoryStore } from '@deuz-sdk/core/memory/versioned';
-import { createInMemoryDurableStreamStateStore } from '@deuz-sdk/core/ui';
+import { DEFAULT_DURABLE_STREAM_RETAIN_MS, createInMemoryDurableStreamStateStore } from '@deuz-sdk/core/ui';
 
 const DAY = 86_400_000;
 const memory = createInMemoryVersionedMemoryStore();
@@ -81,7 +81,7 @@ export async function prune(now: number) {
     inboxPayloads: await goals.prunePayloads({ before: now - DEFAULT_GOAL_RUNTIME_POLICY.retainPayloadMs }),
     occurrences: await goals.pruneOccurrences({ before: now - 30 * DAY }),
     intents: await goals.pruneIntents({ before: now - 30 * DAY }),
-    streams: await streams.prune({ terminalBefore: now - DAY }),
+    streams: await streams.prune({ terminalBefore: now - DEFAULT_DURABLE_STREAM_RETAIN_MS }),
     processes: await processes.prune({ terminalBefore: now - 7 * DAY }),
     runs: await runs.prune({ terminalBefore: now - 30 * DAY }),
     tombstones: await chats.pruneTombstones(now - 365 * DAY),
@@ -93,9 +93,9 @@ Run it from a cron trigger (`createScheduler` from `/schedule` in one process, o
 
 ## What a forget reaches
 
-`session.forget(id)` (`references/versioned-memory.md`) deletes the record's content, revisions and vectors and leaves content-free receipts. Wired as `onForget: async (event) => { await runs.redactForgotten(event); }`, it also redacts every V3 context package blob holding a forgotten revision (`getBlob` → `{ status: 'redacted' }`, manifests `redacted: true`, the step compiled again on resume — `references/v3-runs.md`); the run store remembers the forget (`deuz_runs_v3_forgotten`, ids and revisions only), so a package written later is stored redacted too. A failed listener leaves `redaction: 'failed'`: forget again, or call `redactForgotten` with the event.
+`session.forget(id)` (`references/versioned-memory.md`) deletes the record's content, revisions and vectors and leaves content-free receipts. Wired as `onForget: async (event) => { await runs.redactForgotten(event); }`, it also redacts every V3 context package blob holding a forgotten revision (`getBlob` → `{ status: 'redacted' }`, manifests `redacted: true`, the step compiled again on resume — `references/v3-runs.md`); the run store remembers the forget (`deuz_runs_v3_forgotten`, ids and revisions only), so a package written later is stored redacted too. The same call rewrites, in place (same revision and last-save time), every stored copy of a redacted package's retrieval block in the runs that point to it (history, checkpoints, `result.messages`, a terminal run included) into a stand-in that keeps the `<deuz_context pass="P" step="S">` marker and no record; a later save of such a run is stored the same way, and a resume still drops the block and recompiles. A failed listener leaves `redaction: 'failed'`: forget again, or call `redactForgotten` with the event.
 
-A forget does **not** reach chat records and the transcript index (tombstone the chat), the legacy `MemoryStore`, goal inbox payloads, durable stream logs, process output tails, V3 transcripts or tool results that quote the text (prune or delete them), your own logs, or files and provider logs outside the SDK. On SQLite the versioned FTS5 index drops forgotten tokens at once (secure-delete); freed pages and PostgreSQL dead tuples keep bytes until `VACUUM` (or `PRAGMA secure_delete`).
+A forget does **not** reach chat records and the transcript index (tombstone the chat), the legacy `MemoryStore`, goal inbox payloads, durable stream logs and process output tails (prune or delete them), text the model wrote from a block (assistant turns, `result.text`, a compaction summary), memory tool results (`memory_recall` output in tool messages, the run transcript, a chat store), the in-memory history of a leg running at forget time (until it ends or is resumed), run stores not subscribed through `onForget`, your own logs, or files and provider logs outside the SDK. On SQLite the versioned FTS5 index drops forgotten tokens at once (secure-delete); freed pages and PostgreSQL dead tuples keep bytes until `VACUUM` (or `PRAGMA secure_delete`).
 
 ## Deep dive
 
