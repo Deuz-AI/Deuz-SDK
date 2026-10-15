@@ -1,0 +1,813 @@
+---
+title: Goal runtime
+description: A supervisor that drives durable goals with the native executor, the goal runtime stores, a time-zone aware durable scheduler, webhook delivery into a goal's inbox, and acceptance verified on evidence (2.4).
+---
+
+`@deuz-sdk/core/goal/runtime` (2.4) runs the [goal](/docs/modules/goals)
+records of 2.3. A supervisor claims a goal, applies what arrived in its inbox,
+starts or resumes a V3 native run for it, charges what the run spent, and
+completes the goal only on evidence the host's verifiers produced. A durable
+scheduler and a webhook handler put events into the inbox in the same
+transaction as their own bookkeeping, so a restart neither loses nor repeats
+one. Everything here is a library loop in your process: there is no service,
+daemon or control server, and nothing runs until you create one. The entry is
+edge-safe; the SQLite and PostgreSQL stores are Node-only.
+
+| Piece | Import | What it is |
+| --- | --- | --- |
+| `createGoalSupervisor(options)` | `@deuz-sdk/core/goal/runtime` | Drives goals: claim, inbox, run intents, retries, cancel, drain, accounting |
+| `createNativeRunLauncher(options)` | `@deuz-sdk/core/goal/runtime` | Starts and resumes V3 runs through `runAgent` and `resumeAgent` |
+| `GoalRuntimeStore` | `createInMemoryGoalRuntimeStore` here, `/goal/runtime/sqlite`, `/goal/runtime/postgres` | Goals, inbox, runtime state, schedules, run intents and ledger watermarks; also a `GoalStore` |
+| `createDurableScheduler(options)` | `@deuz-sdk/core/goal/runtime` | Cron schedules with an IANA time zone, DST policies, catch-up and a durable cursor |
+| `createWebhookHandler(options)` | `@deuz-sdk/core/goal/runtime` | A Fetch API handler that verifies a webhook and queues it into a goal's inbox |
+| `verifyGoalAcceptance(input)` | `@deuz-sdk/core/goal/runtime` | Runs the host's verifiers and returns the `evaluate` command to apply |
+| `digestWorkspace(workspace, options?)` | `@deuz-sdk/core/workspace` | The `deuz-workspace-v1` digest acceptance evidence is bound to |
+
+The supervisor does not add an agent loop. Each run is an ordinary
+[V3 native run](/docs/modules/native-agents#v3-runs-checkpointversion-3) with
+its own checkpoints, lease and recovery; the supervisor decides when a run
+starts, resumes or stops, and what its result means for the goal.
+
+## A supervised goal
+
+```ts
+import { createInMemoryAgentRunStoreV3 } from '@deuz-sdk/core/agent';
+import {
+  createGoalSupervisor,
+  createInMemoryGoalRuntimeStore,
+  createNativeRunLauncher,
+} from '@deuz-sdk/core/goal/runtime';
+import { createInMemoryLeaseProvider } from '@deuz-sdk/core/ops';
+import { createMockModel } from '@deuz-sdk/core/testing';
+
+const store = createInMemoryGoalRuntimeStore();
+const runs = createInMemoryAgentRunStoreV3();
+const model = createMockModel({ responses: [{ text: 'Release notes drafted in NOTES.md.' }] });
+
+const supervisor = createGoalSupervisor({
+  store,
+  lease: { provider: createInMemoryLeaseProvider() },
+  launcher: createNativeRunLauncher({
+    store: runs,
+    options: ({ goal }) => ({ model, prompt: goal.objective }),
+  }),
+  // The host checks the run's work; here a stand-in for a real test run.
+  verify: ({ runId }) => ({
+    type: 'evaluate',
+    evidence: [{ id: `ci:${runId}`, source: 'test', ref: 'ci/report.xml', runId }],
+    results: [
+      { criterionId: 'objective', verdict: 'passed', source: 'test', evidence: [`ci:${runId}`] },
+    ],
+  }),
+});
+
+const { goal, runtime } = await supervisor.submit({
+  goalId: 'release-notes',
+  scope: 'acme',
+  objective: 'Draft the release notes.',
+});
+console.log(goal.runId, goal.specGeneration, runtime.phase); // release-notes:run:1 1 dispatching
+
+console.log(await supervisor.tick()); // { applied: 0, dispatched: 1, cancelled: 0, skipped: 0 }
+const after = await supervisor.get('acme', 'release-notes');
+console.log(after?.goal.status, after?.runtime.phase, after?.runtime.runs); // completed done 1
+console.log((await runs.load('release-notes:run:1'))?.version); // 3
+```
+
+`tick()` runs one pass and waits for the runs it starts. `start()` ticks every
+`pollMs` on `deps.clock` and returns `{ stop() }`, which waits for the tick in
+flight; starting a running supervisor throws. A tick that fails is logged
+(`'goal supervisor tick failed'`) and the loop goes on.
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `store` | required | A `GoalRuntimeStore` |
+| `launcher` | required | A `RunLauncher`, usually `createNativeRunLauncher` |
+| `lease.provider` | required | The `LeaseProvider` for goal leases (`goalLeaseKey(scope, goalId)`) |
+| `lease.owner` | a generated id | This supervisor's lease owner |
+| `lease.ttlMs` | `30000` | The goal lease, renewed every `ttlMs / 3`; an integer of at least 3 |
+| `scopes` | every scope | Only goals of these scopes |
+| `concurrency` | `1` | Goals driven at once; each goal has one executor at a time |
+| `pollMs` | `1000` | How often `start()` ticks |
+| `policy` | `DEFAULT_GOAL_RUNTIME_POLICY` | Limits for new goals (below) |
+| `verify` | none | The host's judgement of a completed run: the commands to apply, usually the `evaluate` command of `verifyGoalAcceptance` |
+| `runFinished` | none | Whether a native run a dependency wait names has finished, for dependency reconciliation |
+| `deps` | host defaults | Clock, ids, logger and observer (`deuz.goal.*` spans) |
+
+`DEFAULT_GOAL_SUPERVISOR` holds the `concurrency`, `leaseTtlMs` and `pollMs`
+defaults.
+
+### Submitting and reading goals
+
+`submit(input)` takes the fields of `createGoal` plus `policy` and `start`. It
+creates the goal with `specGeneration: 1` unless you give one (supervised goals
+use [spec generations](#spec-generations)), its runtime state, and a start
+intent `<goalId>#1` for the run `<goalId>:run:1`. `start: false` skips only
+that first intent: an active goal still gets an automatic run at the next
+tick, so give it a wait to keep it idle. A goal id that exists in any scope
+throws `GoalError('revision_conflict')`.
+
+`get(scope, goalId)` returns `{ goal, runtime }`. `list(query)` needs a
+`scope`, so a listing never crosses tenants; without one it rejects with a
+`TypeError`.
+
+| `runtime` field | Meaning |
+| --- | --- |
+| `phase` | `idle`, `dispatching`, `running`, `retrying`, `draining` or `done` |
+| `activeRun` | The intent, run id, attempt and start time of the run the supervisor drives now |
+| `runs`, `retries` | Automatic runs started; retries of the current failure |
+| `retryAt` | When a failed run is due again |
+| `cancel` | `{ requestedAt, reason?, appliedAt? }`: a cancel request and when it took effect |
+| `maintenance` | `{ status, runId }` while a completed run's memory extraction is still pending |
+| `workingMemory` | The last run's working memory snapshot, for the next run |
+| `policy`, `revision` | The goal's limits; the state's own revision (the fence for `updatePolicy`) |
+
+### What a tick does
+
+A tick finds the goals with work (unfinished, or with open intents) and drives
+each under its goal lease. A drive takes one step at a time on freshly read
+state, each step one checked write, in this order:
+
+1. Apply a recorded cancel.
+2. Close what an ended goal left open, and follow its maintenance.
+3. Apply time: a passed deadline fails the goal, a due wakeup ends its wait.
+4. Reconcile a dependency wait with dependencies that already finished.
+5. Settle the oldest due inbox entry, with the run intent it implies, in one write.
+6. Close an intent the runtime state no longer names; launch the one it names,
+   claimed with the lease token.
+7. Record a due retry; resume a run the host made active again.
+8. Start an automatic run, while `runs` is below `policy.maxRuns`.
+
+Every intent is recorded together with a runtime state whose `activeRun` names
+it, so a crash between two steps leaves a state the next drive continues from.
+Only an `active` goal runs: a goal waiting for a person, an event, budget or a
+dependency launches nothing and schedules no retry.
+
+How a run's leg ends decides the next step:
+
+| Leg outcome | What the supervisor does |
+| --- | --- |
+| Completed | Applies the `verify` hook's commands, then tries `complete`. A goal that stays active gets another automatic run, up to `maxRuns` |
+| Suspended (approval or client tools) | The goal waits with reason `'user'` and note `'approval'` or `'client-tools'`; answer with `resume` |
+| Stopped, drained | Resumable; the phase goes back to `dispatching` |
+| Stopped, cancelled | The cancel is applied |
+| Stopped, other reason | The goal waits with reason `'user'` and note `'run-stopped:<reason>'` |
+| Failed and retryable, or the launch threw | The same run is retried after `retryDelaysMs`, up to `maxRetries`; then the goal stays in phase `retrying` and a `policy-limit` event (`limit: 'retries'`) is reported |
+| Failed, not retryable | The goal waits with reason `'user'` and note `'run-failed:<code or name>'`; no automatic new run |
+| `verify` throws or returns a malformed command | The goal waits with reason `'user'` and note `'verify-failed'` |
+
+Without `verify`, a completed run completes nothing: the goal completes only on
+evidence and verdicts you record through `command`, and an active goal keeps
+getting automatic runs until `maxRuns`. A goal that should wait between runs,
+such as a recurring job, can return a `wait` command from `verify` (see the
+[scheduler example](#durable-scheduler)).
+
+### Commands, cancel and drain
+
+`command(scope, goalId, command, { expectedRevision? })` applies a
+`transitionGoal` command and saves the goal with its runtime state in one
+write. A stale `expectedRevision` throws `GoalError('revision_conflict')`.
+
+A cancel is recorded, not applied on the spot. The request is written to the
+runtime state first, then the supervisor asks `launcher.cancel` to stop the
+active run and signals `'cancel'` on the goal lease. The goal turns `cancelled`
+at its next claim, or when the working run stops, and `runtime.cancel.appliedAt`
+says when. A cancel for a run no executor holds, or one that arrives before
+the run's first checkpoint, therefore waits in the store instead of getting
+lost. A later runtime save cannot withdraw or rewrite it.
+
+```ts
+const asked = await supervisor.command('acme', 'report', { type: 'cancel', reason: 'not needed' });
+console.log(asked.outcome, asked.changed); // applied false: recorded, not yet applied
+console.log((await supervisor.command('acme', 'report', { type: 'cancel' })).outcome); // ignored
+await supervisor.tick(); // the goal is cancelled now; runtime.cancel.appliedAt is set
+```
+
+`drain()` stops the supervisor taking new work for good: later ticks do
+nothing and `start()` loops end. It sends `launcher.drain` to the runs it
+drives and waits for them; a drained run stops at its next safe checkpoint and
+stays resumable.
+
+`resume(scope, goalId, { approvalResponses?, clientToolResults? })` answers a
+suspended run (phase `idle` with an `activeRun`); anything else throws
+`GoalError('invalid_command')`. The verdicts are stored on the resume intent and
+on every retry of it, so a retried call that waited for approval is not asked
+again.
+
+`dispatch(event, { namespace?, deliveryId?, payload? })` queues an event of
+your own into the goal's inbox (`namespace` defaults to `'host'`, `deliveryId`
+to `event.key`): `'enqueued'`, or `'duplicate'` for the same content. Other
+content under the same id throws `GoalError('delivery_conflict')`, and a goal
+outside the event's scope `scope_mismatch`.
+
+### Policy and limits
+
+| `GoalRuntimePolicy` | Default | Meaning |
+| --- | --- | --- |
+| `maxRuns` | `10` | Automatic new runs per goal |
+| `maxRetries` | `3` | Retries of a failure the native run marks retryable |
+| `retryDelaysMs` | `[1000, 5000, 30000]` | The wait before each retry |
+| `retainPayloadMs` | 7 days | How long a settled inbox payload is kept; you pass it to `prunePayloads` |
+
+The policy is merged in this order: `DEFAULT_GOAL_RUNTIME_POLICY`, the
+supervisor's `policy`, `submit({ policy })`. At a limit the goal stays as it is,
+starts nothing more and reports one `policy-limit` event. Only the host raises a
+limit: `updatePolicy(scope, goalId, partial, { expectedRevision: runtime.revision })`.
+A stale revision throws `GoalError('revision_conflict')`, a malformed value a
+`TypeError`.
+
+### Leases and fencing
+
+A goal has one executor at a time: the supervisor holds the goal lease
+(`goal:` plus the JSON of `[scope, goalId]`) on the existing `LeaseProvider`
+while it drives the goal, and a second supervisor skips the goal meanwhile
+(`skipped` in the tick result). The lease is liveness only. Every write is a
+revision compare-and-set in the store, and an intent is claimed with the lease
+token, so a claim with a higher token fences out an earlier holder.
+
+A supervisor loses the goal lease when a renewal answers `held: false`, or when
+renewals fail for a whole `ttlMs`. It then drains the run it started, writes
+nothing more and starts nothing; the next holder takes the intent over with a
+higher token and resumes the run, never starting it a second time.
+
+### Accounting and maintenance
+
+After every leg, the run's durable ledger totals (from `launcher.accounting`,
+else the leg's `result.accounting`) above the run's watermark are charged to
+the goal once, with the key `ledger:["<runId>",<revision>]`. The watermark and
+the charged goal are written together, so a repeat after a crash finds nothing
+left to charge. Uncertain amounts stay on the watermark as reservations and are
+never charged. A charge that arrives after the goal completed raises `spent`
+and does not reopen it.
+
+A verified goal completes without waiting for its run's optional memory
+extraction. While that is `'pending'`, the intent stays `launched` and
+`runtime.maintenance` says so; each tick asks `launcher.maintenance`, charges
+late amounts and closes the intent once the status is `'complete'` or
+`'failed'`.
+
+### Working memory hand-over
+
+The supervisor keeps each leg's [working memory](/docs/modules/context#working-memory)
+snapshot in `runtime.workingMemory`, stamped with `goalRef: { goalId,
+specGeneration }` when the run did not name them. A new run (`'start'`)
+receives it only when its scope and `goalRef.specGeneration` match the goal's;
+a resumed run keeps its own. Hypotheses and decisions keep their status: a
+hypothesis a model proposed is still only proposed in the next run.
+
+### Events
+
+`events({ signal })` is an async iterable of what the supervisor does:
+
+| Event | Fields |
+| --- | --- |
+| `claimed` | `token` |
+| `lease-lost` | |
+| `inbox-applied` | `entryId`, `disposition` |
+| `dispatched` | `intent` |
+| `retry-scheduled` | `attempt`, `at` |
+| `cancel-requested`, `cancel-applied` | `runId?` on `cancel-applied` |
+| `drained` | `runId?` |
+| `generation-changed` | `specGeneration` |
+| `run-ended` | `runId`, `status` |
+| `policy-limit` | `limit: 'runs' \| 'retries'` |
+
+Every event also carries `scope` and `goalId`.
+
+### The native launcher
+
+`createNativeRunLauncher({ store, options, lease? })` takes an `AgentRunStoreV3`
+(a store of another version throws a `TypeError`) and a function that returns
+the run options for a request, without `session` and `checkpointVersion`, which
+it fills in. Per leg it starts a run its store does not hold and resumes a
+stored one, so a repeated launch never starts a run twice; only a `'retry'` of a
+run whose envelope records a transient failure resumes with `retryFailed`. The
+inherited working memory goes to new runs only.
+
+`cancel` and `drain` signal the native run's lease (`agentRunLeaseKey`). Give
+the launcher `lease` (the native run's own lease, apart from the goal lease) for
+them to reach a working run; without it, or while no executor holds the run,
+they answer `false` and the supervisor keeps the cancel for the next claim.
+`accounting` reads the ledger of the run's last checkpoint; `maintenance` reads
+its memory extraction status.
+
+A `RunLauncher` of your own implements `launch`, `resume`, `cancel`, `drain` and
+optionally `accounting` and `maintenance`, and must be idempotent per `runId`.
+
+## Goal runtime stores
+
+| Factory | Import | Notes |
+| --- | --- | --- |
+| `createInMemoryGoalRuntimeStore({ deps? })` | `@deuz-sdk/core/goal/runtime` | Edge-safe; times from `deps.clock` |
+| `createSqliteGoalRuntimeStore({ path \| database, wal?, clock? })` | `@deuz-sdk/core/goal/runtime/sqlite` | Every write is one `BEGIN IMMEDIATE` transaction; several processes can share the file |
+| `createPostgresGoalRuntimeStore({ pool \| connectionString, schema?, clock? })` | `@deuz-sdk/core/goal/runtime/postgres` | Needs a pool with `connect()`; `migrate()`; one pinned connection per write, re-run on a serialization failure, deadlock or unique violation |
+
+All three are `GoalStore`s and pass the 2.3 goal store conformance fixture, so
+goals are durable for the first time. Every process that shares a store must
+agree on its `clock`. A store borrows a `database` or `pool` you give it and
+closes only what it opened.
+
+The SQL stores keep `deuz_goal_runtime_goals`, `_states`, `_inbox`,
+`_schedules`, `_occurrences`, `_intents` and `_watermarks`, with their version
+in `deuz_goal_runtime_schema` (version 1). They change no 2.3 table,
+`PRAGMA user_version` or 2.3 version table, so `@deuz-sdk/core` 2.3 still opens
+the same file or database.
+
+Scopes are checked everywhere. `load(goalId, { scope })` reads a goal of
+another scope as `undefined`, so its existence is not disclosed, and a goal
+never changes scope. Runtime state, inbox entries, schedules, intents and
+watermarks must name a goal stored in their own scope.
+`createInMemoryGoalStore` of `@deuz-sdk/core/goal` gained the same
+`load(goalId, { scope })` option.
+
+A checked write returns `{ status: 'committed' }` or `{ status: 'conflict',
+reason }`, and a conflict writes nothing. The reasons are `goal-revision`,
+`runtime-revision`, `entry-settled`, `intent-exists`, `intent-revision`,
+`watermark-revision` and `scope-mismatch`.
+
+| Part | What it keeps |
+| --- | --- |
+| `runtime` | The supervisor's state per goal; `save(state, goal?)` writes both at their next revisions |
+| `inbox` | Deliveries keyed by `goalInboxKey(scope, namespace, deliveryId)`; `enqueue`, `apply`, `get`, `list` (oldest first; `dueBy` leaves out entries whose `notBefore` is later) |
+| `schedules` | Durable schedules keyed by scope and schedule id, and their occurrence records |
+| `intents` | Run intents: `record`, `claim`, `launched`, `complete`, `list` |
+| `watermarks` | How much of each run's ledger is charged to its goal |
+
+Inbox dispositions are `pending`, `applied`, `duplicate`, `unmatched`, `stale`,
+`expired`, `terminal` and `cancelled`.
+
+## Durable scheduler
+
+`createDurableScheduler({ store, ... })` turns cron schedules into events in a
+goal's inbox. It moves a schedule's cursor and queues the occurrence in one
+store transaction, so an occurrence is delivered once even across a crash and
+across several schedulers sharing the store. A schedule targets a goal that
+already exists in its scope; the scheduler never creates goals.
+
+```ts
+import { createInMemoryAgentRunStoreV3 } from '@deuz-sdk/core/agent';
+import {
+  createDurableScheduler,
+  createGoalSupervisor,
+  createInMemoryGoalRuntimeStore,
+  createNativeRunLauncher,
+} from '@deuz-sdk/core/goal/runtime';
+import { createInMemoryLeaseProvider } from '@deuz-sdk/core/ops';
+import { createMockModel } from '@deuz-sdk/core/testing';
+
+let now = Date.parse('2026-03-07T12:00:00Z');
+const clock = {
+  now: () => now,
+  setTimeout: (fn: () => void, ms: number) => {
+    const handle = setTimeout(fn, ms);
+    return () => clearTimeout(handle);
+  },
+};
+
+const nightly = { reason: 'event', source: { type: 'schedule', id: 'nightly' } } as const;
+const store = createInMemoryGoalRuntimeStore({ deps: { clock } });
+const scheduler = createDurableScheduler({ store, deps: { clock } });
+const supervisor = createGoalSupervisor({
+  store,
+  lease: { provider: createInMemoryLeaseProvider({ clock }) },
+  launcher: createNativeRunLauncher({
+    store: createInMemoryAgentRunStoreV3(),
+    options: ({ goal }) => ({
+      model: createMockModel({ responses: [{ text: 'Report sent.' }] }),
+      prompt: goal.objective,
+    }),
+  }),
+  // A recurring goal: after each run it waits for the next occurrence again.
+  verify: () => ({ type: 'wait', wait: nightly }),
+  deps: { clock },
+});
+
+// A goal that sleeps until its schedule wakes it.
+await supervisor.submit({ goalId: 'report', scope: 'acme', objective: 'Send the report.', start: false });
+await supervisor.command('acme', 'report', { type: 'wait', wait: nightly });
+
+// Every day at 02:30 New York time. On 2026-03-08 the clocks jump from 02:00 to 03:00.
+const schedule = await scheduler.put({
+  scheduleId: 'nightly',
+  scope: 'acme',
+  goalId: 'report',
+  spec: { cron: '30 2 * * *', timezone: 'America/New_York' },
+});
+console.log(schedule.spec); // { cron: '30 2 * * *', timezone: 'America/New_York', dstGap: 'shift', dstOverlap: 'first', catchUp: 'latest' }
+
+now = Date.parse('2026-03-08T07:00:10Z');
+const ticked = await scheduler.tick();
+console.log(ticked.occurrences.map((o) => [o.occurrenceId, new Date(o.at).toISOString(), o.disposition]));
+// [ [ 'nightly@1772953200000', '2026-03-08T07:00:00.000Z', 'delivered' ] ]
+
+console.log(await supervisor.tick()); // { applied: 1, dispatched: 1, cancelled: 0, skipped: 0 }
+const after = await supervisor.get('acme', 'report');
+console.log(after?.goal.status, after?.runtime.runs); // waiting 1
+
+// The same tick again delivers nothing; the next night delivers one more.
+console.log((await scheduler.tick()).occurrences.length); // 0
+now = Date.parse('2026-03-09T06:30:10Z');
+console.log((await scheduler.tick()).occurrences.length); // 1
+console.log(await supervisor.tick()); // { applied: 1, dispatched: 1, cancelled: 0, skipped: 0 }
+```
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `store` | required | A `GoalRuntimeStore` |
+| `graceMs` | `60000` | An occurrence found this late still counts as on time |
+| `maxDeliveriesPerTick` | `100` | Deliveries per tick, across every schedule |
+| `maxScanMinutes` | `10000` | UTC minutes scanned per schedule per tick |
+| `pollMs` | `1000` | How often `start()` ticks on `deps.clock` |
+| `deps` | host defaults | Clock, logger and observer (`deuz.schedule.delivery` spans) |
+
+`DEFAULT_DURABLE_SCHEDULER` holds these defaults. `put(schedule, {
+expectedRevision? })` creates or changes a schedule; the stored `spec` spells
+out every default (`timezone: 'UTC'`, `dstGap: 'shift'`, `dstOverlap: 'first'`,
+`catchUp: 'latest'`). `schedule.event` adds `correlationId` and
+`expiresAfterMs` to every delivered event. A malformed cron, zone, policy,
+catch-up mode or id throws a `TypeError` before anything is written; a target
+goal missing from the scope throws `GoalError('scope_mismatch')`; a stale
+`expectedRevision` throws `GoalError('revision_conflict')`. Omitting
+`expectedRevision` creates the schedule or takes the stored revision.
+
+`tick({ now?, signal? })` returns the `occurrences` it handled (delivered and
+skipped, in order), the number of `duplicates`, the `backlog` (schedules whose
+due work continues next tick) and the `errors` of schedules whose step failed.
+A failed schedule is logged and tried again next tick while the others still
+advance; `tick` rejects only when listing the schedules fails. `start()` ticks
+at once and then every `pollMs`, and `stop()` waits for the tick in flight.
+
+### Deliveries
+
+A delivery's inbox namespace is `schedule:<scheduleId>` and its delivery id is
+the occurrence id, `<scheduleId>@<UTC ms>`. The goal event comes from
+`goalEventFromOccurrence`: its `key` and `id` are the occurrence id, its
+`source` is `{ type: 'schedule', id: scheduleId }`, and `at` and `notBefore` are
+the instant it runs (a DST-shifted run is dated at the shifted instant).
+
+### Time zones and DST
+
+Times are UTC unless a schedule names an IANA `timezone`. Zones are read with
+`Intl`, with no dependency, and give the same results whatever the host's own
+time zone is.
+
+| Policy | Values | Default | For |
+| --- | --- | --- | --- |
+| `dstGap` | `'shift'`, `'skip'` | `'shift'` | A local time that does not exist on a spring-forward day |
+| `dstOverlap` | `'first'`, `'both'` | `'first'` | A local time that happens twice on a fall-back day |
+
+- `'shift'` runs a skipped local time once, at the first valid instant after
+  the gap: New York's 02:30 on 2026-03-08 runs at 03:00 EDT (07:00Z). Several
+  skipped times collapse into that one run, and none is added when that
+  instant is a regular run anyway. `'skip'` drops them.
+- `'first'` runs a repeated local time once, at its first instant: New York's
+  01:30 on 2026-11-01 runs at 05:30Z. `'both'` runs it at 05:30Z and 06:30Z,
+  with distinct occurrence ids.
+- Zones with a 30-minute DST change, such as `Australia/Lord_Howe`, and zones
+  without DST, such as `Europe/Istanbul`, work the same way.
+
+The same rules are available on their own from
+[`@deuz-sdk/core/schedule`](/docs/modules/schedule#time-zones-and-the-durable-scheduler-24).
+
+### Catch-up and backlog
+
+An occurrence found within `graceMs` is on time and delivered under any mode.
+When the first due occurrence is older than that, for example after downtime,
+a catch-up window up to now opens and is stored as `scanTo`, so it survives a
+restart.
+
+| `catchUp` | Delivers |
+| --- | --- |
+| `'latest'` (default) | Only the newest occurrence of the window, once the window is fully scanned; the others are recorded as skipped (`'catch-up-latest'`) |
+| `'all'` | Every occurrence, oldest first, continuing next tick from the durable cursor when a tick's limits are reached |
+| `'none'` | Only occurrences within `graceMs` of the window's end; older ones are skipped (`'catch-up-none'`) |
+
+Each tick scans at most `maxScanMinutes` of UTC time per schedule and makes at
+most `maxDeliveriesPerTick` deliveries in total. Schedules take turns with a
+fair share of what is left, and the next tick starts after the schedule served
+last, so one large backlog never starves the others. A schedule with nothing
+due writes nothing on a tick.
+
+### Changing, pausing and cancelling
+
+Every change (`put` on an existing schedule, or `resume`) is a new revision
+whose `effectiveFrom` is the time of the call: an explicit UTC boundary.
+Scanning resumes at the later of the cursor and the boundary, so nothing of
+either revision before the boundary is delivered, nor an occurrence exactly at
+it. Tick before a change if the old revision's due occurrences matter.
+
+`pause` stops new scans; occurrences that fall inside a pause are neither
+delivered nor recorded. `resume` starts again from its own boundary. `cancel`
+is final and also ends the schedule's deliveries not yet applied: their inbox
+disposition becomes `'cancelled'`. `pause`, `resume` and `cancel` are
+idempotent on their own state. A cancelled schedule refuses `put`, `pause` and
+`resume` (`GoalError('invalid_command')`); an unknown schedule, or one in
+another scope, throws `GoalError('scope_mismatch')`.
+
+### When to use which scheduler
+
+| | `createScheduler` (`/schedule`, 2.2) | `createDurableScheduler` (`/goal/runtime`, 2.4) |
+| --- | --- | --- |
+| Time | UTC only | UTC or an IANA zone, with DST policies |
+| Cursor | In memory | In the store, moved with the delivery in one transaction |
+| What it starts | Your `run` callback, after `claim(key)` | An event in a goal's inbox |
+| A failed run | Not retried; the claim is spent | The supervisor retries what the native run marks retryable |
+| Restart | Catch-up from the last tick it saw in memory | Continues from the durable cursor and catch-up window |
+| Several processes | Safe only with a durable `claim` | Safe: the advance is a compare-and-set |
+
+Use `createScheduler` for a cron trigger that calls a function. Use
+`createDurableScheduler` when the work is a goal that must survive restarts,
+must not run twice and should be retried.
+
+## Webhooks
+
+`createWebhookHandler(options)` returns a Fetch API handler,
+`(request: Request) => Promise<Response>`, that runs on the edge as it is. It
+verifies the request, takes the scope and goal from your configuration (never
+from the request), and queues the delivery into that goal's inbox.
+
+```ts
+import { createHmac } from 'node:crypto';
+import { createGoal } from '@deuz-sdk/core/goal';
+import { createInMemoryGoalRuntimeStore, createWebhookHandler } from '@deuz-sdk/core/goal/runtime';
+
+const store = createInMemoryGoalRuntimeStore();
+await store.save(
+  createGoal({ goalId: 'triage', scope: 'acme', objective: 'Triage new issues.' }, { now: Date.now() }),
+);
+
+const secret = 'whsec_test';
+// POST /api/webhooks/github
+const handler = createWebhookHandler({
+  store,
+  verify: { kind: 'github', secret },
+  target: { scope: 'acme', goalId: 'triage' },
+  namespace: 'webhook:github',
+});
+
+const body = JSON.stringify({ action: 'opened', issue: { number: 42 } });
+const delivery = () =>
+  new Request('https://app.example/api/webhooks/github', {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'x-github-delivery': 'd-1',
+      'x-hub-signature-256': `sha256=${createHmac('sha256', secret).update(body).digest('hex')}`,
+    },
+    body,
+  });
+
+const first = await handler(delivery());
+console.log(first.status, await first.json()); // 202 { ok: true, deliveryId: 'd-1' }
+const retry = await handler(delivery());
+console.log(retry.status, await retry.json()); // 200 { ok: true, duplicate: true, deliveryId: 'd-1' }
+
+const forged = new Request('https://app.example/api/webhooks/github', {
+  method: 'POST',
+  headers: { 'x-github-delivery': 'd-2', 'x-hub-signature-256': 'sha256=00' },
+  body,
+});
+console.log((await handler(forged)).status); // 401
+```
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `store` | required | A `GoalRuntimeStore` |
+| `verify` | required | `{ kind: 'hmac', secret, header, algorithm?, encoding?, prefix? }`, `{ kind: 'github', secret }`, `{ kind: 'slack', signingSecret, toleranceSeconds? }` or `{ kind: 'custom', verify(request) }`; secrets are strings or `Uint8Array` |
+| `target` | required | A fixed `{ scope, goalId }`, or `({ request, body }) => target \| undefined` |
+| `namespace` | required | The dedupe namespace: `webhook:<endpoint>`, plus `:<account>` for a multi-account provider |
+| `deliveryId` | see below | A header name, or a function of the verified request |
+| `event` | none | Extra event fields from the verified body (`correlationId`, `expiresAt`, `causationId`, `source`, ...); never `scope`, `goalId` or `key` |
+| `maxBodyBytes` | 1 MiB | Larger bodies are refused |
+| `deps` | host defaults | The clock (also the Slack replay window) |
+
+The checks reuse `verifyHmacSignature`, `verifyGitHubWebhook` and
+`verifySlackRequest` from [`/schedule`](/docs/modules/schedule#verify-webhooks).
+
+| Status | Body | When |
+| --- | --- | --- |
+| `202` | `{ ok: true, deliveryId }` | The delivery is durably in the inbox |
+| `200` | `{ ok: true, duplicate: true, deliveryId }` | The same delivery with the same payload and target was recorded before; a later retry is still a duplicate (the digest ignores event times) |
+| `401` | `{ ok: false, reason }` | The signature check failed (`'missing-signature'`, `'bad-signature'`, `'stale-timestamp'`, ...), or the body was already read (`'body-used'`) |
+| `404` | `'unknown-target'` | The target function declined, or the goal does not exist in that scope (a goal in another scope is not disclosed) |
+| `405` | `'method-not-allowed'` | Not a `POST`; the response carries `Allow: POST` |
+| `409` | `'delivery_conflict'` | The same delivery id with another payload or target; nothing is recorded |
+| `413` | `'payload-too-large'` | Over `maxBodyBytes`, by `content-length` or while reading |
+| `500` | `'verify-error'`, `'target-error'`, `'event-error'` or `'store-error'` | Something on your side failed; never `202`, so the sender retries |
+
+The dedupe id is the scope, the namespace and the delivery id. The delivery id
+comes from the `deliveryId` option, else from `X-GitHub-Delivery` for GitHub,
+else it is `sha256:<hex>` of the body; a missing header or an `undefined`
+function result also falls back to the body digest. The queued event's `key`
+and `id` are the inbox entry id, its `source` is `{ type: 'signal', id:
+namespace }`, `at` is the arrival time, and its `payload` reference names the
+entry, the body's digest, media type and size. The raw body is kept as the
+entry's payload until you prune it. Dedupe ids do not expire by default.
+
+`toNodeHandler(handler, { origin? })` serves the handler from `node:http` or
+Express without importing `node:http`. It builds the URL from `origin`, else
+from `http://` and the `Host` header, and streams the body to the handler, so an
+oversized body stops being read. A handler that throws answers `500`
+(`'handler-error'`). With Express, mount it before any body-parsing middleware:
+a body that was already consumed arrives empty.
+
+```ts
+import { createServer } from 'node:http';
+import { toNodeHandler } from '@deuz-sdk/core/goal/runtime';
+
+createServer(toNodeHandler(handler, { origin: 'https://app.example' })).listen(3000);
+```
+
+### Inbox event rules
+
+The supervisor settles inbox entries with three pure helpers you can also call
+yourself:
+
+- `goalDeliveryDigest({ scope, goalId, event, payload? })` is the inbox digest:
+  the target, the event without `at`, `notBefore` and `expiresAt`, and the
+  payload's digest and media type.
+- `settleGoalEvent(goal, entry, { now })` returns `{ disposition: 'pending',
+  retryAt }` for an event early for its `notBefore`, or `'applied'`,
+  `'duplicate'`, `'unmatched'`, `'stale'`, `'expired'` or `'terminal'` with the
+  goal to save. An event is applied as it was queued: an event older than a
+  wait that began after it is `'stale'`, never re-dated.
+- `goalDependencyEvents(goal, { now, goals?, runFinished? })` returns one event
+  per dependency of a dependency wait that already finished, keyed by
+  dependency and wait, so a repeated reconcile is a duplicate.
+
+## Acceptance on evidence
+
+2.4 extends the [2.3 acceptance rules](/docs/modules/goals#acceptance-on-evidence)
+with optional fields instead of a second system. `GoalEvidence` gains
+`criterionId`, `verifier: { id, version }`, `specGeneration`, `artifactDigest`
+and `workspaceDigest` (`sha256:` and 64 lower-case hex digits). Evidence that
+names a `criterionId` supports a pass on that criterion only.
+
+`verifyGoalAcceptance(input)` runs your verifiers against the artifact or
+workspace each criterion names and returns `{ command, results, evidence }`.
+It writes nothing: apply `command` with `transitionGoal` (or return it from the
+supervisor's `verify` hook).
+
+```ts
+import { createGoal, transitionGoal } from '@deuz-sdk/core/goal';
+import { verifyGoalAcceptance } from '@deuz-sdk/core/goal/runtime';
+import type { GoalArtifactResolver, GoalVerifier } from '@deuz-sdk/core/goal/runtime';
+import { createInMemoryWorkspace, digestWorkspace } from '@deuz-sdk/core/workspace';
+
+const workspace = createInMemoryWorkspace();
+await workspace.write('src/add.ts', 'export const add = (a: number, b: number) => a + b;\n');
+await workspace.write('node_modules/x/index.js', 'ignored');
+
+const now = Date.parse('2026-10-15T09:00:00Z');
+let goal = createGoal(
+  {
+    goalId: 'add',
+    scope: 'acme',
+    objective: 'Implement add().',
+    criteria: [{ id: 'tests', description: 'The unit tests pass.' }],
+    specGeneration: 1,
+    runId: 'add:run:1',
+  },
+  { now },
+);
+
+// Resolves a ref to what exists now; here, one workspace.
+const resolver: GoalArtifactResolver = {
+  async resolve(ref) {
+    if (ref !== 'workspace:main') return undefined;
+    return { ref, kind: 'workspace', digest: await digestWorkspace(workspace, { exclude: ['node_modules'] }) };
+  },
+};
+// The host's own check, for example a test run in a sandbox.
+const tests: GoalVerifier = {
+  id: 'unit-tests',
+  version: '1.0.0',
+  async verify() {
+    return { verdict: 'passed', summary: '12 tests passed.' };
+  },
+};
+
+const checked = await verifyGoalAcceptance({
+  goal,
+  verifiers: { tests },
+  artifacts: { tests: { ref: 'workspace:main' } },
+  resolver,
+  now: now + 1,
+});
+const [evidence] = checked.evidence;
+console.log(checked.results[0]?.verdict, evidence?.source, evidence?.verifier, evidence?.specGeneration);
+// passed verifier { id: 'unit-tests', version: '1.0.0' } 1
+goal = transitionGoal(goal, checked.command, { now: now + 1 }).record;
+console.log(transitionGoal(goal, { type: 'complete' }, { now: now + 2 }).record.status); // completed
+
+// A new criterion is a new spec generation: the earlier verdict no longer counts.
+const revised = transitionGoal(
+  goal,
+  {
+    type: 'revise',
+    criteria: [...goal.criteria, { id: 'docs', description: 'The README documents add().' }],
+  },
+  { now: now + 3 },
+).record;
+console.log(revised.specGeneration, revised.results.map((r) => [r.criterionId, r.verdict])); // 2 [ [ 'tests', 'inconclusive' ] ]
+```
+
+| Input | Meaning |
+| --- | --- |
+| `goal` | The goal record |
+| `criteria` | The criterion ids to check; default every required one. An id the goal lacks throws `GoalError('invalid_command')` |
+| `verifiers` | A record of `GoalVerifier` per criterion id, or a function choosing one |
+| `artifacts` | Per criterion id, `{ ref, expectedDigest? }`: what it is checked against |
+| `resolver` | `resolve(ref)` returns `{ ref, kind: 'artifact' \| 'workspace', digest }` as it exists now |
+| `runId` | The producing run; default the goal's `runId` |
+| `now`, `signal` | The evidence time; an abort rejects with its reason |
+
+For each criterion the verdict is `'inconclusive'`, with a note saying why and
+no evidence, when any of these holds: no verifier with a nonempty `id` and
+`version`, no producing run, no `artifacts` entry, no `resolver`, a ref that
+resolves to nothing, a resolver that throws or returns a malformed digest, a
+digest that differs from `expectedDigest` (or else from the digest the
+producing run last recorded for that ref in non-model evidence), an artifact
+that changed between the reads before and after the verifier ran, or a verifier
+that throws or returns no valid verdict. Otherwise the verifier's verdict is
+recorded on evidence with `source: 'verifier'`, bound to the scope, goal and
+criterion, the run, the digest, the verifier's id and version and the goal's
+`specGeneration`. Its id is `acceptance:` and the SHA-256 of what it binds, so
+verifying the same state again adds nothing.
+
+A remembered fact, a model's claim or a working memory hypothesis is never
+evidence by itself.
+
+### Spec generations
+
+A goal opts into generations with `specGeneration` (a positive integer,
+usually 1); supervised goals start at 1. On such a goal:
+
+- A new objective, an added, removed or changed criterion (a reorder does not
+  count), or `revise({ nextSpecGeneration: true })` (for a changed host
+  constraint or verifier) raises the generation by 1.
+- Every earlier verdict becomes `inconclusive`, with a note naming the old
+  generation; results of removed criteria are dropped.
+- Only evidence of the current generation supports a pass; evidence recorded
+  without `specGeneration` is stamped with the current one.
+- Charges, `link-run`, waits, events and budget, deadline or `meta` revisions
+  never change the generation.
+
+`revise({ nextSpecGeneration: true })` on a goal without the field opts it in
+at 1. Goals without `specGeneration` keep the 2.3 rules exactly: a revise drops
+only the verdict of a criterion whose text changed, and a new objective keeps
+the verdicts. Two notes can come with a refused pass: "A passed verdict needs
+evidence produced for its criterion." and "A passed verdict needs evidence of
+the current spec generation."
+
+### Workspace digests
+
+`digestWorkspace(workspace, { include?, exclude? })` returns the
+`deuz-workspace-v1` digest: the SHA-256 of the canonical JSON of `{ path, size,
+digest }` entries sorted by the UTF-8 bytes of their paths, where `digest` is
+`sha256:<hex>` of the file's bytes. The [Docker runner's](/docs/modules/docker)
+artifact digests use the same per-file digest. Globs are anchored at the
+workspace root: `*` stays within one segment, `?` matches one character, `**`
+spans segments, and a glob naming a directory covers everything below it;
+`exclude` wins. It reads with `readBytes` when the backend has it, else with
+`read`. It is edge-safe (WebCrypto) and caches nothing.
+
+## Retention
+
+Nothing is deleted in the background; every cleanup is a call you schedule,
+for example on a durable schedule of its own.
+
+| Call | Removes |
+| --- | --- |
+| `store.prunePayloads({ before, scope? })` | The payloads of entries settled before `before`, replaced by content-free tombstones (`payloadPruned: true`); ids stay, so dedupe holds. Pass `now - policy.retainPayloadMs` |
+| `store.pruneInbox({ before, scope? })` | Settled entries, ids included: a repeated delivery is queued again. Only for a dedupe window you choose |
+| `store.pruneOccurrences({ before, scope? })` | Occurrence records, by `recordedAt` |
+| `store.pruneIntents({ before, scope? })` | Completed, failed and cancelled intents, by `updatedAt` |
+
+Each returns how many it touched. See [Retention](/docs/modules/retention) for
+every 2.4 store.
+
+## Telemetry
+
+| Span | Attributes |
+| --- | --- |
+| `deuz.goal.claim`, `deuz.goal.dispatch` (covers the leg), `deuz.goal.retry`, `deuz.goal.cancel_requested`, `deuz.goal.cancel_applied`, `deuz.goal.drain`, `deuz.goal.generation` | `deuz.goal.id`, `deuz.goal.revision`, `deuz.goal.spec_generation`, `deuz.goal.run_id`, `deuz.goal.attempt` |
+| `deuz.schedule.delivery`, one per occurrence | `deuz.schedule.id`, `deuz.schedule.occurrence_id`, `deuz.schedule.disposition` (`delivered` or `skipped`), `deuz.schedule.catch_up`, `deuz.goal.id`, and `deuz.schedule.reason` on a skipped occurrence |
+
+Attributes carry ids, counts and revisions, never goal text or payloads. See
+[Observability](/docs/modules/observability#24-spans).
+
+## Limits
+
+- The supervisor, the scheduler and the webhook handler are loops and handlers
+  in your process. Nothing runs while it is down; the durable cursor, the inbox
+  and the recorded intents let the next process continue.
+- Retries cover only failures the native run marks retryable. A non-retryable
+  failure, a stopped run and a failed verification wait for the host.
+- There is no exactly-once model call: a run that crashes before its checkpoint
+  can call the model again on resume. Memory writes and tool receipts follow the
+  native run's own guarantees.
+- A schedule targets one existing goal; there are no goal templates.
+- A webhook body is kept as the inbox payload until you prune it; keep secrets
+  out of payloads you do not want stored.
+- Not live-verified against real providers: the samples run on mock models.

@@ -1,6 +1,6 @@
 ---
 title: Chat Persistence & State
-description: The ChatStore seam, auto-persist via the chat call option, the pure chat state engine (applyUIPart and the ordered parts projection), and branching for regenerate / edit-and-resend.
+description: The ChatStore seam, auto-persist via the chat call option, stable message ids, the pure chat state engine (applyUIPart and the ordered parts projection), and branching for regenerate / edit-and-resend.
 ---
 
 `@deuz-sdk/core/chat` is the framework-agnostic chat layer (1.7, extended in 1.9): a two-method **`ChatStore`** persistence seam the agentic loops auto-save into, plus a **pure chat state engine** — the render-friendly `UIMessage` shape, the reducer that folds [Deuz UI wire](/docs/modules/ui-streaming) parts into it, the ordered `parts` projection, canonical-history reconstruction in both directions, and the branch helpers behind regenerate / edit-and-resend. `@deuz-sdk/react`'s hooks bind this module to React state — no business logic lives there.
@@ -22,6 +22,8 @@ interface ChatRecord {
   parentId?: string;
   /** `deps.clock.now()` at save time. */
   updatedAt: number;
+  /** One stable id per message, aligned with `messages` (2.3); a native run's are `<runId>:<n>`. */
+  messageIds?: string[];
 }
 
 interface ChatStore {
@@ -35,6 +37,8 @@ interface ChatStore {
 ```
 
 Scope is mandatory and reuses [`MemoryScope`](/docs/modules/memory#scope-is-mandatory) — which gained a `chatId` field in 1.7 precisely so chat records, memory records, and durable runs share one ownership model. `listChats(scope)` filters by exact match on the scope fields you provide.
+
+A `ChatStore` is last writer wins: two writers that load the same chat and save it both succeed, and the later save replaces the earlier one. 2.4 adds a [`ConditionalChatStore`](/docs/modules/chat-durability#conditional-chat-stores) beside it (in-memory, SQLite and PostgreSQL): every chat has a revision, `writeChat` writes only at the revision the writer read, and a delete leaves a tombstone that a late write cannot bring back. It is still a `ChatStore`, so it plugs into the `chat` option unchanged, and its SQL stores keep a [transcript index](/docs/modules/transcript-search) in the same transaction. The legacy stores on this page and in the store packs are unchanged.
 
 ## Auto-persist: the `chat` call option
 
@@ -293,15 +297,19 @@ It is idempotent and returns the **same object** when there is nothing to seal (
 
 - `assistantMessageFromTurn(turn)` — the canonical assistant `Message` for the request history, exactly as the wire streamed it (the client-tools reconstruction). Since 2.3 it follows the ordered `parts`: every reasoning block rides back unchanged and in place next to the text and `tool_use` parts, where it used to drop all reasoning. A plain answer is still a string, and a turn with neither text nor a tool call sends no reasoning back. Each `tool_use` carries the provider metadata the wire's `tool-call` frame brought (a Gemini function call's `thoughtSignature`, since 2.3). A Gemini signature on a plain *text* part is not on the wire, so the rebuilt text carries none (Gemini does not enforce it; not live-verified).
 - `clientToolResultMessage(results)` — the canonical `role: 'tool'` message for client-executed tool results.
-- `uiFromMessages(messages, generateId)` — the reverse projection: a canonical history (e.g. a chat loaded from a `ChatStore`) into render-friendly `UIMessage`s. `tool` messages merge their results into the preceding assistant turn; `system` messages are not rendered; `generateId` supplies stable ids (inject `deps.generateId`, or scripted ids in tests). Since 1.9 each message also carries the ordered `parts` projection, in canonical array order — which is what makes attachments visible instead of rendering as an empty bubble.
+- `uiFromMessages(messages, generateId, { messageIds }?)` — the reverse projection: a canonical history (e.g. a chat loaded from a `ChatStore`) into render-friendly `UIMessage`s. `tool` messages merge their results into the preceding assistant turn; `system` messages are not rendered. Since 2.4, pass `{ messageIds: record.messageIds }` and the UI message made from `messages[i]` keeps `messageIds[i]`, so a reloaded chat renders under the ids the server stored, and a transcript search hit or a memory source names the same message. `generateId` covers a missing or empty id and a repeat of an id an earlier message kept (inject `deps.generateId`, or scripted ids in tests); before 2.4 it gave every message a new id. Since 1.9 each message also carries the ordered `parts` projection, in canonical array order — which is what makes attachments visible instead of rendering as an empty bubble.
 - `canonicalFromUI(ui)` — the inverse of `uiFromMessages` (1.9), for a binding that lets the app **replace** history (`setMessages`): the two views must stay coherent, and only the canonical one is POSTable.
 
 ```ts title="load-a-chat.ts"
 import { uiFromMessages } from '@deuz-sdk/core/chat';
 
 const record = await store.loadChat('chat-42');
-const ui = record ? uiFromMessages(record.messages, () => crypto.randomUUID()) : [];
+const ui = record
+  ? uiFromMessages(record.messages, () => crypto.randomUUID(), { messageIds: record.messageIds })
+  : [];
 ```
+
+In React, `useChat({ initialSnapshot: { version: 1, messages: record.messages, messageIds: record.messageIds } })` restores the chat under the same ids; see [React hooks](/docs/modules/react-hooks#snapshots-and-the-handshake-24).
 
 `canonicalFromUI` prefers the ordered `parts` over the buckets, and it is **lossy on purpose** — where it loses matters:
 
@@ -352,3 +360,5 @@ if (branched) {
 - [The unbreakable chatbot](/docs/agents/unbreakable-chatbot) — persisting the live *stream*; this page persists the *conversation*.
 - [Durable Runtime](/docs/agents/durable-runtime) — the `$deuzBytes` codec convention and the SessionStore pattern this seam follows.
 - [React hooks](/docs/modules/react-hooks) — `useChat`, the binding built on this engine.
+- [Chat and stream durability](/docs/modules/chat-durability) — conditional chat stores, durable streams and chat snapshots (2.4).
+- [Transcript search](/docs/modules/transcript-search) — lexical search over stored chats (2.4).

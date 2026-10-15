@@ -108,6 +108,7 @@ All options live on `EmbedOptions` / `EmbedManyOptions`.
 | `headers` | `Record<string, string>` | — | Extra request headers. |
 | `deps` | `Dependencies` | — | Inject `fetch`/`clock`/`keyProvider`/etc. |
 | `onUsage` | `(usage, meta) => void` | — | Fired once after the call completes. |
+| `accounting` | `CallAccounting` | — | 2.4: charge the call to an execution context's ledger. See [Budget accounting](#budget-accounting-24). |
 
 ### taskType
 
@@ -174,6 +175,52 @@ console.log(usage.totalTokens);
 ```
 
 `onUsage` fires once per call (after all sub-batches finish), so it is safe to use as the single metering/credit hook.
+
+### Budget accounting (2.4)
+
+`onUsage` reports usage after the fact. To bound embeddings with the same
+budgets as model calls, pass `accounting: { execution, requestId, kind?, tokens?,
+usd? }`. The call is reserved on `execution` before its first request (kind
+`'embedding'`, `tokens` the shared estimator's count of the values, `usd` the
+price of that many input tokens, or unpriced when the model has none), checked
+against the context's policy, and settled with the usage the provider reports.
+
+```ts
+import { embedMany } from '@deuz-sdk/core';
+import { createExecutionContext } from '@deuz-sdk/core/agent';
+import { createOpenAIEmbedding } from '@deuz-sdk/core/openai';
+import { mockFetch } from '@deuz-sdk/core/testing';
+
+// A stand-in for the provider: two vectors and the usage it reports.
+const { fetch } = mockFetch(() =>
+  Response.json({
+    data: [{ index: 0, embedding: [0.1, 0.2] }, { index: 1, embedding: [0.3, 0.4] }],
+    usage: { prompt_tokens: 7, total_tokens: 7 },
+  }),
+);
+const openai = createOpenAIEmbedding({ apiKey: 'sk-test', fetch });
+const execution = createExecutionContext({ budget: { tokens: 1_000 } });
+
+await embedMany({
+  model: openai('text-embedding-3-small'),
+  values: ['refund policy', 'shipping times'],
+  accounting: { execution, requestId: 'ingest-42' },
+});
+console.log(execution.ledger.get('ingest-42')?.actual.tokens); // 7: the provider's count, not the estimate
+// Without a priceProvider the model has no price, so the entry stays 'unknown' for USD.
+```
+
+- A `requestId` is charged once: an id already settled is not charged again,
+  and one that was released is refused (`reservation_conflict`); charge a retry
+  under a new id.
+- A response without token counts leaves the estimate held as `unknown`.
+- A failed call is released only when nothing could have been billed (a single
+  request answered 400, 401, 403, 404, 422 or 429); otherwise its estimate stays
+  held as `unknown`.
+- Without `accounting` the call is exactly the 2.3 call, request for request.
+
+See [Unaccounted calls](/docs/modules/budgets#unaccounted-calls-24) for the
+other helper calls 2.4 can charge.
 
 ## Voyage with taskType
 
