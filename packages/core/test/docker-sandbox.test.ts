@@ -184,6 +184,43 @@ describe('createDockerSandbox', () => {
     expect(aborted).toMatchObject({ exitCode: null, timedOut: true });
   }, 20_000);
 
+  it('an abort while the run is still preparing keeps the command from starting (R4-1)', async () => {
+    const fake = await fakeDocker(bundle);
+    const controller = new AbortController();
+    const inner = createInMemoryWorkspace();
+    // Aborted while the workspace is listed for staging, before create.
+    const listing = {
+      ...inner,
+      async list(...args: Parameters<typeof inner.list>) {
+        controller.abort();
+        return inner.list(...args);
+      },
+    };
+    const early = createDockerSandbox({ image: FAKE_IMAGE, ...fake.cli, workspace: listing });
+    const res = await early.runShell!({ command: 'echo ran', signal: controller.signal });
+    expect({ stdout: res.stdout, exitCode: res.exitCode, timedOut: res.timedOut }).toEqual({
+      stdout: '',
+      exitCode: null,
+      timedOut: true,
+    });
+    expect(fake.subcommands()).not.toContain('start');
+    expect(fake.containers()).toEqual([]);
+  });
+
+  it('an abort that lands during create or staging removes the container unstarted (R4-1)', async () => {
+    const fake = await fakeDocker(bundle);
+    const controller = new AbortController();
+    const sandbox = createDockerSandbox({ image: FAKE_IMAGE, ...fake.cli });
+    const pending = sandbox.runShell!({ command: 'echo ran', signal: controller.signal });
+    for (let i = 0; i < 400 && !fake.subcommands().includes('create'); i++)
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    controller.abort();
+    const res = await pending;
+    expect(res).toMatchObject({ stdout: '', exitCode: null, timedOut: true });
+    expect(fake.subcommands()).not.toContain('start');
+    expect(fake.containers()).toEqual([]);
+  });
+
   it('keeps the tail of a long output and says which stream was cut', async () => {
     const fake = await fakeDocker(bundle);
     const sandbox = createDockerSandbox({ image: FAKE_IMAGE, maxOutputBytes: 8, ...fake.cli });

@@ -32,6 +32,14 @@ const ATTACH_GRACE_MS = 5_000;
 
 const encoder = new TextEncoder();
 
+/** The result of a run whose signal fired before its container started. */
+const abortedBeforeStart = (): CodeExecutionResult => ({
+  stdout: '',
+  stderr: 'Aborted before start.',
+  exitCode: null,
+  timedOut: true,
+});
+
 interface RunInput {
   command: readonly string[];
   cwd?: string;
@@ -47,12 +55,13 @@ export function createDockerSandboxFromOptions(options: ResolvedDockerOptions): 
   const scope = options.scope ?? 'default';
 
   async function run(input: RunInput): Promise<CodeExecutionResult> {
-    if (input.signal?.aborted)
-      return { stdout: '', stderr: 'Aborted before start.', exitCode: null, timedOut: true };
+    if (input.signal?.aborted) return abortedBeforeStart();
     assertEnv(input.env);
     const startedAt = deps.clock.now();
     const files = await collectStageFiles(options);
     const imageId = await engine.resolveImage();
+    // An abort while the workspace was read or the image resolved: nothing is made.
+    if (input.signal?.aborted) return abortedBeforeStart();
     const operationId = deps.generateId();
     const spec: ContainerSpec = {
       name: `deuz-sbx-${safeName(operationId)}`,
@@ -78,6 +87,10 @@ export function createDockerSandboxFromOptions(options: ResolvedDockerOptions): 
         },
       );
       const id = containerId;
+      // An abort during create or staging: the container is removed (finally)
+      // without ever starting. Checked right before the listener goes on, so
+      // no abort falls between the two.
+      if (input.signal?.aborted) return abortedBeforeStart();
       const stdout = new ByteTail(options.maxOutputBytes);
       const stderr = new ByteTail(options.maxOutputBytes);
       let timedOut = false;
