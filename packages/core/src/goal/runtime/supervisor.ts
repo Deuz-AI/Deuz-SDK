@@ -44,6 +44,7 @@ import type {
 import { createGoalDriver } from './supervisor-drive';
 import { createNativeRunLauncher as createNative } from './supervisor-native';
 import {
+  carriedRun,
   createEventHub,
   goalAttributes,
   goalLeaseKey,
@@ -592,7 +593,13 @@ export function createGoalSupervisor(options: GoalSupervisorOptions): GoalSuperv
               updatedAt: Math.max(runtime.updatedAt, now),
               phase: 'dispatching',
               retries: 0,
-              activeRun: { intentId, runId: run.runId, attempt: 1, startedAt: now },
+              activeRun: {
+                intentId,
+                runId: run.runId,
+                attempt: 1,
+                startedAt: now,
+                ...carriedRun(run),
+              },
             },
             ...(resumed?.changed ? { goal: resumed.record } : {}),
           },

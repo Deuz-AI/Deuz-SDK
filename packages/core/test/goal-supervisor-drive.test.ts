@@ -699,6 +699,53 @@ describe('working memory', () => {
     await supervisor.tick();
     expect(launcher.calls[3]?.request.workingMemory).toBeUndefined();
   });
+
+  it('keeps the generation a run started under when the goal is revised before its resume or retry', async () => {
+    for (const first of ['suspended', 'retryable'] as const) {
+      const w = world();
+      const launcher = fakeRunLauncher((request, kind) => {
+        const result =
+          kind === 'launch' && request.runId === 'g-1:run:1'
+            ? first === 'suspended'
+              ? results.suspended(request.runId)
+              : results.failed(request.runId)
+            : results.completed(request.runId);
+        return {
+          runId: request.runId,
+          result,
+          ...(result.status === 'failed' ? { retryable: true } : {}),
+          workingMemory: snapshot(),
+        };
+      });
+      const { supervisor } = supervisorIn(w, { launcher });
+      await supervisor.submit({ goalId: 'g-1', scope: SCOPE, objective: 'x' });
+      await supervisor.tick();
+      await supervisor.command(SCOPE, 'g-1', { type: 'revise', objective: 'y' });
+      expect((await supervisor.get(SCOPE, 'g-1'))?.goal.specGeneration).toBe(2);
+      if (first === 'suspended')
+        await supervisor.resume(SCOPE, 'g-1', {
+          approvalResponses: [{ approvalId: 'ap-1', approved: true }],
+        });
+      else await w.time.advance(1_000);
+      // The resume or retry leg of run 1, which started under generation 1.
+      await supervisor.tick();
+      expect(launcher.calls[1]?.request).toMatchObject({
+        runId: 'g-1:run:1',
+        goal: { specGeneration: 2 },
+      });
+      expect((await supervisor.get(SCOPE, 'g-1'))?.runtime.workingMemory?.goalRef).toEqual({
+        goalId: 'g-1',
+        specGeneration: 1,
+      });
+      // The next run, under generation 2, inherits nothing from run 1.
+      await supervisor.tick();
+      expect(launcher.calls[2]?.request).toMatchObject({
+        runId: 'g-1:run:2',
+        goal: { specGeneration: 2 },
+      });
+      expect(launcher.calls[2]?.request.workingMemory).toBeUndefined();
+    }
+  });
 });
 
 describe('inbox, dependencies and time', () => {

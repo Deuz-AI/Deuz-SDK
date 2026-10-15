@@ -52,6 +52,7 @@ import {
   quietly,
   reportGeneration,
   runIdFor,
+  carriedRun,
   stampWorkingMemory,
   withoutRun,
   type EventHub,
@@ -686,7 +687,13 @@ export function createGoalDriver(options: GoalDriverOptions): {
         ...withoutRun(next),
         phase: 'dispatching',
         retries: runtime.retries + 1,
-        activeRun: { intentId, runId: active.runId, attempt, startedAt: now },
+        activeRun: {
+          intentId,
+          runId: active.runId,
+          attempt,
+          startedAt: now,
+          ...carriedRun(active),
+        },
       },
     );
   }
@@ -764,7 +771,13 @@ export function createGoalDriver(options: GoalDriverOptions): {
           ...withoutRun(next),
           phase: 'dispatching',
           retries: 0,
-          activeRun: { intentId, runId: active.runId, attempt: 1, startedAt: now },
+          activeRun: {
+            intentId,
+            runId: active.runId,
+            attempt: 1,
+            startedAt: now,
+            ...carriedRun(active),
+          },
         },
       );
     }
@@ -803,7 +816,16 @@ export function createGoalDriver(options: GoalDriverOptions): {
     const now = clock.now();
     if (drive.lost) return 'stop';
     if (draining) return 'stop';
-    const running: GoalRuntimeState = { ...bump(runtime, now), phase: 'running' };
+    // The generation the run first launched under: its later legs keep it (spec §2.5).
+    const active = runtime.activeRun;
+    const generation = active?.specGeneration ?? goal.specGeneration;
+    const running: GoalRuntimeState = {
+      ...bump(runtime, now),
+      phase: 'running',
+      ...(active !== undefined && generation !== undefined
+        ? { activeRun: { ...active, specGeneration: generation } }
+        : {}),
+    };
     if ((await store.runtime.save(running)).status === 'conflict') return 'conflict';
     if (drive.lost) return 'stop';
     if (draining) {
@@ -872,7 +894,7 @@ export function createGoalDriver(options: GoalDriverOptions): {
           runId: held.runId,
           status: outcome.ok.result.status,
         });
-      await settleLeg(drive, held, request, outcome, result);
+      await settleLeg(drive, held, request, generation, outcome, result);
     } finally {
       finish();
     }
@@ -962,6 +984,7 @@ export function createGoalDriver(options: GoalDriverOptions): {
     drive: Drive,
     intent: GoalRunIntent,
     request: RunLaunchRequest,
+    generation: number | undefined,
     outcome: { ok: RunLaunchResult } | { error: unknown },
     result: GoalSupervisorTickResult,
   ): Promise<void> {
@@ -986,8 +1009,12 @@ export function createGoalDriver(options: GoalDriverOptions): {
       const now = clock.now();
       const leg = 'ok' in outcome ? outcome.ok : undefined;
       const status = leg?.result.status;
+      // Named after the generation the run started under, not the goal's now.
       const memory = leg?.workingMemory
-        ? stampWorkingMemory(leg.workingMemory, request.goal)
+        ? stampWorkingMemory(leg.workingMemory, {
+            goalId,
+            ...(generation !== undefined ? { specGeneration: generation } : {}),
+          })
         : runtime0.workingMemory;
       const base: GoalRuntimeState = {
         ...bump(runtime0, now),
