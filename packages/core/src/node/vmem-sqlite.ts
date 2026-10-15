@@ -920,7 +920,7 @@ export function createSqliteVersionedMemoryStore(
           }),
         ),
       );
-      if (count > 0) logger.warn(pruneOperationsWarning(count), { count });
+      if (count > 0) logger.warn(pruneOperationsWarning(count), { count, olderThan });
       return count;
     },
 

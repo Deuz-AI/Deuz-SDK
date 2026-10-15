@@ -328,16 +328,20 @@ export interface MemoryForgetResult extends MemoryForgetEvent {
 // The store
 // ===================================================================
 
-/** Retention for `pruneHistory`. */
+/** Retention for `pruneHistory` (spec §4.4); an explicit call, never run in the background. */
 export interface MemoryPruneHistoryOptions {
-  /** Delete past revisions of retracted or expired records recorded before this time (epoch ms). */
+  /**
+   * Delete past revisions of retracted or expired records recorded before
+   * this time (epoch ms on the store clock; exclusive).
+   */
   olderThan: number;
+  /** Only this scope (matched exactly); every scope when absent. */
   scope?: MemoryScope;
 }
 
-/** Retention for `pruneOperations`. */
+/** Retention for `pruneOperations` (spec §4.4); an explicit call, never run in the background. */
 export interface MemoryPruneOperationsOptions {
-  /** Delete receipts committed before this time (epoch ms). */
+  /** Delete receipts committed before this time (epoch ms on the store clock; exclusive). */
   olderThan: number;
 }
 
@@ -407,11 +411,18 @@ export interface VersionedMemoryStore {
      */
     activate(generation: number): Promise<boolean>;
   };
-  /** Deletes past revisions of retracted or expired records; receipts stay. Returns how many. */
+  /**
+   * Deletes the past revisions (and their vectors) of records whose current
+   * revision is retracted or expired. The current revision, every receipt
+   * (content-free, so dedupe holds) and forgotten ids stay. Returns how many
+   * revisions it deleted.
+   */
   pruneHistory(options: MemoryPruneHistoryOptions): Promise<number>;
   /**
    * Deletes old receipts. This removes the dedupe protection for those
-   * operation ids (a redelivery is applied again): it warns through the logger.
+   * operation ids (a redelivery is applied again): it warns through the
+   * logger, with `{ count, olderThan }`. A forgotten id stays forgotten: its
+   * tombstone is not a receipt. Returns how many receipts it deleted.
    */
   pruneOperations(options: MemoryPruneOperationsOptions): Promise<number>;
   /** Releases a connection the store opened itself; a borrowed one stays open. */

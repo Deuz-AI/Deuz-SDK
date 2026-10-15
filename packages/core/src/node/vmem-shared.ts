@@ -720,13 +720,8 @@ export function retentionSpan(
   );
 }
 
-/** The message `pruneOperations` warns with. */
-export function pruneOperationsWarning(count: number): string {
-  return (
-    `Versioned memory: pruned ${count} operation receipt(s). Their operation ids no longer ` +
-    'deduplicate: a redelivery of one of them is applied again.'
-  );
-}
+/** The message `pruneOperations` warns with (shared with the in-memory store). */
+export { pruneOperationsWarning } from '../memory/versioned/shared';
 
 /** Checks `embeddings.begin` input. */
 export function validateGeneration(request: { modelId: string; dims: number }): void {

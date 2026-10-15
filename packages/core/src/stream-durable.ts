@@ -23,6 +23,15 @@ import {
 /** The coalescing defaults of the durable serializer: 20 ms or 16 KiB, whichever first. */
 export const DEFAULT_DURABLE_STREAM_BATCH = { maxDelayMs: 20, maxBytes: 16_384 } as const;
 
+/**
+ * How long a terminal stream stays replayable by default (spec §4.4): 24
+ * hours. Nothing is deleted in the background; the host prunes, e.g. on a
+ * durable schedule:
+ * `store.prune({ terminalBefore: Date.now() - DEFAULT_DURABLE_STREAM_RETAIN_MS })`
+ * (the store clock: the database's for Postgres, the server's for Redis).
+ */
+export const DEFAULT_DURABLE_STREAM_RETAIN_MS = 24 * 60 * 60 * 1_000;
+
 interface StoredRecord {
   seq: number;
   /** The part as JSON text: a read hands out a fresh copy, as a database would. */

@@ -483,13 +483,19 @@ export type GoalRuntimeCommitResult =
         | 'scope-mismatch';
     };
 
-/** Retention options; times are epoch ms on the store's clock. */
+/**
+ * Retention options (spec §4.4); times are epoch ms on the store's clock.
+ * Retention is always an explicit call (the host may schedule it on the
+ * durable scheduler): no store deletes anything in the background.
+ */
 export interface GoalRuntimePruneOptions {
   /**
-   * Delete before this time: an entry's `settledAt`, an occurrence record's
-   * `recordedAt`, an intent's `updatedAt`.
+   * Delete before this time (exclusive: a record stamped exactly then
+   * stays): an entry's `settledAt`, an occurrence record's `recordedAt`, an
+   * intent's `updatedAt`. The spec's `olderThan` for `pruneOccurrences`.
    */
   before: number;
+  /** Only this tenancy scope; every scope when absent. */
   scope?: string;
 }
 
@@ -681,9 +687,13 @@ export interface GoalRuntimeStore extends GoalStore {
    * window. Returns how many.
    */
   pruneInbox(options: GoalRuntimePruneOptions): Promise<number>;
-  /** Deletes occurrence records before `before` (`pruneOccurrences({ olderThan })`). */
+  /**
+   * Deletes occurrence records recorded before `before` (the spec's
+   * `pruneOccurrences({ olderThan })`). The schedules and their cursors
+   * stay. Returns how many.
+   */
   pruneOccurrences(options: GoalRuntimePruneOptions): Promise<number>;
-  /** Deletes completed, failed and cancelled intents updated before `before`. */
+  /** Deletes completed, failed and cancelled intents updated before `before`. Returns how many. */
   pruneIntents(options: GoalRuntimePruneOptions): Promise<number>;
   /** Releases a connection the store opened itself; a borrowed one stays open. */
   close?(): Promise<void>;

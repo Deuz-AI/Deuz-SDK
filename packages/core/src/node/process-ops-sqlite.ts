@@ -12,6 +12,7 @@ import type { ProcessOperationRecord, ProcessOperationStore } from '../compute/d
 import {
   applyChanges,
   assertNewRecord,
+  checkTerminalBefore,
   encodeCursor,
   initialRecord,
   operationConflict,
@@ -190,7 +191,8 @@ export function createSqliteProcessOperationStore(
       });
     },
 
-    prune({ terminalBefore }) {
+    async prune(pruneOptions) {
+      const terminalBefore = checkTerminalBefore(pruneOptions);
       return connection.use((db) => {
         const result = statement(
           db,

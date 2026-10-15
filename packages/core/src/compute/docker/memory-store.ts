@@ -8,6 +8,7 @@ import type { Dependencies } from '../../types/deps';
 import {
   applyChanges,
   assertNewRecord,
+  checkTerminalBefore,
   cloneRecord,
   compareRecords,
   initialRecord,
@@ -60,7 +61,8 @@ export function createInMemoryProcessOperationStore(
       return pageRecords([...records.values()].sort(compareRecords), resolved);
     },
 
-    async prune({ terminalBefore }) {
+    async prune(pruneOptions) {
+      const terminalBefore = checkTerminalBefore(pruneOptions);
       let removed = 0;
       for (const [id, record] of records) {
         if (TERMINAL_PROCESS_STATES.has(record.state) && record.updatedAt < terminalBefore) {
