@@ -8,19 +8,25 @@
  * (a repeated launch never starts a run twice); only a `'retry'` of a run
  * whose failure the native layer recorded as transient resumes with
  * `retryFailed`. The inherited working memory goes to a new run only (a
- * stored run keeps its own). A leg that another executor of the run
- * refused (its lease held or lost, or an executor in this process) reports
- * `heldElsewhere`: the supervisor resumes the run later. Cancel and drain are
- * signals to the native run's lease (`agentRunLeaseKey`); a launcher created
- * without `lease` takes the lease provider of the first supervisor it is
- * given to. Without one, or while no executor holds the run, they answer
- * false and the supervisor keeps the cancel.
+ * stored run keeps its own). A run that extracts memory after its outcome
+ * returns its leg once that outcome is durable, its maintenance pending. A
+ * leg that another executor of the run refused (its lease held or lost, or
+ * an executor in this process) reports `heldElsewhere`: the supervisor
+ * resumes the run later. Cancel and drain are signals to the native run's
+ * lease (`agentRunLeaseKey`); a launcher created without `lease` takes the
+ * lease provider of the first supervisor it is given to. Without one, or
+ * while no executor holds the run, they answer false and the supervisor
+ * keeps the cancel.
  *
  * Edge-safe.
  */
 import { agentRunLeaseKey } from '../../internal/agent-run-lease';
 import type { AgentResult, AgentRunLeaseOptions } from '../../types/agent-run';
-import type { AgentRunEnvelopeV3, AgentRunOptionsV3 } from '../../types/agent-run-v3';
+import type {
+  AgentRunEnvelopeV3,
+  AgentRunOptionsV3,
+  AgentStreamV3,
+} from '../../types/agent-run-v3';
 import type { BudgetTotals } from '../../types/execution';
 import { GoalError } from '../errors';
 import type {
@@ -32,6 +38,11 @@ import type {
 
 /** The executor's V3 entry points (lane L3b adds them as overloads of `runAgent` and `resumeAgent`). */
 type RunV3 = (options: AgentRunOptionsV3<unknown>) => Promise<AgentResult<unknown>>;
+/** Its streaming V3 entry points (`streamAgent`, `resumeStreamAgent`). */
+type StreamV3 = (options: AgentRunOptionsV3<unknown>) => AgentStreamV3<unknown>;
+
+/** How often, at most, a finalizing run's store is read for its terminal commit. */
+const COMMIT_POLL_MS = 250;
 
 /** A run's after-verdict work, as the supervisor follows it. */
 function maintenanceOf(
@@ -104,6 +115,40 @@ export function createNativeRunLauncher(options: NativeRunLauncherOptions): RunL
     return envelope;
   }
 
+  /**
+   * A leg's outcome as soon as it is durable: the stored terminal outcome of
+   * a run whose memory extraction is still pending (read once the run has
+   * entered its finalizing phase), else the executor's answer. The executor
+   * goes on extracting; `maintenance` follows it.
+   */
+  async function durableOutcome(
+    stream: AgentStreamV3<unknown>,
+    runId: string,
+  ): Promise<{ result: AgentResult<unknown>; envelope?: AgentRunEnvelopeV3 }> {
+    let settled = false;
+    const answered = stream.result.then((result) => {
+      settled = true;
+      return { result };
+    });
+    const committed = (async () => {
+      for await (const event of stream.events)
+        if (event.type === 'phase' && event.phase === 'finalizing') break;
+      for (let wait = 5; !settled; wait = Math.min(wait * 2, COMMIT_POLL_MS)) {
+        // A read that fails is only a missed look: the executor's answer still comes.
+        const envelope = await store.load(runId).catch(() => undefined);
+        if (
+          envelope?.phase === 'terminal' &&
+          envelope.result !== undefined &&
+          maintenanceOf(envelope) === 'pending'
+        )
+          return { result: envelope.result, envelope };
+        await new Promise((resolve) => setTimeout(resolve, wait));
+      }
+      return answered;
+    })();
+    return Promise.race([answered, committed]);
+  }
+
   async function leg(request: RunLaunchRequest): Promise<RunLaunchResult> {
     const before = await stored(request.scope, request.runId);
     const base = await options.options(request);
@@ -128,11 +173,26 @@ export function createNativeRunLauncher(options: NativeRunLauncherOptions): RunL
     } as AgentRunOptionsV3<unknown>;
     executor ??= import('../../agent-run');
     const native = await executor;
-    const run = (before === undefined ? native.runAgent : native.resumeAgent) as unknown as RunV3;
-    const result = await run(runOptions);
+    const fresh = before === undefined;
+    // A run that extracts memory after its outcome (2.3 `memory`) is
+    // reported once that outcome is durable, its maintenance pending: a
+    // verified goal never waits for the extraction (spec §3.1).
+    const { result, envelope } =
+      base.memory !== undefined
+        ? await durableOutcome(
+            ((fresh ? native.streamAgent : native.resumeStreamAgent) as unknown as StreamV3)(
+              runOptions,
+            ),
+            request.runId,
+          )
+        : {
+            result: await ((fresh ? native.runAgent : native.resumeAgent) as unknown as RunV3)(
+              runOptions,
+            ),
+          };
     // Nothing of the run happened here: the supervisor resumes it at a later claim.
     if (heldElsewhere(result)) return { runId: request.runId, result, heldElsewhere: true };
-    const after = await store.load(request.runId);
+    const after = envelope ?? (await store.load(request.runId));
     const maintenance = maintenanceOf(after);
     return {
       runId: request.runId,
