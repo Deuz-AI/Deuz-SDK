@@ -16,16 +16,11 @@ import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { PGlite } from '@electric-sql/pglite';
 import pg from 'pg';
 import { createInMemoryAgentRunStoreV3 } from '../src/agent-run-v3-store';
-import { contextPackageBlob } from '../src/agent-run-v3-context';
 import { createInMemoryConditionalChatStore } from '../src/chat-conditional';
 import { createInMemoryProcessOperationStore } from '../src/compute/docker';
 import type { ProcessOperationStore } from '../src/compute/docker/types';
 import { InvalidRequestError } from '../src/errors';
-import {
-  createInMemoryVersionedMemoryStore,
-  createMemorySession,
-  type VersionedMemoryStore,
-} from '../src/memory/versioned';
+import { createInMemoryVersionedMemoryStore } from '../src/memory/versioned';
 import { createPostgresConditionalChatStore } from '../src/node/chat-conditional-postgres';
 import { createSqliteConditionalChatStore } from '../src/node/chat-conditional-sqlite';
 import type { PgPoolLike } from '../src/node/pg-tx';
@@ -40,13 +35,18 @@ import {
 } from '../src/stream-durable';
 import type { AgentRunStoreV3 } from '../src/types/agent-run-v3';
 import type { ConditionalChatStore } from '../src/types/chat-conditional';
-import type { Clock, Logger } from '../src/types/deps';
+import type { Clock } from '../src/types/deps';
 import { chat } from './fixtures/conditional-chat-store-conformance';
-import { contextPackage, envelopeV3 } from './fixtures/agent-run-v3';
-import { withBlobs } from './fixtures/agent-run-store-v3-conformance';
+import { envelopeV3 } from './fixtures/agent-run-v3';
 import { manualClock } from './fixtures/manual-clock';
 import { pglitePool } from './fixtures/pg-pool';
 import { newRecord } from './fixtures/process-ops-store-conformance';
+import {
+  checkForgetOutlivesPrune,
+  checkMemoryRetention,
+  loggerWith,
+  type MemoryRetentionHarness,
+} from './fixtures/retention-2-4';
 import { postgresUrl } from './fixtures/services';
 import { SLOW_HOOK_TIMEOUT_MS, SLOW_TEST_TIMEOUT_MS } from './fixtures/timeouts';
 
@@ -172,16 +172,8 @@ describe('the durable stream default retention', () => {
 // Versioned memory: dedupe and forgetting outlive retention
 // ===================================================================
 
-interface MemoryHarness {
-  store: VersionedMemoryStore;
-  clock: Clock;
-  advance(ms: number): Promise<void>;
-  warn: ReturnType<typeof vi.fn>;
+interface MemoryHarness extends MemoryRetentionHarness {
   cleanup?(): Promise<void>;
-}
-
-function loggerWith(warn: ReturnType<typeof vi.fn>): Logger {
-  return { debug: () => {}, info: () => {}, warn, error: () => {} } as unknown as Logger;
 }
 
 function memoryRetention(name: string, make: () => Promise<MemoryHarness>, slow = false): void {
@@ -189,70 +181,11 @@ function memoryRetention(name: string, make: () => Promise<MemoryHarness>, slow 
     `${name}: receipts outlive pruneHistory, a forgotten id outlives pruneOperations`,
     slow ? SLOW : {},
     async () => {
-      const { store, clock, advance, warn, cleanup } = await make();
+      const harness = await make();
       try {
-        const scope = { userId: 'u-1' };
-        const session = createMemorySession({ store, scope, deps: { clock } });
-        // gone: revision 1 at t0, 2 at t0+1000, retracted (3) at t0+2000.
-        const t0 = clock.now();
-        const created = await session.remember(
-          { text: 'The old office is on Elm Street.' },
-          { operationId: 'op-1' },
-        );
-        const id = created.records[0]!.id;
-        await advance(1_000);
-        await session.revise(
-          id,
-          { text: 'The old office is on Oak Street.' },
-          { expectedRevision: 1, operationId: 'op-2' },
-        );
-        await advance(1_000);
-        await session.retract(id, { expectedRevision: 2, operationId: 'op-3' });
-        const kept = (
-          await session.remember({ text: 'Standups are at nine.' }, { operationId: 'op-k' })
-        ).records[0]!;
-
-        // Exclusive: revision 2, recorded exactly at the cutoff, stays.
-        expect(await store.pruneHistory({ olderThan: t0 + 1_000 })).toBe(1);
-        expect((await store.history(scope, id)).map((record) => record.revision)).toEqual([2, 3]);
-        expect(await store.pruneHistory({ olderThan: clock.now() + 1 })).toBe(1);
-        expect((await store.history(scope, id)).map((record) => record.revision)).toEqual([3]);
-        // The live record keeps its history; the receipts stay, without content.
-        expect(await store.history(scope, kept.id)).toHaveLength(1);
-        for (const operationId of ['op-1', 'op-2', 'op-3', 'op-k']) {
-          const receipt = await store.receipt(operationId);
-          expect(receipt, operationId).toBeDefined();
-          expect(JSON.stringify(receipt)).not.toMatch(/Street|Standups/);
-        }
-        // A redelivered operation is still recognized: nothing is applied twice.
-        const revision = await store.scopeRevision(scope);
-        const replay = await session.remember(
-          { text: 'The old office is on Elm Street.' },
-          { operationId: 'op-1' },
-        );
-        expect(replay.replayed).toBe(true);
-        expect(await store.scopeRevision(scope)).toBe(revision);
-
-        // Forget, then drop every receipt: the id stays forgotten.
-        await session.forget(kept.id, { operationId: 'op-f' });
-        const cutoff = clock.now() + 1;
-        expect(await store.pruneOperations({ olderThan: cutoff })).toBe(5);
-        expect(warn).toHaveBeenCalledTimes(1);
-        expect(warn.mock.calls[0]![0]).toMatch(
-          /^Versioned memory: pruned 5 operation receipt\(s\)\. Their operation ids no longer deduplicate/,
-        );
-        expect(warn.mock.calls[0]![1]).toEqual({ count: 5, olderThan: cutoff });
-        expect(await store.receipt('op-f')).toBeUndefined();
-        expect(await store.get(scope, kept.id, { includeRetracted: true })).toBeUndefined();
-        expect(await store.forget(scope, kept.id, 'op-f2')).toMatchObject({
-          revisions: [],
-          alreadyForgotten: true,
-        });
-        // Nothing is deleted without a call: time alone changes nothing.
-        await advance(30 * 86_400_000);
-        expect((await store.history(scope, id)).map((record) => record.revision)).toEqual([3]);
+        await checkMemoryRetention(harness);
       } finally {
-        await cleanup?.();
+        await harness.cleanup?.();
       }
     },
   );
@@ -323,23 +256,8 @@ function runsRetention(name: string, make: () => Promise<AgentRunStoreV3>, slow 
     async () => {
       const store = await make();
       try {
-        const held = await contextPackageBlob(contextPackage(0, 'held', 7));
-        await store.putBlob(held);
-        await store.save(withBlobs('run', 1, [held], { phase: 'terminal' }));
-        await store.redactForgotten({
-          scope: {},
-          recordId: 'mem-a',
-          revisions: [7],
-          operationId: 'f',
-        });
-        // Prune everything, waiting past a database clock too.
-        await new Promise((resolve) => setTimeout(resolve, 5));
-        expect(await store.prune({ terminalBefore: Date.now() + 60_000 })).toBe(1);
-        expect(await store.getBlob(held.digest)).toEqual({ status: 'missing' });
-        // A compile that read the record before the forget writes its package
-        // after the prune: still stored redacted.
-        await store.putBlob(held);
-        expect(await store.getBlob(held.digest)).toEqual({ status: 'redacted' });
+        // Past the last save, a database clock included.
+        await checkForgetOutlivesPrune(store, () => Date.now() + 60_000);
       } finally {
         await store.close?.();
       }
