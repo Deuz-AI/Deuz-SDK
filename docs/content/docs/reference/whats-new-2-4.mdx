@@ -305,10 +305,11 @@ time with `UnsupportedStoreError` (`unsupported_store`).
   package again without asking the sources. A package a `forget` redacted is
   compiled again (`redacted: true` in its manifest), the one case where a
   reopened step does not reuse its stored context, and a resumed run drops the
-  retrieval blocks of redacted packages from its history before the next
-  request. The store already rewrote the stored copies of those blocks
-  (history, checkpoints, `result.messages`, a terminal run included) into
-  stand-ins with no record when the forget landed.
+  stand-ins and any block that held a forgotten record from its history before
+  the next request; a block under the same marker whose package is still found
+  (an overflow retry's) stays. The store already rewrote the stored copies of
+  those blocks (history, checkpoints, `result.messages`, a terminal run
+  included) into stand-ins with no record when the forget landed.
 - **`workingMemory: { snapshot?, create?, tools? }`** keeps the snapshot, with
   the task list and the active task, in the V3 record, so the active task
   survives a restart. A model's patch becomes durable in the same save as its
@@ -567,9 +568,11 @@ which you can run from a durable schedule.
 
 Every cutoff is exclusive: a record stamped exactly at it stays. A forget also
 reaches the V3 run stores subscribed to it: they redact the context packages
-that held the record and rewrite the runs' stored copies of their retrieval
-blocks, a terminal run's `result.messages` included (see
-[Known limits](#known-limits) for what it does not reach). See
+that held the record and rewrite the runs' stored copies of the exact
+retrieval blocks that hold it, a terminal run's `result.messages` included.
+A resumed run drops those stand-ins, and an overflow retry's block under the
+same marker whose package is still found stays (see
+[Known limits](#known-limits) for what a forget does not reach). See
 [Retention](/docs/modules/retention).
 
 ## Bug fixes
@@ -892,14 +895,21 @@ the 2.3 one goes: a `ConditionalChatStore` is a `ChatStore`, a
   `compileContext` yourself there.
 - **What a forget reaches in V3 runs.** A forget redacts every stored context
   package that held the record, and the run store rewrites, in place, each
-  stored copy of those packages' retrieval blocks (history, checkpoints and
-  stored result messages, a finished run's `result.messages` included) into a
-  stand-in that keeps the marker and holds no record. It does not reach text
-  the model wrote from a block (assistant turns, `result.text`, a compaction
-  summary), memory tool results (`memory_recall` output in tool messages, the
-  run transcript, a chat store), the in-memory history of a leg running at
-  forget time until it ends or is resumed, or run stores not subscribed
-  through `onForget`.
+  stored copy of those packages' retrieval blocks that holds a forgotten record
+  (history, checkpoints and stored result messages, a finished run's
+  `result.messages` included) into a stand-in that keeps the marker and holds
+  no record. Only the exact blocks the compiler appended are replaced: a user's
+  message that only opens with a `<deuz_context pass=... step=...>` marker
+  stays, and so does an overflow retry's block that dropped the forgotten
+  record. A forget also does not reach a retrieval block a run received in its
+  input messages, such as a previous run's `result.messages` passed to
+  `runAgent({ messages })`: it is not redacted in that run's record, so
+  continue from the chat projection or the transcript, which carry no
+  retrieval blocks. Nor does it reach text the model wrote from a block
+  (assistant turns, `result.text`, a compaction summary), memory tool results
+  (`memory_recall` output in tool messages, the run transcript, a chat store),
+  the in-memory history of a leg running at forget time until it ends or is
+  resumed, or run stores not subscribed through `onForget`.
 - **pgvector.** The versioned PostgreSQL store's pgvector path was checked only
   against an emulated `vector` type in PGlite. Without pgvector, cosine runs in
   the process over the freshest `candidateLimit` rows (default 1000).

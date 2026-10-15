@@ -78,7 +78,7 @@ await chats.close();
 | `saveChat(record)` | The legacy write: last writer wins at the stored revision plus one, never over a tombstone (`RevisionConflictError`) |
 | `loadChat(chatId)` | The record with its revision, or `undefined` for a missing or deleted chat |
 | `listChats(scope?)` | Live chats only, most recently updated first, then by `chatId` |
-| `pruneTombstones(before)` | Deletes tombstones with `deletedAt < before` (exclusive: one deleted exactly at `before` stays) and returns the count; the id can be reused after that. A `before` that is not a finite number throws `InvalidRequestError` before anything is deleted |
+| `pruneTombstones(before)` | Deletes tombstones with `deletedAt < before` (exclusive: one deleted exactly at `before` stays) and returns the count; the id can be reused after that. A `before` that is not a finite number throws `InvalidRequestError` before anything is deleted. PostgreSQL compares a fractional `before` as its whole-millisecond ceiling, which removes the same tombstones as the other stores |
 
 A tombstone is final: `writeChat` and `tombstoneChat` conflict, `saveChat`
 throws, and `deleteChat` does nothing. Deleting or tombstoning

@@ -425,6 +425,15 @@ The low-level generation API (`embeddings.begin`, `pending`, `put`, `activate`)
 is on the store for hosts that run the job themselves; `activate` returns
 `false` and changes nothing while a current revision still lacks a vector.
 
+One generation is prepared at a time. `embeddings.begin` (and so `reembed`)
+with another model or size retires the pending generation and deletes its
+vectors in the same transaction, so an abandoned job leaves no vectors behind,
+and a `reembed` still filling the retired generation ends with
+`activated: false`. For an unknown or retired generation, `pending` lists
+nothing, `put` stores nothing and returns `0`, and `activate` returns `false`.
+A generation an activation replaced never becomes active again. The in-memory,
+SQLite and PostgreSQL stores behave the same.
+
 ## Model tools
 
 `createVersionedMemoryTools(session, { include?, prefix? })` returns native
