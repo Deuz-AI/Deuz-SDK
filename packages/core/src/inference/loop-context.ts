@@ -15,7 +15,11 @@
  * succeeded, right after the messages the step was compiled for (an overflow
  * retry replaces them, so a failed attempt leaves no block behind); the
  * `tail` messages follow the last message of this request only and never
- * reach the history. The loop never touches the system message or the tools.
+ * reach the history. A V3 run on a model that binds preserved thinking to the
+ * prefix (Claude 5.x) hands its working memory in `append`, after the
+ * retrieval block, so the bytes a step's thinking was generated after stay in
+ * place for every later request. The loop never touches the system message
+ * or the tools.
  */
 import type { WireToolRequest } from '../adapters/types';
 import type { TelemetryParent } from '../internal/telemetry';

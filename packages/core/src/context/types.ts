@@ -12,7 +12,12 @@
  *   rewritten in place, which on Claude 5.x would drop preserved thinking.
  * - The working memory's current state is an `'ephemeral-tail'` block, added
  *   after the last message of each request and never written to history, so
- *   the model never sees stale versions of it.
+ *   the model never sees stale versions of it. On a model that binds
+ *   preserved thinking to the prefix (Claude 5.x) a V3 run keeps each step's
+ *   copy in the history once the call succeeded instead, since the step's
+ *   thinking was generated right after it (the provider's prefix rule wins);
+ *   every copy reads as replacing the earlier ones, and the manifest records
+ *   `placement.tailKept`.
  * - Old blocks go only at a safe compaction boundary; the working memory is
  *   then placed again from the durable V3 state, never from a summary.
  *
@@ -276,8 +281,13 @@ export interface ContextManifest {
    * reused. `'source-failed'`: an optional source failed and was left out.
    */
   fallback?: 'pass-limit' | 'source-failed';
-  /** Which blocks the package placed. */
-  placement: { append: boolean; tail: boolean };
+  /**
+   * Which blocks the package placed. `tailKept` (2.4, V3 runs): the working
+   * memory block joined the history after the call instead of ending that
+   * request only, because the model binds preserved thinking to the
+   * transcript prefix (Claude 5.x); absent otherwise.
+   */
+  placement: { append: boolean; tail: boolean; tailKept?: boolean };
   /**
    * Whether the request's cached prefix (system, tools, earlier turns) differs
    * from the previous request's. False in normal operation; true only after a
