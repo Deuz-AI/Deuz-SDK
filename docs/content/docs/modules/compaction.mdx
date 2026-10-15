@@ -246,6 +246,7 @@ Details that matter in production:
 - **The retry re-measures before calibrating.** Feeding the EMA the pre-compaction estimate would teach it the history is far bigger than what was actually sent.
 - **On Claude 5.x the forced pass is simple (2.3).** One summary replaces the conversation, as on every compaction for a model that binds thinking to the transcript prefix; the pending user turn stays, so the retry still asks the same question.
 - **It is a loop feature.** A single-turn `generateText` (no tools, no `chat`, no `memory`) has no step to retry, so a `ContextOverflowError` there is final. Catch it and call [`compactMessages`](#compactmessages--the-manual-api) yourself, as in the example above.
+- **A V3 run with a context compiler also recompiles (2.4).** After the forced compaction (`prepareStep` is not re-run), the [context compiler](/docs/modules/context#in-a-native-run) compiles the step's context again for just under the size of the request that overflowed (refresh `'overflow-retry'`). Mandatory content that still does not fit fails the run with `ContextBudgetExceededError` (`context_budget_exceeded`, phase `'overflow-retry'`). A package that placed nothing and a compaction that shrank nothing leave the provider's original error. Without a compiler the recovery is exactly as above.
 
 The events this pass emits are labeled `trigger: 'overflow'` on both the `compaction` stream part and the observation event, so a UI can tell "we planned for this" from "we were caught out".
 
