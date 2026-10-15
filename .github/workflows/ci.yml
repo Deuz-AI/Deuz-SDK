@@ -210,36 +210,35 @@ jobs:
       - run: npm run build -w @deuz-sdk/core
       - run: npm run test -w @deuz-sdk/core
 
-  # rollback:
-  #   # TODO(W2 R1): uncomment once packages/core/package.json has a `test:rollback`
-  #   # script. The rollback rule (2.4 spec §4.2, §5.3): @deuz-sdk/core@2.3.0, which
-  #   # that script installs from npm into a scratch directory, still opens and
-  #   # uses the SQLite and Postgres databases 2.4 wrote. test/release-pipeline.test.ts
-  #   # fails while the script exists and this job is still commented out.
-  #   name: Rollback (2.3.0 opens what 2.4 wrote)
-  #   runs-on: ubuntu-latest
-  #   services:
-  #     postgres:
-  #       image: postgres:16
-  #       env:
-  #         POSTGRES_PASSWORD: deuz
-  #         POSTGRES_DB: deuz
-  #       ports: ['5432:5432']
-  #       options: >-
-  #         --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 3s
-  #         --health-retries 10
-  #   env:
-  #     DEUZ_TEST_POSTGRES_URL: postgres://postgres:deuz@localhost:5432/deuz
-  #     DEUZ_TEST_REQUIRE_SERVICES: postgres
-  #   steps:
-  #     - uses: actions/checkout@v5
-  #     - uses: actions/setup-node@v5
-  #       with:
-  #         node-version: 22
-  #         cache: npm
-  #     - run: npm ci
-  #     - run: npm run build -w @deuz-sdk/core
-  #     - run: npm run test:rollback -w @deuz-sdk/core
+  rollback:
+    # The rollback rule (2.4 spec §4.2, §5.3): @deuz-sdk/core@2.3.0, which
+    # `test:rollback` installs from npm into a scratch directory, still opens and
+    # uses the SQLite file and the Postgres schema 2.4 wrote (packages/core/test/rollback).
+    # test/release-pipeline.test.ts checks this job and the script together.
+    name: Rollback (2.3.0 opens what 2.4 wrote)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: deuz
+          POSTGRES_DB: deuz
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 3s
+          --health-retries 10
+    env:
+      DEUZ_TEST_POSTGRES_URL: postgres://postgres:deuz@localhost:5432/deuz
+      DEUZ_TEST_REQUIRE_SERVICES: postgres
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build -w @deuz-sdk/core
+      - run: npm run test:rollback -w @deuz-sdk/core
 
   docs:
     name: Documentation build

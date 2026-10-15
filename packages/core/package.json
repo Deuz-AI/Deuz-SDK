@@ -846,7 +846,8 @@
     "check": "npm run lint && npm run typecheck && npm run test && npm run test:types && npm run build && npm run verify:package && npm run verify:runtime && npm run verify:size && npm run verify:api",
     "prepare": "node tooling/build.mjs",
     "prepublishOnly": "node tooling/prepublish-guard.mjs",
-    "test:live": "vitest run --config vitest.live.config.ts"
+    "test:live": "vitest run --config vitest.live.config.ts",
+    "test:rollback": "vitest run --config test/rollback/vitest.config.ts"
   },
   "keywords": [
     "ai",
