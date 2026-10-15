@@ -14,7 +14,9 @@
  * - a container that vanished makes the operation `lost`, never recreated.
  *
  * Cancel is recorded first, then stop with a 2 s grace, kill if needed and a
- * state check; while the daemon is unreachable the operation stays
+ * state check (a container that never started is removed instead, so a start
+ * another host already dispatched has nothing to run); while the daemon is
+ * unreachable the operation stays
  * `cancel-requested` and the next poll, cancel or reconcile drives it on.
  * `durableTimeout` is false: a deadline is enforced by this runner's timer
  * while it lives, and a deadline that passed while the host was down cancels
@@ -434,6 +436,11 @@ export function createDockerRunnerFromOptions(
           return result.record;
         }
       }
+      if (info.startedAt === undefined)
+        // Never started: removed before the cancel is final, so a start another
+        // host has already dispatched finds nothing to run (that host notices
+        // the cancel only after its start). Its volume goes with dispose.
+        await engine.remove(info.id);
       const withId =
         containerId !== record.containerId && containerId !== undefined
           ? (await commit(record, { containerId })).record

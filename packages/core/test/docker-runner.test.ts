@@ -628,6 +628,47 @@ describe('createDockerProcessRunner: cancel', () => {
     expect((await runner.start(request())).state).toBe('cancelled');
     expect(startCount(fake)).toBe(0);
   });
+
+  it('a cancel between start-dispatched and the docker start leaves nothing a late start can run (R4-10)', async () => {
+    const fake = await fakeDocker(bundle);
+    const durable = createInMemoryProcessOperationStore();
+    const hostB = setup(fake, { store: durable });
+    let dispatched = false;
+    let crashed = false;
+    // Host A records start-dispatched; host B cancels before A's docker start
+    // lands; A then crashes before it reads the record again.
+    const storeA: ProcessOperationStore = {
+      ...durable,
+      create: (r) => durable.create(r),
+      list: (q) => durable.list(q),
+      prune: (o) => durable.prune(o),
+      async get(s, id) {
+        if (dispatched && !crashed) {
+          crashed = true;
+          throw new HostCrash('crash after docker start');
+        }
+        return durable.get(s, id);
+      },
+      async update(s, id, changes, o) {
+        const result = await durable.update(s, id, changes, o);
+        if (changes.state === 'start-dispatched' && result.status === 'committed') {
+          expect((await hostB.runner.cancel(s, id)).state).toBe('cancelled');
+          dispatched = true;
+        }
+        return result;
+      },
+    };
+    const hostA = setup(fake, { store: storeA });
+    await expect(hostA.runner.start(request())).rejects.toThrow(HostCrash);
+    const hostC = setup(fake, { store: durable });
+    expect((await hostC.runner.poll('tenant-a', 'op-1')).state).toBe('cancelled');
+    expect(fake.containers().filter((c) => c.state === 'running')).toEqual([]);
+    expect(startCount(fake)).toBe(0);
+    expect((await hostC.runner.reconcile()).orphans).toEqual([]);
+    // Dispose of the cancelled operation is still clean.
+    await hostC.runner.dispose('tenant-a', 'op-1');
+    expect((await hostC.runner.poll('tenant-a', 'op-1')).state).toBe('disposed');
+  });
 });
 
 describe('createDockerProcessRunner: artifacts', () => {
