@@ -16,6 +16,7 @@
     "goals",
     "evolve",
     "memory",
+    "versioned-memory",
     "stores",
     "chat-persistence",
     "compaction",

@@ -11,6 +11,8 @@ Import the core from `@deuz-sdk/core/memory`; the markdown backend from `@deuz-s
 
 Since 1.7 you rarely wire the pipeline by hand for a chatbot: the [`memory` call option](#built-in-chat-memory-17) runs recall + extract around any `generateText` / `streamChat` call.
 
+2.4 adds [versioned memory](/docs/modules/versioned-memory) (`@deuz-sdk/core/memory/versioned`) beside this API: records with revisions, sources, an asserted or inferred origin, receipts and forget. This page's API is unchanged apart from the [2.4 fixes](#embedding-mismatch-and-accounting-24) to vector ranking, `memory_update` and accounting.
+
 ## The mental model
 
 Memory is not a longer message history. They answer different questions and live in different places.
@@ -426,9 +428,10 @@ Note that the reconciliation pass is scoped too: facts extracted in one scope ar
 | `llm` | `MemoryLLM` | yes | `(prompt: { system, user }) => Promise<string>`. Used for extraction + reconciliation. |
 | `clock` | `Clock` | yes | `{ now, setTimeout }`. Time source for timestamps / TTL. |
 | `generateId` | `() => string` | yes | New record ids. |
-| `embedder` | `Embedder` | no | Needed only when a vector store searches by embedding and the query has none. |
+| `embedder` | `Embedder` | no | Needed only when a vector store searches by embedding and the query has none. 2.4 also accepts an accounted embedder. |
 | `hashFn` | `HashFn` | no | Content hash for dedupe. Default: WebCrypto SHA-256 hex (`defaultHashFn`). |
-| `logger` | `{ warn(...) }` | no | Optional warning sink — currently used by link expansion. |
+| `logger` | `{ warn(...) }` | no | Optional warning sink — link expansion, and the 2.4 warnings when no `onWarning` is given. |
+| `execution` | `NativeExecutionContext` | no | 2.4: charges every memory LLM and embedder call to this context's ledger. See [Embedding mismatch and accounting](#embedding-mismatch-and-accounting-24). |
 
 `llm` is required by the type even when you never infer. A recall-only or `infer: false` deployment can pass a stub that throws; nothing will call it.
 
@@ -469,7 +472,42 @@ const embedder = createEmbedder(google('gemini-embedding-001'));
 Both reference stores fall back to a case-insensitive `includes()` when the query has no embedding. The in-memory store scores non-matches `0` and **still returns them** up to `topK` — so `recall` can hand you completely unrelated memories with score `0`, and `formatMemoriesForPrompt` will happily render them into the system prompt. The markdown store drops zero-score grep hits, so it behaves differently on the same data. If you rely on the no-embedder path, set a `scorer` or filter `hit.score > 0` yourself.
 </Callout>
 
-Changing embedding models later is a silent break: `cosineSimilarity` returns `0` on a length mismatch, so records written at 768 dimensions simply stop surfacing once queries are 1536-dimensional — no error, no warning. `MemoryRecord.embeddingModelId` records which model wrote each vector (that is what it is for), but **nothing validates it**. Re-embed on a model change, or scope the change to new records only.
+Changing embedding models later leaves the old vectors behind. Since 2.4 a vector search ranks only records whose stored vector has the query's length and, when both name one, the same `embeddingModelId`; the others are found by text only, and `recall` reports an `embedding-mismatch` warning (see [Embedding mismatch and accounting](#embedding-mismatch-and-accounting-24)). Before 2.4 such records stayed in the ranking at score `0`. Re-embed on a model change, or move to [versioned memory](/docs/modules/versioned-memory#embeddings-and-re-embedding), whose `reembed` switches models without a gap.
+
+## Embedding mismatch and accounting (2.4)
+
+2.4 changes three behaviours of this API in every built-in store (in-memory, Markdown, SQLite, PostgreSQL and Redis). Each is listed in the 2.4 migration notes.
+
+- **Vector ranking compares only comparable vectors.** A vector query ranks a record only when its stored vector has the query's length and, when both name a model, the same `embeddingModelId` (`'unknown'`, which `memoryEmbedderFromRag` writes without a `modelId`, names no model). A record with another length or model, and a record without a vector, never fills the results at score `0`; it is still returned when the query text matches it. The PostgreSQL store no longer tops up a short pgvector page with records that have no vector.
+- **`recall` warns about mismatched vectors.** `recall` names the embedder's model on the query, and when a search left records out for another length or model it reports one `embedding-mismatch` warning: through `recall(query, seams, { onWarning })` (also on `RememberOptions.onWarning`), or, without `onWarning`, one `seams.logger.warn` line per seams and mismatch. The message names the current model and size and says the records are found by text until they are embedded again.
+- **`memory_update` drops a stale vector.** A text change without a new embedding, or a patch that sets `embedding: undefined`, removes the stored vector and `embeddingModelId` in every built-in store's `update`. The record is found by text until it is embedded again.
+
+A store of your own can follow the same rule with two new optional `MemoryQuery` fields: `embeddingModelId` (the model the query vector came from) and `onEmbeddingMismatch({ records, dims, modelId? })`, which a search calls at most once with how many records it left out. `cosineSimilarity` itself is unchanged and still returns `0` on a length mismatch.
+
+**Accounting.** With `seams.execution`, every memory LLM and embedder call is reserved on that context's ledger before it runs (a token estimate: the prompt plus 1024 output tokens for the LLM), under `'<scopeId>/memory/<id>'`, kind `'memory-llm'` or `'memory-embedding'`, model `'memory-llm'` or `'memory-embedder'`, unpriced. A callback that reports usage settles it: build the LLM with `defineAccountedMemoryLLM` (exported from `@deuz-sdk/core/memory` with `isAccounted`), or give an embedder `accounted: true` and return `usage` and `modelId` with the vectors. An unmarked callback is reserved as unaccounted, stays at its estimate as unknown (never free), and reports one `unaccounted-usage` warning. Without `execution` nothing is charged, as in 2.3.
+
+```ts
+import { generateText } from '@deuz-sdk/core';
+import { defineAccountedMemoryLLM } from '@deuz-sdk/core/memory';
+import { createMockModel } from '@deuz-sdk/core/testing';
+
+const model = createMockModel({ responses: [{ text: '{"facts":[]}' }] });
+
+// The text and the usage the provider reported, so the ledger settles real numbers.
+const llm = defineAccountedMemoryLLM(async ({ system, user }) => {
+  const result = await generateText({
+    model,
+    messages: [
+      { role: 'system', content: system },
+      { role: 'user', content: user },
+    ],
+  });
+  return { text: result.text, usage: result.usage, modelId: model.modelId };
+});
+console.log(llm.accounted); // true
+```
+
+The built-in `memory` option charges these calls for you: a [native run](/docs/modules/native-agents#memory) charges them to the run's execution context unless `seams.execution` is set, and reports `embedding-mismatch` and `unaccounted-usage` as warning parts on its stream; `generateText` and `streamChat` put the same warnings in `warnings` and charge `options.execution` when the call has one.
 
 ## The MemoryStore seam
 
@@ -499,6 +537,8 @@ Writing your own backend is mostly about honoring four unwritten rules the refer
 2. **`search` must respect `query.topK`** (default 5) and return hits sorted by descending score. `recall` does not re-sort unless a `scorer` is given.
 3. **`get(id, scope)` must return `null` when the record exists but the scope does not match** — link resolution relies on it as an ownership check.
 4. **`findByHash` must apply the same soft-delete filter.** Otherwise an invalidated fact permanently blocks the model from learning it again.
+5. **A vector `search` should rank only comparable vectors (2.4).** Leave out records without a vector or with one of another length or `query.embeddingModelId`, find them by text instead, and report how many you left out once through `query.onEmbeddingMismatch`. The built-in stores do; a 2.3 store that does not still works, as before.
+6. **`update` should drop a stale vector (2.4).** A patch that changes `text` without a new `embedding` leaves the old vector describing the old text.
 
 The two 2.0 methods are **optional on purpose**: their fallbacks (`list` + an in-memory hash scan, `list` + filter + `delete`) are correct everywhere and cheap for the in-memory and markdown backends, but wrong for a SQL table with a `hash` index. Omitting them keeps a pre-2.0 store valid; implementing them turns an O(all records) scan into one statement. The [SQLite and Postgres packs](/docs/modules/stores) implement both.
 
@@ -615,12 +655,15 @@ interface MemoryQuery {
   topK?: number; // default 5
   asOf?: number; // bi-temporal point-in-time
   filter?: Record<string, unknown>;
+  embeddingModelId?: string; // 2.4: the query vector's model
+  onEmbeddingMismatch?: (mismatch: MemoryEmbeddingMismatch) => void; // 2.4
 }
 ```
 
 | `opts` field | Type | Default | Effect |
 | --- | --- | --- | --- |
 | `dropExpired` | `boolean` | `true` | Filter out records whose `expiresAt <= clock.now()`. |
+| `onWarning` | `(warning: CallWarning) => void` | — | 2.4: receives `embedding-mismatch` and `unaccounted-usage` warnings; without it they go to `seams.logger.warn`. |
 | `scorer` | `MemoryScorer` | — | Rerank by recency · importance · relevance (`defaultMemoryScorer` provided). |
 | `expandLinks` | `number` | `0` | Follow graph links out of the primary hits (2.0) — see [Graph link expansion](#graph-link-expansion). |
 
@@ -680,7 +723,7 @@ const { text } = await generateText({
 ```
 
 <Callout type="warn" title="The tools bypass the pipeline — including embedding">
-`memory_append` writes the record the model dictated: no extraction, no reconciliation, no hash dedup, and **no embedding**. On a vector-ranked store those records score `0` against every embedded query and effectively never surface through `memory_search` or `recall`. `memory_update` has the same gap in reverse: it rewrites `text` and `hash` but leaves the old vector in place, so the record is now findable by the wrong meaning.
+`memory_append` writes the record the model dictated: no extraction, no reconciliation, no hash dedup, and **no embedding**. On a vector-ranked store those records never enter the vector ranking; since 2.4 an embedded query finds them only when its text matches theirs (before 2.4 they filled the results at score `0`). `memory_update` rewrites `text` and `hash`; since 2.4 it also drops the record's stored vector and `embeddingModelId`, which described the old text, so the record is found by text until it is embedded again. No embedding call is added.
 
 Use the tools when the model should *curate* memory in a store you search lexically (a markdown vault), or alongside `remember` rather than instead of it. If you need embedded records from the tool path, wrap `memory_append` yourself and embed before `upsert`.
 </Callout>
@@ -788,10 +831,10 @@ Because the vault is plain markdown, `[[wikilinks]]` you write by hand in the bo
 | `expandLinks` does nothing | The chat option's extract never passes `links: true` | Write links via `remember(..., { links: true })`, a markdown vault, or your own `metadata.links` |
 | The store keeps growing despite `ttlMs` | `expiresAt` only hides a record at read time | `sweep: 'on-extract'`, or `sweepExpired` from a cron |
 | Near-duplicate facts pile up | Hash dedup is byte-exact; the reconciler only sees the top-K it retrieved | Raise `RememberOptions.topK` |
-| Old memories stopped surfacing after a model swap | `cosineSimilarity` returns `0` on dimension mismatch — silently | Re-embed, or version your scope |
+| Old memories stopped surfacing after a model swap | Since 2.4, vectors of another length or model leave the vector ranking (found by text only), with an `embedding-mismatch` warning | Re-embed, or use versioned memory's `reembed` |
 | `defaultMemoryScorer` ranks a trivial new fact first | `importance` defaults to `0` and recency is weighted equally with relevance | Write a custom `MemoryScorer` with your own weights |
 | The recall block ends mid-sentence | `maxChars` is a hard `slice`, applied after rendering | Raise the budget above your longest fact |
-| Memories written by `memory_append` are never found | The tools do not embed | Embed in your own wrapper, or use a lexical store |
+| Memories written by `memory_append` are found only by text | The tools do not embed; records without a vector stay out of the vector ranking | Embed in your own wrapper, or use a lexical store |
 | Nothing was written on a serverless deploy | The extract pass runs after the response ends | `await result.memory` before returning |
 | `result.memory` is missing on `generateText` | A suppressing `writePolicy` means no pass started | Read the resolved array, not the field's presence |
 
@@ -835,6 +878,8 @@ The `action` is dropped — a RAG embedder has no task-type parameter to pass it
 
 ## See also
 
+- [Versioned memory](/docs/modules/versioned-memory) — revisions, sources, receipts, forget and re-embedding (2.4).
+- [Context compiler](/docs/modules/context) — memory, RAG, transcript and skills in one token budget (2.4).
 - [Persistent stores](/docs/modules/stores) — SQLite / Redis / Postgres `MemoryStore` implementations.
 - [Embeddings](/docs/core/embeddings) — `embed` / `embedMany`, the engine behind `createEmbedder`.
 - [RAG](/docs/modules/rag) — document ingestion and retrieval over the same vector primitives.
