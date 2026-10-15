@@ -624,3 +624,139 @@ describe('useChat({ initialSnapshot }) — gates', () => {
     });
   });
 });
+
+/**
+ * A route without a `messageId` names every response 'deuz-msg'
+ * (`toDeuzStreamResponse`'s default), so a stored history repeats that id.
+ * Restoring keeps it on the FIRST message and gives the later ones fresh ids,
+ * while the gate's turn still carries the stored id: its answers must fold
+ * into its own bubble, never into the earlier one that kept the id.
+ */
+describe('useChat({ initialSnapshot }) — a gate under a repeated message id', () => {
+  it('folds a restored parked call’s result into its own bubble, not the earlier one', async () => {
+    const first = recordingFetch((round) =>
+      round === 1
+        ? postResponse([parts.start('deuz-msg'), parts.text('first answer'), parts.finish()])
+        : postResponse([
+            parts.start('deuz-msg'),
+            parts.toolCall('c1', 'pick', { what: 'file' }),
+            parts.finish(),
+          ]),
+    );
+    const live = renderHook(() => useChat({ api: '/api/chat', fetch: first.fetch }));
+    await act(async () => {
+      await live.result.current.sendMessage('q1');
+    });
+    await act(async () => {
+      await live.result.current.sendMessage('q2');
+    });
+    await waitFor(() => expect(live.result.current.pendingToolCalls).toHaveLength(1));
+    const snapshot = live.result.current.exportSnapshot();
+    expect(snapshot.messageIds?.[1]).toBe('deuz-msg');
+    expect(snapshot.messageIds?.[3]).toBe('deuz-msg');
+    expect(snapshot.gate?.turn?.message.id).toBe('deuz-msg');
+
+    const wire = recordingFetch(() =>
+      postResponse([parts.start('deuz-msg'), parts.text('done'), parts.finish()]),
+    );
+    const restored = renderHook(() =>
+      useChat({
+        api: '/api/chat',
+        fetch: wire.fetch,
+        initialSnapshot: JSON.parse(JSON.stringify(snapshot)) as ChatSnapshotV1,
+      }),
+    );
+    const parkedId = restored.result.current.messages[3]!.id;
+    expect(parkedId).not.toBe('deuz-msg');
+    // The gate a restored chat exports names the bubble it folds into.
+    expect(restored.result.current.exportSnapshot().gate?.turn?.message.id).toBe(parkedId);
+
+    await act(async () => {
+      await restored.result.current.addToolResult({ toolCallId: 'c1', output: 'a.txt' });
+    });
+    await waitFor(() => expect(restored.result.current.status).toBe('idle'));
+    const view = restored.result.current.messages;
+    expect(view.map((m) => [m.id, m.content, m.toolCalls?.map((call) => call.state)])).toEqual([
+      [snapshot.messageIds![0], 'q1', undefined],
+      ['deuz-msg', 'first answer', undefined],
+      [snapshot.messageIds![2], 'q2', undefined],
+      [parkedId, '', ['result']],
+      ['deuz-msg', 'done', undefined],
+    ]);
+    expect(wire.bodies).toHaveLength(1);
+    expect(wire.bodies[0]!.messages.at(-1)).toEqual({
+      role: 'tool',
+      content: [{ type: 'tool_result', toolUseId: 'c1', result: 'a.txt' }],
+    });
+  });
+
+  it('folds a restored native gate’s client results into its own bubble', async () => {
+    const approval = {
+      approvalId: 'ap1',
+      toolCallId: 'd1',
+      toolName: 'del',
+      input: { path: '/a' },
+    };
+    const agentFrame = (payload: Record<string, unknown>) =>
+      ({ type: 'data-agent', id: String(payload.kind), payload }) as unknown as DeuzUIPart;
+    const first = recordingFetch((round) =>
+      round === 1
+        ? postResponse([parts.start('deuz-msg'), parts.text('first answer'), parts.finish()])
+        : postResponse([
+            parts.start('deuz-msg'),
+            agentFrame({ kind: 'run', seq: 1, runId: 'run-1', status: 'running' }),
+            parts.toolCall('d1', 'del', { path: '/a' }),
+            parts.approval('ap1', 'd1', 'del', { path: '/a' }),
+            parts.toolCall('c1', 'pick', { what: 'file' }),
+            parts.finish(),
+            agentFrame({
+              kind: 'result',
+              seq: 6,
+              runId: 'run-1',
+              status: 'suspended',
+              pendingApprovals: [approval],
+              pendingClientCalls: [{ toolCallId: 'c1', toolName: 'pick', input: { what: 'file' } }],
+            }),
+          ]),
+    );
+    const live = renderHook(() => useChat({ api: '/api/agent', fetch: first.fetch }));
+    await act(async () => {
+      await live.result.current.sendMessage('q1');
+    });
+    await act(async () => {
+      await live.result.current.sendMessage('go');
+    });
+    await waitFor(() => expect(live.result.current.pendingApprovals).toHaveLength(1));
+    const gated = live.result.current.exportSnapshot();
+    expect(gated.gate?.turn?.message.id).toBe('deuz-msg');
+
+    // The verdict lands on a restored chat whose onToolCall answers the client call.
+    const wire = recordingFetch(() =>
+      postResponse([parts.start('deuz-msg'), parts.text('done'), parts.finish()]),
+    );
+    const restored = renderHook(() =>
+      useChat({
+        api: '/api/agent',
+        fetch: wire.fetch,
+        onToolCall: () => 'a.txt',
+        initialSnapshot: JSON.parse(JSON.stringify(gated)) as ChatSnapshotV1,
+      }),
+    );
+    const gateId = restored.result.current.messages[3]!.id;
+    expect(gateId).not.toBe('deuz-msg');
+    await act(async () => {
+      await restored.result.current.addToolApprovalResponse({ approvalId: 'ap1', approved: true });
+    });
+    await waitFor(() => expect(restored.result.current.status).toBe('idle'));
+    const view = restored.result.current.messages;
+    expect(view[1]).toMatchObject({ id: 'deuz-msg', content: 'first answer' });
+    expect(view[1]!.toolCalls).toBeUndefined();
+    expect(view[3]!.id).toBe(gateId);
+    expect(view[3]!.toolCalls?.find((call) => call.toolCallId === 'c1')?.state).toBe('result');
+    expect(view).toHaveLength(5);
+    expect(wire.bodies[0]).toMatchObject({
+      runId: 'run-1',
+      clientToolResults: [{ toolCallId: 'c1', output: 'a.txt' }],
+    });
+  });
+});

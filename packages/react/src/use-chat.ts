@@ -101,6 +101,7 @@ import {
   assertChatSnapshot,
   capabilitiesFromHeader,
   capabilitiesOf,
+  gateOnItsBubble,
   normalizeCapabilities,
   pairViews,
   restoreUI,
@@ -953,7 +954,10 @@ export function useChat(options: UseChatOptions): UseChatResult {
   // A restored snapshot's gates (2.4): the chat is still paused on them.
   const restoredApprovals = restored?.pendingApprovals ?? [];
   const restoredCalls = restored?.pendingToolCalls ?? [];
-  const restoredGate = restored?.gate;
+  // Its turn names the bubble it renders as, which a repeated stored id may not.
+  const [restoredGate] = useState<ChatSnapshotGateV1 | undefined>(() =>
+    gateOnItsBubble(restored?.gate, restored?.messages ?? [], snapshot.history.ui),
+  );
   const [pendingApprovals, setPendingApprovals] =
     useState<ToolApprovalRequest[]>(restoredApprovals);
   const [pendingToolCalls, setPendingToolCalls] = useState<UIToolCall[]>(restoredCalls);
