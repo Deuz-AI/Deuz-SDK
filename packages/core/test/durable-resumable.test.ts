@@ -6,10 +6,14 @@ import {
   toDeuzStreamResponse,
   readDeuzStream,
   connectDeuzStream,
+  createInMemoryDurableStreamStateStore,
   createInMemoryStreamStateStore,
   type DeuzUIPart,
+  type DurableStreamStateStore,
 } from '../src/ui';
+import { createInMemoryLeaseProvider } from '../src/ops';
 import type { JSONSchema } from '../src/types/schema';
+import { bodyReader, manualResult, textPart } from './fixtures/manual-stream';
 import { sseResponse, sseEvents, mockFetchSequence } from './fixtures/sse';
 
 const SCHEMA: JSONSchema = {
@@ -274,5 +278,163 @@ describe('durable × resumable — the unbreakable chatbot (D5)', () => {
       .join('');
     expect(text).toContain('Answer after the crash.');
     expect(parts.at(-1)!.type).toBe('finish');
+  });
+});
+
+describe('durable × resumable over a DurableStreamStateStore (2.4)', () => {
+  const texts = async (store: DurableStreamStateStore, streamId: string) => {
+    const parts: string[] = [];
+    for await (const record of store.read(streamId))
+      parts.push(
+        record.part.type === 'text-delta'
+          ? (record.part as { text: string }).text
+          : record.part.type,
+      );
+    return parts;
+  };
+
+  it('a durable continuation leg never writes over a quiet durable producer', async () => {
+    const sessionStore = createInMemorySessionStore();
+    const store = createInMemoryDurableStreamStateStore();
+    const provider = createInMemoryLeaseProvider();
+    const durable = (owner: string) => ({
+      store,
+      lease: { provider, owner },
+      batch: { maxDelayMs: 0 },
+    });
+    // Producer A commits and sends seqs 0..2, then goes quiet (a long tool call).
+    const sourceA = manualResult();
+    const a = bodyReader(
+      toDeuzStreamResponse(sourceA.result, {
+        durable: durable('a'),
+        streamId: 'run-3',
+        messageId: 'm',
+      }),
+    );
+    sourceA.push(textPart('a1'));
+    sourceA.push(textPart('a2'));
+    await a.until('"a2"');
+
+    // The client reconnects; the probe hears silence and starts a continuation leg.
+    const spyFetch = vi.fn();
+    const resumed = await resumeDeuzChatResponse({
+      sessionStore,
+      streamStateStore: store,
+      durable: durable('resumer'),
+      runId: 'run-3',
+      streamId: 'run-3',
+      lastEventId: '2',
+      call: {
+        model: createAnthropic({ apiKey: 'k', fetch: spyFetch as never })('claude-opus-4-8'),
+      },
+      liveProbeMs: 10,
+      pollIntervalMs: 2,
+      clock: instantClock,
+    }).text();
+    // A still holds the lease: the leg is refused, and writes nothing.
+    expect(resumed).toContain('Durable stream: another producer holds this stream.');
+    expect(await texts(store, 'run-3')).toEqual(['start', 'a1', 'a2']);
+
+    // A goes on: its committed frames are the log, gapless.
+    sourceA.push(textPart('a3'));
+    sourceA.end();
+    const rawA = await a.rest();
+    expect(rawA).toContain('"a3"');
+    expect(rawA).toContain('[DONE]');
+    expect(await texts(store, 'run-3')).toEqual(['start', 'a1', 'a2', 'a3', 'done']);
+    expect(spyFetch).not.toHaveBeenCalled();
+  });
+
+  it('continues a crashed durable producer once its lease lapsed, gapless and durable', async () => {
+    const sessionStore = createInMemorySessionStore();
+    const store = createInMemoryDurableStreamStateStore();
+    let providerNow = 1_700_000_000_000;
+    const provider = createInMemoryLeaseProvider({
+      clock: { now: () => providerNow, setTimeout: instantClock.setTimeout },
+    });
+    const tools = { search: { parameters: SCHEMA, execute: vi.fn(async () => 'found') } };
+
+    // Leg 1, durable: step 1 completes, step 2's model call hangs, the process dies
+    // (its timers never fire, so its lease is never renewed nor released).
+    const hung = new Promise<Response>(() => {});
+    const leg1 = mockFetchSequence([() => sseResponse([TOOL_CALL]), () => hung as never]);
+    const result1 = streamChat({
+      model: createAnthropic({ apiKey: 'k', fetch: leg1.fetch })('claude-opus-4-8'),
+      messages: [{ role: 'user', content: 'find x' }],
+      tools,
+      maxSteps: 5,
+      session: { store: sessionStore, runId: 'run-4' },
+      deps: { clock: deadTimerClock },
+    });
+    const live = toDeuzStreamResponse(result1, {
+      durable: {
+        store,
+        lease: { provider, owner: 'a', ttlMs: 300 },
+        // Every frame commits at once: the dead clock fires no coalescing window.
+        batch: { maxBytes: 1 },
+        deps: { clock: deadTimerClock },
+      },
+      streamId: 'run-4',
+      messageId: 'm1',
+    });
+    const reader = live.body!.getReader();
+    await reader.read();
+    await reader.read();
+    await reader.cancel();
+    await new Promise((r) => setTimeout(r, 20));
+    const committed: number[] = [];
+    for await (const record of store.read('run-4')) committed.push(record.seq);
+    expect(committed.length).toBeGreaterThan(2);
+    providerNow += 1_000; // the dead producer's lease lapses
+
+    const leg2 = mockFetchSequence([() => sseResponse([FINAL])]);
+    const resume = (lastEventId: string | null) =>
+      resumeDeuzChatResponse({
+        sessionStore,
+        streamStateStore: store,
+        durable: { store, lease: { provider, owner: 'resumer' } },
+        runId: 'run-4',
+        streamId: 'run-4',
+        lastEventId,
+        call: {
+          model: createAnthropic({ apiKey: 'k', fetch: leg2.fetch })('claude-opus-4-8'),
+          tools,
+        },
+        liveProbeMs: 10,
+        pollIntervalMs: 2,
+        clock: instantClock,
+      });
+    const parts: DeuzUIPart[] = [];
+    for await (const part of readDeuzStream(resume('1'))) parts.push(part);
+    expect(leg2.calls.length).toBeGreaterThan(0);
+    const text = parts
+      .filter((p): p is Extract<DeuzUIPart, { type: 'text-delta' }> => p.type === 'text-delta')
+      .map((p) => p.text)
+      .join('');
+    expect(text).toContain('Answer after the crash.');
+    // A replay of the whole log: gapless ids past the crash, ended by the leg's sentinel.
+    const raw = await resume(null).text();
+    const ids = [...raw.matchAll(/^id: (\d+)$/gm)].map((m) => Number(m[1]));
+    expect(ids).toEqual(ids.map((_, i) => i));
+    expect(raw.trimEnd().endsWith('data: [DONE]')).toBe(true);
+    // The leg gave its lease back.
+    expect(await provider.acquire({ key: 'stream:run-4', owner: 'next', ttlMs: 300 })).toBeTruthy();
+  });
+
+  it('refuses a durable store other than the stream state store', () => {
+    const store = createInMemoryDurableStreamStateStore();
+    expect(() =>
+      resumeDeuzChatResponse({
+        sessionStore: createInMemorySessionStore(),
+        streamStateStore: store,
+        durable: {
+          store: createInMemoryDurableStreamStateStore(),
+          lease: { provider: createInMemoryLeaseProvider() },
+        },
+        runId: 'r',
+        streamId: 'r',
+        call: { model: createAnthropic({ apiKey: 'k' })('claude-opus-4-8') },
+      }),
+    ).toThrow(/durable\.store/);
   });
 });

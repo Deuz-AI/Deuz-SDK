@@ -7,7 +7,10 @@
  *
  * Text is folded before it is stored or matched (NFKD, combining marks
  * dropped, lower case), the way SQLite FTS5's default `unicode61` tokenizer
- * folds, so `İzmir`, `IZMIR` and `izmir` are one term in every backend.
+ * folds, so `İzmir`, `IZMIR` and `izmir` are one term in every backend. A
+ * message's stored text is capped at `MAX_INDEXED_TEXT_BYTES` and U+0000
+ * becomes a space, so every backend can store every message and holds the
+ * same terms of it.
  */
 import type { ChatRecord } from '../chat';
 import type { MemoryScope } from '../memory';
@@ -21,6 +24,15 @@ export const DEFAULT_TRANSCRIPT_LIMIT = 10;
 
 /** Terms a query keeps at most: the rest is ignored. */
 export const MAX_QUERY_TERMS = 32;
+
+/**
+ * The most of a message's folded text an index holds, in UTF-8 bytes: 256 KiB,
+ * cut before the term the limit falls in. A larger message (a log dump, a
+ * file read whole) is searchable by the terms of its first 256 KiB in every
+ * backend, and its Postgres `tsvector` stays well under the 1 MB a
+ * `tsvector` may take, past which the whole chat write would fail.
+ */
+export const MAX_INDEXED_TEXT_BYTES = 262_144;
 
 /** Attempts of a conditional chat write against concurrent writers, the first included. */
 export const CHAT_WRITE_ATTEMPTS = 3;
@@ -68,17 +80,52 @@ export function foldText(text: string): string {
 /**
  * A message's searchable text, folded: its string content, its `text` parts
  * and its string tool results, one per line. Reasoning, tool inputs, images
- * and structured tool results are not searched.
+ * and structured tool results are not searched. U+0000 becomes a space
+ * (Postgres refuses it in text, SQLite's LIKE stops at it), and the text is
+ * capped at `MAX_INDEXED_TEXT_BYTES`.
  */
 export function searchText(message: Message): string {
-  if (typeof message.content === 'string') return foldText(message.content);
+  if (typeof message.content === 'string') return indexedText(message.content);
   const pieces: string[] = [];
   for (const part of message.content) {
     if (part.type === 'text') pieces.push(part.text);
     else if (part.type === 'tool_result' && typeof part.result === 'string')
       pieces.push(part.result);
   }
-  return foldText(pieces.join('\n'));
+  return indexedText(pieces.join('\n'));
+}
+
+const TERM_CHAR = /^[\p{L}\p{N}]$/u;
+
+/** Whether the code point starting at `index` is a term character (letter or digit). */
+const termCharAt = (text: string, index: number): boolean =>
+  TERM_CHAR.test(String.fromCodePoint(text.codePointAt(index)!));
+
+/** Folded, U+0000 as a space, and at most `MAX_INDEXED_TEXT_BYTES` of UTF-8. */
+function indexedText(text: string): string {
+  const folded = foldText(text).replaceAll('\u0000', ' ');
+  // A UTF-16 unit is at most three UTF-8 bytes: a short text needs no count.
+  if (folded.length * 3 <= MAX_INDEXED_TEXT_BYTES) return folded;
+  let bytes = 0;
+  let end = 0;
+  for (const char of folded) {
+    const code = char.codePointAt(0)!;
+    const size = code < 0x80 ? 1 : code < 0x800 ? 2 : code < 0x10000 ? 3 : 4;
+    if (bytes + size > MAX_INDEXED_TEXT_BYTES) break;
+    bytes += size;
+    end += char.length;
+  }
+  if (end === folded.length || !termCharAt(folded, end)) return folded.slice(0, end);
+  // The head of a term the limit cuts through is no term of the message:
+  // step back over it, a code point at a time (a low surrogate with its pair).
+  while (end > 0) {
+    const low = folded.charCodeAt(end - 1);
+    const high = end >= 2 ? folded.charCodeAt(end - 2) : 0;
+    const width = low >= 0xdc00 && low <= 0xdfff && high >= 0xd800 && high <= 0xdbff ? 2 : 1;
+    if (!termCharAt(folded, end - width)) break;
+    end -= width;
+  }
+  return folded.slice(0, end);
 }
 
 /** The messages of `record` an index holds: all but system ones, each with its stable id. */

@@ -8,6 +8,7 @@ import { describe, expect, it } from 'vitest';
 import type { ChatRecord } from '../src/chat';
 import type { Message } from '../src/types/message';
 import {
+  MAX_INDEXED_TEXT_BYTES,
   MAX_QUERY_TERMS,
   foldText,
   queryTerms,
@@ -117,6 +118,36 @@ describe('searchable text', () => {
         ],
       }),
     ).toBe('one\ntwo');
+  });
+
+  it('turns U+0000 into a separator: Postgres refuses it, SQLite LIKE stops at it', () => {
+    expect(searchText({ role: 'user', content: 'Binary \u0000tail\u0000\u0000end' })).toBe(
+      'binary  tail  end',
+    );
+  });
+
+  it(`keeps at most ${MAX_INDEXED_TEXT_BYTES} UTF-8 bytes, cut before the term the limit crosses`, () => {
+    const bytes = (text: string) => new TextEncoder().encode(text).byteLength;
+    const short = 'word '.repeat(1_000);
+    expect(searchText({ role: 'user', content: short })).toBe(short);
+    // ASCII: the cut lands inside 'abcdefgh', which is dropped whole.
+    const ascii = `${'x'.repeat(MAX_INDEXED_TEXT_BYTES - 4)} abcdefgh tail`;
+    expect(searchText({ role: 'user', content: ascii })).toBe(
+      `${'x'.repeat(MAX_INDEXED_TEXT_BYTES - 4)} `,
+    );
+    // A cut between two terms keeps the term before it.
+    const exact = `${'y'.repeat(MAX_INDEXED_TEXT_BYTES)} next`;
+    expect(searchText({ role: 'user', content: exact })).toBe('y'.repeat(MAX_INDEXED_TEXT_BYTES));
+    // Three bytes a character: whole characters, within the budget.
+    const wide = searchText({ role: 'user', content: '界 '.repeat(MAX_INDEXED_TEXT_BYTES) });
+    expect(bytes(wide)).toBeLessThanOrEqual(MAX_INDEXED_TEXT_BYTES);
+    expect(bytes(wide)).toBeGreaterThan(MAX_INDEXED_TEXT_BYTES - 4);
+    expect(wide.replaceAll('界 ', '')).toMatch(/^界?$/);
+    // A four-byte character is never split.
+    const astral = `${'z'.repeat(MAX_INDEXED_TEXT_BYTES - 2)} 𠀀`;
+    expect(searchText({ role: 'user', content: astral })).toBe(
+      `${'z'.repeat(MAX_INDEXED_TEXT_BYTES - 2)} `,
+    );
   });
 });
 

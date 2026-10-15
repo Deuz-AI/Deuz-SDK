@@ -105,6 +105,13 @@ export interface DurableStreamOptions {
    * The producer lease: key `stream:<streamId>`, its token the fencing token.
    * `owner` defaults to a random id, `ttlMs` (an integer of at least 3) to
    * 30 000; the lease is renewed every `ttlMs / 3` and released at the end.
+   * When the provider's `prune` removed the released key since the stream's
+   * last leg, its tokens start again at 1, below the stream's fence: the
+   * lease's holder (a renewal proves it still holds it) then fences the
+   * stream one past the stored token, and a producer whose lease changed
+   * hands is refused as before. A producer cut off past the prune cutoff
+   * can hold the same token as the next holder: keep the lease retention
+   * longer than any producer pause.
    */
   lease: { provider: LeaseProvider; owner?: string; ttlMs?: number };
   batch?: DurableStreamBatchOptions;

@@ -129,6 +129,31 @@ describe('PostgreSQL conditional chat store', () => {
     await store.close();
   });
 
+  it('keeps the tsvector of a message of all-distinct short terms under the 1 MB limit', async () => {
+    const schema = await liteSchema();
+    const store = createPostgresConditionalChatStore({ pool: litePool, schema });
+    // The densest tsvector per indexed byte: distinct two- and three-character
+    // terms, then distinct CJK characters (three bytes each), past the cap.
+    const alphabet = 'abcdefghijklmnopqrstuvwxyz0123456789';
+    const terms: string[] = [];
+    for (const a of alphabet) for (const b of alphabet) terms.push(a + b);
+    for (const a of alphabet)
+      for (const b of alphabet) for (const c of alphabet) terms.push(a + b + c);
+    for (let code = 0x4e00; code <= 0x9fff; code++) terms.push(String.fromCodePoint(code));
+    const result = await store.writeChat(chat('dense', [terms.join(' ')]), {
+      expectedRevision: 0,
+    });
+    expect(result.status).toBe('committed');
+    const { rows } = await litePool.query(
+      // The datum as computed, before any TOAST compression.
+      `SELECT pg_column_size(to_tsvector('simple', body)) AS size, length(tsv) AS lexemes FROM ${schema}.deuz_chat_transcript`,
+    );
+    expect(Number(rows[0]!.size)).toBeLessThan(1_048_575);
+    expect(Number(rows[0]!.lexemes)).toBeGreaterThan(50_000);
+    expect(await store.transcript.search(scope, 'zz')).toHaveLength(1);
+    await store.close();
+  });
+
   it('refuses calls after close, and leaves a borrowed pool open', async () => {
     const schema = await liteSchema();
     const store = createPostgresConditionalChatStore({ pool: litePool, schema });

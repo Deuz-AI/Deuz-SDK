@@ -158,7 +158,9 @@ export interface TranscriptIndex {
    * `scope` (as `listChats(scope)` does), best first. Never crosses scopes.
    * A message matches when it holds any of the query's terms (letters and
    * digits, case and diacritics folded); the best hit scores 1. System
-   * messages are not indexed. An empty `scope` matches every chat.
+   * messages are not indexed, and of a message larger than 256 KiB (UTF-8)
+   * only the terms of its first 256 KiB are. An empty `scope` matches every
+   * chat.
    */
   search(
     scope: MemoryScope,

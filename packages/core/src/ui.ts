@@ -1129,11 +1129,19 @@ function deuzSSEResponse(
         send({ type: 'start', messageId });
       }
       if (unreadable) warnStoreFailure();
-      await produce(
-        send,
-        () => seq,
-        () => stopped,
-      );
+      try {
+        await produce(
+          send,
+          () => seq,
+          () => stopped,
+        );
+      } catch (error) {
+        // Durable: a producer that throws still ends its journal (what is
+        // queued is committed and sent, the lease renewal stops and the lease
+        // goes back), then the body errors as a legacy one does: no sentinel.
+        if (journal) await journal.end();
+        throw error;
+      }
       // Leg-end sentinel: appended for EVERY ended leg (complete, errored, or
       // suspended-for-approval). Replay treats it as terminal only when
       // nothing was appended after it, so a continued run stays reachable.

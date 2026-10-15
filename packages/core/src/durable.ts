@@ -12,6 +12,7 @@ import type { GenerateTextResult, StreamChatResult } from './types/methods';
 import type { AgentCheckpoint, SessionStore } from './types/session';
 import type { ToolApprovalRequest } from './types/tool';
 import type { Clock } from './types/deps';
+import type { DurableStreamOptions } from './types/stream-durable';
 import { DeuzError } from './errors';
 import { assertCheckpointVersion } from './internal/checkpoint-version';
 import { runToolLoop } from './inference/tool-loop';
@@ -336,6 +337,18 @@ export interface ResumeDeuzChatOptions {
   /** Timer seam (deterministic tests). Default: global setTimeout. */
   clock?: Pick<Clock, 'setTimeout'>;
   onStoreError?: (error: unknown) => void;
+  /**
+   * Durable mode for the continuation leg (2.4, preview), as
+   * `toDeuzStreamResponse`'s `durable`; `durable.store` must be
+   * `streamStateStore`. Set it when the stream's producers run durable: the
+   * leg then takes the producer lease and commits before it sends, so a
+   * producer that only went quiet past `liveProbeMs` keeps the stream (the
+   * leg fails closed with 'another producer holds this stream', and
+   * reconnecting tails it), and so do two concurrent resumers. Without it the
+   * leg is a legacy one: its writes are not fenced, and it can take over seqs
+   * such a producer goes on to commit.
+   */
+  durable?: DurableStreamOptions;
 }
 
 /**
@@ -348,6 +361,10 @@ export interface ResumeDeuzChatOptions {
  * on the same client behavior: `connectDeuzStream` sees one gapless stream.
  */
 export function resumeDeuzChatResponse(options: ResumeDeuzChatOptions): Response {
+  if (options.durable && options.durable.store !== options.streamStateStore)
+    throw new TypeError(
+      'resumeDeuzChatResponse: `durable.store` must be the `streamStateStore` the stream is replayed from.',
+    );
   const encoder = new TextEncoder();
   const version: DeuzWireVersion = options.wireVersion ?? 'v2';
   const pollIntervalMs = Math.max(1, options.pollIntervalMs ?? 150);
@@ -439,7 +456,8 @@ export function resumeDeuzChatResponse(options: ResumeDeuzChatOptions): Response
           options.call,
         );
         const continuation = toDeuzStreamResponse(result, {
-          store: options.streamStateStore,
+          // Durable (2.4): the leg is fenced by the producer lease, its journal the same store.
+          ...(options.durable ? { durable: options.durable } : { store: options.streamStateStore }),
           streamId: options.streamId,
           wireVersion: version,
           ...(options.onStoreError ? { onStoreError: options.onStoreError } : {}),

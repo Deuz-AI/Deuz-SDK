@@ -5,7 +5,9 @@
  *
  * - The producer takes the lease `stream:<streamId>`, opens the stream with
  *   the lease token (its fencing token), renews the lease every `ttlMs / 3`
- *   and gives it back at the end.
+ *   and gives it back at the end. When a lease prune restarted the key's
+ *   tokens below the stream's stored one, the lease's holder (a renewal
+ *   proves it) fences the stream one past the stored token instead.
  * - Frames are queued and committed in batches: when the queue reaches
  *   `maxBytes` (encoded), or `maxDelayMs` after its first frame, whichever
  *   comes first. One commit is in flight at a time; what arrives meanwhile
@@ -37,7 +39,11 @@ export interface DurableFrame {
 export interface DurableJournal {
   /** Queues a frame; dropped once the journal halted. */
   push(frame: DurableFrame): void;
-  /** Commits and publishes everything queued, then gives the lease back. */
+  /**
+   * Commits everything queued, gives the lease back, then publishes what it
+   * committed: a client that starts the next leg as soon as it reads
+   * `[DONE]` finds the lease free.
+   */
   end(): Promise<void>;
   /** True once the journal failed closed. */
   readonly halted: boolean;
@@ -99,6 +105,10 @@ export async function openDurableJournal(host: DurableJournalHost): Promise<Dura
 
   let lease: Lease;
   let lastSeq: number;
+  // The token this producer opens and commits with: its lease token, unless
+  // the stream already holds a higher one while the lease is still this
+  // producer's (see below).
+  let fence: number;
   try {
     const acquired = await provider.acquire({
       key: `stream:${streamId}`,
@@ -112,7 +122,23 @@ export async function openDurableJournal(host: DurableJournalHost): Promise<Dura
     return { status: 'refused', message: DURABLE_STREAM_MESSAGES.storeFailed };
   }
   try {
-    const opened = await store.open(streamId, lease.token);
+    fence = lease.token;
+    let opened = await store.open(streamId, fence);
+    if (opened.status === 'fenced') {
+      // The stream holds a higher token than this lease. Either the lease
+      // changed hands after this producer took it (a newer producer owns the
+      // stream: refused), or the provider pruned the released key since the
+      // stream's last leg and its tokens started again at 1 (types/lease.ts).
+      // A renewal tells them apart: only the lease's current holder renews.
+      // The holder then fences the stream one past the stored token, so a
+      // producer from before the prune is refused all the same.
+      const renewal = await provider.renew(lease, ttlMs);
+      if (renewal.held) {
+        lease = renewal.lease;
+        fence = opened.token + 1;
+        opened = await store.open(streamId, fence);
+      }
+    }
     if (opened.status === 'fenced') {
       fencedSpan(opened.token);
       await releaseLease(lease);
@@ -133,6 +159,15 @@ export async function openDurableJournal(host: DurableJournalHost): Promise<Dura
   let cancelRenewal: (() => void) | undefined;
   let inFlight: Promise<void> | undefined;
   let flushAgain = false;
+  // Once `end` began: the bytes of the batches committed since, sent after
+  // the lease went back (or before the error frame of a halt).
+  let ending = false;
+  let tail: Uint8Array[] = [];
+
+  const sendTail = (): void => {
+    for (const bytes of tail) host.enqueue(bytes);
+    tail = [];
+  };
 
   const stopTimers = (): void => {
     cancelWindow?.();
@@ -148,6 +183,8 @@ export async function openDurableJournal(host: DurableJournalHost): Promise<Dura
     queue = [];
     queuedBytes = 0;
     if (error !== undefined) host.onStoreError(error);
+    // Committed while ending: these frames precede the error.
+    sendTail();
     host.onHalt(message);
     void releaseLease(lease);
   };
@@ -172,7 +209,7 @@ export async function openDurableJournal(host: DurableJournalHost): Promise<Dura
             [DEUZ_ATTR.streamBatchBytes]: bytes,
           },
           async (annotate) => {
-            const committed = await store.commit({ streamId, token: lease.token, records });
+            const committed = await store.commit({ streamId, token: fence, records });
             annotate({ [DEUZ_ATTR.streamCommitMs]: clock.now() - startedAt });
             return committed;
           },
@@ -193,7 +230,9 @@ export async function openDurableJournal(host: DurableJournalHost): Promise<Dura
     }
     // Committed, but the response may have failed closed meanwhile (a lost lease).
     if (halted) return;
-    for (const frame of batch) host.enqueue(frame.bytes);
+    for (const frame of batch)
+      if (ending) tail.push(frame.bytes);
+      else host.enqueue(frame.bytes);
   };
 
   const flush = (): void => {
@@ -260,13 +299,18 @@ export async function openDurableJournal(host: DurableJournalHost): Promise<Dura
       }
     },
     async end() {
+      ending = true;
       while (!halted && (queue.length > 0 || inFlight)) {
         if (inFlight) await inFlight;
         else flush();
       }
       ended = true;
       stopTimers();
-      if (!halted) await releaseLease(lease);
+      if (halted) return;
+      // Every frame is committed (and fenced): the lease goes back before the
+      // last frames, [DONE] among them, reach the client.
+      await releaseLease(lease);
+      sendTail();
     },
     get halted() {
       return halted;
