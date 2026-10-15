@@ -21,7 +21,6 @@
  * matches every revision. Edge-safe.
  */
 import { decodeAgentRunEnvelopeV3, encodeAgentRunEnvelopeV3 } from './agent-run-v3';
-import { messageText, RETRIEVAL_CLOSING } from './context/render';
 import type { ContextBlock, ContextPackage } from './context/types';
 import { canonicalJson, isSha256Digest, sha256Digest, type Sha256Digest } from './internal/digest';
 import type { MemoryForgetEvent } from './memory/versioned/types';
@@ -162,6 +161,21 @@ export function isForgotten(record: ContextBlobRecord, tombstone: ContextBlobRec
       tombstone.revision === undefined ||
       record.revision === tombstone.revision)
   );
+}
+
+/**
+ * The retrieval block's closing tag and a message's text, as
+ * `context/render.ts` writes and reads them; repeated here so the run stores
+ * (the in-memory one is eager in `/agent`) do not load the renderer.
+ */
+const RETRIEVAL_CLOSING = '</deuz_context>';
+
+function messageText(message: Message): string {
+  if (typeof message.content === 'string') return message.content;
+  return message.content
+    .filter((part) => part.type === 'text')
+    .map((part) => (part as { text: string }).text)
+    .join('\n');
 }
 
 /** The text of a redacted block's stand-in. */

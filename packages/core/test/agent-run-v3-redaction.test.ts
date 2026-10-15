@@ -15,8 +15,20 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { PGlite } from '@electric-sql/pglite';
 import pg from 'pg';
 import { createInMemoryAgentRunStoreV3 } from '../src/agent-run-v3-store';
-import { contextPackageBlob, type ContextPackageBlob } from '../src/agent-run-v3-context';
-import { renderRecord, retrievalOpening, RETRIEVAL_CLOSING } from '../src/context/render';
+import {
+  contextPackageBlob,
+  redactedRetrievalBlock,
+  retrievalBlockMarker,
+  type ContextPackageBlob,
+} from '../src/agent-run-v3-context';
+import {
+  isContextMessage,
+  messageText,
+  placedBlocks,
+  renderRecord,
+  retrievalOpening,
+  RETRIEVAL_CLOSING,
+} from '../src/context/render';
 import type { PgPoolLike } from '../src/node/pg-tx';
 import { createPostgresAgentRunStoreV3 } from '../src/node/runs-v3-postgres';
 import { createSqliteAgentRunStoreV3 } from '../src/node/runs-v3-sqlite';
@@ -116,6 +128,20 @@ function everyCopy(envelope: AgentRunEnvelopeV3): string[][] {
     ...(envelope.result ? [texts(envelope.result.messages)] : []),
   ];
 }
+
+describe('the stand-in of a redacted retrieval block', () => {
+  it('reads as the block the renderer wrote: same marker and closing, no record', () => {
+    const marker = retrievalBlockMarker(3, 7);
+    expect(retrievalOpening(3, 7).startsWith(`${marker}\n`)).toBe(true);
+    const standIn = { role: 'user' as const, content: redactedRetrievalBlock(marker) };
+    expect(standIn.content.endsWith(RETRIEVAL_CLOSING)).toBe(true);
+    expect(standIn.content).not.toContain('<record');
+    // The compiler still sees which block it was (a resume drops it first).
+    expect(isContextMessage(standIn)).toBe(true);
+    expect([...placedBlocks([standIn])]).toEqual(['3:7']);
+    expect(messageText(standIn)).toBe(standIn.content);
+  });
+});
 
 interface Harness {
   store: AgentRunStoreV3;
