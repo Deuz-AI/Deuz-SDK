@@ -107,6 +107,12 @@ export interface GoalRuntimeState {
    */
   maintenance?: { status: 'pending' | 'complete' | 'failed'; runId?: string };
   /**
+   * The runs whose maintenance is still pending (2.4 refinement): each is
+   * followed until it settles, whatever the goal does meanwhile, and its
+   * late charges are added. While one is pending, `maintenance` shows it.
+   */
+  maintenanceRuns?: string[];
+  /**
    * The last working memory, handed to the goal's next run only when its
    * scope and `specGeneration` match the goal's; hypotheses keep their status.
    */

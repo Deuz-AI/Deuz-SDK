@@ -32,6 +32,7 @@ import type { GoalInboxSettlement } from './delivery';
 import type {
   GoalInboxApplication,
   GoalInboxEntry,
+  GoalRuntimeCommitResult,
   GoalRunIntent,
   GoalRunIntentInput,
   GoalRuntimeState,
@@ -138,6 +139,32 @@ function bump(runtime: GoalRuntimeState, now: number): GoalRuntimeState {
     revision: runtime.revision + 1,
     updatedAt: Math.max(runtime.updatedAt, now),
   };
+}
+
+/**
+ * The runtime state once `runId` reports its maintenance (2.4 refinement): a
+ * pending run is followed until it settles, and the goal shows the oldest
+ * pending run while one is; once none is, the last one that settled.
+ */
+function maintained(
+  runtime: GoalRuntimeState,
+  runId: string,
+  status: 'pending' | 'complete' | 'failed' | undefined,
+): GoalRuntimeState {
+  if (status === undefined) return runtime;
+  const { maintenanceRuns: followed = [], maintenance: _shown, ...rest } = runtime;
+  const others = followed.filter((id) => id !== runId);
+  const runs = status === 'pending' ? [...others, runId] : others;
+  return {
+    ...rest,
+    maintenance: runs.length > 0 ? { status: 'pending', runId: runs[0]! } : { status, runId },
+    ...(runs.length > 0 ? { maintenanceRuns: runs } : {}),
+  };
+}
+
+/** Whether an open intent is a completed run's, kept open while its maintenance is followed. */
+function following(runtime: GoalRuntimeState, intent: GoalRunIntent): boolean {
+  return runtime.maintenanceRuns?.includes(intent.runId) === true;
 }
 
 /** The error a leg reports, for the intent's outcome. */
@@ -272,6 +299,8 @@ export function createGoalDriver(options: GoalDriverOptions): {
   async function wanted(view: View, now: number): Promise<boolean> {
     const { goal, runtime, open } = view;
     if (runtime.cancel !== undefined && runtime.cancel.appliedAt === undefined) return true;
+    // A run's pending maintenance is followed, whatever the goal does.
+    if ((runtime.maintenanceRuns?.length ?? 0) > 0) return true;
     if (isTerminal(goal))
       return (
         open.length > 0 ||
@@ -444,11 +473,13 @@ export function createGoalDriver(options: GoalDriverOptions): {
       phase: 'done',
       cancel: { requestedAt: now, ...runtime.cancel, appliedAt: now },
     };
-    const intent = open[0];
+    // A run whose maintenance is followed stays open: the cancel does not stop its upkeep.
+    const closing = open.filter((candidate) => !following(runtime, candidate));
+    const intent = closing[0];
     if (intent !== undefined) {
       const held = await claim(drive, intent);
       if (!held) return 'conflict';
-      const last = open.length === 1;
+      const last = closing.length === 1;
       const written = await store.intents.complete(held.scope, held.intentId, {
         token: drive.token,
         expectedRevision: held.revision,
@@ -476,15 +507,14 @@ export function createGoalDriver(options: GoalDriverOptions): {
   }
 
   /**
-   * A goal that ended: its open intents close (a run that completed it stays
-   * open while its maintenance is pending, and is followed: late charges are
-   * added, the goal never reopens) and its phase becomes done.
+   * A goal that ended: its open intents close (a run whose maintenance is
+   * followed stays open until it settles) and its phase becomes done.
    */
   async function settleEnded(drive: Drive, view: View): Promise<Step> {
-    const { goal, runtime, open } = view;
+    const { runtime, open } = view;
     const now = clock.now();
-    const maintenance = runtime.maintenance;
-    const intent = open[0];
+    const closing = open.filter((candidate) => !following(runtime, candidate));
+    const intent = closing[0];
     if (intent === undefined) {
       if (runtime.phase === 'done') return 'stop';
       const state = { ...withoutRun(bump(runtime, now)), phase: 'done' as const };
@@ -492,28 +522,7 @@ export function createGoalDriver(options: GoalDriverOptions): {
     }
     const held = await claim(drive, intent);
     if (!held) return 'conflict';
-    const following = maintenance?.status === 'pending' && maintenance.runId === held.runId;
-    if (following) {
-      const status = launcher.maintenance
-        ? await quietly(deps.logger, 'goal supervisor: maintenance check failed', () =>
-            launcher.maintenance!({ scope: goal.scope, runId: held.runId }),
-          )
-        : 'complete';
-      await charge(drive, goal.scope, goal.goalId, held.runId);
-      if (status === 'pending' || status === undefined) return 'stop';
-      const fresh = await store.runtime.get(goal.scope, goal.goalId);
-      if (!fresh) return 'stop';
-      const latest = (await store.intents.get(held.scope, held.intentId)) ?? held;
-      const written = await store.intents.complete(held.scope, held.intentId, {
-        token: drive.token,
-        expectedRevision: latest.revision,
-        status: 'completed',
-        outcome: { status: 'completed' },
-        runtime: { ...bump(fresh, now), maintenance: { status, runId: held.runId } },
-      });
-      return written.status === 'conflict' ? 'conflict' : 'stop';
-    }
-    const last = open.length === 1;
+    const last = closing.length === 1;
     const written = await store.intents.complete(held.scope, held.intentId, {
       token: drive.token,
       expectedRevision: held.revision,
@@ -523,6 +532,51 @@ export function createGoalDriver(options: GoalDriverOptions): {
     });
     if (written.status === 'conflict') return 'conflict';
     return last ? 'stop' : 'continue';
+  }
+
+  /**
+   * Follows the runs whose maintenance is pending (2.4 refinement), whatever
+   * the goal did since: their late charges are added (a completed goal never
+   * reopens), and a run whose maintenance settled closes its intent and
+   * leaves the list. Undefined when no run is followed.
+   */
+  async function followMaintenance(
+    drive: Drive,
+    view: View,
+    now: number,
+  ): Promise<Step | undefined> {
+    const { goal, runtime, open } = view;
+    const runs = runtime.maintenanceRuns ?? [];
+    if (runs.length === 0) return undefined;
+    for (const runId of runs) {
+      if (drive.lost) return 'stop';
+      const status = launcher.maintenance
+        ? await quietly(deps.logger, 'goal supervisor: maintenance check failed', () =>
+            launcher.maintenance!({ scope: goal.scope, runId }),
+          )
+        : 'complete';
+      // Read after the status, so a settled run's last charge is in its ledger.
+      await charge(drive, goal.scope, goal.goalId, runId);
+      if (status !== 'complete' && status !== 'failed') continue;
+      const fresh = await store.runtime.get(goal.scope, goal.goalId);
+      if (!fresh || drive.lost) return 'stop';
+      const next = maintained(bump(fresh, now), runId, status);
+      const intent = open.find((candidate) => candidate.runId === runId);
+      const held = intent !== undefined ? await claim(drive, intent) : undefined;
+      if (intent !== undefined && held === undefined) return 'conflict';
+      const written = held
+        ? await store.intents.complete(held.scope, held.intentId, {
+            token: drive.token,
+            expectedRevision: held.revision,
+            status: 'completed',
+            outcome: { status: 'completed' },
+            runtime: next,
+          })
+        : await store.runtime.save(next);
+      if (written.status === 'conflict') return 'conflict';
+    }
+    // Decided again on fresh state: a charge moved the goal.
+    return 'continue';
   }
 
   /** Time alone: a passed deadline fails the goal, a due wakeup ends its wait. */
@@ -703,7 +757,7 @@ export function createGoalDriver(options: GoalDriverOptions): {
     drive: Drive,
     view: View,
     result: GoalSupervisorTickResult,
-    state: { reconciled: boolean; floor: number },
+    state: { reconciled: boolean; followed: boolean; floor: number },
   ): Promise<Step> {
     const { goal, runtime, open } = view;
     const now = Math.max(state.floor, clock.now());
@@ -712,8 +766,14 @@ export function createGoalDriver(options: GoalDriverOptions): {
     if (isTerminal(goal)) {
       // What was queued for it settles as 'terminal' (spec §3.2), so its payload ages out.
       const settled = await settleInbox(view, now, result);
-      return settled ?? settleEnded(drive, view);
+      if (settled !== undefined) return settled;
     }
+    if (!state.followed) {
+      state.followed = true;
+      const followed = await followMaintenance(drive, view, now);
+      if (followed !== undefined) return followed;
+    }
+    if (isTerminal(goal)) return settleEnded(drive, view);
     const timed = await applyTime(view, now);
     if (timed !== undefined) return timed;
     if (!state.reconciled) {
@@ -725,7 +785,9 @@ export function createGoalDriver(options: GoalDriverOptions): {
 
     const active = runtime.activeRun;
     // An open intent the state no longer names was overtaken (a crash between two writes).
-    const stray = open.find((intent) => intent.intentId !== active?.intentId);
+    const stray = open.find(
+      (intent) => intent.intentId !== active?.intentId && !following(runtime, intent),
+    );
     if (stray !== undefined) {
       const held = await claim(drive, stray);
       if (!held) return 'conflict';
@@ -1016,24 +1078,41 @@ export function createGoalDriver(options: GoalDriverOptions): {
             ...(generation !== undefined ? { specGeneration: generation } : {}),
           })
         : runtime0.workingMemory;
-      const base: GoalRuntimeState = {
-        ...bump(runtime0, now),
-        ...(memory !== undefined ? { workingMemory: memory } : {}),
-      };
+      // A completed run's maintenance: a pending one is followed apart,
+      // whatever the goal does (its intent stays open until it settles).
+      const upkeep = leg?.result.status === 'completed' ? leg.maintenance : undefined;
+      const base: GoalRuntimeState = maintained(
+        { ...bump(runtime0, now), ...(memory !== undefined ? { workingMemory: memory } : {}) },
+        runId,
+        upkeep,
+      );
       const complete = async (
         intentStatus: 'completed' | 'failed' | 'cancelled',
         intentOutcome: GoalRunIntent['outcome'],
         runtime: GoalRuntimeState,
         goal?: GoalRecord,
-      ) =>
-        store.intents.complete(scope, held.intentId, {
+      ): Promise<GoalRuntimeCommitResult> => {
+        const changed = goal !== undefined && goal !== goal0 ? goal : undefined;
+        if (upkeep === 'pending') {
+          // The intent stays open (launched): following its maintenance closes it.
+          if (held.status === 'claimed') {
+            const marked = await store.intents.launched(scope, held.intentId, {
+              token: drive.token,
+              expectedRevision: held.revision,
+            });
+            if (marked.status === 'conflict') return marked;
+          }
+          return store.runtime.save(runtime, changed);
+        }
+        return store.intents.complete(scope, held.intentId, {
           token: drive.token,
           expectedRevision: held.revision,
           status: intentStatus,
           ...(intentOutcome !== undefined ? { outcome: intentOutcome } : {}),
           runtime,
-          ...(goal !== undefined && goal !== goal0 ? { goal } : {}),
+          ...(changed !== undefined ? { goal: changed } : {}),
         });
+      };
       const outcomeOf = (): GoalRunIntent['outcome'] => {
         if (!leg)
           return { status: 'failed', error: errorOf((outcome as { error: unknown }).error) };
@@ -1148,28 +1227,7 @@ export function createGoalDriver(options: GoalDriverOptions): {
         const completion = transitionGoal(goal, { type: 'complete' }, { now });
         const finalGoal = completion.changed ? completion.record : goal;
         const ended = isTerminal(finalGoal);
-        const maintenance = leg.maintenance;
-        const state: GoalRuntimeState = {
-          ...withoutRun(base),
-          phase: ended ? 'done' : 'idle',
-          ...(maintenance !== undefined ? { maintenance: { status: maintenance, runId } } : {}),
-        };
-        if (ended && maintenance === 'pending') {
-          // The goal completes now; the run's maintenance is followed apart.
-          if (held.status === 'claimed') {
-            const marked = await store.intents.launched(scope, held.intentId, {
-              token: drive.token,
-              expectedRevision: held.revision,
-            });
-            if (marked.status === 'conflict') continue;
-          }
-          const written = await store.runtime.save(
-            state,
-            finalGoal !== goal ? finalGoal : undefined,
-          );
-          if (written.status === 'conflict') continue;
-          return;
-        }
+        const state: GoalRuntimeState = { ...withoutRun(base), phase: ended ? 'done' : 'idle' };
         const written = await complete('completed', outcomeOf(), state, finalGoal);
         if (written.status === 'conflict') continue;
         return;
@@ -1298,7 +1356,7 @@ export function createGoalDriver(options: GoalDriverOptions): {
         goalId: candidate.goalId,
         token: lease.token,
       });
-      const state = { reconciled: false, floor: now };
+      const state = { reconciled: false, followed: false, floor: now };
       let conflicts = 0;
       for (let steps = 0; steps < MAX_STEPS && !drive.lost; steps++) {
         const view = await read(candidate.scope, candidate.goalId);

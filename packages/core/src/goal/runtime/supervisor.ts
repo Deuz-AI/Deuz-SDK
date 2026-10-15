@@ -56,6 +56,9 @@ import {
   withoutRun,
 } from './supervisor-shared';
 
+/** Intents a drive still holds or will hold. */
+const OPEN_INTENTS: readonly GoalRunIntent['status'][] = ['pending', 'claimed', 'launched'];
+
 /** How often a write that lost a revision race is decided again on fresh state. */
 const WRITE_ATTEMPTS = 5;
 
@@ -363,10 +366,10 @@ export function createGoalSupervisor(options: GoalSupervisorOptions): GoalSuperv
     if (!transition.changed) return transition;
     const next = transition.record;
     const terminal = TERMINAL_STATUSES.includes(next.status);
-    // A run with an open intent has a holder that settles the goal's end; a
+    // A run whose intent is open has a holder that settles the goal's end; a
     // run no one holds (suspended, or failed and waiting for its retry) has
     // none, so the end settles here. The runtime revision fences the read.
-    const ended = terminal && (runtime.activeRun === undefined || !(await hasOpenIntent(runtime)));
+    const ended = terminal && !(await held(runtime));
     const state: GoalRuntimeState = {
       ...(ended ? withoutRun(runtime) : runtime),
       revision: runtime.revision + 1,
@@ -385,15 +388,12 @@ export function createGoalSupervisor(options: GoalSupervisorOptions): GoalSuperv
     return transition;
   }
 
-  /** Whether an intent of the goal is still open: a drive holds or will hold its run. */
-  async function hasOpenIntent(runtime: GoalRuntimeState): Promise<boolean> {
-    const page = await store.intents.list({
-      scope: runtime.scope,
-      goalId: runtime.goalId,
-      statuses: ['pending', 'claimed', 'launched'],
-      limit: 1,
-    });
-    return page.intents.length > 0;
+  /** Whether the active run's intent is open: a drive holds, or will hold, the run. */
+  async function held(runtime: GoalRuntimeState): Promise<boolean> {
+    const run = runtime.activeRun;
+    if (run === undefined) return false;
+    const intent = await store.intents.get(runtime.scope, run.intentId);
+    return intent !== undefined && OPEN_INTENTS.includes(intent.status);
   }
 
   /** Asks the active run, and whoever holds the goal, to stop. Best effort. */

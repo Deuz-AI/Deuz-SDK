@@ -653,6 +653,51 @@ describe('accounting', () => {
       skipped: 0,
     });
   });
+
+  it('follows the pending maintenance of a run whose goal stayed active, after a later run completed it', async () => {
+    const w = world();
+    const launcher = fakeRunLauncher((request) => ({
+      runId: request.runId,
+      result: results.completed(request.runId),
+      maintenance: request.runId === 'g-1:run:1' ? 'pending' : 'complete',
+    }));
+    launcher.ledger.set('g-1:run:1', totals({ tokens: 100, usd: 0 }));
+    launcher.upkeep.set('g-1:run:1', 'pending');
+    const { supervisor } = supervisorIn(w, {
+      launcher,
+      verify: ({ runId }) => (runId === 'g-1:run:2' ? passed(runId) : undefined),
+    });
+    await supervisor.submit({ goalId: 'g-1', scope: SCOPE, objective: 'x' });
+    await supervisor.tick();
+    let after = (await supervisor.get(SCOPE, 'g-1'))!;
+    expect(after.goal).toMatchObject({ status: 'active', spent: { tokens: 100 } });
+    expect(after.runtime.maintenance).toEqual({ status: 'pending', runId: 'g-1:run:1' });
+    expect(after.runtime.maintenanceRuns).toEqual(['g-1:run:1']);
+    // Its intent stays open while its maintenance is followed.
+    expect((await w.store.intents.get(SCOPE, 'g-1#1'))?.status).toBe('launched');
+    // Run 1's extraction charges more while run 2 completes the goal; run
+    // 2's settled maintenance does not hide run 1's pending one.
+    launcher.ledger.set('g-1:run:1', totals({ tokens: 300, usd: 0 }));
+    await supervisor.tick();
+    after = (await supervisor.get(SCOPE, 'g-1'))!;
+    expect(launcher.calls.map((call) => call.request.runId)).toEqual(['g-1:run:1', 'g-1:run:2']);
+    expect(after.goal).toMatchObject({ status: 'completed', spent: { tokens: 300 } });
+    expect(after.runtime.maintenance).toEqual({ status: 'pending', runId: 'g-1:run:1' });
+    launcher.ledger.set('g-1:run:1', totals({ tokens: 350, usd: 0 }));
+    launcher.upkeep.set('g-1:run:1', 'complete');
+    await supervisor.tick();
+    after = (await supervisor.get(SCOPE, 'g-1'))!;
+    expect(after.goal).toMatchObject({ status: 'completed', spent: { tokens: 350 } });
+    expect(after.runtime.maintenance).toEqual({ status: 'complete', runId: 'g-1:run:1' });
+    expect(after.runtime.maintenanceRuns).toBeUndefined();
+    expect((await w.store.intents.get(SCOPE, 'g-1#1'))?.status).toBe('completed');
+    expect(await supervisor.tick()).toEqual({
+      applied: 0,
+      dispatched: 0,
+      cancelled: 0,
+      skipped: 0,
+    });
+  });
 });
 
 describe('working memory', () => {
