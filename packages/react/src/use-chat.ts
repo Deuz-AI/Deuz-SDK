@@ -219,6 +219,22 @@ function recordPart(ledger: ReplayLedger, turn: AssistantTurnState, part: DeuzUI
   }
 }
 
+/**
+ * Whether a frame that follows a leg's `finish` opens the next leg (2.4). A
+ * leg can end with frames after its `finish`: data parts written after the
+ * model finished, a native run's result frame (`data-agent`) and the error
+ * that may follow it. A continued leg with no `start` opens with content, or,
+ * on a native route, with its run frame (`data-agent` of kind `run`). A leg
+ * that opens with a data part is told apart only at its first content frame.
+ */
+function opensLeg(part: DeuzUIPart): boolean {
+  if (part.type === 'error') return false;
+  if (!part.type.startsWith('data-')) return true;
+  return (
+    part.type === 'data-agent' && (part as { payload?: { kind?: unknown } }).payload?.kind === 'run'
+  );
+}
+
 /** How many legs of a replayed turn delivered the call: at least once, as it is in the turn. */
 const deliveries = (ledger: ReplayLedger, key: string): number =>
   Math.max(1, (ledger.legs.get(key) ?? 0) + (ledger.openLeg.has(key) ? 1 : 0));
@@ -822,7 +838,9 @@ export interface UseChatResult {
    * uses a feature only while it is listed here:
    *
    * - `message-ids`: a resume read that delivers a message the history already
-   *   holds (same id) skips it instead of rendering it twice;
+   *   holds (same id) skips it instead of rendering it twice. A leg that
+   *   continued its run on the same stream (no `start` of its own) is skipped
+   *   only while the history holds a later assistant message for it;
    * - `chat-snapshot-v1`: each request body also carries `messageIds`, aligned
    *   with `messages`, so the server can store the ids the UI renders;
    * - `durable-stream`: a POST read that drops before it ends continues from
@@ -1245,15 +1263,32 @@ export function useChat(options: UseChatOptions): UseChatResult {
     [handshake],
   );
 
-  /** The ids of the messages the canonical history holds (2.4): settled messages. */
-  const settledIds = useCallback((): Set<string> => {
-    const held = new Set<string>();
-    for (const message of snapshotRef.current.history.canonical) {
-      const id = messageIds.get(message);
-      if (id !== undefined) held.add(id);
-    }
-    return held;
-  }, [messageIds]);
+  /**
+   * Where the canonical history holds the message with id `id` (2.4): a
+   * settled message. -1 when it holds none.
+   */
+  const settledIndex = useCallback(
+    (id: string): number => {
+      const canonical = snapshotRef.current.history.canonical;
+      for (let index = canonical.length - 1; index >= 0; index--)
+        if (messageIds.get(canonical[index]!) === id) return index;
+      return -1;
+    },
+    [messageIds],
+  );
+
+  /**
+   * The first assistant message the canonical history holds after index `at`
+   * (2.4): where the next leg of the stream of the message at `at` settled,
+   * since every leg the hook reads settles as one assistant message. -1 when
+   * there is none.
+   */
+  const nextSettledReply = useCallback((at: number): number => {
+    const canonical = snapshotRef.current.history.canonical;
+    for (let index = at + 1; index < canonical.length; index++)
+      if (canonical[index]!.role === 'assistant') return index;
+    return -1;
+  }, []);
 
   /** Drop every parked gate — the turn they belonged to is no longer current. */
   const clearGates = useCallback((): void => {
@@ -1987,8 +2022,11 @@ export function useChat(options: UseChatOptions): UseChatResult {
           ...(headers ? { headers } : {}),
         });
         // Dedupe by message id (2.4, `message-ids`): set while the read
-        // re-delivers a message the history already holds.
+        // re-delivers a message the history already holds, at `held`.
         let skipping = false;
+        let held = -1;
+        /** Whether the skipped leg's `finish` arrived: the leg is over. */
+        let legEnded = false;
         for await (const part of parts) {
           // The handshake's frame (2.4): the hook's, never a part of the turn,
           // and never content (a caught-up read that sends only it is a no-op).
@@ -2006,8 +2044,22 @@ export function useChat(options: UseChatOptions): UseChatResult {
           // announcement ids may repeat (2.3 routes can name every message
           // the same), so nothing is skipped. An error frame is the read's
           // own and is never skipped.
-          if (part.type === 'start')
-            skipping = serverHas(CAPABILITY.messageIds) && settledIds().has(part.messageId);
+          if (part.type === 'start') {
+            held = serverHas(CAPABILITY.messageIds) ? settledIndex(part.messageId) : -1;
+            skipping = held !== -1;
+            legEnded = false;
+          } else if (skipping && legEnded && opensLeg(part)) {
+            // A leg with no `start` of its own after the skipped one ended: a
+            // run continued on the same stream (an approval or a client-result
+            // continuation). The hook settled such a leg as a message of its
+            // own, under a generated id, so its id says nothing. It is skipped
+            // only while the history holds a later assistant message for it;
+            // otherwise it is new and folds into the turn.
+            held = nextSettledReply(held);
+            skipping = held !== -1;
+            legEnded = false;
+          }
+          if (skipping && part.type === 'finish') legEnded = true;
           if (skipping && part.type !== 'error') continue;
           skipping = false;
           folded++;
@@ -2076,7 +2128,8 @@ export function useChat(options: UseChatOptions): UseChatResult {
       announce,
       handshake,
       serverHas,
-      settledIds,
+      settledIndex,
+      nextSettledReply,
       fold,
       flush,
       run,

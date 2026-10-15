@@ -338,6 +338,136 @@ describe('useChat — features used only when the server announced them', () => 
       expect(result.current.exportSnapshot().messageIds).toEqual(['u-1', 'm-1', 'm-2']);
     });
 
+    describe('a leg without its own start (a continued run on the same stream)', () => {
+      const ASKED: Message[] = [
+        { role: 'user', content: 'delete /a' },
+        {
+          role: 'assistant',
+          content: [
+            { type: 'text', text: 'Checking.' },
+            { type: 'tool_use', id: 'd1', name: 'del', input: { path: '/a' } },
+          ],
+        },
+      ];
+
+      /** Leg 1 asks to approve d1; leg 2, the approval continuation, sends no `start`. */
+      async function continuedFixture() {
+        const wire = journal();
+        await wire.leg([
+          parts.start('m-1'),
+          parts.text('Checking.'),
+          parts.toolCall('d1', 'del', { path: '/a' }),
+          parts.approval('ap1', 'd1', 'del', { path: '/a' }),
+          parts.finish(),
+        ]);
+        await wire.leg([
+          parts.toolResult('d1', 'del', 'deleted'),
+          parts.text('Deleted /a.'),
+          parts.finish(),
+        ]);
+        return wire;
+      }
+
+      function restoredFrom(
+        wire: Awaited<ReturnType<typeof continuedFixture>>,
+        messages: Message[],
+        messageIds: string[],
+        capabilities?: string[],
+      ) {
+        return renderHook(() =>
+          useChat({
+            api: '/api/chat',
+            resume: { endpoint: wire.replayEverything },
+            initialSnapshot: {
+              version: 1,
+              messages,
+              messageIds,
+              ...(capabilities ? { capabilities } : {}),
+            },
+          }),
+        );
+      }
+
+      it('not announced (2.3): the continuation leg shows', async () => {
+        const wire = await continuedFixture();
+        const { result } = restoredFrom(wire, ASKED, ['u-1', 'm-1']);
+        await act(async () => {
+          await result.current.reconnect();
+        });
+        expect(result.current.messages.some((m) => m.content.includes('Deleted /a.'))).toBe(true);
+      });
+
+      it('announced: a leg the history does not hold is kept, as a message of its own', async () => {
+        const wire = await continuedFixture();
+        const { result } = restoredFrom(wire, ASKED, ['u-1', 'm-1'], ['message-ids']);
+        await act(async () => {
+          await result.current.reconnect();
+        });
+        expect(result.current.status).toBe('idle');
+        expect(result.current.messages.map((m) => m.content)).toEqual([
+          'delete /a',
+          'Checking.',
+          'Deleted /a.',
+        ]);
+        expect(result.current.messages.slice(0, 2).map((m) => m.id)).toEqual(['u-1', 'm-1']);
+        expect(result.current.pendingApprovals).toEqual([]);
+        // The approved call's result answers the history's open d1 first.
+        const canonical = result.current.history.canonical;
+        expect(canonical).toHaveLength(4);
+        expect(canonical[2]).toEqual({
+          role: 'tool',
+          content: [{ type: 'tool_result', toolUseId: 'd1', result: 'deleted' }],
+        });
+        expect(canonical[3]).toMatchObject({ role: 'assistant' });
+        expect(JSON.stringify(canonical[3]!.content)).toContain('Deleted /a.');
+        expect(JSON.stringify(canonical[3]!.content)).not.toContain('tool_use');
+      });
+
+      it('announced: a leg the history holds after the skipped message is skipped too', async () => {
+        const wire = await continuedFixture();
+        const held: Message[] = [
+          ...ASKED,
+          { role: 'tool', content: [{ type: 'tool_result', toolUseId: 'd1', result: 'deleted' }] },
+          { role: 'assistant', content: 'Deleted /a.' },
+        ];
+        const { result } = restoredFrom(wire, held, ['u-1', 'm-1', 't-1', 'a-2'], ['message-ids']);
+        const before = result.current.history;
+        await act(async () => {
+          await result.current.reconnect();
+        });
+        expect(result.current.history).toBe(before);
+        expect(result.current.pendingApprovals).toEqual([]);
+      });
+
+      it('announced: frames after a skipped message’s finish that end its leg stay skipped', async () => {
+        // A data part written after the model finished, and a native run's result frame.
+        const agentFrame = (payload: Record<string, unknown>) =>
+          ({ type: 'data-agent', id: String(payload.kind), payload }) as unknown as DeuzUIPart;
+        const wire = journal();
+        await wire.leg([
+          parts.start('m-1'),
+          agentFrame({ kind: 'run', seq: 1, runId: 'run-1', status: 'running' }),
+          parts.text('Hi there.'),
+          parts.finish(),
+          { type: 'data-note', payload: { late: true } } as DeuzUIPart,
+          agentFrame({ kind: 'result', seq: 5, runId: 'run-1', status: 'completed' }),
+        ]);
+        const { result } = renderHook(() =>
+          useChat({
+            api: '/api/chat',
+            resume: { endpoint: wire.replayEverything },
+            initialSnapshot: settled(['message-ids']),
+          }),
+        );
+        const before = result.current.history;
+        await act(async () => {
+          await result.current.reconnect();
+        });
+        expect(result.current.history).toBe(before);
+        expect(result.current.status).toBe('idle');
+      });
+    });
+
     it('announced: an error frame of the read itself is never skipped', async () => {
       const wire = journal();
       await wire.leg([
