@@ -115,6 +115,7 @@ import {
   type ModelGate,
 } from './loop-shared';
 import type { CompactionEvent } from './compaction';
+import { placeContext, type LoopContextHook, type LoopContextPlacement } from './loop-context';
 import type { UsageCostSnapshot } from '../internal/usage-cost';
 
 async function* projectText(source: AsyncIterable<StreamPart>): AsyncGenerator<string> {
@@ -213,6 +214,12 @@ export interface StreamToolLoopInternal {
    * steps keep them without one, so a later call still suspends.
    */
   settleTools?: ToolSet;
+  /**
+   * V3 native runs (2.4): the context hook, called after compaction,
+   * `prepareStep` and the step's model and tools, before the model call (see
+   * `loop-context.ts`). Absent, every request is what 2.3 sent.
+   */
+  context?: LoopContextHook;
 }
 
 export interface StreamToolLoopSnapshot {
@@ -1107,8 +1114,11 @@ export function runStreamToolLoop(
         }
         const stepTools = offeredTools(tools, stepWire.offered);
         lastWire = stepWire.wire;
+        /** The step's compiled context (2.4, V3 runs): its append block and tail. */
+        let placement: LoopContextPlacement | undefined;
         const estimateAtCall = (): number =>
-          (compactionRunner?.estimator.estimate(messages) ?? 0) + recallOverheadTokens;
+          (compactionRunner?.estimator.estimate(placeContext(messages, placement)) ?? 0) +
+          recallOverheadTokens;
         let estimatedAtCall = estimateAtCall();
         if (lo && stepSpan) {
           emitStepStarted(
@@ -1122,6 +1132,24 @@ export function runStreamToolLoop(
             prepared.wire.tools.length,
             durableUsage(durable, totalUsage),
           );
+        }
+        // The context compiler (2.4, V3 runs): after compaction, prepareStep and
+        // the step's real model and tools, before the model call, under the
+        // step's span. Its append block joins the history only once the call
+        // succeeded; its tail never does.
+        const contextStep = (): Parameters<LoopContextHook['beforeModelCall']>[0] => ({
+          stepIndex,
+          messages,
+          model: prepared.options.model,
+          wire: stepWire.wire,
+          ...(lo && stepSpan
+            ? { telemetry: { runtime: lo.rt, parentSpanId: stepSpan.spanId } }
+            : {}),
+          ...(userSignal ? { signal: userSignal } : {}),
+        });
+        if (internal?.context) {
+          placement = await internal.context.beforeModelCall(contextStep());
+          estimatedAtCall = estimateAtCall();
         }
         let text = '';
         // Every reasoning block, text run and tool call in arrival order (2.3, F21).
@@ -1149,7 +1177,7 @@ export function runStreamToolLoop(
           const inner = runStream(
             preserveClientContext(options, {
               ...prepared.options,
-              messages: withSystemBlock(messages, recallBlock),
+              messages: withSystemBlock(placeContext(messages, placement), recallBlock),
             }),
             {
               tools: stepWire.wire,
@@ -1256,12 +1284,19 @@ export function runStreamToolLoop(
             observeCtx,
             active?.model ?? options.model,
           );
-          if (!recovered) {
+          if (recovered) messages = recovered;
+          // The compiled context (2.4) is placed again under the smaller budget
+          // the overflow proved, never re-running prepareStep; mandatory content
+          // that cannot fit throws ContextBudgetExceededError, which fails the run.
+          const replaced = internal?.context
+            ? await internal.context.onOverflow({ ...contextStep(), compacted: !!recovered })
+            : undefined;
+          if (replaced) placement = replaced;
+          if (!recovered && !replaced) {
             // Nothing could be shrunk — the original rejection stands.
             await failRun(overflow);
             return;
           }
-          messages = recovered;
           // Re-measure: calibrating the EMA against the PRE-compaction estimate
           // would teach it that the history is far bigger than what was sent.
           estimatedAtCall = estimateAtCall();
@@ -1269,6 +1304,10 @@ export function runStreamToolLoop(
 
         totalUsage = sumUsage(totalUsage, stepUsage);
         calibrateCompaction(compactionRunner, estimatedAtCall, stepUsage);
+        // The call succeeded (2.4): its retrieval block joins the history right
+        // after the messages it was compiled for, once; the tail is dropped.
+        if (placement && placement.append.length > 0) messages = [...messages, ...placement.append];
+        if (placement) internal?.context?.afterModelCall?.(stepUsage);
         lastFinish = stepFinish;
         lastFinishMeta = stepFinishMeta;
         broadcaster.push({

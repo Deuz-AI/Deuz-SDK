@@ -13,8 +13,10 @@ import type {
   AgentToolReceipt,
   AgentValidation,
 } from './types/agent-run';
+import type { LoopContextHook } from './inference/loop-context';
 import type {
   AgentEventV3,
+  AgentRunEnvelopeV3,
   AgentRunOptionsV3,
   AgentRunReconcileOptionsV3,
   AgentStreamV3,
@@ -744,6 +746,8 @@ function makeAgentStream<T>(
   let nativeMemory: typeof import('./internal/native-memory') | undefined;
   /** The V3 runtime (2.4), loaded when the run takes the V3 path. */
   let nativeV3: typeof import('./agent-run-v3-run') | undefined;
+  /** The V3 run's context hook (2.4), handed to its loop. */
+  let contextHook: LoopContextHook | undefined;
   /** Model fail-over (2.3): the routing of every model call, once `fallbackModels` is set. */
   let router: import('./internal/native-fallback').ModelRouter | undefined;
   /** The run's memory scope is claimed for its execution until the executor ends (2.3). */
@@ -1002,6 +1006,7 @@ function makeAgentStream<T>(
       if (checkpointVersionOf(input) === 3) {
         nativeV3 = await import('./agent-run-v3-run');
         nativeV3.assertV3Session(v3Options.session);
+        nativeV3.assertV3Options(v3Options as AgentRunOptionsV3<unknown>);
       } else assertNoV3Options(input, options.session?.store);
       if (options.session && (!options.session.runId || !options.session.scope)) {
         throw new TypeError('Native sessions require non-empty runId and scope.');
@@ -1539,6 +1544,32 @@ function makeAgentStream<T>(
         }
         envelope.transcript = nativeChat!.createTranscript(envelope.messages, input, internal);
       }
+      // The V3 state (2.4): a new run starts its working memory here, before its
+      // first save; a resumed run keeps the stored one, so the active task
+      // survives a restart. The compiler continues from its stored state.
+      if (nativeV3) {
+        const record = envelope as unknown as AgentRunEnvelopeV3;
+        if (!resume) {
+          const snapshot = nativeV3.initialWorkingMemory(v3Options as AgentRunOptionsV3<unknown>);
+          if (snapshot) record.workingMemory = snapshot;
+        }
+        const compiler = nativeV3.createV3Compiler(
+          v3Options as AgentRunOptionsV3<unknown>,
+          record,
+          (warning) => runWarnings.add(warning),
+        );
+        if (compiler)
+          contextHook = nativeV3.createContextHook({
+            compiler,
+            store: v3Options.session.store,
+            runId: envelope.runId,
+            envelope: () => envelope as unknown as AgentRunEnvelopeV3,
+            persist,
+            emit: (event) => eventsV3?.push(event),
+            ...(options.capabilities ? { capabilities: options.capabilities } : {}),
+            logger: resolveDependencies(options.deps).logger,
+          });
+      }
       admitted = true;
       if (options.execution && options.session) {
         removeLedgerPersistence = options.execution.ledger.addPersistence(() => {
@@ -1936,6 +1967,8 @@ function makeAgentStream<T>(
                 },
                 // Client calls answered from a supplied or recorded result (2.3).
                 ...(settleTools ? { settleTools } : {}),
+                // The V3 context compiler (2.4), placed by the loop before each call.
+                ...(contextHook ? { context: contextHook } : {}),
               },
             );
             for await (const part of inner.fullStream) {

@@ -74,6 +74,12 @@ export interface AgentRunContextStepV3 {
   manifest: ContextManifest;
   /** The content-addressed package; written once, reused when unchanged. */
   blob: ContextBlobRef;
+  /**
+   * The digest of the messages the step was compiled for (2.4). A step whose
+   * answer was never saved is reopened with the same messages after a
+   * restart, and then uses this package again instead of compiling anew.
+   */
+  input?: string;
 }
 
 /** A V3 run's context state: the compiler's state and every step's package reference. */
