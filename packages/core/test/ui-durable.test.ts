@@ -815,3 +815,36 @@ describe('durable mode: the lease across legs', () => {
     });
   });
 });
+
+describe('durable mode: the end of a leg', () => {
+  it('gives the lease back and stops renewing when the producer rejects', async () => {
+    const time = immediateClock(1_000_000);
+    const provider = createInMemoryLeaseProvider({ clock: time.clock });
+    const store = createInMemoryDurableStreamStateStore();
+    const manual = manualResult();
+    const writer = createDeuzStream(manual.result, {
+      streamId: 's',
+      messageId: 'm',
+      durable: {
+        store,
+        lease: { provider, owner: 'a', ttlMs: 300 },
+        deps: { clock: time.clock },
+      },
+    });
+    const body = writer.response.text().catch((error: unknown) => String(error));
+    await driver(time)(0);
+    // JSON.stringify throws inside send: produce rejects.
+    writer.writeData('x', { n: 1n });
+    manual.push(textPart('hello'));
+    manual.end();
+    await time.advance(50);
+    expect(await body).toContain('BigInt');
+    await time.advance(3_000); // ten lease lifetimes
+    expect(time.pending()).toBe(0);
+    expect(await provider.acquire({ key: 'stream:s', owner: 'b', ttlMs: 300 })).toBeDefined();
+    // What was committed stays; the leg wrote no `done`, as a legacy leg that throws.
+    const parts = (await readAll(store, 's')).map((record) => record.part.type);
+    expect(parts[0]).toBe('start');
+    expect(parts).not.toContain('done');
+  });
+});
