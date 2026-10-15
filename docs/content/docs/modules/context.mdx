@@ -107,7 +107,7 @@ The working memory block:
 
 ```text
 <deuz_working_memory revision="0">
-Your working memory as of this point in the conversation: it replaces every earlier copy, and a later one replaces it. The host sets the goal and constraints; proposed items are unverified.
+Your working memory at this point; the latest copy replaces every earlier one. The host sets the goal and constraints; proposed items are unverified.
 <goal>Deploy the billing service.</goal>
 <constraints>
 - [constraints-0-0] No deploys on Friday.
@@ -198,8 +198,8 @@ intact:
   memory block, so a V3 run keeps each step's copy in the history once the
   call succeeded, right after that step's retrieval block, and the bytes before
   every replayed thinking block stay the same. The next request ends with the
-  current copy again. Every copy says that it replaces the earlier ones and
-  that a later one replaces it, so the model reads the latest. The manifest
+  current copy again. Every copy says that the latest copy replaces every
+  earlier one, so the model reads the latest. The manifest
   records this as `placement.tailKept: true`. If you place blocks yourself on
   such a model, do the same.
 - Old blocks leave only at a compaction boundary. The working memory is then

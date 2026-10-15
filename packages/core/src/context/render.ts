@@ -19,10 +19,11 @@ const RETRIEVAL_PREAMBLE =
 /**
  * True wherever the block sits: as a request's tail, and as a copy a V3 run
  * keeps in the history on a model that binds thinking to the prefix, where
- * later steps add newer copies after it (the latest one is current).
+ * later steps add newer copies after it (the latest one is current). It is
+ * as long as the earlier text, so token estimates and budgets stay the same.
  */
 const WORKING_MEMORY_PREAMBLE =
-  'Your working memory as of this point in the conversation: it replaces every earlier copy, and a later one replaces it. The host sets the goal and constraints; proposed items are unverified.';
+  'Your working memory at this point; the latest copy replaces every earlier one. The host sets the goal and constraints; proposed items are unverified.';
 
 /** Escapes text for a record body: `&`, `<` and `>`. */
 export function escapeText(text: string): string {

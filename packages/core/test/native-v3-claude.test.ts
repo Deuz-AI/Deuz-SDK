@@ -165,7 +165,7 @@ describe('the working memory on a model that binds thinking to the prefix (S1-1)
     expect(isTail(last.at(-1)!)).toBe(true);
     expect(copies.map((copy) => /revision=\\"(\d+)\\"/.exec(copy)?.[1])).toEqual(['0', '1', '1']);
     expect(last.at(-1)).toContain('CI is green');
-    for (const copy of copies) expect(copy).toContain('a later one replaces it');
+    for (const copy of copies) expect(copy).toContain('the latest copy replaces every earlier one');
   });
 
   it('records in the manifest that the working memory block joined the history', async () => {
