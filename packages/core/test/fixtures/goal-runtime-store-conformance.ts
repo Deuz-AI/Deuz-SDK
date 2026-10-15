@@ -1702,6 +1702,49 @@ export function goalRuntimeStoreContracts(
       );
 
       it(
+        "takes the spec's olderThan for pruneOccurrences, as before, and exactly one of them",
+        withStore(async (store, time) => {
+          const goal = await goalWithSchedule(store);
+          await store.schedules.advance({
+            scope: 'tenant',
+            scheduleId: 's1',
+            expectedRevision: 1,
+            fromCursor: T0,
+            toCursor: T0 + MINUTE,
+            occurrences: [occurrence(goal, 's1', T0 + MINUTE, 'catch-up-none')],
+          });
+          await time.advance(5);
+          await store.schedules.advance({
+            scope: 'tenant',
+            scheduleId: 's1',
+            expectedRevision: 1,
+            fromCursor: T0 + MINUTE,
+            toCursor: T0 + 2 * MINUTE,
+            occurrences: [occurrence(goal, 's1', T0 + 2 * MINUTE, 'catch-up-none')],
+          });
+          for (const options of [
+            { before: T0 + 5, olderThan: T0 + 5 },
+            { olderThan: Number.NaN },
+            { olderThan: T0 + 5, scope: '' },
+            { scope: 'tenant' },
+          ])
+            await expect(
+              Promise.resolve().then(() => store.pruneOccurrences(options as never)),
+              JSON.stringify(options),
+            ).rejects.toThrow(TypeError);
+          // Exclusive, as `before`: a record stamped exactly then stays.
+          expect(await store.pruneOccurrences({ olderThan: T0 })).toBe(0);
+          expect(await store.pruneOccurrences({ olderThan: T0 + 5, scope: 'other' })).toBe(0);
+          expect(await store.pruneOccurrences({ olderThan: T0 + 5, scope: 'tenant' })).toBe(1);
+          expect(
+            (await store.schedules.occurrences!({ scope: 'tenant' })).occurrences.map(
+              (record) => record.at,
+            ),
+          ).toEqual([T0 + 2 * MINUTE]);
+        }),
+      );
+
+      it(
         'refuses malformed retention options',
         withStore(async (store) => {
           for (const options of [{ before: Number.NaN }, { before: T0, scope: '' }, {}])

@@ -32,6 +32,7 @@ import {
   checkIntentInput,
   checkIntentRecordOptions,
   checkMark,
+  checkOccurrencePruneOptions,
   checkPruneOptions,
   checkRuntimeState,
   checkScheduleInput,
@@ -343,7 +344,7 @@ export function createPostgresGoalRuntimeStore(
       return prune(SQL.retention.inbox(checkPruneOptions(pruneOptions)));
     },
     async pruneOccurrences(pruneOptions) {
-      return prune(SQL.retention.occurrences(checkPruneOptions(pruneOptions)));
+      return prune(SQL.retention.occurrences(checkOccurrencePruneOptions(pruneOptions)));
     },
     async pruneIntents(pruneOptions) {
       return prune(SQL.retention.intents(checkPruneOptions(pruneOptions)));

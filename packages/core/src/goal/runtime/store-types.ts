@@ -508,12 +508,27 @@ export interface GoalRuntimePruneOptions {
   /**
    * Delete before this time (exclusive: a record stamped exactly then
    * stays): an entry's `settledAt`, an occurrence record's `recordedAt`, an
-   * intent's `updatedAt`. The spec's `olderThan` for `pruneOccurrences`.
+   * intent's `updatedAt`. `pruneOccurrences` also takes it as `olderThan`.
    */
   before: number;
   /** Only this tenancy scope; every scope when absent. */
   scope?: string;
 }
+
+/**
+ * The options of `pruneOccurrences` (2.4): `before`, or `olderThan`, the
+ * name spec §4.4 gives it (`pruneOccurrences({ olderThan })`), with the same
+ * meaning. Exactly one of the two: both, or neither, is a `TypeError`.
+ */
+export type GoalRuntimeOccurrencePruneOptions =
+  | (GoalRuntimePruneOptions & { olderThan?: never })
+  | {
+      /** Delete occurrence records recorded before this time (exclusive), as `before`. */
+      olderThan: number;
+      before?: never;
+      /** Only this tenancy scope; every scope when absent. */
+      scope?: string;
+    };
 
 // ===================================================================
 // The store
@@ -707,11 +722,11 @@ export interface GoalRuntimeStore extends GoalStore {
    */
   pruneInbox(options: GoalRuntimePruneOptions): Promise<number>;
   /**
-   * Deletes occurrence records recorded before `before` (the spec's
-   * `pruneOccurrences({ olderThan })`). The schedules and their cursors
-   * stay. Returns how many.
+   * Deletes occurrence records recorded before `before`, or `olderThan`
+   * (the spec's `pruneOccurrences({ olderThan })`; exactly one of the two).
+   * The schedules and their cursors stay. Returns how many.
    */
-  pruneOccurrences(options: GoalRuntimePruneOptions): Promise<number>;
+  pruneOccurrences(options: GoalRuntimeOccurrencePruneOptions): Promise<number>;
   /** Deletes completed, failed and cancelled intents updated before `before`. Returns how many. */
   pruneIntents(options: GoalRuntimePruneOptions): Promise<number>;
   /** Releases a connection the store opened itself; a borrowed one stays open. */

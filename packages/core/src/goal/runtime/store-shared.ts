@@ -1520,6 +1520,19 @@ export function checkPruneOptions(value: unknown): GoalRuntimePruneOptions {
   return { before, scope: check.string(options.scope, 'scope') };
 }
 
+/**
+ * `pruneOccurrences` options as the other retention calls take them: its
+ * `olderThan` (the spec's name) is `before`. Exactly one of the two.
+ */
+export function checkOccurrencePruneOptions(value: unknown): GoalRuntimePruneOptions {
+  const check = new RuntimeChecker('retention options');
+  const options = check.object(value, 'options');
+  if (options.olderThan === undefined) return checkPruneOptions(options);
+  if (options.before !== undefined) check.fail('options', 'take before or olderThan, not both');
+  const { olderThan, ...rest } = options;
+  return checkPruneOptions({ ...rest, before: check.time(olderThan, 'olderThan') });
+}
+
 /** Whether a settled entry falls under a retention cut. */
 export function settledBefore(entry: GoalInboxEntry, options: GoalRuntimePruneOptions): boolean {
   return (
