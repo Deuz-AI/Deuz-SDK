@@ -7,13 +7,13 @@
 
 **Load when:** running a native agent from a script, a CI job or a cron entry with no UI, branching a shell on how the run ended, resuming a stored run with the answers it waits for, loading a repository's `AGENTS.md` / `CLAUDE.md` into a run, giving a run Agent Skills from disk, or checking a model and its configuration before spending a call.
 
-`@deuz-sdk/core/headless` is a **preview**, not a stable API: report fields, finding codes and exit codes can still change in a 2.x minor. It is **Node only** (it reads files, the environment and the Node version) and never reaches the edge-safe entries. There is no `deuz` binary, CLI package, TUI or daemon in 2.3; `examples/13-headless` is a small command line built on these functions (`run`, `inspect`, `doctor`, and `resume` with `--approve` / `--deny`, `--retry-call <id>`, `--reconcile <file.json>` and `--retry-failed`), keyless with its `--mock` scenarios, among them `crash` (a call whose effect is unknown) and `outage` (a failure in transit).
+`@deuz-sdk/core/headless` is a **preview**, not a stable API: report fields, finding codes and exit codes can still change in a 2.x minor. It is **Node only** (it reads files, the environment and the Node version) and never reaches the edge-safe entries. There is no `deuz` binary, CLI package, TUI or daemon in 2.3 or 2.4 (a CLI, TUI and daemon are 2.5 targets); `examples/13-headless` is a small command line built on these functions (`run`, `inspect`, `doctor`, and `resume` with `--approve` / `--deny`, `--retry-call <id>`, `--reconcile <file.json>` and `--retry-failed`), keyless with its `--mock` scenarios, among them `crash` (a call whose effect is unknown) and `outage` (a failure in transit).
 
 | Function | What it does |
 | --- | --- |
 | `runHeadless(options)` | `streamAgent` with a durable session, its events drained, and a `HeadlessReport` of the result |
 | `resumeHeadless(options)` | `resumeStreamAgent` with the answers a report asked for, reported the same way |
-| `inspectRun(store, runId)` | The report of a stored run, with no model call |
+| `inspectRun(store, runId)` | The report of a stored run, with no model call; since 2.4 `store` may also be an `AgentRunStoreV3` |
 | `doctor(options)` | Why a model or configuration will not work, with no network call |
 | `loadProjectInstructions(dir, options?)` | The project's instruction files as one message |
 | `exitCodeFor(report)`, `HEADLESS_EXIT_CODES` | The exit code of a run report or a doctor report |

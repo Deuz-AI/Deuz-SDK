@@ -10,13 +10,15 @@
      packages/core/src/node/{ops-sqlite,ops-postgres,swarm-postgres,budget-sqlite,budget-postgres,evolve-sqlite}.ts,
      packages/core/src/node/{ops-redis,redis-budget,swarm-redis,postgres-migrate}.ts,
      packages/core/src/internal/checkpoint-version.ts, packages/core/src/inference/tool-loop.ts,
-     docs/content/docs/modules/operations.mdx -->
+     docs/content/docs/modules/operations.mdx, packages/core/src/node/{runs-v3-sqlite,runs-v3-postgres,vmem-sqlite,vmem-postgres,
+     goal-runtime-sqlite,goal-runtime-postgres,chat-conditional-sqlite,chat-conditional-postgres,stream-state-sqlite,
+     stream-state-postgres,stream-state-redis,process-ops-sqlite,store-connection}.ts, packages/core/test/rollback/README.md -->
 
 # Persistence: stores, chat history, checkpoints and resumable runs
 
 **Load when:** picking a database for an AI feature, persisting a conversation across requests, making an agent survive a crash, a deploy or an approval a human answers hours later, resuming a chat stream after F5, running long agent jobs in the background, or choosing the SQLite / Postgres / Redis backend for native runs, swarms, leases and persistent budgets.
 
-The store packs and checkpoints below belong to the existing APIs. Native `runAgent` uses a separate strict `AgentRunStore`; swarm uses atomic `SwarmStore` snapshots/events. Their durable backends (2.2; Redis since 2.3) are in [Native, swarm and ops backends](#native-swarm-and-ops-backends-22) below. These stores are not interchangeable. See `references/native-execution.md` for approval recovery, interrupted-effect reconciliation, leases and cross-process operations.
+The store packs and checkpoints below belong to the existing APIs. Native `runAgent` uses a separate strict `AgentRunStore`; swarm uses atomic `SwarmStore` snapshots/events. Their durable backends (2.2; Redis since 2.3) are in [Native, swarm and ops backends](#native-swarm-and-ops-backends-22) below; the stores 2.4 adds, and the rule that keeps a 2.3 process working on the same database, are in [2.4 stores and rollback](#24-stores-and-rollback). These stores are not interchangeable. See `references/native-execution.md` for approval recovery, interrupted-effect reconciliation, leases and cross-process operations.
 
 ## The four seams
 
@@ -159,6 +161,21 @@ try {
 - **Retention (2.3).** `agentRuns.prune(before)` deletes terminal native runs, `claims.prune(before)` old claim keys (claimable again), `leases.prune(before)` keys nobody holds that queue no cancel, `SwarmStore.prune({ before, scope?, limit? })` settled swarm runs, and `BudgetStore.prune({ before })` folds closed budget history without changing usage (`references/ops.md`). Memory, SQLite, Postgres and Redis implement them all.
 - **Postgres (2.3).** The ops, swarm and budget stores' schema statement now upgrades a schema stored at an older version in place, under its advisory lock and in one statement, and refuses a newer one naming both versions. No store changes its schema version in 2.3; on first use they add indexes (`deuz_claims_claimed_at`, `deuz_agent_runs_updated_at`, `deuz_budget_requests_state`; on SQLite also `deuz_swarm_runs_settled`) that 2.2 ignores, so 2.2 and 2.3 processes can share a database. On a large Postgres table create them beforehand with `CREATE INDEX CONCURRENTLY` under the same names. Contended writes (40001 / 40P01) retry up to five times; a swarm write that runs out rejects with `SwarmConflictError` carrying the driver error as `cause`.
 
+## 2.4 stores and rollback
+
+Every 2.4 store lives in new tables with its own version table, beside the 2.3 tables, and changes no existing schema version, `PRAGMA user_version` or legacy migrate version. A connection the store opened (`path`, `connectionString`) is closed by its `close()`; a borrowed one (`database`, `pool`) stays open. The PostgreSQL stores need a pool with `connect()` (a `query()`-only client is refused) because they pin one connection per transaction; they create their tables on first use, and `migrate()` does it up front.
+
+| Data | In-memory | SQLite | PostgreSQL | Redis | Version table |
+| --- | --- | --- | --- | --- | --- |
+| Versioned memory | `/memory/versioned` | `/memory/versioned/sqlite` | `/memory/versioned/postgres` | — | `deuz_vmem_schema` |
+| Goal runtime (+ `GoalStore`) | `/goal/runtime` | `/goal/runtime/sqlite` | `/goal/runtime/postgres` | — | `deuz_goal_runtime_schema` |
+| V3 native runs | `/agent` | `/ops/sqlite` | `/ops/postgres` | — (refused: `UnsupportedStoreError`) | `deuz_runs_v3_schema` |
+| Conditional chats + transcript index | `/chat` | `/stores/sqlite` | `/stores/postgres` | — | `deuz_chat_conditional_schema` |
+| Durable streams | `/ui` | `/stores/sqlite` | `/stores/postgres` | `/stores/redis` | `deuz_stream_state_schema` |
+| Process operations | `/compute/docker` | `/compute/docker` | — | — | `deuz_process_ops_schema` |
+
+**Rollback.** Because no 2.3 table or version moves, `@deuz-sdk/core@2.3.0` still opens a SQLite file or PostgreSQL schema that 2.4 wrote and continues its legacy work there; it never lists, prunes or resumes a V3 run (its `resumeAgent` refuses one without calling a model or a tool) and simply does not see the conditional chats. The repository's rollback suite installs 2.3.0 from npm and checks exactly this. To roll back, stop the 2.4 workers and keep the tables: V3 runs wait for a 2.4 worker; version 1 and 2 records are never converted. Before turning on conditional chats for a scope, stop legacy writers there (there is no dual write), and copy legacy chats with `writeChat(record, { expectedRevision: 0 })`. Details per store: `references/versioned-memory.md`, `references/goal-runtime.md`, `references/v3-runs.md`, `references/chat-stream-durability.md`, `references/docker-runner.md`; retention for all of them: `references/observability-retention.md`.
+
 ## Wiring a pack into one call
 
 The seams are ordinary values. One call, three kinds of persistence:
@@ -214,7 +231,7 @@ Mixing packs is legitimate — Postgres for `memory` and `runs`, Redis for `sess
 - **Setting `chat` routes even a tool-less call through the agentic loop.** The visible consequence is `step-start` / `step-finish` parts on the stream where there were none — keep the `default` case in your part switch.
 - For a SQL/text column, serialize with `serializeChatRecord` / `deserializeChatRecord` (`@deuz-sdk/core/chat`). Plain `JSON.stringify` decays a `Uint8Array` image part into `{ "0": 1, … }`. The codec tags bytes as `{ "$deuzBytes": "<base64>" }`; only that exact shape converts back, so lookalike payloads stay plain data. The store packs already do this for you.
 - `createJsonlChatStore({ dir })` from `@deuz-sdk/core/chat/node` is the file-backed reference: one JSON file per chat, zero dependencies, lazy `node:fs/promises`, write-to-`.tmp`-then-`rename` so a crash cannot tear an existing chat, and `loadChat` returns `undefined` for a missing or corrupt file instead of throwing. Good for a single-user CLI; use a pack for a server.
-- To render a loaded chat, project it: `uiFromMessages(record.messages, generateId)`. To fork one (edit-and-resend), `branchBeforeUserMessage` then save under a new `chatId` with `parentId` pointing at the original.
+- To render a loaded chat, project it: `uiFromMessages(record.messages, generateId, { messageIds: record.messageIds })` (2.4) keeps the ids the chat stored (`ChatRecord.messageIds`, which native runs write as `<runId>:<n>`); `generateId` is only the fallback for a missing, empty or repeated id, and the two-argument call is unchanged. Compare-and-set chat writes with tombstoned deletes (`ConditionalChatStore`), transcript search and durable stream stores are in `references/chat-stream-durability.md`. To fork one (edit-and-resend), `branchBeforeUserMessage` then save under a new `chatId` with `parentId` pointing at the original.
 
 ## Durable runs: checkpoints and resume
 

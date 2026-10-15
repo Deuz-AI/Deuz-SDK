@@ -6,7 +6,8 @@
      skills/deuz-sdk/rules/pitfalls.md, packages/core/src/{observe,otel,pricing,middleware,errors}.ts,
      packages/core/src/node/observe.ts, packages/core/src/inference/stop.ts,
      packages/core/src/core/{timeout,resilience}.ts,
-     packages/core/src/types/{observe,deps,config}.ts -->
+     packages/core/src/types/{observe,deps,config,accounting}.ts, packages/core/src/internal/telemetry.ts,
+     .changeset/{2-4-w0d,2-4-l4c}.md -->
 
 # Production operations: observability, cost, middleware, resilience
 
@@ -85,7 +86,7 @@ One versioned protocol (`ObserveEvent`, `schemaVersion: 1`) covers a run's whole
 | compaction | `compaction`, `compaction.skipped` | `layer`, `trigger` (`threshold`/`manual`/`overflow`), `tokensBefore`/`tokensAfter` (calibrated **estimates**) |
 | subagent | `subagent.started`, `subagent.completed`, `subagent.suspended`, `subagent.failed` | `agentName`, `depth`, `childRunId`, child `usage` (already folded into the parent — never sum twice) |
 | cost | `cost.calculated` | `target: 'model' \| 'run'`, `costUsd`. May arrive **after** the terminal event. |
-| operation | `operation.started`, `operation.completed`, `operation.failed` | `subsystem` (`image`, `speech`, `video`, `rag`, `memory`, `mcp`, …), `operation` |
+| operation | `operation.started`, `operation.completed`, `operation.failed` | `subsystem` (`image`, `speech`, `video`, `rag`, `memory`, `mcp`, …; 2.4 adds `context`, `goal`, `schedule`, `process`, `stream`), `operation`, `attributes?` (2.4: scalar `deuz.*` ids, counts and digests, never content) |
 
 Canonical orderings, worth knowing before you write a consumer:
 
@@ -97,6 +98,8 @@ suspension    … approval.requested → step.completed → checkpoint.saved{sus
 resume        checkpoint.loaded → run.started{resumed} → approval.resolved → tool.* → step.started → …
 abort         … model.completed{finishReason:'aborted'} → run.aborted   (never model.failed / run.failed)
 ```
+
+The 2.4 subsystems name their operations by span (`deuz.context.compile`, `deuz.memory.op`, `deuz.goal.*`, `deuz.schedule.delivery`, `deuz.process.*`, `deuz.stream.*`); the full table with attributes is in `references/observability-retention.md`. `createOtelObserver` copies `attributes` onto the operation's span, and since 2.4 an operation inside a run (a built-in memory recall, say) no longer ends the run's `invoke_agent` span early.
 
 Guarantees you can build on: exactly one terminal event per execution leg; a durable run keeps one `runId` across legs while each leg gets a fresh `executionId`; a throwing, slow or closed observer can never affect the run; `streamChat` stays lazy, so `run.started` fires when the pump starts, not at call time.
 
@@ -233,6 +236,7 @@ The core never bills; it returns a token breakdown (`Usage`) and nothing else. `
 - `createPriceProvider({ table?, aliases?, margin? })` builds the `PriceProvider` for `deps.priceProvider`. `table` is shallow-merged per model over `PRICES_2026`; `aliases` (your id → a row id) merges over `PRICE_ALIASES`; `margin` multiplies every result (default 1). It performs no I/O and reads no globals, so it is edge-safe, and it implements the optional `cacheSavings` seam out of the box.
 - **Service tiers (2.3).** `PriceProvider.priceUsage(model, usage, { tier: 'batch' })` (and the fourth argument of the free functions) prices a row's `ModelPrice.batch` card, a complete rate card of its own. Only rates a primary source states are carded: the bundled table has batch cards for the Claude rows Anthropic lists (50% of standard), none for OpenAI or Gemini, so their batch requests are unpriced until you add a card through `table`. A `PriceProvider` written before 2.3 ignores the tier and prices batch usage at standard rates. `@deuz-sdk/core/batch` is the caller (`references/realtime-batch.md`).
 - **Unpriced models (2.3).** A model is unpriced when no `deps.priceProvider` is set or it returns `undefined`. Under a USD budget the call still runs: its tokens are reserved and bounded, its cost adds nothing to the USD totals, and the run reports `CallWarning` `'unpriced-model'` once per model in each leg (a resumed leg that calls the model reports it again). `budget.unknownPrice: 'reject'` (on the loop's `budget`, or on `BudgetLimits` for contexts, swarms, evolve and persistent scopes; `'reject'` wins when budgets intersect) refuses it before the call: `UnpricedModelError` (code `unpriced_model`, fatal to the run) in the legacy loop, `BudgetLedgerError` code `unpriced_model` in native runs.
+- **Unaccounted callbacks (2.4).** A reservation marked `unaccounted` (a plain memory LLM, memory embedder or RAG embedder callback that reports no usage) holds its estimates as unknown — never free — and is counted in `BudgetTotals.unaccounted` while unknown (after `compact` too, via `BudgetAggregate.unaccounted`). Any budget, scope budget or persistent `BudgetStore` scope with `unknownPrice: 'reject'` refuses it with `BudgetLedgerError` code `'unaccounted_call'` (a new member: keep a default branch); use the accounted variant (`defineAccountedMemoryLLM`, an embedder marked `accounted: true`). `embed` / `embedMany` (`EmbedOptions.accounting`), the RAG ingestion and retrieval calls (`accounting`) and `createVerifier({ execution })` now reach the ledger too; without those options nothing changes.
 
 Injecting `deps.priceProvider` also turns on two loop features: a canonical `cost` stream part (`{ type: 'cost', costUsd, deltaUsd?, cacheSavingsUsd?, stepIndex? }`, one after every step, `costUsd` cumulative across the whole run including durable resume legs) and the `budget` call option. A `budget` trip emits `{ type: 'budget-exceeded', kind: 'usd' | 'tokens', limit, value }` right before the terminal `finish`.
 
