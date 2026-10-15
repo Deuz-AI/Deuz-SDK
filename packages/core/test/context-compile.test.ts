@@ -226,6 +226,31 @@ describe('compileContext budget', () => {
       ['c', 'over-budget'],
     ]);
   });
+
+  it('breaks a tie across sources of one kind by source order, then by record id (T4-4)', () => {
+    const pkg = compileContext(
+      input({
+        inputTokens: 5_000,
+        usedTokens: 3_750, // room for two of these candidates
+        results: [
+          ok('rag-a', 'rag', [candidate('z', 'zeta '.padEnd(200, 'z'), 0.5)]),
+          ok('rag-b', 'rag', [
+            candidate('b', 'beta '.padEnd(200, 'b'), 0.5),
+            candidate('a', 'alpha '.padEnd(200, 'a'), 0.5),
+          ]),
+        ],
+      }),
+    );
+    // The earlier source's 'z' goes before 'a' and 'b'; within rag-b, 'a' before 'b'.
+    expect([
+      ...entriesOf(pkg.manifest.entries, 'rag-a'),
+      ...entriesOf(pkg.manifest.entries, 'rag-b'),
+    ]).toEqual([
+      ['z', 'ranked'],
+      ['a', 'ranked'],
+      ['b', 'over-budget'],
+    ]);
+  });
 });
 
 describe('compileContext placed and duplicate entries', () => {
