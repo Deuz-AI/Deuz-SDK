@@ -13,11 +13,33 @@ import {
   createNativeRunLauncher,
 } from '../src/goal/runtime';
 import type { RunLaunchRequest } from '../src/goal/runtime';
+import { createDeferred } from '../src/internal/async-iter';
 import { agentRunLeaseKey, createInMemoryLeaseProvider } from '../src/ops';
 import { createMockModel } from '../src/testing';
+import type { AgentToolSet } from '../src/types/agent-run';
 
 const SCOPE = 'tenant';
 const T0 = Date.parse('2026-10-15T09:00:00Z');
+
+/** A tool that parks the run until the test releases it. */
+function parkedTool() {
+  const entered = createDeferred<void>();
+  const released = createDeferred<void>();
+  const tools: AgentToolSet = {
+    work: {
+      description: 'Long work.',
+      parameters: { type: 'object', properties: {} },
+      async execute() {
+        entered.resolve();
+        await released.promise;
+        return 'worked';
+      },
+    },
+  };
+  return { tools, entered: entered.promise, release: () => released.resolve() };
+}
+
+const pause = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function request(patch: Partial<RunLaunchRequest> = {}): RunLaunchRequest {
   return {
@@ -114,4 +136,48 @@ describe('createNativeRunLauncher on the real V3 executor', () => {
     expect(await runs.load('g:run:1')).toMatchObject({ result: { status: 'completed' } });
     expect(await runs.load('g:run:2')).toBeUndefined();
   });
+
+  it('gives a launcher without a lease of its own the goal lease provider, so drain and cancel reach its run', async () => {
+    for (const stop of ['drain', 'cancel'] as const) {
+      const goals = createInMemoryGoalRuntimeStore();
+      const runs = createInMemoryAgentRunStoreV3();
+      const provider = createInMemoryLeaseProvider();
+      const parked = parkedTool();
+      const model = createMockModel({
+        responses: [{ toolCalls: [{ toolName: 'work', id: 'w1', args: {} }] }, { text: 'done' }],
+      });
+      // No `lease`: the supervisor's provider (and its TTL) becomes the run's.
+      const launcher = createNativeRunLauncher({
+        store: runs,
+        options: () => ({ model, prompt: 'do the goal', tools: parked.tools }),
+      });
+      const supervisor = createGoalSupervisor({
+        store: goals,
+        launcher,
+        lease: { provider, owner: 'sup', ttlMs: 300 },
+      });
+      await supervisor.submit({ goalId: 'g', scope: SCOPE, objective: 'x' });
+      const ticking = supervisor.tick();
+      await parked.entered;
+      const stopping =
+        stop === 'drain' ? supervisor.drain() : supervisor.command(SCOPE, 'g', { type: 'cancel' });
+      // The run hears it at its next lease renewal and stops at its next step boundary.
+      await pause(400);
+      parked.release();
+      await stopping;
+      await ticking;
+      const stored = await runs.load('g:run:1');
+      const after = (await supervisor.get(SCOPE, 'g'))!;
+      if (stop === 'drain') {
+        // Resumable: no result, and the next holder resumes it.
+        expect(stored?.result).toBeUndefined();
+        expect(after.runtime.phase).toBe('dispatching');
+        expect(after.goal.status).toBe('active');
+      } else {
+        expect(stored?.result).toMatchObject({ status: 'stopped', reason: 'cancelled' });
+        expect(after.goal.status).toBe('cancelled');
+        expect(after.runtime.phase).toBe('done');
+      }
+    }
+  }, 30_000);
 });

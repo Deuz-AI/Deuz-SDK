@@ -42,7 +42,7 @@ import type {
   GoalRuntimeStore,
 } from './store-types';
 import { createGoalDriver } from './supervisor-drive';
-import { createNativeRunLauncher as createNative } from './supervisor-native';
+import { adoptRunLease, createNativeRunLauncher as createNative } from './supervisor-native';
 import {
   carriedRun,
   createEventHub,
@@ -165,7 +165,11 @@ export interface NativeRunLauncherOptions {
   ) =>
     | Omit<AgentRunOptionsV3<unknown>, 'session' | 'checkpointVersion'>
     | Promise<Omit<AgentRunOptionsV3<unknown>, 'session' | 'checkpointVersion'>>;
-  /** The native run's own lease, apart from the goal lease. */
+  /**
+   * The native run's own lease, apart from the goal lease (key
+   * `agentRunLeaseKey`). Without it, the launcher takes the provider and TTL
+   * of the goal lease of the first supervisor it is given to.
+   */
   lease?: AgentRunLeaseOptions;
 }
 
@@ -346,6 +350,7 @@ export function createGoalSupervisor(options: GoalSupervisorOptions): GoalSuperv
     );
   }
 
+  const ttlMs = positive(options.lease.ttlMs, DEFAULT_GOAL_SUPERVISOR.leaseTtlMs, 'lease.ttlMs', 3);
   const driver = createGoalDriver({
     store,
     launcher,
@@ -353,13 +358,16 @@ export function createGoalSupervisor(options: GoalSupervisorOptions): GoalSuperv
     hub,
     provider,
     owner: options.lease.owner ?? `goal-supervisor:${deps.generateId()}`,
-    ttlMs: positive(options.lease.ttlMs, DEFAULT_GOAL_SUPERVISOR.leaseTtlMs, 'lease.ttlMs', 3),
+    ttlMs,
     scopes: options.scopes,
     concurrency: positive(options.concurrency, DEFAULT_GOAL_SUPERVISOR.concurrency, 'concurrency'),
     ...(options.verify ? { verify: options.verify } : {}),
     ...(options.runFinished ? { runFinished: options.runFinished } : {}),
   });
   const pollMs = positive(options.pollMs, DEFAULT_GOAL_SUPERVISOR.pollMs, 'pollMs');
+  // The native run keeps its own lease (spec §3.1): a native launcher without
+  // one runs under this provider, so a drain, a cancel and a takeover reach it.
+  adoptRunLease(launcher, { provider, ttlMs });
   let started = false;
 
   /** A host command other than a cancel, saved with the runtime state as its fence. */
@@ -694,9 +702,11 @@ export function createGoalSupervisor(options: GoalSupervisorOptions): GoalSuperv
  * it statically. A run its V3 store does not hold is started, a stored one
  * resumed (`retryFailed` only for a `'retry'` of a transient failure); the
  * inherited working memory goes to a new run only. Cancel and drain go
- * through the native run's lease (false without `lease`, or while no
- * executor holds the run); `accounting` reads the ledger of the run's last
- * checkpoint and `maintenance` its memory extraction.
+ * through the native run's lease (false while no executor holds the run);
+ * without `lease`, the launcher takes the lease provider and TTL of the first
+ * supervisor it is given to (false before that). `accounting` reads the
+ * ledger of the run's last checkpoint and `maintenance` its memory
+ * extraction.
  */
 export function createNativeRunLauncher(options: NativeRunLauncherOptions): RunLauncher {
   return createNative(options);

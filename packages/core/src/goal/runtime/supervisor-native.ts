@@ -11,14 +11,15 @@
  * stored run keeps its own). A leg that another executor of the run
  * refused (its lease held or lost, or an executor in this process) reports
  * `heldElsewhere`: the supervisor resumes the run later. Cancel and drain are
- * signals to the native run's lease (`agentRunLeaseKey`): without `lease`,
- * or while no executor holds the run, they answer false and the supervisor
- * keeps the cancel.
+ * signals to the native run's lease (`agentRunLeaseKey`); a launcher created
+ * without `lease` takes the lease provider of the first supervisor it is
+ * given to. Without one, or while no executor holds the run, they answer
+ * false and the supervisor keeps the cancel.
  *
  * Edge-safe.
  */
 import { agentRunLeaseKey } from '../../internal/agent-run-lease';
-import type { AgentResult } from '../../types/agent-run';
+import type { AgentResult, AgentRunLeaseOptions } from '../../types/agent-run';
 import type { AgentRunEnvelopeV3, AgentRunOptionsV3 } from '../../types/agent-run-v3';
 import type { BudgetTotals } from '../../types/execution';
 import { GoalError } from '../errors';
@@ -40,6 +41,19 @@ function maintenanceOf(
   if (status === undefined) return undefined;
   if (status === 'pending') return 'pending';
   return status === 'completed' ? 'complete' : 'failed';
+}
+
+/** Native launchers created without `lease`, and how a supervisor gives them one. */
+const unleased = new WeakMap<RunLauncher, (lease: AgentRunLeaseOptions) => void>();
+
+/**
+ * Gives a native launcher created without `lease` the supervisor's (spec
+ * §3.1: the native run keeps its own lease), so a drain, a cancel and a
+ * takeover reach its runs. A launcher with a lease of its own, or of another
+ * kind, is left as it is. The first supervisor's lease stays.
+ */
+export function adoptRunLease(launcher: RunLauncher, lease: AgentRunLeaseOptions): void {
+  unleased.get(launcher)?.(lease);
 }
 
 /** What the executor answers a second executor of a run in the same process. */
@@ -80,7 +94,7 @@ export function createNativeRunLauncher(options: NativeRunLauncherOptions): RunL
     throw new TypeError('createNativeRunLauncher needs an AgentRunStoreV3 (checkpointVersion 3)');
   if (typeof options.options !== 'function')
     throw new TypeError('createNativeRunLauncher needs an options function');
-  const lease = options.lease;
+  let lease = options.lease;
   let executor: Promise<typeof import('../../agent-run')> | undefined;
 
   async function stored(scope: string, runId: string): Promise<AgentRunEnvelopeV3 | undefined> {
@@ -132,7 +146,7 @@ export function createNativeRunLauncher(options: NativeRunLauncherOptions): RunL
   const signal = async (scope: string, runId: string, kind: 'cancel' | 'drain') =>
     lease === undefined ? false : lease.provider.signal(agentRunLeaseKey({ scope, runId }), kind);
 
-  return {
+  const launcher: RunLauncher = {
     launch: leg,
     resume: leg,
     cancel: ({ scope, runId }) => signal(scope, runId, 'cancel'),
@@ -148,4 +162,10 @@ export function createNativeRunLauncher(options: NativeRunLauncherOptions): RunL
       return maintenanceOf(envelope);
     },
   };
+  if (lease === undefined)
+    unleased.set(launcher, (given) => {
+      lease = given;
+      unleased.delete(launcher);
+    });
+  return launcher;
 }

@@ -11,7 +11,11 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { createInMemoryAgentRunStoreV3 } from '../src/agent-run-v3-store';
 import { createExecutionContext } from '../src/execution-policy';
 import { createGoal } from '../src/goal';
-import { createNativeRunLauncher } from '../src/goal/runtime';
+import {
+  createGoalSupervisor,
+  createInMemoryGoalRuntimeStore,
+  createNativeRunLauncher,
+} from '../src/goal/runtime';
 import type { RunLaunchRequest } from '../src/goal/runtime';
 import { agentRunLeaseKey, createInMemoryLeaseProvider } from '../src/ops';
 import type { AgentResult } from '../src/types/agent-run';
@@ -209,6 +213,46 @@ describe('createNativeRunLauncher', () => {
     const bare = createNativeRunLauncher({ store, options: () => ({}) as never });
     expect(await bare.cancel({ scope: SCOPE, runId: 'g-1:run:1' })).toBe(false);
     expect(await bare.drain({ scope: SCOPE, runId: 'g-1:run:1' })).toBe(false);
+  });
+
+  it('takes the goal lease of the first supervisor it is given to when created without a lease', async () => {
+    const store = createInMemoryAgentRunStoreV3();
+    agent.runAgent.mockImplementation((options: AgentRunOptionsV3<unknown>) =>
+      finish(options, results.completed(options.session.runId)),
+    );
+    const provider = createInMemoryLeaseProvider();
+    const own = createInMemoryLeaseProvider();
+    const bare = createNativeRunLauncher({ store, options: () => ({}) as never });
+    const leased = createNativeRunLauncher({
+      store,
+      options: () => ({}) as never,
+      lease: { provider: own, ttlMs: 9_000 },
+    });
+    expect(await bare.drain({ scope: SCOPE, runId: 'g-1:run:1' })).toBe(false);
+    for (const launcher of [bare, leased]) {
+      const goals = createInMemoryGoalRuntimeStore();
+      createGoalSupervisor({ store: goals, launcher, lease: { provider, ttlMs: 6_000 } });
+      // A second supervisor changes nothing.
+      createGoalSupervisor({
+        store: goals,
+        launcher,
+        lease: { provider: createInMemoryLeaseProvider() },
+      });
+    }
+    await bare.launch(request());
+    await leased.launch(request({ runId: 'g-1:run:2' }));
+    const first = agent.runAgent.mock.calls[0]![0] as AgentRunOptionsV3<unknown>;
+    const second = agent.runAgent.mock.calls[1]![0] as AgentRunOptionsV3<unknown>;
+    expect(first.lease?.provider).toBe(provider);
+    expect(first.lease?.ttlMs).toBe(6_000);
+    expect(second.lease?.provider).toBe(own);
+    expect(second.lease?.ttlMs).toBe(9_000);
+    // Its cancel and drain now reach a run that holds its lease.
+    const key = agentRunLeaseKey({ scope: SCOPE, runId: 'g-1:run:1' });
+    const executor = await provider.acquire({ key, owner: 'executor', ttlMs: 30_000 });
+    expect(await bare.drain({ scope: SCOPE, runId: 'g-1:run:1' })).toBe(true);
+    expect(await bare.cancel({ scope: SCOPE, runId: 'g-1:run:1' })).toBe(true);
+    expect(await provider.renew(executor!, 30_000)).toMatchObject({ held: true });
   });
 
   it('reads the run ledger from its durable checkpoint, and its maintenance', async () => {
