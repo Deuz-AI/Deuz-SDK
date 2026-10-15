@@ -267,9 +267,35 @@ export function createDockerRunnerFromOptions(
       operationId: record.operationId,
       scope: record.scope,
       command: record.request.command,
+      requestDigest: record.requestDigest,
       interactive: request?.stdin !== undefined,
       ...(request?.env !== undefined ? { env: request.env } : {}),
     };
+  }
+
+  /**
+   * Whether a container found under a record's name is a create of that very
+   * record a crash cut short: it never ran and carries the record's request
+   * digest. Anything else an earlier operation under the same id left behind
+   * (its record pruned before the container was disposed).
+   */
+  const adoptable = (record: ProcessOperationRecord, info: ContainerInfo): boolean =>
+    info.startedAt === undefined && info.labels[DEUZ_LABEL.requestDigest] === record.requestDigest;
+
+  /** Fails a fresh record whose name an earlier operation's container holds; never adopted, never removed. */
+  async function refuseLeftover(
+    record: ProcessOperationRecord,
+    name: string,
+  ): Promise<{ ok: boolean; record: ProcessOperationRecord }> {
+    return commit(record, {
+      state: 'failed',
+      endedAt: deps.clock.now(),
+      error: {
+        name: 'DockerSandboxError',
+        message: `The container ${name} was left by an earlier operation under this id; dispose this operation to remove it, then prune the record before reusing the id.`,
+        code: 'container_conflict',
+      },
+    });
   }
 
   /** Records an exit (or a cancel's end) with the output tail, and reports it. */
@@ -523,6 +549,12 @@ export function createDockerRunnerFromOptions(
               'docker_failed',
               `The container name ${name} belongs to another operation.`,
             );
+          if (info && !adoptable(record, info)) {
+            const result = await refuseLeftover(record, name);
+            record = result.record;
+            if (result.ok) return record;
+            continue;
+          }
           let containerId = info?.id;
           if (containerId === undefined) {
             files ??= await collectStageFiles(options, request.files);
@@ -909,7 +941,9 @@ export function createDockerRunnerFromOptions(
   ): Promise<ProcessOperationRecord> {
     switch (record.state) {
       case 'recorded':
-        // Created, but the host stopped before recording it.
+        // Created, but the host stopped before recording it; or left by an
+        // earlier operation under this id, which is never adopted.
+        if (!adoptable(record, info)) return (await refuseLeftover(record, info.name)).record;
         return (await commit(record, { state: 'created', containerId: info.id })).record;
       case 'start-dispatched':
       case 'needs-reconcile': {

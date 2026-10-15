@@ -283,6 +283,66 @@ describe('createDockerProcessRunner: start', () => {
     expect(startCount(fake)).toBe(0);
   });
 
+  it('a new record never adopts a container an earlier operation under the same id left (R4-4)', async () => {
+    const fake = await fakeDocker(bundle);
+    const { runner, store } = setup(fake);
+    const old = await runner.start(request({ command: ['echo', 'old', ';', 'exit', '7'] }));
+    expect(old.state).toBe('exited');
+    // Retention drops the record, but nothing removed the container.
+    expect(await store.prune({ terminalBefore: Date.now() + 1_000 })).toBe(1);
+    const reused = await runner.start(request({ command: ['echo', 'new', ';', 'exit', '0'] }));
+    expect(reused).toMatchObject({ state: 'failed', error: { code: 'container_conflict' } });
+    expect(reused.exitCode).not.toBe(7);
+    expect(reused.containerId).toBeUndefined();
+    expect(startCount(fake)).toBe(1);
+    expect(fake.containers()).toHaveLength(1);
+    expect((await runner.readOutput('tenant-a', 'op-1')).stdout).toBe('');
+    // Disposing the refused operation removes the leftover; the id is then free again.
+    await runner.dispose('tenant-a', 'op-1');
+    expect(fake.containers()).toEqual([]);
+    expect(await store.prune({ terminalBefore: Date.now() + 1_000 })).toBe(1);
+    const fresh = await runner.start(request({ command: ['echo', 'new', ';', 'exit', '0'] }));
+    expect(fresh).toMatchObject({ state: 'exited', exitCode: 0 });
+    expect((await runner.readOutput('tenant-a', 'op-1')).stdout).toBe('new\n');
+  });
+
+  it('a never-started leftover with another request is not adopted either, by start or reconcile (R4-4)', async () => {
+    const fake = await fakeDocker(bundle);
+    const time = manualClock(Date.now());
+    const store = createInMemoryProcessOperationStore({ deps: { clock: time.clock } });
+    const { runner } = setup(fake, { store, clock: time.clock });
+    fake.fault({ command: 'start', mode: 'unreachable' });
+    expect((await runner.start(request({ command: ['echo', 'old'] }))).state).toBe(
+      'needs-reconcile',
+    );
+    await time.advance(60_000);
+    expect((await runner.reconcile()).matched.map((s) => s.state)).toEqual(['failed']);
+    expect(await store.prune({ terminalBefore: time.clock.now() + 1_000 })).toBe(1);
+    // A host that crashed right after recording the new request: reconcile sees it first.
+    const crashOnCreate: ProcessOperationStore = {
+      ...store,
+      async create(record) {
+        await store.create(record);
+        throw new HostCrash('crash after recorded');
+      },
+      get: (scope, id) => store.get(scope, id),
+      list: (query) => store.list(query),
+      update: (scope, id, changes, options) => store.update(scope, id, changes, options),
+      prune: (options) => store.prune(options),
+    };
+    const crashed = setup(fake, { store: crashOnCreate, clock: time.clock });
+    await expect(crashed.runner.start(request({ command: ['echo', 'new'] }))).rejects.toThrow(
+      HostCrash,
+    );
+    const report = await runner.reconcile();
+    expect(report.matched).toMatchObject([
+      { operationId: 'op-1', state: 'failed', error: { code: 'container_conflict' } },
+    ]);
+    expect(startCount(fake)).toBe(0);
+    expect((await runner.start(request({ command: ['echo', 'new'] }))).state).toBe('failed');
+    expect(startCount(fake)).toBe(0);
+  });
+
   it('refuses a malformed request before recording anything', async () => {
     const fake = await fakeDocker(bundle);
     const { runner, store } = setup(fake);
@@ -687,20 +747,22 @@ describe('createDockerProcessRunner: reconcile', () => {
     const fake = await fakeDocker(bundle);
     const sandbox = createDockerSandbox({ image: FAKE_IMAGE, ...fake.cli });
     const { runner } = setup(fake);
-    const pending = sandbox.runShell!({ command: 'echo started ; sleep', timeoutMs: 20_000 });
-    for (let i = 0; i < 400 && !fake.containers().some((c) => c.state === 'running'); i++)
-      await new Promise((resolve) => setTimeout(resolve, 25));
-    const live = fake.containers().find((c) => c.state === 'running')!;
-    expect(live.labels['deuz.kind']).toBe('sandbox');
+    // The run ends by its own timeout: the test never writes the fake's state meanwhile.
+    const pending = sandbox.runShell!({ command: 'echo started ; sleep', timeoutMs: 6_000 });
+    let live: FakeContainer | undefined;
+    for (let i = 0; i < 200 && !live; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      live = fake.containers().find((c) => c.state === 'running');
+    }
+    expect(live?.labels['deuz.kind']).toBe('sandbox');
     const report = await runner.reconcile({ removeOrphans: true });
-    if (fake.container(live.id))
-      fake.update((state) => {
-        state.containers[live.id]!.state = 'exited';
-      });
     const res = await pending;
     expect(report.orphans).toEqual([]);
     expect(report.removed).toEqual([]);
-    expect(res).toMatchObject({ stdout: 'started\n', exitCode: 0 });
+    // Killed by its own timeout, not removed under it.
+    expect(res).toMatchObject({ stdout: 'started\n', exitCode: null, timedOut: true });
+    expect(res.stderr).not.toContain('docker start failed');
+    expect(fake.containers()).toEqual([]);
   });
 
   it('reports sandbox containers and staging helpers only once no run can still be using them (R4-2)', async () => {

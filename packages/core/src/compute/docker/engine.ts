@@ -41,6 +41,11 @@ export const DEUZ_LABEL = {
    * it, so `reconcile` can tell a live run from one its host left behind.
    */
   runTimeoutMs: 'deuz.run-timeout-ms',
+  /**
+   * A runner operation's request digest: a create a crash cut short is
+   * adopted only by the record whose request made it.
+   */
+  requestDigest: 'deuz.request-digest',
 } as const;
 
 export type ContainerKind = 'process' | 'sandbox' | 'staging';
@@ -209,6 +214,8 @@ export interface ContainerSpec {
   cwd?: string;
   /** A sandbox run's timeout, written to the `deuz.run-timeout-ms` label. */
   runTimeoutMs?: number;
+  /** A runner operation's request digest, written to the `deuz.request-digest` label. */
+  requestDigest?: string;
 }
 
 /** What inspection reports of one container. */
@@ -488,14 +495,14 @@ export function createDockerEngine(options: ResolvedDockerOptions): DockerEngine
             : []),
           ...(spec.interactive ? ['--interactive'] : []),
           ...(envFile !== undefined ? ['--env-file', envFile] : []),
-          ...labelArgs(
-            spec.kind,
-            spec.operationId,
-            spec.scope,
-            spec.runTimeoutMs !== undefined
+          ...labelArgs(spec.kind, spec.operationId, spec.scope, {
+            ...(spec.runTimeoutMs !== undefined
               ? { [DEUZ_LABEL.runTimeoutMs]: String(spec.runTimeoutMs) }
-              : {},
-          ),
+              : {}),
+            ...(spec.requestDigest !== undefined
+              ? { [DEUZ_LABEL.requestDigest]: spec.requestDigest }
+              : {}),
+          }),
           // The argv runs as given: an image ENTRYPOINT would prefix it.
           '--entrypoint=',
           imageId,

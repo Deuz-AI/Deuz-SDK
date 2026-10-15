@@ -149,7 +149,18 @@ function withLock<T>(fn: (state: FakeState) => T): T {
     // Atomic: a command killed mid-write never leaves half a state behind.
     const temp = `${statePath}.${process.pid}`;
     writeFileSync(temp, JSON.stringify(state));
-    renameSync(temp, statePath);
+    for (let attempt = 0; ; attempt++) {
+      try {
+        renameSync(temp, statePath);
+        break;
+      } catch (error) {
+        // Windows refuses to replace a file a test is reading at that moment.
+        const code = (error as NodeJS.ErrnoException).code;
+        if (attempt >= 200 || (code !== 'EPERM' && code !== 'EBUSY' && code !== 'EACCES'))
+          throw error;
+        sleepSync(5);
+      }
+    }
     return result;
   } finally {
     rmSync(lockPath, { recursive: true, force: true });
