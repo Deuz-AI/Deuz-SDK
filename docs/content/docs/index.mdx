@@ -148,6 +148,38 @@ Many AI integrations become hard to test because runtime state, provider-specifi
 | **No vendor lock**     | Our own canonical delta stream and our own versioned UI wire. The SDK never proxies a provider's raw SSE bytes to your client.                                                                                                         |
 | **Secrets never leak** | API keys are masked in every log, error, and span path. This is a regression-tested invariant — see [secret redaction](/docs/core/errors#secret-redaction-p0).                                                                         |
 
+## New in 2.4
+
+2.4 is about what an agent remembers, what it sees on each call, and work that
+outlives one process. Every 2.4 feature is off until you configure it, and the
+2.3 APIs remain available.
+
+- **Versioned memory** — records with a stable id, revisions, sources and an
+  asserted or inferred origin, written through operations with receipts
+  → [Versioned memory](/docs/modules/versioned-memory)
+- **Context compiler and working memory** — memory, RAG, past chats and the
+  skill catalog in one token budget, with a manifest of what each step saw
+  → [Context compiler](/docs/modules/context) ·
+  [Transcript search](/docs/modules/transcript-search)
+- **V3 native runs** — checkpoints that carry the context, the working memory
+  and the memory writes → [Native agents](/docs/modules/native-agents#v3-runs-checkpointversion-3)
+- **Goal supervisor and durable scheduler** — goals driven to a verified
+  result, a time-zone aware scheduler and a webhook inbox
+  → [Goal runtime](/docs/modules/goal-runtime)
+- **Local Docker runner (preview)** — a sandbox for the compute tools and a
+  process runner that reconnects after a host restart
+  → [Docker runner](/docs/modules/docker)
+- **Durable chats and streams** — compare-and-set chat stores, persist-before-publish
+  streams, a capability handshake and React chat snapshots
+  → [Chat and stream durability](/docs/modules/chat-durability)
+- **Accounting and retention** — embedding, RAG, memory and verifier calls on
+  the budget ledger, and explicit cleanup for every new store
+  → [Budgets](/docs/modules/budgets) · [Retention and forget](/docs/modules/retention)
+
+Nothing in 2.4 was run against a model provider; model calls are tested
+against scripted models. Start with [What is new in 2.4](/docs/reference/whats-new-2-4)
+for upgrade notes and known limits.
+
 ## New in 2.3
 
 2.3 puts every tool call on one path, gives native runs memory, chat and model
@@ -176,8 +208,8 @@ available.
   → [Goals](/docs/modules/goals) · [Evals](/docs/modules/evals) ·
   [Headless](/docs/modules/headless)
 
-Start with [What is new in 2.3](/docs/reference/whats-new-2-3) for upgrade notes
-and known limits. Previous releases: [2.2](/docs/reference/whats-new-2-2),
+[What is new in 2.3](/docs/reference/whats-new-2-3) has its upgrade notes and
+known limits. Previous releases: [2.2](/docs/reference/whats-new-2-2),
 [2.1](/docs/reference/whats-new-2-1), [2.0](/docs/reference/whats-new-2-0) and
 [1.9](/docs/reference/whats-new-1-9).
 
@@ -214,6 +246,12 @@ and known limits. Previous releases: [2.2](/docs/reference/whats-new-2-2),
 | Goals (2.3)                   | Versioned goal records with acceptance on evidence, waiting reasons, and wakeup and event envelopes                  | [Goals](/docs/modules/goals)                                                  |
 | Evals (2.3)                   | Versioned eval tasks with per-attempt metrics for success, cost, rescues, repeated effects and recovery              | [Evals](/docs/modules/evals)                                                  |
 | Headless (2.3 preview)        | Run, resume and inspect native runs from a script or CI job, with JSON reports and exit codes (Node-only)            | [Headless](/docs/modules/headless)                                            |
+| Versioned memory (2.4)        | Records with revisions, sources and origin labels, receipts, compare-and-set writes, forget and re-embedding         | [Versioned memory](/docs/modules/versioned-memory)                            |
+| Context compiler (2.4)        | Memory, RAG, past chats and skills in one token budget with a manifest, plus structured working memory               | [Context compiler](/docs/modules/context)                                     |
+| Transcript search (2.4)       | Scope-checked lexical search over stored chats                                                                       | [Transcript search](/docs/modules/transcript-search)                          |
+| Goal runtime (2.4)            | A goal supervisor, a durable time-zone scheduler, a webhook inbox and acceptance on evidence                         | [Goal runtime](/docs/modules/goal-runtime)                                    |
+| Docker runner (2.4 preview)   | A local Docker sandbox and a process runner that reconnects after a restart (Node-only)                              | [Docker runner](/docs/modules/docker)                                         |
+| Chat durability (2.4)         | Compare-and-set chat stores, durable streams (preview), the capability handshake and chat snapshots                  | [Chat and stream durability](/docs/modules/chat-durability)                   |
 
 ## Supported providers
 
