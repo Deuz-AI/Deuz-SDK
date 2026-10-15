@@ -184,6 +184,101 @@ describe('createSqliteVersionedMemoryStore: schema and connection', () => {
   );
 });
 
+/** Whether this Node's SQLite has FTS5 (22.14's does not). */
+function hasFts5(): boolean {
+  const db = new DatabaseSync(':memory:');
+  try {
+    db.exec('CREATE VIRTUAL TABLE probe USING fts5(text)');
+    return true;
+  } catch {
+    return false;
+  } finally {
+    db.close();
+  }
+}
+
+/** Every byte the FTS5 index holds in its shadow b-tree. */
+function ftsShadow(db: DatabaseSync): Buffer {
+  const rows = db.prepare('SELECT block FROM deuz_vmem_fts_data').all() as { block: unknown }[];
+  return Buffer.concat(
+    rows.map((row) => (row.block instanceof Uint8Array ? Buffer.from(row.block) : Buffer.alloc(0))),
+  );
+}
+
+async function changeOp(
+  operationId: string,
+  mutation: VersionedMemoryCommit['mutations'][number],
+): Promise<VersionedMemoryCommit> {
+  const request = { scope: SCOPE, actor: 'host' as const, mutations: [mutation] };
+  return { operationId, ...request, requestDigest: await digestJson(request) };
+}
+
+describe.skipIf(!hasFts5())(
+  'createSqliteVersionedMemoryStore: deleted text leaves the index',
+  () => {
+    it('forget and pruneHistory remove the tokens from the FTS shadow table itself', async () => {
+      const db = new DatabaseSync(':memory:');
+      const store = createSqliteVersionedMemoryStore({
+        database: db as unknown as SqliteDatabaseLike,
+      });
+      await store.commit(await createOp('op-1', 'r1', 'my secret password is zebracornxyz'));
+      await store.commit(await createOp('op-2', 'r2', 'an unrelated kept fact'));
+      await store.commit(await createOp('op-3', 'r3', 'an old quokkaflamingo note'));
+      await store.commit(
+        await changeOp('op-4', {
+          type: 'revise',
+          id: 'r3',
+          expectedRevision: 1,
+          changes: { text: 'a plain note' },
+        }),
+      );
+      await store.commit(
+        await changeOp('op-5', { type: 'retract', id: 'r3', expectedRevision: 2 }),
+      );
+      expect(ftsShadow(db).includes('zebracornxyz')).toBe(true);
+      expect(ftsShadow(db).includes('quokkaflamingo')).toBe(true);
+
+      await store.forget(SCOPE, 'r1', 'forget-1');
+      expect(await store.pruneHistory({ olderThan: Date.now() + 60_000 })).toBe(2);
+
+      const shadow = ftsShadow(db);
+      expect(shadow.includes('zebracornxyz')).toBe(false);
+      expect(shadow.includes('quokkaflamingo')).toBe(false);
+      expect(shadow.includes('unrelated')).toBe(true);
+      expect(
+        (await store.search({ scope: SCOPE, text: 'unrelated' })).map((h) => h.record.id),
+      ).toEqual(['r2']);
+      db.exec("INSERT INTO deuz_vmem_fts(deuz_vmem_fts) VALUES('integrity-check')");
+      await store.close();
+      db.close();
+    });
+
+    it(
+      'a forget by a process without FTS5 leaves the index once a process with it opens the file',
+      { timeout: SLOW_TEST_TIMEOUT_MS },
+      async () => {
+        const path = join(tempDir(), 'mixed-forget.db');
+        const withFts = createSqliteVersionedMemoryStore({ path });
+        await withFts.commit(await createOp('op-1', 'r1', 'my secret password is zebracornxyz'));
+        await withFts.commit(await createOp('op-2', 'r2', 'an unrelated kept fact'));
+        await withFts.close();
+        const without = createSqliteVersionedMemoryStore({ path, fts: false });
+        await without.forget(SCOPE, 'r1', 'forget-1');
+        await without.close();
+
+        const again = createSqliteVersionedMemoryStore({ path });
+        await again.scopeRevision(SCOPE);
+        await again.close();
+        const db = new DatabaseSync(path);
+        const shadow = ftsShadow(db);
+        expect(shadow.includes('zebracornxyz')).toBe(false);
+        expect(shadow.includes('unrelated')).toBe(true);
+        db.close();
+      },
+    );
+  },
+);
+
 describe('createSqliteVersionedMemoryStore: a commit that fails half way', () => {
   it('rolls back the revision, index, vector, scope revision and receipt together', async () => {
     const db = new DatabaseSync(':memory:');

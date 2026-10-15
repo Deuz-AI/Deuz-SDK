@@ -14,7 +14,11 @@
  *
  * FTS5 is optional per process (Node 22.14's SQLite ships without it): a
  * process without it marks the index stale on every write, and the next
- * process with FTS5 rebuilds it before using it.
+ * process with FTS5 rebuilds it before using it. The index runs with FTS5
+ * `secure-delete`, so the tokens of a forgotten or pruned revision leave its
+ * pages at once. Forget is still a logical delete for the file as a whole:
+ * pages SQLite frees keep their bytes unless the host sets
+ * `PRAGMA secure_delete` or runs `VACUUM`.
  */
 import type {
   MemoryEmbeddingGeneration,
@@ -215,6 +219,22 @@ function toGeneration(row: Record<string, unknown>): MemoryEmbeddingGeneration {
 
 const FTS_DIRTY = 'fts_dirty';
 
+/**
+ * Turns on FTS5 `secure-delete` (persistent, SQLite 3.42+): a revision that
+ * forget or pruneHistory deletes leaves the index pages themselves, instead of
+ * staying behind a delete marker until a segment merge that a small store may
+ * never run. An older SQLite keeps the default; its tokens go at the next merge.
+ */
+function secureDelete(s: State): void {
+  try {
+    const row = one(s, "SELECT v FROM deuz_vmem_fts_config WHERE k = 'secure-delete'");
+    if (row && num(row.v) === 1) return;
+    s.db.exec("INSERT INTO deuz_vmem_fts(deuz_vmem_fts, rank) VALUES('secure-delete', 1)");
+  } catch {
+    // SQLite before 3.42 does not know the option: lexical search works the same.
+  }
+}
+
 /** Builds the index in its own transaction; false when this SQLite has no FTS5. */
 function setupFts(s: State): boolean {
   try {
@@ -226,6 +246,7 @@ function setupFts(s: State): boolean {
       s.db.exec(FTS_TABLE);
       if (!existed) s.db.exec("INSERT INTO deuz_vmem_fts(deuz_vmem_fts) VALUES('rebuild')");
     });
+    secureDelete(s);
     all(s, 'SELECT rowid FROM deuz_vmem_fts WHERE deuz_vmem_fts MATCH ? LIMIT 1', ['"deuz"']);
     s.fts = true;
     syncFts(s, false);
