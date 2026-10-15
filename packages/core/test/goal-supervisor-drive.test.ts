@@ -573,6 +573,25 @@ describe('accounting', () => {
     });
   });
 
+  it('charges the result accounting through the same watermark when the launcher reads no ledger', async () => {
+    const w = world();
+    const launcher = fakeRunLauncher((request) => ({
+      runId: request.runId,
+      result: { ...results.suspended(request.runId), accounting: totals({ tokens: 7, usd: 0 }) },
+    }));
+    delete (launcher as Partial<FakeRunLauncher>).accounting;
+    const { supervisor } = supervisorIn(w, { launcher });
+    await supervisor.submit({ goalId: 'g-1', scope: SCOPE, objective: 'x' });
+    await supervisor.tick();
+    await supervisor.resume(SCOPE, 'g-1', {});
+    await supervisor.tick();
+    expect((await supervisor.get(SCOPE, 'g-1'))?.goal.spent).toEqual({ tokens: 7, usd: 0 });
+    expect(await w.store.watermarks.get(SCOPE, 'g-1', 'g-1:run:1')).toMatchObject({
+      tokens: 7,
+      revision: 1,
+    });
+  });
+
   it('completes a verified goal while its maintenance is pending, then adds a late charge without reopening it', async () => {
     const w = world();
     const launcher = fakeRunLauncher((request) => ({

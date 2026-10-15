@@ -20,6 +20,7 @@
  */
 import type { AgentResult } from '../../types/agent-run';
 import type { ResolvedDependencies } from '../../types/deps';
+import type { BudgetTotals } from '../../types/execution';
 import type { Lease, LeaseProvider } from '../../types/lease';
 import { DEUZ_SPAN, observeSpan, recordSpan } from '../../internal/telemetry';
 import { transitionGoal } from '../transition';
@@ -858,7 +859,13 @@ export function createGoalDriver(options: GoalDriverOptions): {
   ): Promise<void> {
     const { scope, goalId, runId } = request;
     if (drive.lost) return;
-    await charge(drive, scope, goalId, runId);
+    await charge(
+      drive,
+      scope,
+      goalId,
+      runId,
+      'ok' in outcome ? outcome.ok.result.accounting : undefined,
+    );
     let verifiedOnce = false;
     for (let conflicts = 0; conflicts < MAX_CONFLICTS && !drive.lost; conflicts++) {
       const goal0 = await store.load(goalId, { scope });
@@ -1051,11 +1058,20 @@ export function createGoalDriver(options: GoalDriverOptions): {
    * watermark's revision, so a repeat after a crash finds nothing to charge.
    * Reservations (uncertain amounts) are recorded, never charged.
    */
-  async function charge(drive: Drive, scope: string, goalId: string, runId: string): Promise<void> {
-    if (!launcher.accounting) return;
-    const totals = await quietly(deps.logger, 'goal supervisor: accounting read failed', () =>
-      launcher.accounting!({ scope, runId }),
-    );
+  async function charge(
+    drive: Drive,
+    scope: string,
+    goalId: string,
+    runId: string,
+    reported?: BudgetTotals,
+  ): Promise<void> {
+    // The durable ledger; a launcher that reads none hands over the leg's own
+    // totals, charged through the same watermark (cumulative, so still once).
+    const totals = launcher.accounting
+      ? await quietly(deps.logger, 'goal supervisor: accounting read failed', () =>
+          launcher.accounting!({ scope, runId }),
+        )
+      : reported;
     if (!totals) return;
     for (let conflicts = 0; conflicts < MAX_CONFLICTS; conflicts++) {
       if (drive.lost) return;
