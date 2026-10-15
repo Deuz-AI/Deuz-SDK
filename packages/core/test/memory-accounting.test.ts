@@ -195,6 +195,29 @@ describe('memory helper calls on a ledger (seams.execution)', () => {
     expect(warnings[0]!.type).toBe('unaccounted-usage');
   });
 
+  it('points the unmarked-LLM warning at seams.accountedLlm, where the wrapped callback compiles', async () => {
+    const { execution } = observedContext();
+    const warnings: CallWarning[] = [];
+    await remember(MESSAGES, SCOPE, seams({ execution }), {
+      onWarning: (warning) => warnings.push(warning),
+    });
+    // `llm` is typed MemoryLLM (Promise<string>): an AccountedMemoryLLM goes to `accountedLlm`.
+    expect(warnings[0]!.message).toContain('defineAccountedMemoryLLM');
+    expect(warnings[0]!.message).toContain('`accountedLlm`');
+    // Following the advice type-checks and settles the calls without a warning.
+    const followed: MemorySeams = seams({
+      execution: observedContext().execution,
+      accountedLlm: defineAccountedMemoryLLM(async () => ({
+        text: '{"facts":[]}',
+        modelId: 'memory-model',
+        usage: usage(5, 2),
+      })),
+    });
+    const after: CallWarning[] = [];
+    await remember(MESSAGES, SCOPE, followed, { onWarning: (warning) => after.push(warning) });
+    expect(after).toEqual([]);
+  });
+
   it('charges the query embedding of recall() the same way', async () => {
     const { execution, reservations } = observedContext();
     const warnings: CallWarning[] = [];
