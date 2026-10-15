@@ -1,4 +1,3 @@
-// @vitest-environment ./test/e2e-2-4/jsdom-ssr-environment.ts
 /**
  * The composite flow of spec §5.1 with a React client: the reviewer's page is
  * `useChat` from @deuz-sdk/react, restored from a snapshot, on the host's

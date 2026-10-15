@@ -5,7 +5,7 @@
  * plain jsdom environment uses, refuses to bundle those on Linux. The
  * server-side transform keeps them external, as in the core tests.
  */
-import { builtinEnvironments, type Environment } from 'vitest/environments';
+import { builtinEnvironments, type Environment } from 'vitest/runtime';
 
 const environment: Environment = {
   ...builtinEnvironments.jsdom,
