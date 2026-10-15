@@ -87,6 +87,16 @@ export interface NativeRunLease {
   release(recorded: boolean): Promise<void>;
 }
 
+/**
+ * A best-effort provider call that never throws: a provider that throws
+ * synchronously (one over a closed client, a host that died) fails the call
+ * like one that rejects, so giving the lease back never strands the run's
+ * result (2.4, X-2).
+ */
+function attempt<T>(call: () => Promise<T>, fallback: T): Promise<T> {
+  return new Promise<T>((resolve) => resolve(call())).catch(() => fallback);
+}
+
 /** Validates the option; a malformed one throws a TypeError. */
 function assertLeaseOptions(options: AgentRunLeaseOptions): number {
   const provider = options?.provider;
@@ -138,7 +148,7 @@ export async function claimNativeRunLease(
   try {
     first = await provider.renew(acquired, ttl, renewOptions);
   } catch (error) {
-    await provider.release(acquired).catch(() => {});
+    await attempt(() => provider.release(acquired), undefined);
     throw error;
   }
   if (!first.held) throw new AgentRunLeaseError('lease_lost');
@@ -253,13 +263,13 @@ export async function claimNativeRunLease(
       stopBeat?.();
       signal?.removeEventListener('abort', follow);
       await renewals;
-      if (recorded && kept && !lost) await provider.ack!(held, 'cancel').catch(() => false);
+      if (recorded && kept && !lost) await attempt(() => provider.ack!(held, 'cancel'), false);
       // A cancel the provider no longer queues and the run did not record goes
       // back to whoever holds the key next (2.2), and so does one the claim
       // found when no `collect` decided on it.
       else if (!recorded && (consumed || (!collected && found === 'consumed')))
-        await provider.signal(key, 'cancel').catch(() => false);
-      if (!lost) await provider.release(held).catch(() => {});
+        await attempt(() => provider.signal(key, 'cancel'), false);
+      if (!lost) await attempt(() => provider.release(held), undefined);
     },
   };
 }

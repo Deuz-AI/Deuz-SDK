@@ -220,6 +220,61 @@ describe('createNativeRunLauncher on the real V3 executor', () => {
     }
   }, 30_000);
 
+  it('settles a leg whose lease provider throws synchronously once its process died (X-2)', async () => {
+    // A host process that dies mid-run: every later call to its lease
+    // provider throws at once, as the composite flow's kill switch does (and
+    // as a provider over a closed client may). The leg must still end: the
+    // run's lease release on its way out never strands the result.
+    const goals = createInMemoryGoalRuntimeStore();
+    const runs = createInMemoryAgentRunStoreV3();
+    const inner = createInMemoryLeaseProvider();
+    let dead = false;
+    const provider = new Proxy(inner, {
+      get(target, key, receiver) {
+        const value: unknown = Reflect.get(target, key, receiver);
+        if (typeof value !== 'function') return value;
+        return (...args: unknown[]) => {
+          if (dead) throw new Error('host process crashed');
+          return (value as (...a: unknown[]) => unknown).apply(target, args);
+        };
+      },
+    });
+    const tools: AgentToolSet = {
+      work: {
+        description: 'The host dies while this runs.',
+        parameters: { type: 'object', properties: {} },
+        execute: () => {
+          dead = true;
+          return 'worked';
+        },
+      },
+    };
+    const model = createMockModel({
+      responses: [{ toolCalls: [{ toolName: 'work', id: 'w1', args: {} }] }, { text: 'done' }],
+    });
+    // No `lease`: the launcher adopts the supervisor's provider (spec §3.1).
+    const launcher = createNativeRunLauncher({
+      store: runs,
+      options: () => ({ model, prompt: 'do the goal', tools }),
+    });
+    const supervisor = createGoalSupervisor({
+      store: goals,
+      launcher,
+      lease: { provider, owner: 'p1', ttlMs: 30_000 },
+    });
+    await supervisor.submit({ goalId: 'g', scope: SCOPE, objective: 'x' });
+    const ticked = await Promise.race([
+      supervisor.tick().then(
+        () => 'ticked' as const,
+        () => 'ticked' as const,
+      ),
+      pause(5_000).then(() => 'timed out' as const),
+    ]);
+    expect(ticked).toBe('ticked');
+    // The run's own outcome was saved before its lease went back.
+    expect(await runs.load('g:run:1')).toMatchObject({ phase: 'terminal' });
+  }, 30_000);
+
   it('completes a verified goal while its memory extraction is still running, then follows it', async () => {
     const extraction = heldExtraction();
     const goals = createInMemoryGoalRuntimeStore();
