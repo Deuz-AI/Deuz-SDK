@@ -39,7 +39,11 @@ export interface DurableFrame {
 export interface DurableJournal {
   /** Queues a frame; dropped once the journal halted. */
   push(frame: DurableFrame): void;
-  /** Commits and publishes everything queued, then gives the lease back. */
+  /**
+   * Commits everything queued, gives the lease back, then publishes what it
+   * committed: a client that starts the next leg as soon as it reads
+   * `[DONE]` finds the lease free.
+   */
   end(): Promise<void>;
   /** True once the journal failed closed. */
   readonly halted: boolean;
@@ -155,6 +159,15 @@ export async function openDurableJournal(host: DurableJournalHost): Promise<Dura
   let cancelRenewal: (() => void) | undefined;
   let inFlight: Promise<void> | undefined;
   let flushAgain = false;
+  // Once `end` began: the bytes of the batches committed since, sent after
+  // the lease went back (or before the error frame of a halt).
+  let ending = false;
+  let tail: Uint8Array[] = [];
+
+  const sendTail = (): void => {
+    for (const bytes of tail) host.enqueue(bytes);
+    tail = [];
+  };
 
   const stopTimers = (): void => {
     cancelWindow?.();
@@ -170,6 +183,8 @@ export async function openDurableJournal(host: DurableJournalHost): Promise<Dura
     queue = [];
     queuedBytes = 0;
     if (error !== undefined) host.onStoreError(error);
+    // Committed while ending: these frames precede the error.
+    sendTail();
     host.onHalt(message);
     void releaseLease(lease);
   };
@@ -215,7 +230,9 @@ export async function openDurableJournal(host: DurableJournalHost): Promise<Dura
     }
     // Committed, but the response may have failed closed meanwhile (a lost lease).
     if (halted) return;
-    for (const frame of batch) host.enqueue(frame.bytes);
+    for (const frame of batch)
+      if (ending) tail.push(frame.bytes);
+      else host.enqueue(frame.bytes);
   };
 
   const flush = (): void => {
@@ -282,13 +299,18 @@ export async function openDurableJournal(host: DurableJournalHost): Promise<Dura
       }
     },
     async end() {
+      ending = true;
       while (!halted && (queue.length > 0 || inFlight)) {
         if (inFlight) await inFlight;
         else flush();
       }
       ended = true;
       stopTimers();
-      if (!halted) await releaseLease(lease);
+      if (halted) return;
+      // Every frame is committed (and fenced): the lease goes back before the
+      // last frames, [DONE] among them, reach the client.
+      await releaseLease(lease);
+      sendTail();
     },
     get halted() {
       return halted;

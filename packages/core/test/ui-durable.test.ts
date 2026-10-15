@@ -848,3 +848,72 @@ describe('durable mode: the end of a leg', () => {
     expect(parts).not.toContain('done');
   });
 });
+
+describe('durable mode: handing the stream to the next leg', () => {
+  it('gives the lease back before the client reads [DONE], so the next leg can start at once', async () => {
+    const store = createInMemoryDurableStreamStateStore();
+    const inner = createInMemoryLeaseProvider();
+    const provider: LeaseProvider = {
+      acquire: (request) => inner.acquire(request),
+      renew: (lease, ttlMs, options) => inner.renew(lease, ttlMs, options),
+      signal: (key, signal) => inner.signal(key, signal),
+      async release(lease) {
+        await new Promise((resolve) => setTimeout(resolve, 5)); // one provider round trip
+        await inner.release(lease);
+      },
+    };
+    const run = (text: string) => {
+      const manual = manualResult();
+      manual.push(textPart(text));
+      manual.end();
+      return toDeuzStreamResponse(manual.result, {
+        streamId: 's',
+        messageId: 'm',
+        durable: { store, lease: { provider }, batch: { maxDelayMs: 0 } },
+      });
+    };
+    const reader = run('one').body!.getReader();
+    const decoder = new TextDecoder();
+    let text = '';
+    while (!text.includes('[DONE]')) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      text += decoder.decode(value);
+    }
+    expect(text).toContain('[DONE]');
+    expect(await run('two').text()).toContain('[DONE]');
+  });
+
+  it('sends what it committed while ending before the error of a failed last commit', async () => {
+    const recording = recordingStore();
+    const { advance, durable } = setup({ store: recording.store, batch: { maxBytes: 1 } });
+    const store: DurableStreamStateStore = {
+      ...recording.store,
+      async commit(batch) {
+        // The batch with the sentinel fails; the ones before it go through.
+        if (batch.records.some((record) => record.part.type === 'done'))
+          throw new Error('store down');
+        return recording.store.commit(batch);
+      },
+    };
+    recording.hold();
+    const manual = manualResult();
+    const response = toDeuzStreamResponse(manual.result, {
+      durable: { ...durable, store },
+      streamId: 's',
+      messageId: 'm',
+    });
+    const body = bodyReader(response);
+    manual.push(textPart('a'));
+    manual.end();
+    // The leg ends while its first batch (the start frame) is still committing.
+    await advance(0);
+    expect(recording.batches).toHaveLength(1);
+    recording.release();
+    const raw = await body.rest();
+    expect(raw).toBe(
+      frameText(0, { type: 'start', messageId: 'm' }) +
+        `data: ${JSON.stringify({ type: 'error', message: 'Durable stream: the stream store failed.' })}\n\n`,
+    );
+  });
+});
