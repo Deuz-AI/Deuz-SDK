@@ -26,6 +26,11 @@ CI with a real Docker engine and was verified on Windows 11 with Docker
 Desktop 29.8 (Linux containers, containerd image store). Only the Docker CLI is
 tested; `dockerPath` can name another binary, at your own risk.
 
+[`examples/23-docker-runner`](https://github.com/Deuz-AI/Deuz-SDK/tree/main/examples/23-docker-runner)
+runs both parts on a pinned alpine image without a key: sandbox runs under the
+defaults, a process with a staged file and a checked artifact, a host restart
+that reconnects instead of starting again, a cancel, and the cleanup calls.
+
 ## The sandbox
 
 ```ts
@@ -254,7 +259,9 @@ Nothing is deleted in the background.
   30 minutes past its start plus its run timeout.
 - `store.prune({ terminalBefore })` deletes the records of terminal operations
   (`exited`, `cancelled`, `lost`, `failed`, `disposed`) last updated before the
-  cutoff and returns the count.
+  cutoff and returns the count. The cutoff is exclusive: a record updated
+  exactly at it stays. A malformed `terminalBefore` throws a `TypeError`
+  before anything is deleted.
 
 ### Operation stores
 
