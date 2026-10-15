@@ -1,4 +1,4 @@
-<!-- verified: 2026-10-15 against @deuz-sdk/core@2.3.0 · api-contract sha256:99750a8aa5fa
+<!-- verified: 2026-10-15 against @deuz-sdk/core@2.3.0 · api-contract sha256:e126e881213b
      sources: packages/core/src/types/{chat-conditional,stream-durable}.ts, packages/core/src/{chat-conditional,stream-durable,ui,chat,chat-request,durable}.ts,
      packages/core/src/internal/capabilities.ts, packages/core/src/node/{chat-conditional-sqlite,chat-conditional-postgres,
      stream-state-sqlite,stream-state-postgres,stream-state-redis}.ts, packages/react/src/{use-chat,chat-snapshot,index}.ts,
@@ -8,7 +8,7 @@
 
 **Load when:** two writers can update one chat (a late run projection must never overwrite a newer chat or bring a deleted one back); past conversations should be searchable within a user's scope; a streamed answer must survive the producer or client dropping with no gap and no repeated frame; or a React chat must restore after a reload with the same message ids, its turn in progress, and its pending approvals or client tools. The 2.3 wire, `StreamStateStore` journaling and `useChat` basics are in `references/streaming-ui.md`.
 
-Everything is opt-in; a 2.3 client and a 2.3 route keep byte-identical behaviour. Docs: `/docs/modules/chat-durability` and `/docs/modules/transcript-search` (2.4).
+Everything is opt-in; a 2.3 client and a 2.3 route keep byte-identical behaviour. Docs: [/docs/modules/chat-durability](/docs/modules/chat-durability) and [/docs/modules/transcript-search](/docs/modules/transcript-search) (2.4).
 
 | Need | Use |
 | --- | --- |
@@ -139,6 +139,6 @@ export function Chat({ streamId }: { streamId: string }): ReactElement {
 
 ## Deep dive
 
-- `/docs/modules/chat-durability` and `/docs/modules/transcript-search` (2.4).
+- [/docs/modules/chat-durability](/docs/modules/chat-durability) and [/docs/modules/transcript-search](/docs/modules/transcript-search) (2.4).
 - [/docs/modules/ui-streaming](/docs/modules/ui-streaming), [/docs/modules/react-hooks](/docs/modules/react-hooks), [/docs/modules/chat-persistence](/docs/modules/chat-persistence).
 - [/docs/agents/unbreakable-chatbot](/docs/agents/unbreakable-chatbot) — `resumeDeuzChatResponse` and durable checkpoints.

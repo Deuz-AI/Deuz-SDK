@@ -1,4 +1,4 @@
-<!-- verified: 2026-10-15 against @deuz-sdk/core@2.3.0 · api-contract sha256:99750a8aa5fa
+<!-- verified: 2026-10-15 against @deuz-sdk/core@2.3.0 · api-contract sha256:e126e881213b
      sources: packages/core/src/{autonomy,plan,verify,workspace,compute,browser,runtime,evolve,schedule}.ts,
      packages/core/src/evolve/*.ts, packages/core/src/schedule/*.ts, packages/core/src/goal/*.ts,
      docs/content/docs/modules/{evolve,schedule,goals}.mdx,
@@ -552,4 +552,4 @@ The **autonomous agent** keeps that skeleton and swaps in the autonomy seams: `p
 - [/docs/modules/evolve](/docs/modules/evolve) — patches, the evaluation cascade, islands, novelty, budget, durable resume.
 - [/docs/modules/schedule](/docs/modules/schedule) — cron syntax, catch-up, durable dedupe with a swarm run, webhook verification.
 - [/docs/modules/goals](/docs/modules/goals) — goal records, transitions, waiting reasons, acceptance on evidence, wakeup and event envelopes, the store contract.
-- `/docs/modules/goal-runtime` and `/docs/modules/docker` (2.4) — the goal supervisor, durable scheduler, webhooks and acceptance; the Docker sandbox and process runner.
+- [/docs/modules/goal-runtime](/docs/modules/goal-runtime) and [/docs/modules/docker](/docs/modules/docker) (2.4) — the goal supervisor, durable scheduler, webhooks and acceptance; the Docker sandbox and process runner.

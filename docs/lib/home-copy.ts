@@ -83,7 +83,7 @@ export const homeCopy: Record<Locale, HomeCopy> = {
     skillsList: [
       {
         name: 'deuz-sdk',
-        body: 'The whole surface: the invariants, a task-to-file router, and eighteen reference files loaded only when a task needs them.',
+        body: 'The whole surface: the invariants, a task-to-file router, and twenty-five reference files loaded only when a task needs them.',
       },
       {
         name: 'migrate-from-ai-sdk',
@@ -150,7 +150,7 @@ export const homeCopy: Record<Locale, HomeCopy> = {
     skillsList: [
       {
         name: 'deuz-sdk',
-        body: 'Die gesamte Oberfläche: die Invarianten, ein Router von Aufgabe zu Datei und achtzehn Referenzdateien, die nur bei Bedarf geladen werden.',
+        body: 'Die gesamte Oberfläche: die Invarianten, ein Router von Aufgabe zu Datei und fünfundzwanzig Referenzdateien, die nur bei Bedarf geladen werden.',
       },
       {
         name: 'migrate-from-ai-sdk',
@@ -217,7 +217,7 @@ export const homeCopy: Record<Locale, HomeCopy> = {
     skillsList: [
       {
         name: 'deuz-sdk',
-        body: 'Yüzeyin tamamı: değişmezler, göreve göre dosya yönlendirmesi ve yalnızca gerektiğinde yüklenen on sekiz referans dosyası.',
+        body: 'Yüzeyin tamamı: değişmezler, göreve göre dosya yönlendirmesi ve yalnızca gerektiğinde yüklenen yirmi beş referans dosyası.',
       },
       {
         name: 'migrate-from-ai-sdk',
@@ -284,7 +284,7 @@ export const homeCopy: Record<Locale, HomeCopy> = {
     skillsList: [
       {
         name: 'deuz-sdk',
-        body: 'Toute la surface : les invariants, un routeur tâche-vers-fichier et dix-huit fichiers de référence chargés seulement quand la tâche l’exige.',
+        body: 'Toute la surface : les invariants, un routeur tâche-vers-fichier et vingt-cinq fichiers de référence chargés seulement quand la tâche l’exige.',
       },
       {
         name: 'migrate-from-ai-sdk',
@@ -351,7 +351,7 @@ export const homeCopy: Record<Locale, HomeCopy> = {
     skillsList: [
       {
         name: 'deuz-sdk',
-        body: 'L’intera superficie: gli invarianti, un router da attività a file e diciotto file di riferimento caricati solo quando servono.',
+        body: 'L’intera superficie: gli invarianti, un router da attività a file e venticinque file di riferimento caricati solo quando servono.',
       },
       {
         name: 'migrate-from-ai-sdk',
@@ -418,7 +418,7 @@ export const homeCopy: Record<Locale, HomeCopy> = {
     skillsList: [
       {
         name: 'deuz-sdk',
-        body: 'Toda la superficie: los invariantes, un enrutador de tarea a archivo y dieciocho archivos de referencia que se cargan solo cuando hacen falta.',
+        body: 'Toda la superficie: los invariantes, un enrutador de tarea a archivo y veinticinco archivos de referencia que se cargan solo cuando hacen falta.',
       },
       {
         name: 'migrate-from-ai-sdk',
@@ -485,7 +485,7 @@ export const homeCopy: Record<Locale, HomeCopy> = {
     skillsList: [
       {
         name: 'deuz-sdk',
-        body: 'Вся поверхность: инварианты, маршрутизатор «задача → файл» и восемнадцать справочных файлов, загружаемых только по необходимости.',
+        body: 'Вся поверхность: инварианты, маршрутизатор «задача → файл» и двадцать пять справочных файлов, загружаемых только по необходимости.',
       },
       {
         name: 'migrate-from-ai-sdk',
@@ -552,7 +552,7 @@ export const homeCopy: Record<Locale, HomeCopy> = {
     skillsList: [
       {
         name: 'deuz-sdk',
-        body: '表面のすべて: 不変条件、タスクからファイルへのルーター、必要なときだけ読み込まれる 18 個のリファレンス。',
+        body: '表面のすべて: 不変条件、タスクからファイルへのルーター、必要なときだけ読み込まれる 25 個のリファレンス。',
       },
       {
         name: 'migrate-from-ai-sdk',
@@ -619,7 +619,7 @@ export const homeCopy: Record<Locale, HomeCopy> = {
     skillsList: [
       {
         name: 'deuz-sdk',
-        body: '표면 전체: 불변 조건, 작업에서 파일로 가는 라우터, 필요할 때만 로드되는 18개의 레퍼런스 파일.',
+        body: '표면 전체: 불변 조건, 작업에서 파일로 가는 라우터, 필요할 때만 로드되는 25개의 레퍼런스 파일.',
       },
       {
         name: 'migrate-from-ai-sdk',
@@ -686,7 +686,7 @@ export const homeCopy: Record<Locale, HomeCopy> = {
     skillsList: [
       {
         name: 'deuz-sdk',
-        body: '完整接口：不变量、从任务到文件的路由，以及仅在需要时加载的十八个参考文件。',
+        body: '完整接口：不变量、从任务到文件的路由，以及仅在需要时加载的二十五个参考文件。',
       },
       { name: 'migrate-from-ai-sdk', body: '从 ai 与 @ai-sdk 系列包逐个名称验证过的迁移路径。' },
     ],

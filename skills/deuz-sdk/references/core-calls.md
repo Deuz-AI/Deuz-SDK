@@ -1,4 +1,4 @@
-<!-- verified: 2026-10-15 against @deuz-sdk/core@2.3.0 · api-contract sha256:99750a8aa5fa
+<!-- verified: 2026-10-15 against @deuz-sdk/core@2.3.0 · api-contract sha256:e126e881213b
      sources: packages/core/src/types/config.ts, packages/core/src/types/methods.ts,
      packages/core/src/internal/{fallback,stable-prefix,warnings}.ts, packages/core/src/adapters/*.ts,
      packages/core/src/types/stream.ts, packages/core/src/types/message.ts,

@@ -1,4 +1,4 @@
-<!-- verified: 2026-10-15 against @deuz-sdk/core@2.3.0 · api-contract sha256:99750a8aa5fa
+<!-- verified: 2026-10-15 against @deuz-sdk/core@2.3.0 · api-contract sha256:e126e881213b
      sources: packages/core/src/goal/runtime/{index,supervisor,supervisor-drive,supervisor-native,supervisor-shared,
      store,store-types,scheduler,webhook,delivery,verify-acceptance}.ts, packages/core/src/goal/{types,transition,acceptance,errors}.ts,
      packages/core/src/node/{goal-runtime-sqlite,goal-runtime-postgres}.ts, packages/core/src/schedule/*.ts,
@@ -9,7 +9,7 @@
 
 **Load when:** a goal (`references/autonomy-workspace.md`, `/goal`) must be driven to completion without a person ticking it — claimed by one process at a time, started and resumed as V3 native runs, retried on transient failures, woken by a durable cron schedule (with a time zone) or a verified webhook, charged exactly once for what its runs spent, and completed only on evidence your verifiers produced.
 
-`@deuz-sdk/core/goal/runtime` is edge-safe and preview where noted; the stores at `@deuz-sdk/core/goal/runtime/sqlite` and `@deuz-sdk/core/goal/runtime/postgres` are Node-only. Everything is a library loop or handler in your process: there is no service, daemon or control server, and nothing runs until you create one. Docs: `/docs/modules/goal-runtime` (2.4).
+`@deuz-sdk/core/goal/runtime` is edge-safe and preview where noted; the stores at `@deuz-sdk/core/goal/runtime/sqlite` and `@deuz-sdk/core/goal/runtime/postgres` are Node-only. Everything is a library loop or handler in your process: there is no service, daemon or control server, and nothing runs until you create one. Docs: [/docs/modules/goal-runtime](/docs/modules/goal-runtime) (2.4).
 
 | Piece | What it is |
 | --- | --- |
@@ -192,6 +192,6 @@ Limits: retries cover only failures the native run marks retryable; there is no 
 
 ## Deep dive
 
-- `/docs/modules/goal-runtime` (2.4) — the supervisor's drive order, every option, stores, scheduler, webhooks, acceptance.
+- [/docs/modules/goal-runtime](/docs/modules/goal-runtime) (2.4) — the supervisor's drive order, every option, stores, scheduler, webhooks, acceptance.
 - [/docs/modules/goals](/docs/modules/goals) — the goal records and transitions this runtime drives.
 - [/docs/modules/schedule](/docs/modules/schedule) — cron syntax, the in-process scheduler, signature verifiers.

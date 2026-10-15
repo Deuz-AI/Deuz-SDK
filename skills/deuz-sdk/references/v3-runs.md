@@ -1,4 +1,4 @@
-<!-- verified: 2026-10-15 against @deuz-sdk/core@2.3.0 · api-contract sha256:99750a8aa5fa
+<!-- verified: 2026-10-15 against @deuz-sdk/core@2.3.0 · api-contract sha256:e126e881213b
      sources: packages/core/src/types/agent-run-v3.ts, packages/core/src/types/agent-run.ts,
      packages/core/src/{agent-run,agent-run-v3,agent-run-v3-run,agent-run-v3-context,agent-run-v3-store}.ts,
      packages/core/src/node/{runs-v3-sqlite,runs-v3-postgres,headless}.ts, packages/core/src/agent.ts,
@@ -8,7 +8,7 @@
 
 **Load when:** a native run (`runAgent` / `streamAgent` / `resumeAgent` / `resumeStreamAgent` / `reconcileAgentRun`) should carry compiled context, working memory or versioned-memory writes across checkpoints and restarts; or you must know what a 2.3 process does with a database that 2.4 V3 runs share. The 2.3 native contract (validated output, receipts, approvals, leases, fail-over) is in `references/native-execution.md` and holds unchanged on V3.
 
-V3 is chosen per run: `checkpointVersion: 3` plus a session on an `AgentRunStoreV3`. Without it nothing changes, and a run with none of the 2.4 options sends provider requests byte-identical to 2.3's. Version 1 and 2 records are never converted: existing runs finish on the 2.3 path. Docs: `/docs/modules/native-agents#v3-runs-checkpointversion-3` (2.4).
+V3 is chosen per run: `checkpointVersion: 3` plus a session on an `AgentRunStoreV3`. Without it nothing changes, and a run with none of the 2.4 options sends provider requests byte-identical to 2.3's. Version 1 and 2 records are never converted: existing runs finish on the 2.3 path. Docs: [/docs/modules/native-agents#v3-runs-checkpointversion-3](/docs/modules/native-agents#v3-runs-checkpointversion-3) (2.4).
 
 ```ts
 import { createInMemoryAgentRunStoreV3, streamAgent } from '@deuz-sdk/core/agent';
@@ -91,6 +91,6 @@ console.log(result.status, record?.version, record?.context?.steps.length); // c
 
 ## Deep dive
 
-- `/docs/modules/native-agents#v3-runs-checkpointversion-3` (2.4) — stores, refusals, record fields, intents.
-- `/docs/modules/context` and `/docs/modules/retention` (2.4) — compile rules, forget redaction.
+- [/docs/modules/native-agents#v3-runs-checkpointversion-3](/docs/modules/native-agents#v3-runs-checkpointversion-3) (2.4) — stores, refusals, record fields, intents.
+- [/docs/modules/context](/docs/modules/context) and [/docs/modules/retention](/docs/modules/retention) (2.4) — compile rules, forget redaction.
 - [/docs/modules/native-agents](/docs/modules/native-agents) — the 2.3 native contract V3 builds on.

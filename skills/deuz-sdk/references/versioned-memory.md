@@ -1,4 +1,4 @@
-<!-- verified: 2026-10-15 against @deuz-sdk/core@2.3.0 · api-contract sha256:99750a8aa5fa
+<!-- verified: 2026-10-15 against @deuz-sdk/core@2.3.0 · api-contract sha256:e126e881213b
      sources: packages/core/src/memory/versioned/{index,types,session,store,tools,import,policy,accounting}.ts,
      packages/core/src/node/{vmem-sqlite,vmem-postgres,store-connection}.ts, packages/core/src/types/accounting.ts,
      packages/core/src/internal/accounting.ts, packages/core/src/memory.ts, packages/core/src/errors.ts,
@@ -8,7 +8,7 @@
 
 **Load when:** memory must be corrected, audited, shared between writers or forgotten on request — facts with a stable id and revisions, a source for every fact, an `asserted | inferred` origin a model cannot relabel, writes that apply once on retry, a re-embed onto a new model without downtime, or importing the 2.3 `deuz_memory` tables. For the legacy recall/extract seam around `generateText` / `streamChat` (`memory:`), read `references/memory-compaction.md`; it is unchanged and stays the simpler choice when no history is needed.
 
-`@deuz-sdk/core/memory/versioned` is opt-in and edge-safe. Its SQLite and PostgreSQL stores are Node-only: `@deuz-sdk/core/memory/versioned/sqlite` and `@deuz-sdk/core/memory/versioned/postgres`. Docs: `/docs/modules/versioned-memory` (2.4).
+`@deuz-sdk/core/memory/versioned` is opt-in and edge-safe. Its SQLite and PostgreSQL stores are Node-only: `@deuz-sdk/core/memory/versioned/sqlite` and `@deuz-sdk/core/memory/versioned/postgres`. Docs: [/docs/modules/versioned-memory](/docs/modules/versioned-memory) (2.4).
 
 | Piece | What it is |
 | --- | --- |
@@ -108,6 +108,6 @@ One LLM call per operation, even across conflict retries. `infer: false` stores 
 
 ## Deep dive
 
-- `/docs/modules/versioned-memory` (2.4) — every option, reconciliation, extraction policy, stores and limits.
-- `/docs/modules/retention` (2.4) — forget and V3 context packages, retention windows.
+- [/docs/modules/versioned-memory](/docs/modules/versioned-memory) (2.4) — every option, reconciliation, extraction policy, stores and limits.
+- [/docs/modules/retention](/docs/modules/retention) (2.4) — forget and V3 context packages, retention windows.
 - [/docs/modules/memory](/docs/modules/memory) — the legacy seam, and what changed in it in 2.4.

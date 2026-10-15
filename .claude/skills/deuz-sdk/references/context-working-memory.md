@@ -1,4 +1,4 @@
-<!-- verified: 2026-10-15 against @deuz-sdk/core@2.3.0 · api-contract sha256:99750a8aa5fa
+<!-- verified: 2026-10-15 against @deuz-sdk/core@2.3.0 · api-contract sha256:e126e881213b
      sources: packages/core/src/context/{index,types,compile,compiler,render,sources,count,defaults}.ts,
      packages/core/src/context/working-memory/{index,types,patch,tools}.ts, packages/core/src/internal/estimate-tokens.ts,
      packages/core/src/rag.ts, packages/core/src/plan.ts, packages/core/src/errors.ts,
@@ -8,7 +8,7 @@
 
 **Load when:** memory, RAG hits, past conversations and the skill catalog should share one token budget instead of each splicing text into the prompt; a long task must not lose its goal, constraints, active task, decisions and failed attempts across compaction or a restart; or you need to explain what context a step saw and why (the manifest), or count a request's tokens before sending it.
 
-Everything is in `@deuz-sdk/core/context` (edge-safe, off unless configured). `compileContext`, the sources and working memory are stable; `createContextCompiler` is a preview. The restart guarantees (stored packages, restored compiler state, redaction after a forget) belong to the V3 native run: `references/v3-runs.md`. Docs: `/docs/modules/context` (2.4).
+Everything is in `@deuz-sdk/core/context` (edge-safe, off unless configured). `compileContext`, the sources and working memory are stable; `createContextCompiler` is a preview. The restart guarantees (stored packages, restored compiler state, redaction after a forget) belong to the V3 native run: `references/v3-runs.md`. Docs: [/docs/modules/context](/docs/modules/context) (2.4).
 
 | Piece | What it does |
 | --- | --- |
@@ -157,6 +157,6 @@ console.log(forbidden.status, forbidden.status === 'rejected' && forbidden.reaso
 
 ## Deep dive
 
-- `/docs/modules/context` (2.4) — the full budget, refresh, placement and working memory rules.
-- `/docs/modules/transcript-search` (2.4) — the `TranscriptIndex` behind the transcript source.
+- [/docs/modules/context](/docs/modules/context) (2.4) — the full budget, refresh, placement and working memory rules.
+- [/docs/modules/transcript-search](/docs/modules/transcript-search) (2.4) — the `TranscriptIndex` behind the transcript source.
 - [/docs/modules/compaction](/docs/modules/compaction) — what compaction removes, and the V3 recompile on overflow.

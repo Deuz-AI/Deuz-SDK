@@ -1,4 +1,4 @@
-<!-- verified: 2026-10-15 against @deuz-sdk/core@2.3.0 · api-contract sha256:99750a8aa5fa
+<!-- verified: 2026-10-15 against @deuz-sdk/core@2.3.0 · api-contract sha256:e126e881213b
      sources: packages/core/src/internal/telemetry.ts, packages/core/src/types/{observe,methods,stream-durable,agent-run-v3,chat-conditional}.ts,
      packages/core/src/{otel,observe}.ts, packages/core/src/memory/versioned/types.ts, packages/core/src/goal/runtime/store-types.ts,
      packages/core/src/compute/docker/types.ts, packages/core/src/context/compiler.ts,
@@ -99,5 +99,5 @@ A forget does **not** reach chat records and the transcript index (tombstone the
 
 ## Deep dive
 
-- `/docs/modules/retention` (2.4) — the retention table, windows, forget and V3 packages.
+- [/docs/modules/retention](/docs/modules/retention) (2.4) — the retention table, windows, forget and V3 packages.
 - [/docs/modules/observability](/docs/modules/observability) and [/docs/reference/observe-events](/docs/reference/observe-events) — the event protocol and the 2.4 span table.

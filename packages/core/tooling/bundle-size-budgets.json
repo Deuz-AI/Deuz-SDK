@@ -343,12 +343,22 @@
     "  mcp-server (lazy): 389200 / 125750 -> 357400 / 115500 (measured 353818 / 114312)",
     "  goal-runtime: 133950 / 40900 -> 128850 / 39350 (measured 127527 / 38934)",
     "  goal-runtime (lazy): 370300 / 118500 -> 340000 / 108800 (measured 336623 / 107686)",
-    "  skills-learning (lazy): 119450 / 36300 -> 109650 / 33300 (measured 108558 / 32958)"
+    "  skills-learning (lazy): 119450 / 36300 -> 109650 / 33300 (measured 108558 / 32958)",
+    "",
+    "RAISED FOR 2.4 (W2 integration): the agent-run-v3-run optional chunk took the V3 package and store-check code that GA's S1-4 moved out of the eager graph, plus E2's retrieval-block redaction, +5%:",
+    "  edge/agent-run-v3-run lazy: 57850 / 20150 -> 62850 / 21850 (measured 59856 / 20805)",
+    "  native-agent/agent-run-v3-run lazy: 57500 / 20000 -> 62500 / 21750 (measured 59484 / 20688)",
+    "  native-swarm/agent-run-v3-run lazy: 60800 / 20950 -> 64450 / 22350 (measured 61334 / 21263)"
   ],
   "bundles": {
     "core": {
       "from": "@deuz-sdk/core",
-      "exports": ["streamChat", "generateText", "generateObject", "createClient"],
+      "exports": [
+        "streamChat",
+        "generateText",
+        "generateObject",
+        "createClient"
+      ],
       "maxRawBytes": 188300,
       "maxGzipBytes": 58600,
       "maxLazyRawBytes": 22500,
@@ -389,7 +399,12 @@
     },
     "edge": {
       "from": "@deuz-sdk/core/edge",
-      "exports": ["streamChat", "generateText", "generateObject", "createApprovalSigner"],
+      "exports": [
+        "streamChat",
+        "generateText",
+        "generateObject",
+        "createApprovalSigner"
+      ],
       "maxRawBytes": 184350,
       "maxGzipBytes": 57350,
       "maxLazyRawBytes": 22500,
@@ -458,8 +473,8 @@
         },
         "agent-run-v3-run": {
           "entryPoint": "agent-run-v3-run",
-          "maxRawBytes": 57850,
-          "maxGzipBytes": 20150
+          "maxRawBytes": 62850,
+          "maxGzipBytes": 21850
         }
       }
     },
@@ -543,14 +558,18 @@
         },
         "agent-run-v3-run": {
           "entryPoint": "agent-run-v3-run",
-          "maxRawBytes": 57500,
-          "maxGzipBytes": 20000
+          "maxRawBytes": 62500,
+          "maxGzipBytes": 21750
         }
       }
     },
     "native-swarm": {
       "from": "@deuz-sdk/core/swarm",
-      "exports": ["createSwarm", "createInMemorySwarmStore", "SwarmConflictError"],
+      "exports": [
+        "createSwarm",
+        "createInMemorySwarmStore",
+        "SwarmConflictError"
+      ],
       "maxRawBytes": 269850,
       "maxGzipBytes": 84750,
       "maxLazyRawBytes": 22500,
@@ -614,14 +633,18 @@
         },
         "agent-run-v3-run": {
           "entryPoint": "agent-run-v3-run",
-          "maxRawBytes": 60800,
-          "maxGzipBytes": 20950
+          "maxRawBytes": 64450,
+          "maxGzipBytes": 22350
         }
       }
     },
     "ops": {
       "from": "@deuz-sdk/core/ops",
-      "exports": ["createInMemoryLeaseProvider", "findStaleAgentRuns", "agentRunLeaseKey"],
+      "exports": [
+        "createInMemoryLeaseProvider",
+        "findStaleAgentRuns",
+        "agentRunLeaseKey"
+      ],
       "maxRawBytes": 3650,
       "maxGzipBytes": 1700
     },
@@ -688,7 +711,12 @@
     },
     "chat": {
       "from": "@deuz-sdk/core/chat",
-      "exports": ["applyUIPart", "uiFromMessages", "canonicalFromUI", "validateChatRequest"],
+      "exports": [
+        "applyUIPart",
+        "uiFromMessages",
+        "canonicalFromUI",
+        "validateChatRequest"
+      ],
       "maxRawBytes": 24500,
       "maxGzipBytes": 7850
     },
@@ -709,49 +737,78 @@
     },
     "otel": {
       "from": "@deuz-sdk/core/otel",
-      "exports": ["createOtelTracer", "createOtelObserver"],
+      "exports": [
+        "createOtelTracer",
+        "createOtelObserver"
+      ],
       "maxRawBytes": 21000,
       "maxGzipBytes": 6500
     },
     "observe": {
       "from": "@deuz-sdk/core/observe",
-      "exports": ["summarizeRun", "renderRunReport", "createMemoryObserver", "composeObservers"],
+      "exports": [
+        "summarizeRun",
+        "renderRunReport",
+        "createMemoryObserver",
+        "composeObservers"
+      ],
       "maxRawBytes": 27800,
       "maxGzipBytes": 10400
     },
     "speech": {
       "from": "@deuz-sdk/core/speech",
-      "exports": ["generateSpeech", "createOpenAISpeech", "createElevenLabs"],
+      "exports": [
+        "generateSpeech",
+        "createOpenAISpeech",
+        "createElevenLabs"
+      ],
       "maxRawBytes": 19100,
       "maxGzipBytes": 7000
     },
     "transcription": {
       "from": "@deuz-sdk/core/transcription",
-      "exports": ["transcribe", "createOpenAITranscription", "createDeepgram"],
+      "exports": [
+        "transcribe",
+        "createOpenAITranscription",
+        "createDeepgram"
+      ],
       "maxRawBytes": 22250,
       "maxGzipBytes": 7870
     },
     "video": {
       "from": "@deuz-sdk/core/video",
-      "exports": ["generateVideo", "submitVideo", "waitForVideo"],
+      "exports": [
+        "generateVideo",
+        "submitVideo",
+        "waitForVideo"
+      ],
       "maxRawBytes": 20720,
       "maxGzipBytes": 7390
     },
     "guardrails": {
       "from": "@deuz-sdk/core/guardrails",
-      "exports": ["promptInjectionGuardrail", "maxOutputLength", "maxToolResultLength"],
+      "exports": [
+        "promptInjectionGuardrail",
+        "maxOutputLength",
+        "maxToolResultLength"
+      ],
       "maxRawBytes": 1450,
       "maxGzipBytes": 700
     },
     "openai-provider": {
       "from": "@deuz-sdk/core/openai",
-      "exports": ["createOpenAI", "createOpenAIResponses"],
+      "exports": [
+        "createOpenAI",
+        "createOpenAIResponses"
+      ],
       "maxRawBytes": 1000,
       "maxGzipBytes": 600
     },
     "mcp-server": {
       "from": "@deuz-sdk/core/mcp/server",
-      "exports": ["createMcpServer"],
+      "exports": [
+        "createMcpServer"
+      ],
       "maxRawBytes": 18250,
       "maxGzipBytes": 6570,
       "maxLazyRawBytes": 357400,
@@ -794,7 +851,11 @@
     },
     "batch": {
       "from": "@deuz-sdk/core/batch",
-      "exports": ["createBatchClient", "createMemoryBatchJobStore", "BatchError"],
+      "exports": [
+        "createBatchClient",
+        "createMemoryBatchJobStore",
+        "BatchError"
+      ],
       "maxRawBytes": 101500,
       "maxGzipBytes": 30000
     },
@@ -839,7 +900,9 @@
     },
     "skills-node": {
       "from": "@deuz-sdk/core/skills/node",
-      "exports": ["nodeSkillSource"],
+      "exports": [
+        "nodeSkillSource"
+      ],
       "maxRawBytes": 5400,
       "maxGzipBytes": 2350
     },
@@ -883,7 +946,9 @@
     },
     "skills-learning": {
       "from": "@deuz-sdk/core/skills/learning",
-      "exports": ["proposeSkillFromRun"],
+      "exports": [
+        "proposeSkillFromRun"
+      ],
       "maxRawBytes": 19750,
       "maxGzipBytes": 7450,
       "maxLazyRawBytes": 109650,

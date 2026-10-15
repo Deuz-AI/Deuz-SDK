@@ -1,4 +1,4 @@
-<!-- verified: 2026-10-15 against @deuz-sdk/core@2.3.0 · api-contract sha256:99750a8aa5fa
+<!-- verified: 2026-10-15 against @deuz-sdk/core@2.3.0 · api-contract sha256:e126e881213b
      sources: packages/core/src/{rag.ts, rag-node.ts, skills.ts, skills/node.ts, parts.ts, ui.ts, voyage.ts, node/store-postgres.ts},
      packages/core/src/internal/rerank-http.ts, packages/core/src/node/headless.ts,
      packages/core/src/types/{tool.ts, stream.ts, methods.ts, message.ts},
@@ -454,7 +454,7 @@ try {
 
 - [/docs/modules/rag](/docs/modules/rag) — the full RAG pipeline in prose, with the parser, chunker, retrieval and native-document sections.
 - [/docs/modules/skills](/docs/modules/skills) — Agent Skills end to end: format, registry, sources, matchers, tool scoping, path safety.
-- `/docs/reference/whats-new-2-4` (2.4) — the skill proposal and its limits.
+- [/docs/reference/whats-new-2-4](/docs/reference/whats-new-2-4) (2.4) — the skill proposal and its limits.
 - [/docs/core/embeddings](/docs/core/embeddings) — `embed` / `embedMany`, the `EmbeddingModel` kind, `taskType` and dimension truncation.
 - [/docs/modules/ui-streaming](/docs/modules/ui-streaming) — the `citation` and `data-{name}` wire parts and how a client reads them.
 - [/docs/agents/tool-loop](/docs/agents/tool-loop) — how `maxSteps` and tool execution work around a retrieval or skill-loading tool.

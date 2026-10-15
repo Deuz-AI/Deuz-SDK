@@ -50,6 +50,16 @@ const NUMBERS = [
   'eighteen',
   'nineteen',
   'twenty',
+  'twenty-one',
+  'twenty-two',
+  'twenty-three',
+  'twenty-four',
+  'twenty-five',
+  'twenty-six',
+  'twenty-seven',
+  'twenty-eight',
+  'twenty-nine',
+  'thirty',
 ];
 
 describe('operations.mdx: Postgres serialization retries', () => {
@@ -195,7 +205,7 @@ describe('home-copy.ts: the deuz-sdk skill card (W3 review V4-4)', () => {
       name.endsWith('.md'),
     ).length;
     const copy = read('docs/lib/home-copy.ts');
-    const english = copy.match(/a task-to-file router, and (\w+) reference files/);
+    const english = copy.match(/a task-to-file router, and ([\w-]+) reference files/);
     expect(english).not.toBeNull();
     expect(NUMBERS.indexOf(english![1]!)).toBe(files);
     // The locales that write the count in digits (ja, ko).

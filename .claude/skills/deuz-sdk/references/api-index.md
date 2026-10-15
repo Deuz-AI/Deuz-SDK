@@ -1,7 +1,7 @@
 <!-- GENERATED FILE — do not hand-edit.
      regenerate: node packages/core/tooling/skills/generate-api-index.mjs --date YYYY-MM-DD
      source: packages/core/{package.json exports, tsup.config.ts} + src walk (export * followed)
-     verified: 2026-10-15 against @deuz-sdk/core@2.3.0 · api-contract sha256:99750a8aa5fa -->
+     verified: 2026-10-15 against @deuz-sdk/core@2.3.0 · api-contract sha256:e126e881213b -->
 
 # API index — every subpath, every export
 
@@ -101,7 +101,7 @@ Deterministic mock models, SSE fixtures, fetch mocks, eval runners and versioned
 
 ## `@deuz-sdk/core/workspace`
 
-A file-tree seam agents use as externalized memory, plus the tools that drive it.
+A file-tree seam agents use as externalized memory, plus the tools that drive it and digestWorkspace (2.4).
 
 **Values** (4): createInMemoryWorkspace, createWorkspaceTools, digestWorkspace, normalizeWorkspacePath
 
@@ -141,7 +141,7 @@ Preview (Node only): local Docker sandbox for the compute tools and a reconnecta
 
 ## `@deuz-sdk/core/agent`
 
-Native run/stream/resume/reconcile, validated outputs, execution policies, shared and persistent budgets; also createAgent templates and handoff.
+Native run/stream/resume/reconcile, validated outputs, execution policies, shared and persistent budgets, V3 runs (checkpointVersion 3, 2.4); also createAgent templates and handoff.
 
 **Values** (18): BudgetLedgerError, BudgetStoreError, createAgent, createBudgetLedger, createExecutionContext, createInMemoryAgentRunStore, createInMemoryAgentRunStoreV3, createInMemoryBudgetStore, ExecutionPersistenceError, ExecutionPolicyError, handoff, intersectExecutionPolicies, reconcileAgentRun, resumeAgent, resumeStreamAgent, runAgent, streamAgent, UnsupportedStoreError
 
@@ -189,7 +189,7 @@ Leases for cross-process runs: the LeaseProvider contract, an in-memory provider
 
 ## `@deuz-sdk/core/ops/sqlite`
 
-Node-only SQLite leases, native agent run store, schedule claims and persistent budget store.
+Node-only SQLite leases, native agent run store, V3 run store (2.4), schedule claims and persistent budget store.
 
 **Values** (5): createSqliteAgentRunStoreV3, createSqliteBudgetStore, createSqliteOpsStore, RUNS_V3_SCHEMA_NAME, RUNS_V3_SCHEMA_VERSION
 
@@ -197,7 +197,7 @@ Node-only SQLite leases, native agent run store, schedule claims and persistent 
 
 ## `@deuz-sdk/core/ops/postgres`
 
-Node-only Postgres leases, native agent run store, schedule claims and persistent budget store.
+Node-only Postgres leases, native agent run store, V3 run store (2.4), schedule claims and persistent budget store.
 
 **Values** (3): createPostgresAgentRunStoreV3, createPostgresBudgetStore, createPostgresOpsStore
 
@@ -229,7 +229,7 @@ Node-only SQLite population store for evolve.
 
 ## `@deuz-sdk/core/schedule`
 
-Five-field UTC cron, a tick-driven scheduler with dedupe, and verified webhooks.
+Five-field UTC cron, a tick-driven scheduler with dedupe, verified webhooks, and IANA time-zone and DST helpers (2.4).
 
 **Values** (14): assertTimeZone, createInMemoryClaim, createScheduler, handleSignal, nextOccurrence, nextZonedOccurrence, occurrencesBetween, parseCron, previousOccurrence, timeZoneOffset, verifyGitHubWebhook, verifyHmacSignature, verifySlackRequest, zonedOccurrencesBetween
 
@@ -463,9 +463,9 @@ One token budget for memory, RAG, transcript and skills: compileContext, the con
 
 Edge-safe RAG: sniff, parse, chunk, embed, dense + BM25 hybrid retrieval, citations.
 
-**Values** (30): approxCountTokens, chunkBlocks, chunkFixed, chunkRecursive, citationsFromHits, COHERE_RERANK_DEFAULT_MODEL, cosineSimilarity, countTokensWith, createBm25Index, createCohereReranker, createMemoryVectorStore, createParserRegistry, csvToText, DEFAULT_CHUNK_OPTIONS, DEFAULT_SEPARATORS, estimatePdfTokens, estimateTokens, hybridRetrieve, identityReranker, indexChunks, modelSupportsDocuments, parse, parseCsv, RagError, reciprocalRankFusion, retrieve, shouldSendWhole, sniffMime, tokenize, toNativeDocumentPart
+**Values** (31): approxCountTokens, chunkBlocks, chunkFixed, chunkRecursive, citationsFromHits, COHERE_RERANK_DEFAULT_MODEL, cosineSimilarity, countTokensWith, createBm25Index, createCohereReranker, createMemoryVectorStore, createParserRegistry, csvToText, DEFAULT_CHUNK_OPTIONS, DEFAULT_SEPARATORS, defineAccountedEmbedder, estimatePdfTokens, estimateTokens, hybridRetrieve, identityReranker, indexChunks, modelSupportsDocuments, parse, parseCsv, RagError, reciprocalRankFusion, retrieve, shouldSendWhole, sniffMime, tokenize, toNativeDocumentPart
 
-**Types** (29): Bm25Index, Bm25Options, Chunk, ChunkOptions, CitationOptions, CohereRerankerSettings, Container, CountTokens, DocBlock, DocBlockType, DocMime, DocumentParser, EmbeddedChunk, Embedder, EmbeddingAccountingOptions, HybridRetrieveDeps, HybridRetrieveOptions, ParsedDocument, ParserRegistry, RagErrorCode, Reranker, RetrieveDeps, RetrieveOptions, RrfOptions, ScoredChunk, SendWholeInput, SniffResult, VectorStore, WithAccountedEmbedder
+**Types** (31): AccountedEmbedder, AccountedEmbeddings, Bm25Index, Bm25Options, Chunk, ChunkOptions, CitationOptions, CohereRerankerSettings, Container, CountTokens, DocBlock, DocBlockType, DocMime, DocumentParser, EmbeddedChunk, Embedder, EmbeddingAccountingOptions, HybridRetrieveDeps, HybridRetrieveOptions, ParsedDocument, ParserRegistry, RagErrorCode, Reranker, RetrieveDeps, RetrieveOptions, RrfOptions, ScoredChunk, SendWholeInput, SniffResult, VectorStore, WithAccountedEmbedder
 
 ## `@deuz-sdk/core/rag/node`
 
@@ -557,7 +557,7 @@ The same MCP server over stdio (Node only).
 
 ## `@deuz-sdk/core/stores/sqlite`
 
-One factory for memory + chat + session + run stores on node:sqlite.
+One factory for memory + chat + session + run stores on node:sqlite; conditional chat store with transcript index and durable stream store (2.4).
 
 **Values** (3): createSqliteConditionalChatStore, createSqliteDurableStreamStateStore, createSqliteStores
 
@@ -565,7 +565,7 @@ One factory for memory + chat + session + run stores on node:sqlite.
 
 ## `@deuz-sdk/core/stores/redis`
 
-The same four store seams on Redis (runs since 2.3), over node-redis or a wrapped ioredis client.
+The same four store seams on Redis (runs since 2.3), over node-redis or a wrapped ioredis client; durable stream store (2.4).
 
 **Values** (3): createRedisDurableStreamStateStore, createRedisStores, wrapIoredisClient
 
@@ -573,7 +573,7 @@ The same four store seams on Redis (runs since 2.3), over node-redis or a wrappe
 
 ## `@deuz-sdk/core/stores/postgres`
 
-The same four store seams on Postgres (pgvector when available).
+The same four store seams on Postgres (pgvector when available); conditional chat store with transcript index and durable stream store (2.4).
 
 **Values** (3): createPostgresConditionalChatStore, createPostgresDurableStreamStateStore, createPostgresStores
 
@@ -621,9 +621,9 @@ A curated re-export subset guaranteed to contain nothing Node-only.
 
 ## `@deuz-sdk/core/ui`
 
-The Deuz UI wire: SSE responses (native agent runs included), resumable streams, and the client-side reader.
+The Deuz UI wire: SSE responses (native agent runs included), resumable streams, durable streams and the capability handshake (2.4), and the client-side reader.
 
-**Values** (20): agentStateFromParts, connectDeuzStream, createDeuzStream, createInMemoryDurableStreamStateStore, createInMemoryStreamStateStore, DEFAULT_DURABLE_STREAM_BATCH, DEUZ_CAPABILITIES, DEUZ_CAPABILITIES_HEADER, DEUZ_CAPABILITY, DEUZ_STREAM_VERSION, DEUZ_STREAM_VERSIONS, formatDeuzCapabilities, negotiateDeuzStreamVersion, parseDeuzCapabilities, readDeuzStream, resumeDeuzStreamResponse, toDeuzAgentStreamResponse, toDeuzObjectStreamResponse, toDeuzStreamResponse, toDeuzTextStreamResponse
+**Values** (21): agentStateFromParts, connectDeuzStream, createDeuzStream, createInMemoryDurableStreamStateStore, createInMemoryStreamStateStore, DEFAULT_DURABLE_STREAM_BATCH, DEFAULT_DURABLE_STREAM_RETAIN_MS, DEUZ_CAPABILITIES, DEUZ_CAPABILITIES_HEADER, DEUZ_CAPABILITY, DEUZ_STREAM_VERSION, DEUZ_STREAM_VERSIONS, formatDeuzCapabilities, negotiateDeuzStreamVersion, parseDeuzCapabilities, readDeuzStream, resumeDeuzStreamResponse, toDeuzAgentStreamResponse, toDeuzObjectStreamResponse, toDeuzStreamResponse, toDeuzTextStreamResponse
 
 **Types** (31): ConnectDeuzStreamOptions, CreateDeuzStreamOptions, DeuzAgentClientCall, DeuzAgentFrame, DeuzAgentResultFrame, DeuzAgentState, DeuzAgentStatus, DeuzAgentUnknownEffect, DeuzCapabilitiesOptions, DeuzCapabilitiesPart, DeuzCapability, DeuzStreamDoneRecord, DeuzStreamSource, DeuzStreamWriter, DeuzUIPart, DeuzWireVersion, DurableStreamBatch, DurableStreamBatchOptions, DurableStreamCommitResult, DurableStreamOpenResult, DurableStreamOptions, DurableStreamStateStore, InMemoryStreamStateStoreOptions, ReadDeuzStreamOptions, ResumeDeuzStreamOptions, StreamStateRecord, StreamStateStore, ToDeuzAgentStreamOptions, ToDeuzStreamOptions, ToDeuzTextStreamOptions, WriteDataOptions
 
@@ -637,7 +637,7 @@ Deprecated (2.4), removed in 3.0: legacy in-core React hooks, frozen at 2.2 (no 
 
 ## `@deuz-sdk/core/chat`
 
-The pure chat state engine plus validateChatRequest — the gate in front of client history.
+The pure chat state engine plus validateChatRequest — the gate in front of client history; conditional chat stores and the transcript index (2.4).
 
 **Values** (22): applyUIPart, assistantMessageFromTurn, branchBeforeUserMessage, canonicalFromUI, clientToolResultMessage, createAssistantTurn, createInMemoryChatStore, createInMemoryConditionalChatStore, createInMemoryTranscriptIndex, deserializeChatRecord, dropTrailingAssistant, filesToImageParts, indexChat, isConditionalChatStore, parseDeuzChatRequest, RevisionConflictError, sealAssistantTurn, serializeChatRecord, uiFromMessages, updateConditionalChat, userMessageFromInput, validateChatRequest
 
@@ -653,7 +653,7 @@ File-backed chat store (Node only).
 
 ## `@deuz-sdk/react`
 
-React hooks and components: useChat, useObject, approval card, cost badge.
+React hooks and components: useChat, useObject, approval card, cost badge, chat snapshots (2.4).
 
 **Values** (5): CostBadge, partsFromFiles, ToolApprovalCard, useChat, useObject
 
@@ -893,12 +893,14 @@ Reverse lookup for "which subpath do I import this from?". Root exports are omit
 - `DEFAULT_DOCKER_SANDBOX` — `compute/docker`
 - `DEFAULT_DURABLE_SCHEDULER` — `goal/runtime`
 - `DEFAULT_DURABLE_STREAM_BATCH` — `ui`
+- `DEFAULT_DURABLE_STREAM_RETAIN_MS` — `ui`
 - `DEFAULT_GOAL_RUNTIME_POLICY` — `goal/runtime`
 - `DEFAULT_GOAL_SUPERVISOR` — `goal/runtime`
 - `DEFAULT_SEPARATORS` — `rag`
 - `defaultHashFn` — `memory`
 - `defaultMemoryScorer` — `memory`
 - `defaultNodeParserRegistry` — `rag/node`
+- `defineAccountedEmbedder` — `rag`
 - `defineAccountedMemoryLLM` — `memory`, `memory/versioned`
 - `deleteGeminiCache` — `google/extras`
 - `deserializeChatRecord` — `chat`

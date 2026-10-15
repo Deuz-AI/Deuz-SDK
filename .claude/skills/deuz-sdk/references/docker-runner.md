@@ -1,4 +1,4 @@
-<!-- verified: 2026-10-15 against @deuz-sdk/core@2.3.0 · api-contract sha256:99750a8aa5fa
+<!-- verified: 2026-10-15 against @deuz-sdk/core@2.3.0 · api-contract sha256:e126e881213b
      sources: packages/core/src/compute/docker/{index,types,errors,engine,sandbox,runner,memory-store,store-shared}.ts,
      packages/core/src/node/{process-ops-sqlite,compute}.ts, packages/core/src/types/compute.ts, packages/core/src/compute.ts,
      .changeset/{2-4-l6,2-4-fc}.md, docs/content/docs/modules/docker.mdx (lane D1) -->
@@ -7,7 +7,7 @@
 
 **Load when:** model-written code must run isolated (not as a child of your host, which `createNodeSandbox` is), or a long process must survive your host restarting — reconnect instead of starting twice, cancel reliably, read its output and files after it stopped. Also when upgrading `createNodeSandbox` users: its 2.4 behaviour changes are at the end.
 
-`@deuz-sdk/core/compute/docker` is Node-only and preview (the API may change in 2.5; the stored record is versioned). It drives the Docker CLI as a child process with `shell: false` and targets Linux containers; it was verified with Docker Desktop on Windows 11 and a Linux engine in CI. It never mounts a host directory or the Docker socket and never pulls an image. Docs: `/docs/modules/docker` (2.4).
+`@deuz-sdk/core/compute/docker` is Node-only and preview (the API may change in 2.5; the stored record is versioned). It drives the Docker CLI as a child process with `shell: false` and targets Linux containers; it was verified with Docker Desktop on Windows 11 and a Linux engine in CI. It never mounts a host directory or the Docker socket and never pulls an image. Docs: [/docs/modules/docker](/docs/modules/docker) (2.4).
 
 | Piece | What it is |
 | --- | --- |
@@ -101,5 +101,5 @@ Every container gets `--cap-drop ALL`, `--security-opt no-new-privileges`, `--re
 
 ## Deep dive
 
-- `/docs/modules/docker` (2.4) — start order, recovery, cancel, artifacts, reconcile, errors and limits.
+- [/docs/modules/docker](/docs/modules/docker) (2.4) — start order, recovery, cancel, artifacts, reconcile, errors and limits.
 - [/docs/modules/autonomy](/docs/modules/autonomy) — `codeActTool`, `shellTool` and the `ComputeSandbox` seam.
