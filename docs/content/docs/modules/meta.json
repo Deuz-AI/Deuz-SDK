@@ -17,6 +17,7 @@
     "evolve",
     "memory",
     "versioned-memory",
+    "context",
     "stores",
     "chat-persistence",
     "compaction",

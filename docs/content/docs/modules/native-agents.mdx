@@ -1,11 +1,16 @@
 ---
 title: Native agents
-description: Typed agent results, strict native checkpoints, tool receipts, verification, and shared execution budgets in 2.1.
+description: Typed agent results, strict native checkpoints, tool receipts, verification, shared execution budgets, and the V3 run path with compiled context, working memory and versioned memory (2.4).
 ---
 
 `runAgent` and `streamAgent` provide the optional native agent engine. Existing
 `generateText`, `streamChat`, and `createAgent` methods retain their existing
 contracts. Import the native functions from `@deuz-sdk/core/agent`.
+
+2.4 adds an opt-in third record version for runs that carry compiled context,
+working memory and versioned-memory writes: see
+[V3 runs](#v3-runs-checkpointversion-3). Without `checkpointVersion: 3`, runs
+behave as the rest of this page describes.
 
 ## A typed, validated result
 
@@ -179,7 +184,7 @@ and absent from a run that does not use the feature:
 
 | Field | What it records |
 | --- | --- |
-| `memory` (`AgentRunMemoryState`) | The run's memory scope, the one recall it was given (`recall.status`, with the message's `index` and `count`), and, once the run completed, its extraction: an `operationId` recorded `pending` with the terminal commit, then `completed` or `failed`. See [Memory](#memory). |
+| `memory` (`AgentRunMemoryState`) | The run's memory scope, the one recall it was given (`recall.status`, with the message's `index` and `count`), and, once the run completed, its extraction: an `operationId` recorded `pending` with the terminal commit, then `completed` or `failed`. Since 2.4 the extraction also records `planned`, the store mutations it planned, before it writes any memory. See [Memory](#memory). |
 | `transcript` (`AgentRunTranscript`) | The run's user-facing transcript, kept for `chat` and `memory`: the caller's input, then the run's turns as they happened. Append-only, so compaction or a `prepareStep` history never rewrites it. See [Chat projection](#chat-projection). |
 | `chat` (`AgentRunChatState`) | Where the chat projection stands: the `cursor` of acknowledged messages, the projected `messageIds`, which assistant turn and tool invocation is which message, and the last attempt's `status` (`'saved'`, `'failed'`, `'scope-mismatch'` or `'superseded'`). See [Chat projection](#chat-projection). |
 | `models` (`AgentRunModelState`) | Written at the first fail-over: the model the run's calls go to now, each fail-over so far (the failed model, the next one, the model step, the phase and the error) and the rules' version. See [Model fail-over](#model-fail-over). |
@@ -661,11 +666,34 @@ the legacy loops. The run waits for the extraction before it resolves.
 
 A resume of a run that already ended (a terminal resume) never extracts again
 and never calls a model. When an interruption or a failed save leaves an
-extraction `pending` (or `failed`), `reconcileAgentRun` settles it. When the
-memory store already holds records of that operation, it records the extraction
-as completed without another memory LLM call; otherwise it runs the extraction
-now. Extraction is therefore at least once and never silent; dedup by content
-hash keeps a repeat from writing the same fact twice.
+extraction `pending` (or `failed`), `reconcileAgentRun` settles it.
+
+Since 2.4 the run saves how many store mutations its extraction planned
+(`AgentRunMemoryExtraction.planned`) before it writes any memory, and writes
+nothing when that save fails: the extraction is then `failed`, and a later
+`reconcileAgentRun` runs it again. Deletions, which leave no record to find, are
+applied first and counted in `mutations`. `reconcileAgentRun` records the
+extraction `completed` without another memory LLM call only when every planned
+mutation is confirmed in the memory store. When only some are, it records the
+extraction `failed` with the confirmed count in `mutations` and an error with
+code `'memory-extraction-partial'`, never runs that pass again, and reports a
+`memory-extraction-partial` warning on `AgentRunReconciliation.warnings` (and to
+`deps.logger.warn`). With nothing of the operation in the store, it runs the
+extraction now. An extraction record a 2.3 process left without `planned` is
+settled as in 2.3: any record of the operation counts as completed. Extraction
+is therefore at least once and never silent; dedup by content hash keeps a
+repeat from writing the same fact twice.
+
+2.4 behaviour changes in this path: a record that an extraction updates now
+carries that extraction's `metadata.deuz` ids instead of those of the operation
+that wrote it before; a run saves its record once more per extraction (twice
+more when it both deletes and writes records); and a completed reconciliation no
+longer keeps the error of an earlier failed attempt. The run's memory also
+reports its 2.4 warnings (`embedding-mismatch` from the recall,
+`unaccounted-usage` for a memory LLM or embedder that reports no usage) as
+`warning` parts on its stream, and charges the memory LLM and embedder calls to
+the run's execution context unless you set `seams.execution` yourself (see
+[Memory](/docs/modules/memory#embedding-mismatch-and-accounting-24)).
 
 Call `reconcileAgentRun` only when no executor drives the run. An extraction
 stays `pending` from the terminal commit until its outcome is saved, also while
@@ -769,10 +797,18 @@ The two stores are written one after the other, never as one transaction:
   `status: 'superseded'`, a resume reports a `warning` part, and
   `reconcileAgentRun` returns `chat: 'superseded'`. The run's turns stay in its
   checkpoint (`AgentRunEnvelope.transcript`), and no later repair tries again.
-  The check reads the record right before the write, and `ChatStore` has no
-  conditional write, so a save that lands in between is still overwritten. A
-  leg that runs (a resume that continues the run) writes its whole projection,
-  and the last writer wins, as in the legacy loops.
+  The check reads the record right before the write, and a legacy `ChatStore`
+  has no conditional write, so a save that lands in between is still
+  overwritten. A leg that runs (a resume that continues the run) writes its
+  whole projection, and the last writer wins, as in the legacy loops.
+- With a [`ConditionalChatStore`](/docs/modules/chat-durability#conditional-chat-stores)
+  (2.4) the projection is written with `writeChat` at the revision it read,
+  instead of `loadChat` followed by `saveChat`. On a conflict the run reads the
+  chat again and decides again, three attempts in all; after that its chat state
+  is `failed` with a `RevisionConflictError`, and a later save or
+  `reconcileAgentRun` repairs it. A deleted chat (a tombstone) makes the
+  projection `superseded`, whether a late repair or a running leg meets it, with
+  a chat warning. Runs with other chat stores behave as above.
 - A failed checkpoint publishes nothing to the chat.
 
 ```ts
@@ -853,6 +889,230 @@ console.log(result.status, result.text); // completed Answered by the fallback.
 
 Provider behavior in this section is derived from the providers' documented
 wire shapes and tested offline; none of it is live-verified.
+
+## V3 runs (`checkpointVersion: 3`)
+
+2.4 adds a third native record version for runs that carry
+[compiled context](/docs/modules/context), [working memory](/docs/modules/context#working-memory)
+and [versioned-memory](/docs/modules/versioned-memory) writes. Choose it per
+run with `checkpointVersion: 3` and a session on an `AgentRunStoreV3`.
+`runAgent`, `streamAgent`, `resumeAgent`, `resumeStreamAgent` and
+`reconcileAgentRun` all take the V3 options, and the same executor runs both
+paths. Without `checkpointVersion: 3` nothing changes, and a run with none of
+the 2.4 options sends provider requests byte-identical to 2.3's.
+
+```ts
+import { createInMemoryAgentRunStoreV3, streamAgent } from '@deuz-sdk/core/agent';
+import { createRagContextSource } from '@deuz-sdk/core/context';
+import { createMockModel } from '@deuz-sdk/core/testing';
+
+const runs = createInMemoryAgentRunStoreV3();
+const stream = streamAgent({
+  checkpointVersion: 3,
+  session: { store: runs, runId: 'deploy-1', scope: 'acme' },
+  model: createMockModel({ responses: [{ text: 'Run CI, then deploy to eu-west.' }] }),
+  prompt: 'How do I deploy?',
+  context: {
+    sources: [
+      createRagContextSource({
+        retrieve: async () => [{ text: 'Deploys need a green CI run.', index: 0, score: 0.9 }],
+      }),
+    ],
+  },
+  workingMemory: { create: { scope: 'acme', goal: 'Deploy the billing service.', now: Date.now() } },
+});
+
+for await (const event of stream.eventsV3) {
+  if (event.type === 'context') console.log('context', event.step, event.manifest.refresh); // context 0 initial
+}
+const result = await stream.result;
+const record = await runs.load('deploy-1');
+console.log(result.status, record?.version, record?.context?.steps.length); // completed 3 1
+console.log((await runs.getBlob(record!.context!.steps[0]!.blob.digest)).status); // found
+```
+
+### Stores
+
+| Store | Import | Notes |
+| --- | --- | --- |
+| `createInMemoryAgentRunStoreV3({ deps? })` | `@deuz-sdk/core/agent` | Tests and one process; times from `deps.clock` |
+| `createSqliteAgentRunStoreV3({ path, wal?, clock? } \| { database, clock? })` | `@deuz-sdk/core/ops/sqlite` | A `path` is opened and closed by the store; a `database` handle is borrowed and left open |
+| `createPostgresAgentRunStoreV3({ pool \| connectionString, schema? })` | `@deuz-sdk/core/ops/postgres` | Needs a pool with `connect()`; `schema` defaults to `'public'`; `migrate()` creates the tables; `close()` ends only a pool it opened; every write is one SERIALIZABLE transaction |
+
+Times come from the store's clock: the injected clock for the in-memory and
+SQLite stores, the database clock for Postgres. V3 runs live in their own
+tables (`deuz_runs_v3`, `_blobs`, `_blob_records`, `_blob_refs`, `_forgotten`)
+with their own version table, `deuz_runs_v3_schema`. The 2.3 run tables and
+`deuz_ops_schema` are never touched, so a 2.3 process still opens the same
+database, its run listing and pruning never see a V3 run, and its
+`resumeAgent` and `reconcileAgentRun` refuse a V3 record (`Native checkpoint
+version, identity, or scope mismatch.`) before calling a model or a tool.
+
+An `AgentRunStoreV3` accepts only version 3 envelopes: a V3 run is never written
+back as version 1 or 2, terminal and bookkeeping saves included. A save must
+carry the stored revision plus one, otherwise it throws `RevisionConflictError`
+(`code: 'revision_conflict'`, `subsystem: 'run'`, with the expected and the
+stored revision). `list(query)` pages like `AgentRunStore.list`. Each compiled
+context package is stored once as a content-addressed blob (`putBlob`,
+`getBlob`), keyed by the `sha256:` of its blocks' canonical JSON; content that
+does not match its digest is rejected. `inspectRun` from
+[`@deuz-sdk/core/headless`](/docs/modules/headless) reads a V3 store too.
+
+Redis has no V3 store in 2.4. A Redis `AgentRunStore` with
+`checkpointVersion: 3` is refused at configuration time with
+`UnsupportedStoreError` (`code: 'unsupported_store'`). Version 1 and 2 records
+are never converted: existing runs finish on the 2.3 path.
+
+### What a V3 run refuses
+
+These configurations fail before anything is read or written. `runAgent` and
+`streamAgent` return a `failed` result; `reconcileAgentRun` rejects.
+
+| Configuration | Error |
+| --- | --- |
+| `checkpointVersion: 3` without a session, or with a 2.3 `AgentRunStore` | `TypeError` |
+| A Redis run store with `checkpointVersion: 3` | `UnsupportedStoreError` |
+| A `checkpointVersion` other than 3 | `TypeError` |
+| `context`, `workingMemory`, `versionedMemory` or a V3 store without `checkpointVersion: 3` | `TypeError` (2.3 ignored such options; 2.4 refuses them) |
+| A compiler with a memory source plus `memory` with recall on | `TypeError` ("Memory would be injected twice"); set `memory.recall: false` |
+| A working memory `snapshot` or `create` for another scope than the session's, or a host tool named like a working memory tool | `TypeError` |
+
+### The record and the stream
+
+`AgentRunEnvelopeV3` is the 2.3 envelope with `version: 3` and four optional
+fields:
+
+| Field | What it records |
+| --- | --- |
+| `context` | The compiler's state and, per model step, the manifest, the package's blob reference and a digest of the messages it was compiled for |
+| `workingMemory` | The `WorkingMemorySnapshot`, with the task list itself and the active task, so the active task survives a restart |
+| `memoryIntents` | One entry per versioned-memory write: its `operationId`, `status` (`intended`, `planned`, `committed`, `acknowledged`), plan digest, planned count and receipt |
+| `memory` | The 2.3 memory state; its extraction status adds `'partial'` |
+
+`streamAgent` and `resumeStreamAgent` return an `AgentStreamV3`. It is still an
+`AgentStream`, so `toDeuzAgentStreamResponse` serializes it unchanged and none
+of the compiled context reaches the wire. Its `eventsV3` carries every 2.3 event
+plus three more: `{ type: 'context', step, manifest }`, `{ type:
+'working-memory', revision }` and `{ type: 'memory-intent', operationId, status }`.
+
+### Context and working memory
+
+`context` takes a `ContextCompiler` or the options of `createContextCompiler`.
+The loop calls it after compaction and your `prepareStep`, with the step's real
+model and tools, and saves the package blob and manifest before the model call;
+retrieval enters the history after the call succeeded, and the working memory is
+the request's ephemeral tail. A final answer call (a structured-output run
+without tools included) is compiled the same way. A resumed run restores the
+compiler's state from the record; a compiler you built yourself resumes only if
+its `state()` equals the stored state. A host estimator given as
+`context.estimator` is calibrated with each call's input, cache-read and
+cache-write tokens. The full step order, overflow handling and placement rules
+are on the [context compiler](/docs/modules/context#in-a-native-run) page.
+
+A step reopened after a restart with the same messages (its answer was never
+saved) reuses its stored package without asking the sources. A package a
+`forget` redacted is compiled again with refresh `'redacted'` and
+`redacted: true`, and on resume the retrieval blocks of redacted packages are
+removed from the run's history and checkpoints, which the manifest records as
+`cachePrefixChanged: true`.
+
+`workingMemory: { snapshot?, create?, tools? }` keeps the snapshot in the
+record; a resume keeps the stored one. Working memory without a compiler still
+gets its tail. With `tools: true` the model gets `working_memory_read`,
+`working_memory_add` and `working_memory_update`, and a model patch becomes
+durable in the same save as its tool receipt, so a call replayed after a crash
+is applied once.
+
+### Versioned memory: intent, commit, acknowledgment
+
+`versionedMemory: { session, tools?, extract? }` connects a
+[versioned memory session](/docs/modules/versioned-memory). Every write follows
+one protocol: a durable intent in the run record, the prepared plan, the atomic
+memory commit with its receipt, then the run's acknowledgment. The run store and
+the memory store are separate, so there is no transaction across them: when the
+acknowledgment is lost after the commit, the receipt is read back by operation
+id, and a memory change is never applied twice, even when a model call repeats
+after a crash.
+
+- `tools: true` offers the session's `memory_remember`, `memory_recall`,
+  `memory_revise` and `memory_retract`. Each write's intent moves with its tool
+  receipt (`intended` with the executing receipt, `committed` with the executed
+  one, `acknowledged` with the completed one) under the session's operation id.
+- `extract` (off by default; `true` or the extraction options without
+  `messages`) extracts the completed run's turns into the session. The intent is
+  saved in the terminal commit, the plan before the memory commit, and the
+  acknowledgment records `{ requestDigest, planned, receipt: { scopeRevision,
+  committedAt } }`. The extraction reads the input's last user turn and the
+  run's own turns, under the session's extraction policy.
+
+```ts
+import {
+  createInMemoryAgentRunStoreV3,
+  reconcileAgentRun,
+  runAgent,
+} from '@deuz-sdk/core/agent';
+import {
+  createInMemoryVersionedMemoryStore,
+  createMemorySession,
+} from '@deuz-sdk/core/memory/versioned';
+import { createMockModel } from '@deuz-sdk/core/testing';
+
+const runs = createInMemoryAgentRunStoreV3();
+const memory = createMemorySession({
+  store: createInMemoryVersionedMemoryStore(),
+  scope: { userId: 'ada' },
+  // Stands in for the memory LLM: one fact citing the user's message.
+  llm: async () => '{"facts":[{"text":"Ada prefers tea.","sources":["s0"]}]}',
+  // A forget redacts the run's stored context packages.
+  onForget: async (event) => {
+    await runs.redactForgotten(event);
+  },
+});
+const session = { store: runs, runId: 'tea-1', scope: 'acme' };
+
+const result = await runAgent({
+  checkpointVersion: 3,
+  session,
+  model: createMockModel({ responses: [{ text: 'Noted: tea.' }] }),
+  prompt: 'I prefer tea.',
+  versionedMemory: { session: memory, extract: true },
+});
+const record = await runs.load('tea-1');
+console.log(result.status, record?.memoryIntents?.map((i) => i.status)); // completed [ 'acknowledged' ]
+const [hit] = await memory.recall({ text: 'tea' });
+console.log(hit?.record.origin, hit?.record.sources[0]?.messageId); // inferred tea-1#0
+
+// For a run whose acknowledgment was lost; a settled run reports its state.
+console.log(await reconcileAgentRun({ checkpointVersion: 3, session, versionedMemory: { session: memory } }));
+// { runId: 'tea-1' }
+```
+
+`reconcileAgentRun({ checkpointVersion: 3, session, versionedMemory: { session } })`
+settles intents whose acknowledgment was lost from the session's receipts (an
+operation that committed is replayed, never applied again) and returns the
+settled operation ids in `memoryIntents`. A resume replays a lost tool write the
+same way.
+
+The source references of an extraction name the run's transcript positions as
+message ids (`<runId>#<index>`). They are not the ids a chat projection gives
+its messages (`<runId>:<n>`), so [`resolveSource`](/docs/modules/transcript-search#resolving-memory-sources)
+does not resolve them to chat messages.
+
+The legacy `memory` option works in a V3 run too. A legacy extraction that
+wrote only part of its plan is stored as `'partial'` with a
+`memory-extraction-partial` warning, and `reconcileAgentRun` reports it as
+`memory: 'failed'` with the warning, in the 2.3 answer shape.
+
+### Retention and forget
+
+`prune({ terminalBefore })` deletes terminal runs last saved before that time and
+the blobs no remaining run points to, and returns the count. `redactForgotten(event)`
+is the versioned-memory `onForget` listener: it redacts every stored package
+that holds one of the forgotten revisions, also one written after the forget,
+and returns how many it redacted. `getBlob` then answers `{ status: 'redacted' }`
+and the manifests that point to it load with `redacted: true`. The forget records
+the store keeps hold record ids and revisions, never text. See
+[Retention and forget](/docs/modules/retention).
 
 ## Mandatory policy and shared budgets
 
