@@ -8,9 +8,12 @@
  * (a repeated launch never starts a run twice); only a `'retry'` of a run
  * whose failure the native layer recorded as transient resumes with
  * `retryFailed`. The inherited working memory goes to a new run only (a
- * stored run keeps its own). Cancel and drain are signals to the native
- * run's lease (`agentRunLeaseKey`): without `lease`, or while no executor
- * holds the run, they answer false and the supervisor keeps the cancel.
+ * stored run keeps its own). A leg that another executor of the run
+ * refused (its lease held or lost, or an executor in this process) reports
+ * `heldElsewhere`: the supervisor resumes the run later. Cancel and drain are
+ * signals to the native run's lease (`agentRunLeaseKey`): without `lease`,
+ * or while no executor holds the run, they answer false and the supervisor
+ * keeps the cancel.
  *
  * Edge-safe.
  */
@@ -37,6 +40,21 @@ function maintenanceOf(
   if (status === undefined) return undefined;
   if (status === 'pending') return 'pending';
   return status === 'completed' ? 'complete' : 'failed';
+}
+
+/** What the executor answers a second executor of a run in the same process. */
+const ACTIVE_EXECUTOR = 'This native run already has an active executor.';
+
+/**
+ * Whether another executor holds the run: its lease refused this leg
+ * (`lease_held`), took the run from it (`lease_lost`), or an executor of the
+ * run in this process is still driving it.
+ */
+function heldElsewhere(result: AgentResult<unknown>): boolean {
+  if (result.status !== 'failed') return false;
+  const { name, code, message } = result.error;
+  if (name === 'AgentRunLeaseError') return code === 'lease_held' || code === 'lease_lost';
+  return name === 'TypeError' && message === ACTIVE_EXECUTOR;
 }
 
 /** The run's durable ledger totals: its checkpoint's ledger, else its result's. */
@@ -98,6 +116,8 @@ export function createNativeRunLauncher(options: NativeRunLauncherOptions): RunL
     const native = await executor;
     const run = (before === undefined ? native.runAgent : native.resumeAgent) as unknown as RunV3;
     const result = await run(runOptions);
+    // Nothing of the run happened here: the supervisor resumes it at a later claim.
+    if (heldElsewhere(result)) return { runId: request.runId, result, heldElsewhere: true };
     const after = await store.load(request.runId);
     const maintenance = maintenanceOf(after);
     return {

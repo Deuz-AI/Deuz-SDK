@@ -1163,6 +1163,19 @@ export function createGoalDriver(options: GoalDriverOptions): {
         return;
       }
 
+      if (leg?.heldElsewhere === true) {
+        // Another executor still drives the run (an earlier holder's, draining):
+        // nothing happened to it here. The intent and the active run stay, and
+        // a later claim resumes the same run; no retry is spent.
+        const written = await store.runtime.save({ ...base, phase: 'dispatching' });
+        if (written.status === 'conflict') continue;
+        deps.logger.warn('goal supervisor: another executor holds the run', {
+          scope,
+          goalId,
+          runId,
+        });
+        return;
+      }
       if (!leg || (leg.result.status === 'failed' && leg.retryable === true)) {
         // A failure the native layer may retry (or a leg that threw): the same
         // run is retried after the policy's wait, never started anew.

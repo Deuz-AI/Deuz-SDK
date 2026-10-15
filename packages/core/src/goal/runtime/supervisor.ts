@@ -112,6 +112,13 @@ export interface RunLaunchResult {
   result: AgentResult<unknown>;
   /** The native run marked the failure retryable (`AgentRunEnvelope.retry`). */
   retryable?: boolean;
+  /**
+   * The leg did not drive the run (2.4 refinement): another executor holds
+   * it (one a takeover has not stopped yet), or this leg lost the run's own
+   * lease to one. The supervisor keeps the intent and the active run, and a
+   * later claim resumes the same run; it is not a retry.
+   */
+  heldElsewhere?: boolean;
   /** The run's working memory at the end of the leg. */
   workingMemory?: WorkingMemorySnapshot;
   /**

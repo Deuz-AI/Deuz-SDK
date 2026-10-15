@@ -154,6 +154,32 @@ describe('createNativeRunLauncher', () => {
     expect(retried.result.status).toBe('completed');
   });
 
+  it('reports a leg that another executor of the run refused, as nothing happened to the run', async () => {
+    const store = createInMemoryAgentRunStoreV3();
+    const launcher = createNativeRunLauncher({ store, options: () => ({}) as never });
+    const failed = (name: string, message: string, code?: string): AgentResult<unknown> => {
+      const result = results.failed('g-1:run:1') as Extract<AgentResult, { status: 'failed' }>;
+      return { ...result, error: { name, message, ...(code !== undefined ? { code } : {}) } };
+    };
+    for (const result of [
+      failed('AgentRunLeaseError', 'Another executor holds this native run.', 'lease_held'),
+      failed('AgentRunLeaseError', 'This executor lost the native run lease.', 'lease_lost'),
+      failed('TypeError', 'This native run already has an active executor.'),
+    ]) {
+      agent.runAgent.mockResolvedValueOnce(result);
+      expect(await launcher.launch(request())).toEqual({
+        runId: 'g-1:run:1',
+        result,
+        heldElsewhere: true,
+      });
+    }
+    // Any other failure is the run's own.
+    agent.runAgent.mockResolvedValueOnce(
+      failed('TypeError', 'maxSteps must be a positive integer.'),
+    );
+    expect((await launcher.launch(request())).heldElsewhere).toBeUndefined();
+  });
+
   it('refuses a stored run of another scope', async () => {
     const store = createInMemoryAgentRunStoreV3();
     await store.save(envelopeV3('g-1:run:1', 1, { scope: 'other' }));

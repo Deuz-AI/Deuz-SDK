@@ -283,6 +283,48 @@ describe('leg outcomes', () => {
     });
   });
 
+  it('keeps the intent and the run while another executor holds it, and resumes it at a later claim', async () => {
+    const w = world();
+    let elsewhere = true;
+    const launcher = fakeRunLauncher((request) =>
+      elsewhere
+        ? {
+            runId: request.runId,
+            result: results.failed(request.runId, 'lease_held'),
+            heldElsewhere: true,
+          }
+        : { runId: request.runId, result: results.completed(request.runId) },
+    );
+    const { supervisor, seen } = supervisorIn(w, { launcher });
+    await supervisor.submit({ goalId: 'g-1', scope: SCOPE, objective: 'x' });
+    await supervisor.tick();
+    await supervisor.tick();
+    expect(await supervisor.get(SCOPE, 'g-1')).toMatchObject({
+      goal: { status: 'active' },
+      runtime: {
+        phase: 'dispatching',
+        activeRun: { intentId: 'g-1#1', runId: 'g-1:run:1', attempt: 1 },
+        runs: 1,
+        retries: 0,
+      },
+    });
+    expect((await w.store.intents.get(SCOPE, 'g-1#1'))?.status).toBe('claimed');
+    expect(seen.filter((event) => event.type === 'retry-scheduled')).toEqual([]);
+    elsewhere = false;
+    await supervisor.tick();
+    expect(launcher.calls.map((call) => [call.request.intentId, call.request.runId])).toEqual([
+      ['g-1#1', 'g-1:run:1'],
+      ['g-1#1', 'g-1:run:1'],
+      ['g-1#1', 'g-1:run:1'],
+    ]);
+    expect((await w.store.intents.get(SCOPE, 'g-1#1'))?.status).toBe('completed');
+    expect((await supervisor.get(SCOPE, 'g-1'))?.runtime).toMatchObject({
+      phase: 'idle',
+      runs: 1,
+      retries: 0,
+    });
+  });
+
   it('hands a run that stopped or failed for good to the host instead of starting another', async () => {
     for (const [result, note, status] of [
       [results.stopped('g-1:run:1', 'max-steps'), 'run-stopped:max-steps', 'completed'],
