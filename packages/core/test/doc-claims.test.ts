@@ -214,3 +214,26 @@ describe('home-copy.ts: the deuz-sdk skill card (W3 review V4-4)', () => {
     for (const m of digits) expect(Number(m[1])).toBe(files);
   });
 });
+
+describe('evals.mdx: the 2.4 acceptance scenarios', () => {
+  it('counts the scenarios and the fault scenarios the registry declares', () => {
+    const dir = join(CORE, 'test/scenarios-2-4');
+    let all = 0;
+    let fault = 0;
+    for (const file of readdirSync(dir)) {
+      if (!file.endsWith('.test.ts') || file === 'scenarios-count.test.ts') continue;
+      const calls = readFileSync(join(dir, file), 'utf8')
+        .split(/\bscenario\(/)
+        .slice(1);
+      for (const call of calls) {
+        if (!/^\s*'[a-z-]+'\s*,\s*'[a-z0-9-]+'/.test(call)) continue;
+        all++;
+        // The options object closes the call, before the next scenario starts.
+        if (/fault:\s*true/.test(call)) fault++;
+      }
+    }
+    const page = prose('docs/content/docs/modules/evals.mdx');
+    expect(Number(page.match(/2\.4 adds (\d+) acceptance scenarios/)?.[1])).toBe(all);
+    expect(Number(page.match(/(\d+) of them are fault scenarios/)?.[1])).toBe(fault);
+  });
+});
