@@ -158,8 +158,9 @@ export interface AgentRunStoreV3 {
    * Commits durably before resolving, only at the stored revision plus one
    * (`RevisionConflictError`, subsystem `'run'`, otherwise). Refuses an
    * envelope whose version is not 3. A run whose package blobs a forget
-   * redacted is stored with those packages' retrieval blocks replaced by
-   * content-free stand-ins that keep the block's marker.
+   * redacted is stored with those packages' retrieval blocks that hold a
+   * forgotten record replaced by content-free stand-ins that keep the
+   * block's marker.
    */
   save(envelope: AgentRunEnvelopeV3): Promise<void>;
   /** Runs, newest save first, as `AgentRunStore.list`. */
@@ -183,6 +184,11 @@ export interface AgentRunStoreV3 {
    * packages' retrieval blocks in the runs that point to them (history,
    * checkpoints, result messages) with a content-free stand-in that keeps
    * the block's marker, so a resume still drops it and recompiles the step.
+   * A block is the exact message the compiler appended, and it is replaced
+   * only when its records include a forgotten one: a user's message that
+   * opens with a marker, and an overflow retry's block that dropped the
+   * forgotten record, stay. A block a run received in its input messages (a
+   * previous run's `result.messages`) is not that run's copy and stays.
    */
   redactForgotten(event: MemoryForgetEvent): Promise<number>;
   /** Retention: deletes terminal runs saved before `terminalBefore`, and blobs only they used. */

@@ -97,7 +97,7 @@ export function createInMemoryAgentRunStoreV3(
       const digests = agentRunV3BlobDigests(envelope);
       runs.set(envelope.runId, {
         // A leg that ran through a forget still holds the block: stored redacted.
-        payload: redactedPayload(payload, redactedAmong(digests)),
+        payload: redactedPayload(payload, redactedAmong(digests), tombstones),
         summary: summarizeAgentRunEnvelopeV3(envelope, clock.now()),
         // Every blob the run ever pointed to, as the SQL stores' refs keep them.
         blobs: [...new Set([...(stored?.blobs ?? []), ...digests])],
@@ -169,7 +169,7 @@ export function createInMemoryAgentRunStoreV3(
       );
       for (const run of runs.values())
         if (run.blobs.some((digest) => covered.has(digest)))
-          run.payload = redactedPayload(run.payload, redactedAmong(run.blobs));
+          run.payload = redactedPayload(run.payload, redactedAmong(run.blobs), tombstones);
       return redacted;
     },
     async prune(options) {

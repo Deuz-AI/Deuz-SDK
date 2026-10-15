@@ -48,6 +48,7 @@ import type {
   AgentRunOptionsV3,
   AgentRunSessionV3,
   AgentRunStoreV3,
+  ContextBlobRead,
 } from './types/agent-run-v3';
 import type { Clock, Logger, ResolvedDependencies } from './types/deps';
 import type { CallWarning } from './types/methods';
@@ -731,36 +732,59 @@ export function createContextHook(input: ContextHookInput): LoopContextHook {
 /**
  * Drops from a resumed V3 run's history the retrieval blocks of packages a
  * `forget` redacted (spec §4.4), before the run makes its next request, so a
- * forgotten record is never sent again. A block is found by the marker its
- * package wrote (`<deuz_context pass="P" step="S">`), in the run's messages
- * and in every checkpoint. The prompt cache prefix changes there, as a
- * compaction boundary changes it: forget is the documented exception.
- * Returns whether a block was dropped (the next compile then retrieves anew).
+ * forgotten record is never sent again. A block is found by its exact shape
+ * (`isBlockOf`: the full opening its package wrote, `<deuz_context pass="P"
+ * step="S">` and the preamble, through the closing, or the stand-in a forget
+ * left), in the run's messages and in every checkpoint; a user's message that
+ * only opens with a marker stays. An overflow retry shares its first
+ * attempt's marker: the block of a package that is still found (the retry's,
+ * which dropped the forgotten record) stays, as the store keeps it. The
+ * prompt cache prefix changes there, as a compaction boundary changes it:
+ * forget is the documented exception. Returns whether a block was dropped
+ * (the next compile then retrieves anew).
  */
 export async function dropRedactedContext(
   envelope: AgentRunEnvelopeV3,
   store: AgentRunStoreV3,
 ): Promise<boolean> {
-  const markers: string[] = [];
-  const seen = new Map<string, boolean>();
+  const markers = new Set<string>();
+  const statuses = new Map<string, ContextBlobRead['status']>();
+  const found: AgentRunContextStepV3[] = [];
   // A step's first attempt too: a step reopened from it after a crash sent it.
   const packages = (envelope.context?.steps ?? []).flatMap((step) =>
-    step.firstAttempt ? [step, step.firstAttempt] : [step],
+    step.firstAttempt ? [step, { ...step.firstAttempt, step: step.step }] : [step],
   );
-  for (const { manifest, blob } of packages) {
+  for (const attempt of packages) {
+    const { manifest, blob } = attempt;
     if (!manifest.placement.append) continue;
-    let redacted = seen.get(blob.digest);
-    if (redacted === undefined) {
-      redacted = (await store.getBlob(blob.digest)).status === 'redacted';
-      seen.set(blob.digest, redacted);
+    let status = statuses.get(blob.digest);
+    if (status === undefined) {
+      status = (await store.getBlob(blob.digest)).status;
+      statuses.set(blob.digest, status);
     }
-    if (redacted) markers.push(retrievalBlockMarker(manifest.pass, manifest.step));
+    if (status === 'redacted') markers.add(retrievalBlockMarker(manifest.pass, manifest.step));
+    else if (status === 'found') found.push(attempt);
   }
-  if (markers.length === 0) return false;
+  if (markers.size === 0) return false;
+  // The blocks of found packages that share a redacted marker: kept.
+  const intact = new Set<string>();
+  for (const attempt of found) {
+    if (!markers.has(retrievalBlockMarker(attempt.manifest.pass, attempt.manifest.step))) continue;
+    const read = await readContextPackage(store, attempt);
+    if (read.status !== 'found') continue;
+    for (const block of read.package.blocks)
+      if (block.placement === 'append' && block.kind === 'retrieval')
+        for (const message of block.messages)
+          if (typeof message.content === 'string') intact.add(message.content);
+  }
+  const redacted = [...markers];
   let dropped = false;
   const keep = (messages: Message[]): Message[] => {
-    // A stand-in a forget left in the stored record carries the marker too.
-    const kept = messages.filter((message) => isBlockOf(message, markers) === undefined);
+    // A stand-in a forget left in the stored record is found too.
+    const kept = messages.filter(
+      (message) =>
+        isBlockOf(message, redacted) === undefined || intact.has(message.content as string),
+    );
     if (kept.length !== messages.length) dropped = true;
     return kept;
   };

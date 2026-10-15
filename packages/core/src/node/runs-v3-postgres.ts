@@ -36,6 +36,7 @@ import {
   forgetTombstones,
   markRedactedSteps,
   redactedPayload,
+  type ContextBlobRecord,
 } from '../agent-run-v3-context';
 import { InvalidRequestError, RevisionConflictError } from '../errors';
 import { agentRunListPage, planAgentRunList, summarizeAgentRun } from '../internal/agent-run-list';
@@ -199,6 +200,31 @@ export function createPostgresAgentRunStoreV3(
         )
       ).map((blob) => String(blob.digest) as Sha256Digest),
     );
+  /**
+   * The tombstones that cover a record of the `redacted` blobs: what tells a
+   * retrieval block that holds a forgotten record from one of the same
+   * marker that does not (`redactRetrievalBlocks`).
+   */
+  const tombstonesOf = async (
+    client: PgClientLike,
+    redacted: ReadonlySet<Sha256Digest>,
+  ): Promise<ContextBlobRecord[]> =>
+    redacted.size === 0
+      ? []
+      : (
+          await rows(
+            client,
+            `SELECT DISTINCT t.record_id, t.revision FROM ${forgotten} t
+             JOIN ${records} r ON r.record_id = t.record_id
+             WHERE r.digest = ANY($1::text[])
+               AND (r.revision = ${NO_REVISION} OR t.revision = ${NO_REVISION} OR t.revision = r.revision)`,
+            [[...redacted]],
+          )
+        ).map((row) =>
+          Number(row.revision) === NO_REVISION
+            ? { recordId: String(row.record_id) }
+            : { recordId: String(row.record_id), revision: Number(row.revision) },
+        );
 
   return {
     checkpointVersion: 3,
@@ -238,7 +264,7 @@ export function createPostgresAgentRunStoreV3(
             revision,
             envelope.phase,
             envelope.result?.status ?? null,
-            redactedPayload(encoded, redacted),
+            redactedPayload(encoded, redacted, await tombstonesOf(tx, redacted)),
           ];
           // A new run starts at 1; a stored one advances by exactly one.
           const saved =
@@ -406,7 +432,12 @@ export function createPostgresAgentRunStoreV3(
             ]);
             if (!row) continue;
             const payload = String(row.payload);
-            const next = redactedPayload(payload, await redactedOf(tx, String(runId)));
+            const redactedBlobs = await redactedOf(tx, String(runId));
+            const next = redactedPayload(
+              payload,
+              redactedBlobs,
+              await tombstonesOf(tx, redactedBlobs),
+            );
             if (next !== payload)
               await tx.query(`UPDATE ${runs} SET payload = $2 WHERE run_id = $1`, [
                 String(runId),
