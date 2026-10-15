@@ -94,7 +94,14 @@ export interface ContextSourceRequest {
   limit: number;
   /** The share of the budget the source may fill, in tokens (a hint). */
   budgetTokens: number;
-  /** Versioned memory reads what the store knew then, so a restart reads the same. */
+  /**
+   * Read memory as the store knew it at this time (epoch ms, the memory
+   * store's clock): a versioned session recalls the revisions recorded by
+   * then. The compiler never sets it, so its passes read the current state; a
+   * host querying a source itself may. A restarted V3 step reads the same
+   * context because the run sends the step's stored package again, not
+   * through this field.
+   */
   recordedAsOf?: number;
   signal?: AbortSignal;
 }
