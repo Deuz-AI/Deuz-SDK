@@ -13,6 +13,7 @@
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import {
   createDockerProcessRunner,
+  createDockerSandbox,
   createInMemoryProcessOperationStore,
   DockerSandboxError,
   OperationConflictError,
@@ -29,6 +30,7 @@ import {
   FAKE_IMAGE,
   FAKE_IMAGE_ID,
   fakeDocker,
+  type FakeContainer,
   type FakeDocker,
   type FakeDockerBundle,
 } from './fixtures/fake-docker';
@@ -132,6 +134,37 @@ function setup(
     },
   });
   return { store, runner };
+}
+
+/** Puts a container straight into the fake daemon, as another host would have left it. */
+function seedContainer(
+  fake: FakeDocker,
+  id: string,
+  overrides: Partial<FakeContainer> & { labels: Record<string, string> },
+): void {
+  fake.update((state) => {
+    state.containers[id] = {
+      id,
+      name: `seed-${id.slice(0, 8)}`,
+      image: FAKE_IMAGE_ID,
+      command: ['sleep'],
+      user: '10001:10001',
+      workdir: '/workspace',
+      env: {},
+      createArgs: [],
+      interactive: false,
+      readOnly: false,
+      mounts: [],
+      state: 'created',
+      exitCode: 0,
+      startCount: 0,
+      stdout: '',
+      stderr: '',
+      files: {},
+      created: new Date().toISOString(),
+      ...overrides,
+    };
+  });
 }
 
 const count = (fake: FakeDocker, sub: string) => fake.subcommands().filter((s) => s === sub).length;
@@ -648,6 +681,81 @@ describe('createDockerProcessRunner: reconcile', () => {
     expect(fake.container(orphan.containerId!)).toBeUndefined();
     expect(fake.container(alive.containerId!)).toBeDefined();
     expect((await runner.reconcile({ scope: 'tenant-b' })).matched).toEqual([]);
+  });
+
+  it('leaves a live sandbox run alone: reconcile({ removeOrphans }) never kills it (R4-2)', async () => {
+    const fake = await fakeDocker(bundle);
+    const sandbox = createDockerSandbox({ image: FAKE_IMAGE, ...fake.cli });
+    const { runner } = setup(fake);
+    const pending = sandbox.runShell!({ command: 'echo started ; sleep', timeoutMs: 20_000 });
+    for (let i = 0; i < 400 && !fake.containers().some((c) => c.state === 'running'); i++)
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    const live = fake.containers().find((c) => c.state === 'running')!;
+    expect(live.labels['deuz.kind']).toBe('sandbox');
+    const report = await runner.reconcile({ removeOrphans: true });
+    if (fake.container(live.id))
+      fake.update((state) => {
+        state.containers[live.id]!.state = 'exited';
+      });
+    const res = await pending;
+    expect(report.orphans).toEqual([]);
+    expect(report.removed).toEqual([]);
+    expect(res).toMatchObject({ stdout: 'started\n', exitCode: 0 });
+  });
+
+  it('reports sandbox containers and staging helpers only once no run can still be using them (R4-2)', async () => {
+    const fake = await fakeDocker(bundle);
+    const { runner } = setup(fake);
+    const hour = 60 * 60_000;
+    const ago = (ms: number) => new Date(Date.now() - ms).toISOString();
+    const labels = (kind: string, extra: Record<string, string> = {}) => ({
+      'deuz.operation-id': `op-${kind}`,
+      'deuz.scope': 'tenant-a',
+      'deuz.kind': kind,
+      ...extra,
+    });
+    // In use: a staging helper mid-copy, a sandbox container being staged, a
+    // long run still inside its timeout, an exit the run is about to remove.
+    seedContainer(fake, 'a'.repeat(64), { labels: labels('staging') });
+    seedContainer(fake, 'b'.repeat(64), { labels: labels('sandbox') });
+    seedContainer(fake, 'c'.repeat(64), {
+      labels: labels('sandbox', { 'deuz.run-timeout-ms': String(24 * hour) }),
+      state: 'running',
+      created: ago(2 * hour),
+      startedAt: ago(2 * hour),
+    });
+    seedContainer(fake, 'd'.repeat(64), {
+      labels: labels('sandbox', { 'deuz.run-timeout-ms': '30000' }),
+      state: 'exited',
+      created: ago(2 * hour),
+      startedAt: ago(2 * hour),
+      finishedAt: ago(1_000),
+    });
+    // Left behind: an old helper, an old exited run, a run long past its timeout.
+    seedContainer(fake, 'e'.repeat(64), { labels: labels('staging'), created: ago(2 * hour) });
+    seedContainer(fake, 'f'.repeat(64), {
+      labels: labels('sandbox', { 'deuz.run-timeout-ms': '30000' }),
+      state: 'exited',
+      created: ago(2 * hour),
+      startedAt: ago(2 * hour),
+      finishedAt: ago(2 * hour),
+    });
+    seedContainer(fake, '9'.repeat(64), {
+      labels: labels('sandbox', { 'deuz.run-timeout-ms': '30000' }),
+      state: 'running',
+      created: ago(2 * hour),
+      startedAt: ago(2 * hour),
+    });
+    const report = await runner.reconcile({ removeOrphans: true });
+    const leftovers = ['e'.repeat(64), 'f'.repeat(64), '9'.repeat(64)];
+    expect(report.orphans.map((o) => o.containerId).sort()).toEqual(leftovers.sort());
+    expect([...report.removed].sort()).toEqual(leftovers.sort());
+    expect(
+      fake
+        .containers()
+        .map((c) => c.id[0])
+        .sort(),
+    ).toEqual(['a', 'b', 'c', 'd']);
   });
 
   it('a start that lands between the container snapshot and the record listing is not lost (R4-3)', async () => {

@@ -61,6 +61,8 @@ export interface FakeContainer {
   mounts: FakeMount[];
   state: 'created' | 'running' | 'exited';
   exitCode: number;
+  /** When `docker create` made it (inspect's `Created`). */
+  created?: string;
   startedAt?: string;
   finishedAt?: string;
   error?: string;
@@ -491,6 +493,7 @@ function inspectJson(container: FakeContainer): string {
     );
   return JSON.stringify({
     Id: container.id,
+    Created: container.created ?? '0001-01-01T00:00:00Z',
     Name: `/${container.name}`,
     Image: container.image,
     Config: {
@@ -669,6 +672,7 @@ function create(state: FakeState, rest: string[]): string {
     mounts,
     state: 'created',
     exitCode: 0,
+    created: new Date().toISOString(),
     startCount: 0,
     stdout: '',
     stderr: '',

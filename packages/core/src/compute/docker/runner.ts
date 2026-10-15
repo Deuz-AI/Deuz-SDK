@@ -62,6 +62,35 @@ const CANCEL_GRACE_SECONDS = 2;
  * issuing that start.
  */
 export const START_SETTLE_MS = 30_000;
+/**
+ * How long a sandbox container or staging helper is left alone by
+ * `reconcile` (2.4): after its create while it never ran, after its exit, and
+ * past its run timeout while it runs. Those containers belong to a sandbox
+ * run or a staging copy, here or on another host, that removes them itself;
+ * the window is longer than every CLI timeout of a run's create and staging
+ * steps put together, so only a container whose host is gone outlives it.
+ */
+export const TRANSIENT_CONTAINER_SETTLE_MS = 30 * 60_000;
+
+/**
+ * When a sandbox container or staging helper stops being in use (epoch ms,
+ * daemon clock): a running one only past its labelled run timeout (never
+ * without the label), any other once it has been created or exited for the
+ * settle window.
+ */
+function transientLeaseEnd(info: ContainerInfo): number {
+  if (info.running) {
+    const label = info.labels[DEUZ_LABEL.runTimeoutMs];
+    const runMs = label === undefined ? Number.NaN : Number(label);
+    const since = info.startedAt ?? info.createdAt;
+    if (since === undefined || !Number.isFinite(runMs) || runMs < 0)
+      return Number.POSITIVE_INFINITY;
+    return since + runMs + TRANSIENT_CONTAINER_SETTLE_MS;
+  }
+  const since = info.finishedAt ?? info.createdAt;
+  return since === undefined ? Number.POSITIVE_INFINITY : since + TRANSIENT_CONTAINER_SETTLE_MS;
+}
+
 /** How long a start with stdin is watched for the container to come up. */
 const STDIN_START_WAIT_MS = 30_000;
 
@@ -793,6 +822,14 @@ export function createDockerRunnerFromOptions(
         for (const info of infos) {
           const operationId = info.labels[DEUZ_LABEL.operationId];
           const scope = info.labels[DEUZ_LABEL.scope];
+          const kind = info.labels[DEUZ_LABEL.kind];
+          // A sandbox run's container or a staging helper has no record: it is
+          // an orphan only once no run can still be using it.
+          if (
+            (kind === 'sandbox' || kind === 'staging') &&
+            deps.clock.now() < transientLeaseEnd(info)
+          )
+            continue;
           let record =
             info.labels[DEUZ_LABEL.kind] === 'process' && operationId && scope
               ? await store.get(scope, operationId)

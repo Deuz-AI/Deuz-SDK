@@ -36,6 +36,11 @@ export const DEUZ_LABEL = {
   sdkVersion: 'deuz.sdk-version',
   /** `process` (a runner operation), `sandbox` (one sandbox run), `staging` (a read-only staging helper). */
   kind: 'deuz.kind',
+  /**
+   * A sandbox run's timeout in ms: how long after its start the run kills
+   * it, so `reconcile` can tell a live run from one its host left behind.
+   */
+  runTimeoutMs: 'deuz.run-timeout-ms',
 } as const;
 
 export type ContainerKind = 'process' | 'sandbox' | 'staging';
@@ -202,12 +207,16 @@ export interface ContainerSpec {
   env?: Readonly<Record<string, string>>;
   /** The working directory of the command; default the workspace. */
   cwd?: string;
+  /** A sandbox run's timeout, written to the `deuz.run-timeout-ms` label. */
+  runTimeoutMs?: number;
 }
 
 /** What inspection reports of one container. */
 export interface ContainerInfo {
   id: string;
   name: string;
+  /** Epoch ms of `docker create`, by the daemon's clock. */
+  createdAt?: number;
   imageId: string;
   labels: Record<string, string>;
   status: string;
@@ -234,6 +243,7 @@ function epoch(value: unknown): number | undefined {
 function parseInfo(line: string): ContainerInfo {
   const raw = JSON.parse(line) as {
     Id: string;
+    Created?: string;
     Name?: string;
     Image?: string;
     Config?: { Labels?: Record<string, string> | null } & Record<string, unknown>;
@@ -252,9 +262,11 @@ function parseInfo(line: string): ContainerInfo {
   const state = raw.State ?? {};
   const startedAt = epoch(state.StartedAt);
   const finishedAt = epoch(state.FinishedAt);
+  const createdAt = epoch(raw.Created);
   return {
     id: raw.Id,
     name: (raw.Name ?? '').replace(/^\//, ''),
+    ...(createdAt !== undefined ? { createdAt } : {}),
     imageId: raw.Image ?? '',
     labels: raw.Config?.Labels ?? {},
     status: state.Status ?? 'unknown',
@@ -373,9 +385,15 @@ export function createDockerEngine(options: ResolvedDockerOptions): DockerEngine
   const { cli } = options;
   let image: Promise<string> | undefined;
 
-  const labelArgs = (kind: ContainerKind, operationId: string, scope: string): string[] => {
+  const labelArgs = (
+    kind: ContainerKind,
+    operationId: string,
+    scope: string,
+    extra: Record<string, string> = {},
+  ): string[] => {
     const labels: Record<string, string> = {
       ...options.labels,
+      ...extra,
       [DEUZ_LABEL.operationId]: operationId,
       [DEUZ_LABEL.scope]: scope,
       [DEUZ_LABEL.sdkVersion]: DOCKER_LABEL_SDK_VERSION,
@@ -470,7 +488,14 @@ export function createDockerEngine(options: ResolvedDockerOptions): DockerEngine
             : []),
           ...(spec.interactive ? ['--interactive'] : []),
           ...(envFile !== undefined ? ['--env-file', envFile] : []),
-          ...labelArgs(spec.kind, spec.operationId, spec.scope),
+          ...labelArgs(
+            spec.kind,
+            spec.operationId,
+            spec.scope,
+            spec.runTimeoutMs !== undefined
+              ? { [DEUZ_LABEL.runTimeoutMs]: String(spec.runTimeoutMs) }
+              : {},
+          ),
           // The argv runs as given: an image ENTRYPOINT would prefix it.
           '--entrypoint=',
           imageId,

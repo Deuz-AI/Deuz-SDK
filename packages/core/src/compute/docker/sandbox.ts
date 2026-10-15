@@ -63,6 +63,7 @@ export function createDockerSandboxFromOptions(options: ResolvedDockerOptions): 
     // An abort while the workspace was read or the image resolved: nothing is made.
     if (input.signal?.aborted) return abortedBeforeStart();
     const operationId = deps.generateId();
+    const timeoutMs = input.timeoutMs ?? DEFAULT_DOCKER_RUN_TIMEOUT_MS;
     const spec: ContainerSpec = {
       name: `deuz-sbx-${safeName(operationId)}`,
       kind: 'sandbox',
@@ -72,6 +73,7 @@ export function createDockerSandboxFromOptions(options: ResolvedDockerOptions): 
       interactive: input.stdin !== undefined,
       ...(input.env !== undefined ? { env: input.env } : {}),
       ...(input.cwd !== undefined ? { cwd: input.cwd } : {}),
+      runTimeoutMs: timeoutMs,
     };
     let containerId: string | undefined;
     try {
@@ -104,10 +106,7 @@ export function createDockerSandboxFromOptions(options: ResolvedDockerOptions): 
         engine.kill(id).catch(() => {});
         graceTimer = deps.clock.setTimeout(() => attach.abort(), ATTACH_GRACE_MS);
       };
-      const cancelTimeout = deps.clock.setTimeout(
-        kill,
-        input.timeoutMs ?? DEFAULT_DOCKER_RUN_TIMEOUT_MS,
-      );
+      const cancelTimeout = deps.clock.setTimeout(kill, timeoutMs);
       input.signal?.addEventListener('abort', kill, { once: true });
       let result;
       try {
