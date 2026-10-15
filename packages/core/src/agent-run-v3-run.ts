@@ -34,7 +34,7 @@ import type {
   LoopContextStep,
 } from './inference/loop-context';
 import { createTokenEstimator, type TokenEstimator } from './internal/estimate-tokens';
-import { claimMemoryScopes, sourceScope } from './internal/memory-scope-claims';
+import { claimMemoryScopes, compilerScope, sourceScope } from './internal/memory-scope-claims';
 import { withTelemetryParent } from './internal/native-context';
 import { bindsThinkingToPrefix } from './internal/stable-prefix';
 import type { MemoryCallOptions } from './memory';
@@ -136,23 +136,31 @@ export function assertV3Options(options: AgentRunOptionsV3<unknown>): void {
 /**
  * Claims every memory scope a V3 run reads or writes for its execution (spec
  * §2.3 "child run yalnızca daraltabilecek", §4.5): the legacy `memory` scope,
- * the versioned memory session's, the compiler's pinned `scope` (when given
- * as options) and the scope each built-in context source was pinned to. A
- * nested run's scopes must each lie within one of its parent run's, by the
- * `claimMemoryScope` / `scopeWithin` rule (a widening throws a TypeError),
- * and its own claim bounds its children in turn. Returns the release, called
- * when the executor ends.
+ * the versioned memory session's, the compiler's pinned `scope` (given as
+ * options or to the instance) and the scope each built-in context source
+ * reads: its pinned scope, narrowed by the compiler's `scope` for a source
+ * that narrows it (a store-backed memory source, a transcript source), since
+ * every query carries that scope. A nested run's scopes must each lie within
+ * one of its parent run's, by the `claimMemoryScope` / `scopeWithin` rule (a
+ * widening throws a TypeError), and its own claim bounds its children in
+ * turn. Returns the release, called when the executor ends.
  */
 export function claimV3MemoryScopes(
   execution: NativeExecutionContext,
   options: AgentRunOptionsV3<unknown>,
 ): () => void {
   const context = options.context;
+  const scope =
+    context === undefined
+      ? undefined
+      : isCompiler(context)
+        ? compilerScope(context)
+        : context.scope;
   return claimMemoryScopes(execution, [
     (options.memory as MemoryCallOptions | undefined)?.scope,
     options.versionedMemory?.session?.scope,
-    ...(context !== undefined && !isCompiler(context) ? [context.scope] : []),
-    ...(context?.sources ?? []).map((source) => sourceScope(source)),
+    scope,
+    ...(context?.sources ?? []).map((source) => sourceScope(source, scope)),
   ]);
 }
 

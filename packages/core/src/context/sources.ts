@@ -120,7 +120,9 @@ function source(
  * compiler's clock; else `clock`). Legacy records carry no revision or origin.
  */
 export function createMemoryContextSource(options: MemoryContextSourceOptions): ContextSource {
-  // A V3 run claims each source's pinned scope, so a nested run may only narrow it.
+  // A V3 run claims the scope each source reads (its pinned scope, narrowed by
+  // the compiler's `scope` where the source narrows), so a nested run may only
+  // narrow its parent's.
   if ('session' in options) {
     const { session } = options;
     const recalled = source('memory', options, async (request) => {
@@ -187,7 +189,9 @@ export function createMemoryContextSource(options: MemoryContextSourceOptions): 
       ),
     );
   });
-  return pinSourceScope(searched, options.scope);
+  return pinSourceScope(searched, options.scope, (requested) =>
+    narrowScope(options.scope, requested),
+  );
 }
 
 /**
@@ -296,7 +300,9 @@ export function createTranscriptContextSource(
       .filter((candidate): candidate is ContextCandidate => candidate !== undefined)
       .slice(0, request.limit);
   });
-  return pinSourceScope(transcript, options.scope);
+  return pinSourceScope(transcript, options.scope, (requested) =>
+    narrowScope(options.scope, requested),
+  );
 }
 
 /**

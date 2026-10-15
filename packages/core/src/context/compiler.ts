@@ -6,6 +6,7 @@
  */
 import { canonicalJson, digestJson, sha256Digest, type Sha256Digest } from '../internal/digest';
 import { createTokenEstimator } from '../internal/estimate-tokens';
+import { pinCompilerScope } from '../internal/memory-scope-claims';
 import { resolveDependencies } from '../internal/resolve-deps';
 import { telemetryParentOf } from '../internal/native-context';
 import { DEUZ_ATTR, DEUZ_SPAN, observeSpan, type TelemetryAttributes } from '../internal/telemetry';
@@ -668,15 +669,19 @@ export function createContextCompiler(options: CreateContextCompilerOptions): Co
     );
   }
 
-  return {
-    sources,
-    beforeModelCall,
-    onOverflow,
-    requestRefresh() {
-      state = { ...state, refreshRequested: true };
+  // A V3 run given this instance claims its `scope` as it claims the options' one.
+  return pinCompilerScope(
+    {
+      sources,
+      beforeModelCall,
+      onOverflow,
+      requestRefresh() {
+        state = { ...state, refreshRequested: true };
+      },
+      state() {
+        return JSON.parse(JSON.stringify(state)) as ContextCompilerState;
+      },
     },
-    state() {
-      return JSON.parse(JSON.stringify(state)) as ContextCompilerState;
-    },
-  };
+    options.scope,
+  );
 }
