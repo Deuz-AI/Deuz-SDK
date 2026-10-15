@@ -100,8 +100,8 @@ export function createInMemoryVersionedMemoryStore(options?: {
   const records = new Map<string, Map<string, StoredRevision[]>>();
   /** Record ids are unique store-wide: id → the scope key that owns it. */
   const owners = new Map<string, string>();
-  /** Ids of forgotten records: never recreated, in any scope. */
-  const forgotten = new Set<string>();
+  /** Ids of forgotten records → the scope key that owned them: never recreated, in any scope. */
+  const forgotten = new Map<string, string>();
   const scopeRevisions = new Map<string, number>();
   const receipts = new Map<string, VersionedMemoryReceipt>();
   const generations: MemoryEmbeddingGeneration[] = [];
@@ -565,7 +565,13 @@ export function createInMemoryVersionedMemoryStore(options?: {
         const stored = receipts.get(operationId);
         if (stored) {
           if (stored.requestDigest === requestDigest)
-            return { scope: copy(checked), recordId: id, revisions: [], operationId };
+            return {
+              scope: copy(checked),
+              recordId: id,
+              revisions: [],
+              operationId,
+              ...(forgotten.get(id) === key ? { alreadyForgotten: true as const } : {}),
+            };
           throw new OperationConflictError({
             subsystem: 'memory',
             operationId,
@@ -575,10 +581,11 @@ export function createInMemoryVersionedMemoryStore(options?: {
         }
         const history = revisionsOf(key, id);
         const revisions = history?.map((item) => item.record.revision) ?? [];
+        const alreadyForgotten = !history && forgotten.get(id) === key;
         if (history) {
           records.get(key)!.delete(id);
           owners.delete(id);
-          forgotten.add(id);
+          forgotten.set(id, key);
           for (const byKey of vectors.values())
             for (const revision of revisions) byKey.delete(vectorKey(key, id, revision));
           // Receipts hold no text; they stay so a redelivery replays, marked redacted.
@@ -597,7 +604,13 @@ export function createInMemoryVersionedMemoryStore(options?: {
           entries: [],
           committedAt: deps.clock.now(),
         });
-        return { scope: copy(checked), recordId: id, revisions, operationId };
+        return {
+          scope: copy(checked),
+          recordId: id,
+          revisions,
+          operationId,
+          ...(alreadyForgotten ? { alreadyForgotten: true as const } : {}),
+        };
       });
     },
 

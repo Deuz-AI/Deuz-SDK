@@ -14,7 +14,11 @@
  *
  * FTS5 is optional per process (Node 22.14's SQLite ships without it): a
  * process without it marks the index stale on every write, and the next
- * process with FTS5 rebuilds it before using it.
+ * process with FTS5 rebuilds it before using it. The index runs with FTS5
+ * `secure-delete`, so the tokens of a forgotten or pruned revision leave its
+ * pages at once. Forget is still a logical delete for the file as a whole:
+ * pages SQLite frees keep their bytes unless the host sets
+ * `PRAGMA secure_delete` or runs `VACUUM`.
  */
 import type {
   MemoryEmbeddingGeneration,
@@ -58,12 +62,15 @@ import {
   embeddingMeta,
   encodeReceipt,
   encodeRecord,
+  forgetReceipt,
+  forgetRequestDigest,
   fuseHits,
   normalizeScope,
   planCommit,
   pruneOperationsWarning,
   queryTokens,
   rankByCosine,
+  refuseForeignForget,
   replayOrRefuse,
   retentionSpan,
   scopeKey,
@@ -72,6 +79,7 @@ import {
   validateGeneration,
   type CommitPlan,
   type CommitSnapshot,
+  type ForgetOutcome,
   type RecordLookup,
   type ScoredRevision,
 } from './vmem-shared';
@@ -211,6 +219,22 @@ function toGeneration(row: Record<string, unknown>): MemoryEmbeddingGeneration {
 
 const FTS_DIRTY = 'fts_dirty';
 
+/**
+ * Turns on FTS5 `secure-delete` (persistent, SQLite 3.42+): a revision that
+ * forget or pruneHistory deletes leaves the index pages themselves, instead of
+ * staying behind a delete marker until a segment merge that a small store may
+ * never run. An older SQLite keeps the default; its tokens go at the next merge.
+ */
+function secureDelete(s: State): void {
+  try {
+    const row = one(s, "SELECT v FROM deuz_vmem_fts_config WHERE k = 'secure-delete'");
+    if (row && num(row.v) === 1) return;
+    s.db.exec("INSERT INTO deuz_vmem_fts(deuz_vmem_fts, rank) VALUES('secure-delete', 1)");
+  } catch {
+    // SQLite before 3.42 does not know the option: lexical search works the same.
+  }
+}
+
 /** Builds the index in its own transaction; false when this SQLite has no FTS5. */
 function setupFts(s: State): boolean {
   try {
@@ -222,6 +246,7 @@ function setupFts(s: State): boolean {
       s.db.exec(FTS_TABLE);
       if (!existed) s.db.exec("INSERT INTO deuz_vmem_fts(deuz_vmem_fts) VALUES('rebuild')");
     });
+    secureDelete(s);
     all(s, 'SELECT rowid FROM deuz_vmem_fts WHERE deuz_vmem_fts MATCH ? LIMIT 1', ['"deuz"']);
     s.fts = true;
     syncFts(s, false);
@@ -282,6 +307,12 @@ function readReceipt(s: State, operationId: string): VersionedMemoryReceipt | un
     operationId,
   ]);
   return row ? decodeReceipt(text(row.receipt), num(row.redacted) === 1) : undefined;
+}
+
+/** Whether record `id` was forgotten while scope `key` owned it. */
+function forgottenIn(s: State, id: string, key: string): boolean {
+  const row = one(s, 'SELECT scope_key FROM deuz_vmem_forgotten WHERE id = ?', [id]);
+  return row !== undefined && text(row.scope_key) === key;
 }
 
 function readScopeRevision(s: State, key: string): number {
@@ -656,43 +687,73 @@ export function createSqliteVersionedMemoryStore(
       const key = scopeKey(normalized);
       if (typeof operationId !== 'string' || operationId === '')
         throw new InvalidRequestError({ message: 'forget needs an operationId.' });
-      const revisions = await write((s) =>
-        sqliteTransaction(s.db, () => {
+      const requestDigest = await forgetRequestDigest(normalized, id);
+      const outcome = await write((s) =>
+        sqliteTransaction(s.db, (): ForgetOutcome => {
+          // The forget is an operation: a repeated id replays, another's id conflicts.
+          const stored = readReceipt(s, operationId);
+          if (stored) {
+            refuseForeignForget(stored, operationId, requestDigest);
+            return { revisions: [], alreadyForgotten: forgottenIn(s, id, key) };
+          }
           syncFts(s, true);
           const record = one(s, 'SELECT scope_key FROM deuz_vmem_records WHERE id = ?', [id]);
-          if (!record || text(record.scope_key) !== key) return [];
-          const rows = all(
-            s,
-            'SELECT seq, revision, text FROM deuz_vmem_revisions WHERE id = ? ORDER BY revision',
-            [id],
-          );
-          for (const row of rows) unindexRevision(s, num(row.seq), text(row.text));
-          run(s, 'DELETE FROM deuz_vmem_vectors WHERE id = ?', [id]);
-          run(s, 'DELETE FROM deuz_vmem_revisions WHERE id = ?', [id]);
-          run(s, 'DELETE FROM deuz_vmem_records WHERE id = ?', [id]);
+          let rows: Record<string, unknown>[] = [];
+          const alreadyForgotten = !record && forgottenIn(s, id, key);
+          if (record && text(record.scope_key) === key) {
+            rows = all(
+              s,
+              'SELECT seq, revision, text FROM deuz_vmem_revisions WHERE id = ? ORDER BY revision',
+              [id],
+            );
+            for (const row of rows) unindexRevision(s, num(row.seq), text(row.text));
+            run(s, 'DELETE FROM deuz_vmem_vectors WHERE id = ?', [id]);
+            run(s, 'DELETE FROM deuz_vmem_revisions WHERE id = ?', [id]);
+            run(s, 'DELETE FROM deuz_vmem_records WHERE id = ?', [id]);
+            run(
+              s,
+              'INSERT OR REPLACE INTO deuz_vmem_forgotten (id, scope_key, operation_id, forgotten_at) VALUES (?, ?, ?, ?)',
+              [id, key, operationId, clock.now()],
+            );
+            run(
+              s,
+              'UPDATE deuz_vmem_receipts SET redacted = 1 WHERE operation_id IN ' +
+                '(SELECT operation_id FROM deuz_vmem_receipt_records WHERE record_id = ?)',
+              [id],
+            );
+            run(s, 'DELETE FROM deuz_vmem_receipt_records WHERE record_id = ?', [id]);
+            markWritten(s);
+          }
+          // Committed even when it deleted nothing: the scope moves and the id is taken.
+          const scopeRevision = readScopeRevision(s, key) + 1;
           run(
             s,
-            'INSERT OR REPLACE INTO deuz_vmem_forgotten (id, scope_key, operation_id, forgotten_at) VALUES (?, ?, ?, ?)',
-            [id, key, operationId, clock.now()],
+            'INSERT INTO deuz_vmem_scopes (scope_key, revision) VALUES (?, ?) ' +
+              'ON CONFLICT(scope_key) DO UPDATE SET revision = excluded.revision',
+            [key, scopeRevision],
+          );
+          const receipt = forgetReceipt(
+            normalized,
+            operationId,
+            requestDigest,
+            scopeRevision,
+            clock.now(),
           );
           run(
             s,
-            'UPDATE deuz_vmem_receipts SET redacted = 1 WHERE operation_id IN ' +
-              '(SELECT operation_id FROM deuz_vmem_receipt_records WHERE record_id = ?)',
-            [id],
+            'INSERT INTO deuz_vmem_receipts (operation_id, request_digest, committed_at, redacted, receipt) VALUES (?, ?, ?, 0, ?)',
+            [operationId, requestDigest, receipt.committedAt, encodeReceipt(receipt)],
           );
-          run(s, 'DELETE FROM deuz_vmem_receipt_records WHERE record_id = ?', [id]);
-          run(
-            s,
-            'INSERT INTO deuz_vmem_scopes (scope_key, revision) VALUES (?, 1) ' +
-              'ON CONFLICT(scope_key) DO UPDATE SET revision = revision + 1',
-            [key],
-          );
-          markWritten(s);
-          return rows.map((row) => num(row.revision));
+          return { revisions: rows.map((row) => num(row.revision)), alreadyForgotten };
         }),
       );
-      return { scope: normalized, recordId: id, revisions, operationId };
+      return {
+        scope: normalized,
+        recordId: id,
+        revisions: outcome.revisions,
+        operationId,
+        ...(outcome.alreadyForgotten ? { alreadyForgotten: true as const } : {}),
+      };
     },
 
     embeddings: {

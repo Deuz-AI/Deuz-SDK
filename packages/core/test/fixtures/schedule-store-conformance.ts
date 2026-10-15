@@ -198,6 +198,76 @@ export function scheduleStoreContracts(
       expect((await store.schedules.get('tenant', 's'))?.revision).toBe(2);
     });
 
+    test('takes only the definition from a put: status, cursor, scanTo and times stay the store\x27s', async () => {
+      const { store, time } = await setup();
+      // A whole stored schedule passes as an input (no excess-property check on a variable).
+      const extras = {
+        status: 'paused',
+        revision: 9,
+        scheduleCursor: 1,
+        scanTo: T0 + 99 * MINUTE,
+        createdAt: 1,
+        updatedAt: 1,
+        effectiveFrom: 1,
+        note: 'not a schedule field',
+      };
+      const created = await store.schedules.put(
+        { ...scheduleInput('s'), ...extras } as DurableScheduleInput,
+        { expectedRevision: 0, effectiveFrom: T0 },
+      );
+      expect(created.status === 'committed' && created.schedule).toEqual({
+        ...scheduleInput('s'),
+        status: 'active',
+        revision: 1,
+        effectiveFrom: T0,
+        scheduleCursor: T0,
+        createdAt: T0,
+        updatedAt: T0,
+      });
+      const before = (await store.schedules.get('tenant', 's'))!;
+      await store.schedules.advance({
+        scope: 'tenant',
+        scheduleId: 's',
+        expectedRevision: 1,
+        fromCursor: T0,
+        toCursor: T0 + 2 * MINUTE,
+        occurrences: [await delivered('s', T0 + MINUTE), await delivered('s', T0 + 2 * MINUTE)],
+      });
+      const after = (await store.schedules.get('tenant', 's'))!;
+      await time.advance(5 * MINUTE);
+
+      // A stale read-modify-put passes the revision check (advance keeps the revision)
+      // but cannot rewind the cursor.
+      const stale = await store.schedules.put(before, {
+        expectedRevision: after.revision,
+        effectiveFrom: T0 + 5 * MINUTE,
+      });
+      expect(stale.status).toBe('committed');
+      expect(await store.schedules.get('tenant', 's')).toMatchObject({
+        revision: 2,
+        status: 'active',
+        scheduleCursor: after.scheduleCursor,
+        effectiveFrom: T0 + 5 * MINUTE,
+        createdAt: T0,
+      });
+      // A schedule read before a pause does not resume it, and no put cancels one
+      // behind the inbox's back: its pending deliveries stay pending only while it lives.
+      await store.schedules.pause('tenant', 's', { expectedRevision: 2 });
+      for (const status of ['active', 'cancelled'] as const) {
+        const revision = (await store.schedules.get('tenant', 's'))!.revision;
+        await store.schedules.put({ ...after, status } as DurableScheduleInput, {
+          expectedRevision: revision,
+          effectiveFrom: T0 + 5 * MINUTE,
+        });
+        const stored = (await store.schedules.get('tenant', 's'))!;
+        expect(stored).toMatchObject({ status: 'paused', revision: revision + 1 });
+        expect(stored.scanTo).toBeUndefined();
+        expect(stored).not.toHaveProperty('note');
+      }
+      const dispositions = (await store.inbox.list({ scope: 'tenant', goalId: 'goal-1' })).entries;
+      expect(dispositions.map((entry) => entry.disposition)).toEqual(['pending', 'pending']);
+    });
+
     test('lists schedules by scope, goal and status, by schedule id, page by page', async () => {
       const { store } = await setup();
       for (const [id, scope, goalId] of [

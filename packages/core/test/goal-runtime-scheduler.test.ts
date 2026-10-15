@@ -9,7 +9,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { GoalError, createGoal } from '../src/goal';
 import { createDurableScheduler } from '../src/goal/runtime/scheduler';
 import type { DurableSchedulerOptions } from '../src/goal/runtime/scheduler';
-import { goalInboxKey } from '../src/goal/runtime/store';
+import { createInMemoryGoalRuntimeStore, goalInboxKey } from '../src/goal/runtime/store';
 import type { DurableScheduleInput, GoalRuntimeStore } from '../src/goal/runtime/store-types';
 import type { ObserveEvent } from '../src/types/observe';
 import {
@@ -185,6 +185,43 @@ describe('createDurableScheduler: schedules', () => {
       expect((error as GoalError).code).toBe('revision_conflict');
     }
     expect((await scheduler.get('tenant', 's'))?.revision).toBe(3);
+  });
+
+  it('an unchanged put (the boot-time ensure) is no change: no revision, no boundary, no write', async () => {
+    const { scheduler, store, time } = await setup();
+    const first = await scheduler.put(input({ event: { correlationId: 'c-1' } }));
+    await time.advance(10 * MINUTE);
+    // The same schedule, with its defaults spelled out or left out, is the stored one.
+    const put = vi.spyOn(store.schedules, 'put');
+    expect(await scheduler.put(input({ event: { correlationId: 'c-1' } }))).toEqual(first);
+    expect(
+      await scheduler.put(
+        input({
+          spec: {
+            cron: '0 9 * * *',
+            timezone: 'UTC',
+            dstGap: 'shift',
+            dstOverlap: 'first',
+            catchUp: 'latest',
+          },
+          event: { correlationId: 'c-1' },
+        }),
+        { expectedRevision: 1 },
+      ),
+    ).toEqual(first);
+    expect(put).not.toHaveBeenCalled();
+    // A paused schedule stays paused, at its revision.
+    const paused = await scheduler.pause('tenant', 's');
+    expect(await scheduler.put(input({ event: { correlationId: 'c-1' } }))).toEqual(paused);
+    expect(put).not.toHaveBeenCalled();
+    // Any difference is a change: the event, the spec or the goal.
+    const changed = await scheduler.put(input());
+    expect(changed).toMatchObject({
+      revision: 3,
+      status: 'paused',
+      effectiveFrom: T0 + 10 * MINUTE,
+    });
+    expect(put).toHaveBeenCalledTimes(1);
   });
 
   it('pauses, resumes and cancels as new revisions; repeating one writes nothing', async () => {
@@ -522,6 +559,39 @@ describe('createDurableScheduler: catch-up and backlog', () => {
       (await scheduler.tick()).occurrences.map((o) => o.scheduleId).join('');
     // Three backlogs, two deliveries per tick: each schedule waits at most one tick.
     expect([await served(), await served(), await served()]).toEqual(['ab', 'ca', 'bc']);
+  });
+
+  it('catches up after downtime although the host ensured the same schedule at boot', async () => {
+    // On the real in-memory store: put at boot, tick on time, down 5 hours, put again, tick.
+    const boot = async (catchUp: 'latest' | 'all', putAtBoot: boolean) => {
+      let now = Date.parse('2026-10-10T10:30:00Z');
+      const clock = { now: () => now, setTimeout: () => () => {} };
+      const store = createInMemoryGoalRuntimeStore({ deps: { clock } });
+      await store.save(createGoal({ goalId: 'g', scope: 't', objective: 'Do g.' }, { now }));
+      const ensured: DurableScheduleInput = {
+        scheduleId: 's',
+        scope: 't',
+        goalId: 'g',
+        spec: { cron: '0 * * * *', catchUp },
+      };
+      const first = createDurableScheduler({ store, deps: { clock } });
+      await first.put(ensured);
+      now = Date.parse('2026-10-10T11:00:30Z');
+      expect(deliveredIds(await first.tick())).toHaveLength(1);
+      now += 5 * 60 * MINUTE;
+      const second = createDurableScheduler({ store, deps: { clock } });
+      if (putAtBoot) await second.put(ensured);
+      return deliveredIds(await second.tick());
+    };
+    const hours = (from: number, to: number) =>
+      Array.from(
+        { length: to - from + 1 },
+        (_, i) => `s@${Date.parse('2026-10-10T00:00:00Z') + (from + i) * 60 * MINUTE}`,
+      );
+    for (const putAtBoot of [false, true]) {
+      expect(await boot('all', putAtBoot)).toEqual(hours(12, 16));
+      expect(await boot('latest', putAtBoot)).toEqual(hours(16, 16));
+    }
   });
 
   it('applies a change from its boundary: no occurrence of either revision is invented before it', async () => {

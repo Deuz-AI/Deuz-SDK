@@ -296,9 +296,20 @@ export interface MemoryReembedItem {
 export interface MemoryForgetEvent {
   scope: MemoryScope;
   recordId: string;
-  /** Every revision that existed, now deleted with its vectors. */
+  /**
+   * Every revision that existed, now deleted with its vectors. Empty with
+   * `alreadyForgotten`: then it stands for every revision the record had.
+   */
   revisions: number[];
   operationId: string;
+  /**
+   * The record had already been forgotten in this scope (a retried forget, or
+   * a replayed operation id): nothing more was deleted. The session calls the
+   * `onForget` listeners again, so a redaction that a crash between the
+   * forget and its listeners cut short completes on the retry. Absent for a
+   * record the scope never had.
+   */
+  alreadyForgotten?: true;
 }
 
 /** Called after a forget committed; awaited in order. A failure never undoes the forget. */
@@ -306,7 +317,10 @@ export type MemoryForgetListener = (event: MemoryForgetEvent) => void | Promise<
 
 /** What `forget` did. */
 export interface MemoryForgetResult extends MemoryForgetEvent {
-  /** `'failed'` when a listener threw: run the redaction again from `event`. */
+  /**
+   * `'failed'` when a listener threw: call `forget` again (it reruns the
+   * listeners with `alreadyForgotten`), or run the redaction from the event.
+   */
   redaction: 'complete' | 'failed' | 'none';
 }
 
@@ -361,8 +375,11 @@ export interface VersionedMemoryStore {
   scopeRevision(scope: MemoryScope): Promise<number>;
   /**
    * Deletes a record's content, every revision and every vector, and redacts
-   * its receipts' content; the operation ids stay, content-free. Returns the
-   * deleted revisions (none for an unknown record).
+   * its receipts' content; the operation ids stay, content-free. The forget
+   * is an operation too: it leaves a content-free receipt and moves the scope
+   * revision, a repeated id replays and another operation's id conflicts.
+   * Returns the deleted revisions (none for an unknown record), and
+   * `alreadyForgotten` when the scope's record was forgotten before.
    */
   forget(scope: MemoryScope, id: string, operationId: string): Promise<MemoryForgetEvent>;
   /** Embedding generations for `reembed`: prepared aside, switched atomically. */
@@ -542,8 +559,10 @@ export interface MemorySession {
   /**
    * Deletes the record's content, revisions and vectors, keeps the operation
    * ids content-free, then calls every `onForget` listener (V3 run stores
-   * redact their context packages). Never touches chats, the transcript
-   * index, host files or exported drafts.
+   * redact their context packages). A retry of a forget whose listeners did
+   * not all run (a crash, a failed listener) calls them again with
+   * `alreadyForgotten`. Never touches chats, the transcript index, host files
+   * or exported drafts.
    */
   forget(id: string, options?: MemoryWriteOptions): Promise<MemoryForgetResult>;
   history(id: string): Promise<VersionedMemoryRecord[]>;

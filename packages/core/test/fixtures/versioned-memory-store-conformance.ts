@@ -897,6 +897,112 @@ export function assertVersionedMemoryStoreContract(
           });
         },
       );
+
+      it(
+        'reports a record forgotten before in the scope, so a retry can finish its redaction',
+        { timeout },
+        async () => {
+          await withStore(async ({ store }) => {
+            await commit(store, await operation('op-1', [await create('r1', 'fact')]));
+            const first = await store.forget(SCOPE, 'r1', 'f-1');
+            expect(first).toEqual({
+              scope: SCOPE,
+              recordId: 'r1',
+              revisions: [1],
+              operationId: 'f-1',
+            });
+            // A replay of the same forget, and a new forget of the same record, both say so:
+            // revisions [] then stands for every revision the record had.
+            const already = { scope: SCOPE, recordId: 'r1', revisions: [], alreadyForgotten: true };
+            expect(await store.forget(SCOPE, 'r1', 'f-1')).toEqual({
+              ...already,
+              operationId: 'f-1',
+            });
+            expect(await store.forget(SCOPE, 'r1', 'f-2')).toEqual({
+              ...already,
+              operationId: 'f-2',
+            });
+            // Never for an id the scope does not own: unknown, or forgotten in another scope.
+            expect(await store.forget(OTHER, 'r1', 'f-3')).toEqual({
+              scope: OTHER,
+              recordId: 'r1',
+              revisions: [],
+              operationId: 'f-3',
+            });
+            expect(await store.forget(SCOPE, 'ghost', 'f-4')).toEqual({
+              scope: SCOPE,
+              recordId: 'ghost',
+              revisions: [],
+              operationId: 'f-4',
+            });
+            expect(await store.forget(SCOPE, 'ghost', 'f-4')).toEqual({
+              scope: SCOPE,
+              recordId: 'ghost',
+              revisions: [],
+              operationId: 'f-4',
+            });
+          });
+        },
+      );
+
+      it(
+        'is an operation: a content-free receipt, a scope revision, an id never reused',
+        { timeout },
+        async () => {
+          await withStore(async ({ store, clock }) => {
+            await commit(
+              store,
+              await operation('op-1', [
+                await create('r1', 'first fact'),
+                await create('r2', 'second fact'),
+                await create('r3', 'third fact'),
+              ]),
+            );
+            expect(await store.scopeRevision(SCOPE)).toBe(1);
+
+            // Every committed forget moves its scope's revision, even one that deleted nothing.
+            await store.forget(SCOPE, 'ghost', 'f-0');
+            expect(await store.scopeRevision(SCOPE)).toBe(2);
+            await store.forget(OTHER, 'r1', 'f-other');
+            expect(await store.scopeRevision(OTHER)).toBe(1);
+            expect(await store.scopeRevision(SCOPE)).toBe(2);
+
+            // A host that lost the answer finds out from the receipt whether it committed.
+            await store.forget(SCOPE, 'r1', 'f-1');
+            const receipt = await store.receipt('f-1');
+            expect(receipt).toMatchObject({
+              operationId: 'f-1',
+              scope: SCOPE,
+              actor: 'host',
+              scopeRevision: 3,
+              entries: [],
+              committedAt: clock.now(),
+            });
+            expect(isSha256Digest(receipt!.requestDigest)).toBe(true);
+            expect(JSON.stringify(receipt)).not.toContain('first fact');
+            expect(await store.receipt('f-0')).toMatchObject({ scopeRevision: 2, entries: [] });
+
+            // The same forget again replays: nothing moves.
+            expect((await store.forget(SCOPE, 'r1', 'f-1')).revisions).toEqual([]);
+            expect(await store.scopeRevision(SCOPE)).toBe(3);
+
+            // Its id, or a commit's, is refused for another forget, and a commit cannot take it.
+            await expect(store.forget(SCOPE, 'r2', 'op-1')).rejects.toBeInstanceOf(
+              OperationConflictError,
+            );
+            await expect(store.forget(SCOPE, 'r3', 'f-1')).rejects.toBeInstanceOf(
+              OperationConflictError,
+            );
+            await expect(
+              store.commit(await operation('f-1', [await create('r4', 'fourth fact')])),
+            ).rejects.toBeInstanceOf(OperationConflictError);
+            expect((await store.get(SCOPE, 'r2'))?.text).toBe('second fact');
+            expect((await store.get(SCOPE, 'r3'))?.text).toBe('third fact');
+            expect(await store.get(SCOPE, 'r4')).toBeUndefined();
+            expect(await store.scopeRevision(SCOPE)).toBe(3);
+          });
+        },
+      );
     });
 
     describe('embedding generations', () => {

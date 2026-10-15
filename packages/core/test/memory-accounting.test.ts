@@ -89,18 +89,40 @@ describe('memory seams accept accounted callbacks', () => {
     expect(isAccounted(async () => '')).toBe(false);
   });
 
-  it('remember() reads the text of an accounted LLM answer', async () => {
+  it('remember() reads the text of an accounted LLM answer (accountedLlm before llm)', async () => {
     const answers = [
       '{"facts":[{"text":"The user lives in Ankara"}]}',
       '{"memory":[{"event":"ADD","text":"The user lives in Ankara"}]}',
     ];
-    const llm = defineAccountedMemoryLLM(async () => ({
+    const accountedLlm = defineAccountedMemoryLLM(async () => ({
       text: answers.shift()!,
       usage: usage(10, 5),
       modelId: 'small-model',
     }));
-    const s = seams({ llm });
+    const llm = vi.fn<MemorySeams['llm']>(async () => '{"facts":[]}');
+    const s = seams({ llm, accountedLlm });
     const mutations = await remember(MESSAGES, SCOPE, s);
+    expect(mutations.map((m) => (m.op === 'upsert' ? m.record.text : m.op))).toEqual([
+      'The user lives in Ankara',
+    ]);
+    expect(llm).not.toHaveBeenCalled();
+  });
+
+  it('still reads the text of an accounted callable that untyped code put in llm', async () => {
+    const answers = [
+      '{"facts":[{"text":"The user lives in Ankara"}]}',
+      '{"memory":[{"event":"ADD","text":"The user lives in Ankara"}]}',
+    ];
+    const accounted = defineAccountedMemoryLLM(async () => ({
+      text: answers.shift()!,
+      usage: usage(10, 5),
+      modelId: 'small-model',
+    }));
+    const mutations = await remember(
+      MESSAGES,
+      SCOPE,
+      seams({ llm: accounted as unknown as MemorySeams['llm'] }),
+    );
     expect(mutations.map((m) => (m.op === 'upsert' ? m.record.text : m.op))).toEqual([
       'The user lives in Ankara',
     ]);
@@ -133,13 +155,13 @@ describe('memory helper calls on a ledger (seams.execution)', () => {
       '{"facts":[{"text":"The user lives in Ankara"}]}',
       '{"memory":[{"event":"ADD","text":"The user lives in Ankara"}]}',
     ];
-    const llm = defineAccountedMemoryLLM(async () => ({
+    const accountedLlm = defineAccountedMemoryLLM(async () => ({
       text: answers.shift()!,
       usage: usage(100, 20),
       modelId: 'small-model',
     }));
     const warnings: CallWarning[] = [];
-    await remember(MESSAGES, SCOPE, seams({ llm, execution }), {
+    await remember(MESSAGES, SCOPE, seams({ accountedLlm, execution }), {
       onWarning: (warning) => warnings.push(warning),
     });
     expect(reservations).toHaveLength(2);

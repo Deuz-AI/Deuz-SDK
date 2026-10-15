@@ -55,12 +55,15 @@ import {
   embeddingMeta,
   encodeReceipt,
   encodeRecord,
+  forgetReceipt,
+  forgetRequestDigest,
   fuseHits,
   normalizeScope,
   planCommit,
   pruneOperationsWarning,
   queryTokens,
   rankByCosine,
+  refuseForeignForget,
   replayOrRefuse,
   retentionSpan,
   scopeKey,
@@ -68,6 +71,7 @@ import {
   validateGeneration,
   type CommitPlan,
   type CommitSnapshot,
+  type ForgetOutcome,
   type RecordLookup,
   type ScoredRevision,
 } from './vmem-shared';
@@ -655,41 +659,79 @@ export function createPostgresVersionedMemoryStore(
       const key = scopeKey(normalized);
       if (typeof operationId !== 'string' || operationId === '')
         throw new InvalidRequestError({ message: 'forget needs an operationId.' });
-      const revisions = await tx(async (q) => {
+      const requestDigest = await forgetRequestDigest(normalized, id);
+      const forgottenIn = async (q: PgClientLike): Promise<boolean> => {
+        const { rows } = await q.query(`SELECT scope_key FROM ${t('forgotten')} WHERE id = $1`, [
+          id,
+        ]);
+        return rows[0] !== undefined && str(rows[0].scope_key) === key;
+      };
+      const outcome = await tx(async (q): Promise<ForgetOutcome> => {
         await q.query(
           `INSERT INTO ${t('scopes')} (scope_key, revision) VALUES ($1, 0) ON CONFLICT (scope_key) DO NOTHING`,
           [key],
         );
         await q.query(`SELECT revision FROM ${t('scopes')} WHERE scope_key = $1 FOR UPDATE`, [key]);
+        // The forget is an operation: a repeated id replays, another's id conflicts.
+        const stored = await readReceipt(q, operationId);
+        if (stored) {
+          refuseForeignForget(stored, operationId, requestDigest);
+          return { revisions: [], alreadyForgotten: await forgottenIn(q) };
+        }
         const record = await q.query(
           `SELECT scope_key FROM ${t('records')} WHERE id = $1 FOR UPDATE`,
           [id],
         );
-        if (!record.rows[0] || str(record.rows[0].scope_key) !== key) return [];
-        const { rows } = await q.query(
-          `SELECT revision FROM ${t('revisions')} WHERE id = $1 ORDER BY revision`,
-          [id],
+        let rows: Record<string, unknown>[] = [];
+        const alreadyForgotten = !record.rows[0] && (await forgottenIn(q));
+        if (record.rows[0] && str(record.rows[0].scope_key) === key) {
+          rows = (
+            await q.query(
+              `SELECT revision FROM ${t('revisions')} WHERE id = $1 ORDER BY revision`,
+              [id],
+            )
+          ).rows;
+          await q.query(`DELETE FROM ${t('vectors')} WHERE id = $1`, [id]);
+          await q.query(`DELETE FROM ${t('revisions')} WHERE id = $1`, [id]);
+          await q.query(`DELETE FROM ${t('records')} WHERE id = $1`, [id]);
+          await q.query(
+            `INSERT INTO ${t('forgotten')} (id, scope_key, operation_id, forgotten_at) VALUES ($1, $2, $3, $4) ` +
+              'ON CONFLICT (id) DO UPDATE SET operation_id = EXCLUDED.operation_id, forgotten_at = EXCLUDED.forgotten_at',
+            [id, key, operationId, clock.now()],
+          );
+          await q.query(
+            `UPDATE ${t('receipts')} SET redacted = TRUE WHERE operation_id IN ` +
+              `(SELECT operation_id FROM ${t('receipt_records')} WHERE record_id = $1)`,
+            [id],
+          );
+          await q.query(`DELETE FROM ${t('receipt_records')} WHERE record_id = $1`, [id]);
+        }
+        // Committed even when it deleted nothing: the scope moves and the id is taken (a
+        // writer in another scope that took it first collides here, and the retry conflicts).
+        const bumped = await q.query(
+          `UPDATE ${t('scopes')} SET revision = revision + 1 WHERE scope_key = $1 RETURNING revision`,
+          [key],
         );
-        await q.query(`DELETE FROM ${t('vectors')} WHERE id = $1`, [id]);
-        await q.query(`DELETE FROM ${t('revisions')} WHERE id = $1`, [id]);
-        await q.query(`DELETE FROM ${t('records')} WHERE id = $1`, [id]);
+        const receipt = forgetReceipt(
+          normalized,
+          operationId,
+          requestDigest,
+          num(bumped.rows[0]!.revision),
+          clock.now(),
+        );
         await q.query(
-          `INSERT INTO ${t('forgotten')} (id, scope_key, operation_id, forgotten_at) VALUES ($1, $2, $3, $4) ` +
-            'ON CONFLICT (id) DO UPDATE SET operation_id = EXCLUDED.operation_id, forgotten_at = EXCLUDED.forgotten_at',
-          [id, key, operationId, clock.now()],
+          `INSERT INTO ${t('receipts')} (operation_id, request_digest, committed_at, redacted, receipt) VALUES ($1, $2, $3, FALSE, $4)`,
+          [operationId, requestDigest, receipt.committedAt, encodeReceipt(receipt)],
         );
-        await q.query(
-          `UPDATE ${t('receipts')} SET redacted = TRUE WHERE operation_id IN ` +
-            `(SELECT operation_id FROM ${t('receipt_records')} WHERE record_id = $1)`,
-          [id],
-        );
-        await q.query(`DELETE FROM ${t('receipt_records')} WHERE record_id = $1`, [id]);
-        await q.query(`UPDATE ${t('scopes')} SET revision = revision + 1 WHERE scope_key = $1`, [
-          key,
-        ]);
-        return rows.map((row) => num(row.revision));
+        return { revisions: rows.map((row) => num(row.revision)), alreadyForgotten };
       });
-      return { scope: normalized, recordId: id, revisions, operationId };
+      return {
+        scope: normalized,
+        recordId: id,
+        revisions: outcome.revisions,
+        operationId,
+        ...(outcome.alreadyForgotten ? { alreadyForgotten: true as const } : {}),
+      };
     },
 
     embeddings: {

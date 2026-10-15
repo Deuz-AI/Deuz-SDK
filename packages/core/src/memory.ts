@@ -16,7 +16,11 @@ import type { Message } from './types/message';
 import type { Clock } from './types/deps';
 import type { Tool, ToolSet } from './types/tool';
 import type { CallWarning, EmbedManyOptions } from './types/methods';
-import type { AccountedMemoryEmbedder, AccountedMemoryLLMResult } from './types/accounting';
+import type {
+  AccountedMemoryEmbedder,
+  AccountedMemoryLLM,
+  AccountedMemoryLLMResult,
+} from './types/accounting';
 import type { NativeExecutionContext } from './types/execution';
 import type { EmbeddingModel } from './types/model';
 // TYPE-ONLY on purpose: the bridge below adapts rag.ts's Embedder shape without
@@ -217,16 +221,16 @@ export interface MemorySeams {
    * 2.4: an `AccountedMemoryEmbedder` (`accounted: true`, usage with the vectors) is accepted too.
    */
   embedder?: Embedder | AccountedMemoryEmbedder;
+  /** Prompt in, raw text out. Its type is the 2.3 `MemoryLLM`, so code that reads it keeps compiling. */
+  llm: MemoryLLM;
   /**
-   * A plain `MemoryLLM`, or (2.4) an `AccountedMemoryLLM` that answers its
-   * text with the call's usage (`defineAccountedMemoryLLM`). One callable
-   * type rather than a union, so `MemorySeams['llm']` still types a plain
-   * callback, and a `vi.fn` of one, as in 2.3.
+   * The accounted memory LLM (2.4, `defineAccountedMemoryLLM`): it answers
+   * its text with the call's usage. When set, every memory LLM call goes to
+   * it instead of `llm` (which is then never called), and with `execution`
+   * the usage it reports is settled on the ledger. Its own field, so
+   * `seams.llm` keeps reading as a plain `MemoryLLM`.
    */
-  llm: {
-    (prompt: { system: string; user: string }): Promise<string | AccountedMemoryLLMResult>;
-    readonly accounted?: true;
-  };
+  accountedLlm?: AccountedMemoryLLM;
   /**
    * Charge the memory LLM and embedder calls to this context's ledger (2.4).
    * Each call is reserved first at a token estimate, so a budget can refuse
@@ -1080,16 +1084,18 @@ function deliverWarning(
 }
 
 /**
- * One memory LLM call (2.4): a plain callback answers text, an accounted one
- * `{ text, usage, modelId }`. With `seams.execution` the call is charged to
- * its ledger first (`internal/memory-accounting.ts`, loaded only then).
+ * One memory LLM call (2.4): `seams.accountedLlm` when set, else `seams.llm`.
+ * A plain callback answers text, an accounted one `{ text, usage, modelId }`
+ * (also when untyped code put it in `llm`). With `seams.execution` the call
+ * is charged to its ledger first (`internal/memory-accounting.ts`, loaded
+ * only then).
  */
 async function askMemoryLLM(
   seams: MemorySeams,
   prompt: { system: string; user: string },
   onWarning?: (warning: CallWarning) => void,
 ): Promise<string> {
-  const llm = seams.llm;
+  const llm: MemoryLLM | AccountedMemoryLLM = seams.accountedLlm ?? seams.llm;
   const execution = seams.execution;
   let answer: string | AccountedMemoryLLMResult;
   if (!execution) answer = await llm(prompt);

@@ -5,7 +5,10 @@
  * the host marked trusted; external content (unmarked tools: MCP, browser,
  * web) only with `allowExternal`, stored with source kind `'external'`;
  * assistant turns only with `allowAssistant`. The kind comes from the message
- * and the host's policy, never from the model. Edge-safe.
+ * and the host's policy, never from the model. The SDK's own turns in a run
+ * or chat transcript (a memory recall block, a compaction summary, a tool-set
+ * change notice) are never read under any policy: they are neither host nor
+ * user input, and a recall block or summary can carry external content. Edge-safe.
  */
 import type { MemoryScope } from '../../memory';
 import type { Message, Part, ToolResultPart } from '../../types/message';
@@ -43,8 +46,42 @@ function resultText(result: unknown): string {
 }
 
 /**
+ * The markers of the SDK's own turns, read here without importing their
+ * builders (`internal/stable-prefix.ts` pulls the model registry,
+ * `inference/compaction.ts` the loop, and this entry stays small and
+ * edge-safe). They are persisted in transcripts, so they do not change; the
+ * extraction tests build their messages with the real builders.
+ */
+const SUMMARY_SENTINEL = '[Earlier conversation summarized]';
+
+/**
+ * A turn the SDK put into the transcript itself, no fact about the user under
+ * any policy: a stable-prefix memory recall block (`recallMessage`), a
+ * tool-set change notice (`toolSetChangeMessage`), both system messages
+ * marked in `providerMetadata.deuz`, or a compaction summary (model-written
+ * from whatever the window held), one user text part opening with the
+ * summary sentinel (`isSummaryMessage`).
+ */
+function isSdkTurn(message: Message): boolean {
+  if (message.role === 'system') {
+    const deuz = message.providerMetadata?.deuz as
+      | { memoryRecall?: unknown; toolChanges?: { remove?: unknown; add?: unknown } }
+      | undefined;
+    const changes = deuz?.toolChanges;
+    return (
+      deuz?.memoryRecall === true || (Array.isArray(changes?.remove) && Array.isArray(changes?.add))
+    );
+  }
+  if (message.role !== 'user' || !Array.isArray(message.content) || message.content.length !== 1)
+    return false;
+  const part = message.content[0]!;
+  return part.type === 'text' && part.text.startsWith(SUMMARY_SENTINEL);
+}
+
+/**
  * The sources `messages` offer under `policy`, in message order. A message is
- * skipped, never read, when the policy does not allow it.
+ * skipped, never read, when the policy does not allow it, and always when the
+ * SDK injected it (see {@link isSdkTurn}).
  */
 export async function readExtractionSources(
   messages: MemoryExtractionInput['messages'],
@@ -92,6 +129,7 @@ export async function readExtractionSources(
     const message = entry.message;
     if (message === null || typeof message !== 'object' || message.content === undefined)
       throw invalid(`Extraction message ${index} needs a message.`);
+    if (isSdkTurn(message)) continue;
     const text = textParts(message.content);
     if (message.role === 'user') await add('user', 'user', text, entry);
     else if (message.role === 'system') await add('host', 'host', text, entry);
