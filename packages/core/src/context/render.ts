@@ -73,6 +73,7 @@ export function isContextMessage(message: Message): boolean {
 }
 
 const PASS_MARKER = new RegExp(`<${RETRIEVAL_TAG} pass="(\\d+)"`, 'g');
+const BLOCK_MARKER = new RegExp(`<${RETRIEVAL_TAG} pass="(\\d+)" step="(\\d+)"`, 'g');
 
 /** The retrieval passes whose blocks the messages still carry. */
 export function placedPasses(messages: readonly Message[]): Set<number> {
@@ -82,6 +83,22 @@ export function placedPasses(messages: readonly Message[]): Set<number> {
     for (const match of messageText(message).matchAll(PASS_MARKER)) passes.add(Number(match[1]));
   }
   return passes;
+}
+
+/** The key of one retrieval block: its pass and model step. */
+export function blockKey(pass: number, step: number): string {
+  return `${pass}:${step}`;
+}
+
+/** The retrieval blocks the messages still carry, by `blockKey`. */
+export function placedBlocks(messages: readonly Message[]): Set<string> {
+  const blocks = new Set<string>();
+  for (const message of messages) {
+    if (message.role !== 'user') continue;
+    for (const match of messageText(message).matchAll(BLOCK_MARKER))
+      blocks.add(blockKey(Number(match[1]), Number(match[2])));
+  }
+  return blocks;
 }
 
 // ===================================================================

@@ -310,6 +310,20 @@ export interface ContextPlacedEntry {
    * (a compaction removed it), so the entry can be placed again.
    */
   pass?: number;
+  /**
+   * The model step of the `'append'` block that carries it (2.4): with
+   * `pass`, it names that one block (`<deuz_context pass="P" step="S">`),
+   * since a block placing entries again after a compaction keeps the
+   * current pass. Without it, any block of the pass counts.
+   */
+  step?: number;
+  /**
+   * Placed as mandatory content (2.4), such as a loaded skill body. When a
+   * compaction removes its block and the compiler did not retrieve it itself
+   * (it was restored from a checkpoint), it asks the source again instead of
+   * waiting for the next refresh.
+   */
+  mandatory?: boolean;
 }
 
 // ===================================================================

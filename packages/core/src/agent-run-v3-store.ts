@@ -43,6 +43,8 @@ interface StoredBlob {
   /** Undefined once redacted. */
   content: string | undefined;
   records: ContextBlobRecord[];
+  /** The store time of its last put: one after the last save of the runs that used it is in use. */
+  putAt: number;
 }
 
 /**
@@ -50,7 +52,8 @@ interface StoredBlob {
  * process. Copies in and out, saves at the stored revision plus one, blobs
  * deduplicated by digest and redacted on `redactForgotten`. Runs are listed
  * and pruned by the time of their last save on `deps.clock` (default: the
- * host clock).
+ * host clock). `prune` keeps a blob put again after the last save of every
+ * run that pointed to it: another run is about to save it.
  */
 export function createInMemoryAgentRunStoreV3(
   options: { deps?: Dependencies } = {},
@@ -103,7 +106,9 @@ export function createInMemoryAgentRunStoreV3(
     },
     async putBlob(blob) {
       await assertBlobInput(blob);
-      const stored = blobs.get(blob.digest) ?? { content: blob.content, records: [] };
+      const now = clock.now();
+      const stored = blobs.get(blob.digest) ?? { content: blob.content, records: [], putAt: now };
+      stored.putAt = Math.max(stored.putAt, now);
       for (const record of blob.records)
         if (
           !stored.records.some(
@@ -151,8 +156,17 @@ export function createInMemoryAgentRunStoreV3(
       );
       for (const [runId] of pruned) runs.delete(runId);
       const kept = new Set([...runs.values()].flatMap((run) => run.blobs));
+      /** The last save of the pruned runs that pointed to each blob. */
+      const lastSave = new Map<Sha256Digest, number>();
       for (const [, run] of pruned)
-        for (const digest of run.blobs) if (!kept.has(digest)) blobs.delete(digest);
+        for (const digest of run.blobs)
+          lastSave.set(digest, Math.max(lastSave.get(digest) ?? -Infinity, run.summary.updatedAt));
+      for (const [digest, savedAt] of lastSave) {
+        if (kept.has(digest)) continue;
+        // Put again since: a run that has not saved yet is using it.
+        if ((blobs.get(digest)?.putAt ?? -Infinity) > savedAt) continue;
+        blobs.delete(digest);
+      }
       return pruned.length;
     },
   };
