@@ -6,6 +6,15 @@
  */
 import { vi } from 'vitest';
 import { createInMemoryAgentRunStoreV3 } from '../../src/agent-run-v3-store';
+import { sha256DigestSync } from '../../src/context/sha256';
+import type {
+  ContextCandidate,
+  ContextCompiler,
+  ContextSource,
+  ContextSourceKind,
+  ContextSourceRequest,
+  ContextStepInput,
+} from '../../src/context/types';
 import { readConfig } from '../../src/internal/config-symbol';
 import { createMockModel, type MockResponse } from '../../src/testing';
 import type { AgentRunEnvelopeV3, AgentRunStoreV3 } from '../../src/types/agent-run-v3';
@@ -125,4 +134,42 @@ export function fixedDeps(start = 10_000): Dependencies {
     },
     generateId: () => `id-${++id}`,
   } as Dependencies;
+}
+
+/** A context candidate whose digest is that of its text. */
+export function candidate(recordId: string, text: string, score = 1): ContextCandidate {
+  return { recordId, text, score, digest: sha256DigestSync(text) };
+}
+
+/** A context source answering from a fixed list, recording every request. */
+export function fakeSource(id: string, kind: ContextSourceKind, answer: ContextCandidate[]) {
+  const requests: ContextSourceRequest[] = [];
+  const source: ContextSource = {
+    id,
+    kind,
+    async query(request) {
+      requests.push(request);
+      return answer;
+    },
+  };
+  return { source, requests };
+}
+
+/** A compiler that records what the loop hands it. */
+export function spyCompiler(compiler: ContextCompiler) {
+  const inputs: ContextStepInput[] = [];
+  const spied: ContextCompiler = {
+    sources: compiler.sources,
+    requestRefresh: () => compiler.requestRefresh(),
+    state: () => compiler.state(),
+    beforeModelCall(input) {
+      inputs.push(structuredClone({ ...input, signal: undefined }));
+      return compiler.beforeModelCall(input);
+    },
+    onOverflow(input) {
+      inputs.push(structuredClone({ ...input, signal: undefined }));
+      return compiler.onOverflow(input);
+    },
+  };
+  return { compiler: spied, inputs };
 }

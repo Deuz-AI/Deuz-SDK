@@ -189,9 +189,6 @@ function placementOf(pkg: ContextPackage): LoopContextPlacement {
   };
 }
 
-/** The share of the failed request's estimate an overflow retry is compiled for. */
-const OVERFLOW_RETRY_RATIO = 0.8;
-
 /** What the context hook needs from the executor. */
 export interface ContextHookInput {
   compiler: V3Compiler;
@@ -219,7 +216,8 @@ export interface ContextHookInput {
  * uses the stored package again, byte for byte, without asking the sources;
  * a package a `forget` redacted is compiled again (`redacted` in its
  * manifest), the one documented exception. An overflow retry compiles the
- * step again for `OVERFLOW_RETRY_RATIO` of the failed request's estimate.
+ * step again for just under the failed request's estimate (a package that
+ * placed nothing, with no compaction, leaves the provider's overflow).
  */
 export function createContextHook(input: ContextHookInput): LoopContextHook {
   const { compiler, store, runId } = input;
@@ -322,9 +320,15 @@ export function createContextHook(input: ContextHookInput): LoopContextHook {
     async onOverflow(step) {
       if (!current) return undefined;
       const failed = current.pkg.manifest.budget;
-      const budget = Math.floor(
-        Math.min(failed.inputTokens, failed.usedTokens + failed.selectedTokens) *
-          OVERFLOW_RETRY_RATIO,
+      // The package placed nothing and the history did not shrink: the
+      // provider's overflow stands, as in 2.3.
+      if (failed.selectedTokens === 0 && !step.compacted) return undefined;
+      // The request that overflowed (as estimated) did not fit: the retry is
+      // compiled for less than that, so optional context shrinks to what the
+      // added-context share of the gap allows and mandatory content must fit.
+      const budget = Math.max(
+        0,
+        Math.min(failed.inputTokens, failed.usedTokens + failed.selectedTokens) - 1,
       );
       const pkg = await compiler.compiler.onOverflow({
         ...stepInput(step, current.step),

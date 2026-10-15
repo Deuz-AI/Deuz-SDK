@@ -11,57 +11,19 @@
 import { describe, expect, it } from 'vitest';
 import { runAgent } from '../src/agent-run';
 import { createContextCompiler } from '../src/context/compiler';
-import { sha256DigestSync } from '../src/context/sha256';
-import type {
-  ContextCandidate,
-  ContextCompiler,
-  ContextSource,
-  ContextSourceKind,
-  ContextSourceRequest,
-  ContextStepInput,
-} from '../src/context/types';
 import type { AgentRunOptionsV3, AgentRunStoreV3 } from '../src/types/agent-run-v3';
 import type { Message } from '../src/types/message';
-import { recordingStoreV3, scriptedModel, wireText, type ScriptedCall } from './fixtures/native-v3';
+import {
+  candidate,
+  fakeSource,
+  recordingStoreV3,
+  scriptedModel,
+  spyCompiler,
+  wireText,
+  type ScriptedCall,
+} from './fixtures/native-v3';
 
 const parameters = { type: 'object', properties: { q: { type: 'string' } } };
-
-export function candidate(recordId: string, text: string, score = 1): ContextCandidate {
-  return { recordId, text, score, digest: sha256DigestSync(text) };
-}
-
-/** A source answering from a fixed list, recording every request. */
-export function fakeSource(id: string, kind: ContextSourceKind, answer: ContextCandidate[]) {
-  const requests: ContextSourceRequest[] = [];
-  const source: ContextSource = {
-    id,
-    kind,
-    async query(request) {
-      requests.push(request);
-      return answer;
-    },
-  };
-  return { source, requests };
-}
-
-/** A compiler that records what the loop hands it. */
-export function spyCompiler(compiler: ContextCompiler) {
-  const inputs: ContextStepInput[] = [];
-  const spied: ContextCompiler = {
-    sources: compiler.sources,
-    requestRefresh: () => compiler.requestRefresh(),
-    state: () => compiler.state(),
-    beforeModelCall(input) {
-      inputs.push(structuredClone({ ...input, signal: undefined }));
-      return compiler.beforeModelCall(input);
-    },
-    onOverflow(input) {
-      inputs.push(structuredClone({ ...input, signal: undefined }));
-      return compiler.onOverflow(input);
-    },
-  };
-  return { compiler: spied, inputs };
-}
 
 const isContext = (message: { content?: unknown }) =>
   wireText(message).startsWith('<deuz_context ');
