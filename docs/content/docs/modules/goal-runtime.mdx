@@ -328,7 +328,7 @@ answers `{ runId, result, retryable?, workingMemory?, maintenance? }`.
 | --- | --- | --- |
 | `createInMemoryGoalRuntimeStore({ deps? })` | `@deuz-sdk/core/goal/runtime` | Edge-safe; times from `deps.clock` |
 | `createSqliteGoalRuntimeStore({ path \| database, wal?, clock? })` | `@deuz-sdk/core/goal/runtime/sqlite` | Every write is one `BEGIN IMMEDIATE` transaction; several processes can share the file |
-| `createPostgresGoalRuntimeStore({ pool \| connectionString, schema?, clock? })` | `@deuz-sdk/core/goal/runtime/postgres` | Needs a pool with `connect()`; `migrate()`; one pinned connection per write, re-run on a serialization failure, deadlock or unique violation |
+| `createPostgresGoalRuntimeStore({ pool \| connectionString, schema?, clock? })` | `@deuz-sdk/core/goal/runtime/postgres` | Needs a pool with `connect()` (a `query()`-only client throws a `TypeError`); creates its schema on first use, or with `migrate()` (idempotent, tried again after a failure); one pinned connection per write, re-run on a serialization failure, deadlock or unique violation |
 
 All three are `GoalStore`s and pass the 2.3 goal store conformance fixture, so
 goals are durable for the first time. Every process that shares a store must
