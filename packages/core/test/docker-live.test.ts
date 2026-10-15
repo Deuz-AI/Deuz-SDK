@@ -307,4 +307,32 @@ describe.runIf(DOCKER)('Docker process runner (live)', () => {
     expect(cleanup.removed).toContain(orphan.containerId);
     expect(labelled()).not.toContain(orphan.containerId);
   });
+
+  it('reconcile({ removeOrphans }) leaves a live sandbox run alone', async () => {
+    const sandbox = createDockerSandbox(base);
+    const pending = sandbox.runShell!({ command: 'sleep 4; echo done', timeoutMs: 60_000 });
+    const running = () =>
+      cli([
+        'ps',
+        '-q',
+        '--no-trunc',
+        '--filter',
+        `label=deuz.scope=${SCOPE}`,
+        '--filter',
+        'label=deuz.kind=sandbox',
+        '--filter',
+        'status=running',
+      ]).stdout.trim();
+    let live = running();
+    for (let i = 0; i < 100 && !live; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      live = running();
+    }
+    expect(live).not.toBe('');
+    const report = await runner().reconcile({ scope: SCOPE, removeOrphans: true });
+    expect(report.orphans.map((o) => o.containerId)).not.toContain(live);
+    expect(report.removed).not.toContain(live);
+    expect(await pending).toMatchObject({ stdout: 'done\n', exitCode: 0 });
+    expect(labelled()).toEqual([]);
+  });
 });
