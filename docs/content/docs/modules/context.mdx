@@ -144,8 +144,9 @@ The defaults are exported as `DEFAULT_CONTEXT_BUDGET`. The added-context budget
 is `min(ratio × (inputTokens − usedTokens), maxTokens)`. The working memory takes
 up to `workingMemoryTokens` of it. The rest is split by kind, and a share a
 source leaves unused flows to the others (manifest reason `'reallocated'`).
-Within a share, candidates go by descending score, then by source order, then
-by `recordId` within a source.
+Within a share, candidates go by descending score; an equal score goes by
+source order (the order of the compiler's sources), then by `recordId` within
+one source.
 
 Mandatory content is never cut: the working memory's goal, constraints and
 active task, and mandatory candidates (skill bodies the model already loaded
@@ -269,9 +270,11 @@ console.log(compiler.state().passes); // 2
 The query is the active task's title plus the latest user text (the compiler's
 own blocks are skipped), at most 2000 characters. With an empty query every
 source is `'skipped'`, no pass is spent and the refresh stays due. Each source
-receives the pinned `scope`, `limit` (`candidatesPerSource`), a token hint of
-its share (`budgetTokens`) and `recordedAsOf` (the compiler's clock at the
-pass), so a restart reads versioned memory as it was.
+receives the pinned `scope`, `limit` (`candidatesPerSource`) and a token hint
+of its share (`budgetTokens`), and reads what it holds now: the compiler sends
+no `recordedAsOf`, because its clock is not the memory store's. A restarted V3
+step reads the same context because the run sends the step's stored package
+again.
 
 An optional source that fails produces a `context-source-failed` warning
 (through `onWarning`, and `contextWarnings(manifest)`) and the manifest records
@@ -304,12 +307,17 @@ that step's placements. Mandatory content that does not fit throws
 Every built-in source takes `id` (default: its kind) and `required` (default
 `false`), and reads only within the scope you pin: a request may narrow that
 scope, never widen it (a field both set to different values throws a
-`TypeError`), the same narrowing rule native runs apply to memory scopes.
+`TypeError`), the same narrowing rule native runs apply to memory scopes. In a
+nested V3 run each source counts at the scope it reads (a store or transcript
+source at its pinned scope narrowed by the compiler's `scope`, a session source
+at its session's scope), and so does the compiler's `scope`, whether given as
+options or to a `createContextCompiler` instance; each must lie within the
+parent run's memory scope.
 
 | Source | Reads | Candidates |
 | --- | --- | --- |
-| `createMemoryContextSource({ session })` | A [versioned memory](/docs/modules/versioned-memory) session (its scope must be within the request scope) | Record id and revision, origin and source kinds, at `recordedAsOf` |
-| `createMemoryContextSource({ store, scope, embedder?, clock? })` | A legacy `MemoryStore`, within the narrowed scope; expired and invalidated records left out | Record id, `match` `'vector'` or `'lexical'` |
+| `createMemoryContextSource({ session })` | A [versioned memory](/docs/modules/versioned-memory) session (its scope must be within the request scope) | Record id and revision, origin and source kinds, at the request's `recordedAsOf` when a host sets one (the compiler reads current memory) |
+| `createMemoryContextSource({ store, scope, embedder?, clock? })` | A legacy `MemoryStore`, within the narrowed scope; expired and invalidated records left out. `clock` is the clock TTL expiry is read against (pass the memory seams' clock; default the host clock), unless the request sets `recordedAsOf` | Record id, `match` `'vector'` or `'lexical'` |
 | `createRagContextSource({ retrieve })` | Your `retrieve(query, topK, signal)`, for example over `retrieve` or `hybridRetrieve` from `/rag` | `meta.id` when it is a string, else the chunk index |
 | `createTranscriptContextSource({ index, scope, chatIds?, around?, refs? })` | A [`TranscriptIndex`](/docs/modules/transcript-search); `refs` returns message references (such as those memory records cite) that are resolved under the same scope and ranked above search hits | Message id; text as `role: text` lines, with `around` neighbours (default 0) |
 | `createSkillsContextSource({ registry, loaded? })` | The skill catalog: `name (id): description` lines from `registry.match` (none for an empty query), and the bodies of skills the model loaded (`loaded()`) as mandatory `<id>/SKILL.md` candidates | Catalog lines; loaded bodies |

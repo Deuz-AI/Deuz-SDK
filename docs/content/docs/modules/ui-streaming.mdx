@@ -282,7 +282,11 @@ response never reads a lazy source, so the run behind it never starts: a
 refused `resumeDeuzChatResponse` continuation leg, makes no model call, runs
 no tool and saves no checkpoint. An agent stream is not lazy: it starts as soon
 as it is passed to `toDeuzAgentStreamResponse`, so for native runs the run's
-own lease, not the stream lease, keeps a second executor out.
+own lease, not the stream lease, keeps a second executor out. A refused agent
+response gives its subscription to the run's events back at once, so events
+no longer queue up for it, while the run itself goes on. A refused
+`createDeuzStream` drops what was queued and every later `writeData`, as after
+the stream ended.
 
 **`capabilities: { request, announce? }`** answers a client that lists what it
 understands in an `x-deuz-capabilities` request header (a 2.4 `useChat` does).
