@@ -9,12 +9,23 @@ import type { TelemetryAttributes } from '../../internal/telemetry';
 import type { Logger, ResolvedDependencies } from '../../types/deps';
 import type { GoalRecord } from '../types';
 import { DEFAULT_GOAL_RUNTIME_POLICY } from './store';
-import type { GoalRuntimePolicy } from './store-types';
+import type { GoalActiveRun, GoalRuntimePolicy, GoalRuntimeState } from './store-types';
 import type { GoalSupervisorEvent } from './supervisor';
 
 /** The goal lease key (2.4): `goal:` and the JSON of `[scope, goalId]`. */
 export function goalLeaseKey(scope: string, goalId: string): string {
   return `goal:${JSON.stringify([scope, goalId])}`;
+}
+
+/** What a new leg of the active run keeps from it: the generation it started under. */
+export function carriedRun(run: GoalActiveRun): Pick<GoalActiveRun, 'specGeneration'> {
+  return run.specGeneration !== undefined ? { specGeneration: run.specGeneration } : {};
+}
+
+/** The runtime state without its active run (and that run's retry time). */
+export function withoutRun(runtime: GoalRuntimeState): GoalRuntimeState {
+  const { activeRun: _activeRun, retryAt: _retryAt, ...rest } = runtime;
+  return rest;
 }
 
 /**
@@ -40,7 +51,7 @@ export function inheritedWorkingMemory(
  */
 export function stampWorkingMemory(
   snapshot: WorkingMemorySnapshot,
-  launchedFor: GoalRecord,
+  launchedFor: Pick<GoalRecord, 'goalId' | 'specGeneration'>,
 ): WorkingMemorySnapshot {
   if (snapshot.goalRef !== undefined) return snapshot;
   return {

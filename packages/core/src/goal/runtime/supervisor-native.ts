@@ -8,15 +8,25 @@
  * (a repeated launch never starts a run twice); only a `'retry'` of a run
  * whose failure the native layer recorded as transient resumes with
  * `retryFailed`. The inherited working memory goes to a new run only (a
- * stored run keeps its own). Cancel and drain are signals to the native
- * run's lease (`agentRunLeaseKey`): without `lease`, or while no executor
- * holds the run, they answer false and the supervisor keeps the cancel.
+ * stored run keeps its own). A run that extracts memory after its outcome
+ * returns its leg once that outcome is durable, its maintenance pending. A
+ * leg that another executor of the run refused (its lease held or lost, or
+ * an executor in this process) reports `heldElsewhere`: the supervisor
+ * resumes the run later. Cancel and drain are signals to the native run's
+ * lease (`agentRunLeaseKey`); a launcher created without `lease` takes the
+ * lease provider of the first supervisor it is given to. Without one, or
+ * while no executor holds the run, they answer false and the supervisor
+ * keeps the cancel.
  *
  * Edge-safe.
  */
 import { agentRunLeaseKey } from '../../internal/agent-run-lease';
-import type { AgentResult } from '../../types/agent-run';
-import type { AgentRunEnvelopeV3, AgentRunOptionsV3 } from '../../types/agent-run-v3';
+import type { AgentResult, AgentRunLeaseOptions } from '../../types/agent-run';
+import type {
+  AgentRunEnvelopeV3,
+  AgentRunOptionsV3,
+  AgentStreamV3,
+} from '../../types/agent-run-v3';
 import type { BudgetTotals } from '../../types/execution';
 import { GoalError } from '../errors';
 import type {
@@ -28,6 +38,11 @@ import type {
 
 /** The executor's V3 entry points (lane L3b adds them as overloads of `runAgent` and `resumeAgent`). */
 type RunV3 = (options: AgentRunOptionsV3<unknown>) => Promise<AgentResult<unknown>>;
+/** Its streaming V3 entry points (`streamAgent`, `resumeStreamAgent`). */
+type StreamV3 = (options: AgentRunOptionsV3<unknown>) => AgentStreamV3<unknown>;
+
+/** How often, at most, a finalizing run's store is read for its terminal commit. */
+const COMMIT_POLL_MS = 250;
 
 /** A run's after-verdict work, as the supervisor follows it. */
 function maintenanceOf(
@@ -37,6 +52,34 @@ function maintenanceOf(
   if (status === undefined) return undefined;
   if (status === 'pending') return 'pending';
   return status === 'completed' ? 'complete' : 'failed';
+}
+
+/** Native launchers created without `lease`, and how a supervisor gives them one. */
+const unleased = new WeakMap<RunLauncher, (lease: AgentRunLeaseOptions) => void>();
+
+/**
+ * Gives a native launcher created without `lease` the supervisor's (spec
+ * §3.1: the native run keeps its own lease), so a drain, a cancel and a
+ * takeover reach its runs. A launcher with a lease of its own, or of another
+ * kind, is left as it is. The first supervisor's lease stays.
+ */
+export function adoptRunLease(launcher: RunLauncher, lease: AgentRunLeaseOptions): void {
+  unleased.get(launcher)?.(lease);
+}
+
+/** What the executor answers a second executor of a run in the same process. */
+const ACTIVE_EXECUTOR = 'This native run already has an active executor.';
+
+/**
+ * Whether another executor holds the run: its lease refused this leg
+ * (`lease_held`), took the run from it (`lease_lost`), or an executor of the
+ * run in this process is still driving it.
+ */
+function heldElsewhere(result: AgentResult<unknown>): boolean {
+  if (result.status !== 'failed') return false;
+  const { name, code, message } = result.error;
+  if (name === 'AgentRunLeaseError') return code === 'lease_held' || code === 'lease_lost';
+  return name === 'TypeError' && message === ACTIVE_EXECUTOR;
 }
 
 /** The run's durable ledger totals: its checkpoint's ledger, else its result's. */
@@ -62,7 +105,7 @@ export function createNativeRunLauncher(options: NativeRunLauncherOptions): RunL
     throw new TypeError('createNativeRunLauncher needs an AgentRunStoreV3 (checkpointVersion 3)');
   if (typeof options.options !== 'function')
     throw new TypeError('createNativeRunLauncher needs an options function');
-  const lease = options.lease;
+  let lease = options.lease;
   let executor: Promise<typeof import('../../agent-run')> | undefined;
 
   async function stored(scope: string, runId: string): Promise<AgentRunEnvelopeV3 | undefined> {
@@ -70,6 +113,40 @@ export function createNativeRunLauncher(options: NativeRunLauncherOptions): RunL
     if (envelope !== undefined && envelope.scope !== scope)
       throw new GoalError('scope_mismatch', `Native run ${runId} belongs to another scope.`);
     return envelope;
+  }
+
+  /**
+   * A leg's outcome as soon as it is durable: the stored terminal outcome of
+   * a run whose memory extraction is still pending (read once the run has
+   * entered its finalizing phase), else the executor's answer. The executor
+   * goes on extracting; `maintenance` follows it.
+   */
+  async function durableOutcome(
+    stream: AgentStreamV3<unknown>,
+    runId: string,
+  ): Promise<{ result: AgentResult<unknown>; envelope?: AgentRunEnvelopeV3 }> {
+    let settled = false;
+    const answered = stream.result.then((result) => {
+      settled = true;
+      return { result };
+    });
+    const committed = (async () => {
+      for await (const event of stream.events)
+        if (event.type === 'phase' && event.phase === 'finalizing') break;
+      for (let wait = 5; !settled; wait = Math.min(wait * 2, COMMIT_POLL_MS)) {
+        // A read that fails is only a missed look: the executor's answer still comes.
+        const envelope = await store.load(runId).catch(() => undefined);
+        if (
+          envelope?.phase === 'terminal' &&
+          envelope.result !== undefined &&
+          maintenanceOf(envelope) === 'pending'
+        )
+          return { result: envelope.result, envelope };
+        await new Promise((resolve) => setTimeout(resolve, wait));
+      }
+      return answered;
+    })();
+    return Promise.race([answered, committed]);
   }
 
   async function leg(request: RunLaunchRequest): Promise<RunLaunchResult> {
@@ -96,9 +173,26 @@ export function createNativeRunLauncher(options: NativeRunLauncherOptions): RunL
     } as AgentRunOptionsV3<unknown>;
     executor ??= import('../../agent-run');
     const native = await executor;
-    const run = (before === undefined ? native.runAgent : native.resumeAgent) as unknown as RunV3;
-    const result = await run(runOptions);
-    const after = await store.load(request.runId);
+    const fresh = before === undefined;
+    // A run that extracts memory after its outcome (2.3 `memory`) is
+    // reported once that outcome is durable, its maintenance pending: a
+    // verified goal never waits for the extraction (spec §3.1).
+    const { result, envelope } =
+      base.memory !== undefined
+        ? await durableOutcome(
+            ((fresh ? native.streamAgent : native.resumeStreamAgent) as unknown as StreamV3)(
+              runOptions,
+            ),
+            request.runId,
+          )
+        : {
+            result: await ((fresh ? native.runAgent : native.resumeAgent) as unknown as RunV3)(
+              runOptions,
+            ),
+          };
+    // Nothing of the run happened here: the supervisor resumes it at a later claim.
+    if (heldElsewhere(result)) return { runId: request.runId, result, heldElsewhere: true };
+    const after = envelope ?? (await store.load(request.runId));
     const maintenance = maintenanceOf(after);
     return {
       runId: request.runId,
@@ -112,7 +206,7 @@ export function createNativeRunLauncher(options: NativeRunLauncherOptions): RunL
   const signal = async (scope: string, runId: string, kind: 'cancel' | 'drain') =>
     lease === undefined ? false : lease.provider.signal(agentRunLeaseKey({ scope, runId }), kind);
 
-  return {
+  const launcher: RunLauncher = {
     launch: leg,
     resume: leg,
     cancel: ({ scope, runId }) => signal(scope, runId, 'cancel'),
@@ -128,4 +222,10 @@ export function createNativeRunLauncher(options: NativeRunLauncherOptions): RunL
       return maintenanceOf(envelope);
     },
   };
+  if (lease === undefined)
+    unleased.set(launcher, (given) => {
+      lease = given;
+      unleased.delete(launcher);
+    });
+  return launcher;
 }

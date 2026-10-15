@@ -76,6 +76,12 @@ export interface GoalActiveRun {
   /** 1 for the first run of an intent, plus one per retry. */
   attempt: number;
   startedAt: number;
+  /**
+   * The goal's `specGeneration` when the run first launched (2.4
+   * refinement): its resume and retry legs keep it, so the working memory
+   * the run builds is never handed to a run of a later generation.
+   */
+  specGeneration?: number;
 }
 
 /**
@@ -104,6 +110,12 @@ export interface GoalRuntimeState {
    * a verified goal completes without waiting for it.
    */
   maintenance?: { status: 'pending' | 'complete' | 'failed'; runId?: string };
+  /**
+   * The runs whose maintenance is still pending (2.4 refinement): each is
+   * followed until it settles, whatever the goal does meanwhile, and its
+   * late charges are added. While one is pending, `maintenance` shows it.
+   */
+  maintenanceRuns?: string[];
   /**
    * The last working memory, handed to the goal's next run only when its
    * scope and `specGeneration` match the goal's; hypotheses keep their status.

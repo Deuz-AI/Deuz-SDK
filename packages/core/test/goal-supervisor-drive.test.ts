@@ -10,6 +10,7 @@ import { createGoalEvent } from '../src/goal';
 import {
   createGoalSupervisor,
   createInMemoryGoalRuntimeStore,
+  goalDeliveryDigest,
   goalLeaseKey,
 } from '../src/goal/runtime';
 import type {
@@ -279,6 +280,48 @@ describe('leg outcomes', () => {
     expect(launcher.calls[1]).toMatchObject({
       kind: 'resume',
       request: { kind: 'resume', runId: 'g-1:run:1', approvalResponses, clientToolResults },
+    });
+  });
+
+  it('keeps the intent and the run while another executor holds it, and resumes it at a later claim', async () => {
+    const w = world();
+    let elsewhere = true;
+    const launcher = fakeRunLauncher((request) =>
+      elsewhere
+        ? {
+            runId: request.runId,
+            result: results.failed(request.runId, 'lease_held'),
+            heldElsewhere: true,
+          }
+        : { runId: request.runId, result: results.completed(request.runId) },
+    );
+    const { supervisor, seen } = supervisorIn(w, { launcher });
+    await supervisor.submit({ goalId: 'g-1', scope: SCOPE, objective: 'x' });
+    await supervisor.tick();
+    await supervisor.tick();
+    expect(await supervisor.get(SCOPE, 'g-1')).toMatchObject({
+      goal: { status: 'active' },
+      runtime: {
+        phase: 'dispatching',
+        activeRun: { intentId: 'g-1#1', runId: 'g-1:run:1', attempt: 1 },
+        runs: 1,
+        retries: 0,
+      },
+    });
+    expect((await w.store.intents.get(SCOPE, 'g-1#1'))?.status).toBe('claimed');
+    expect(seen.filter((event) => event.type === 'retry-scheduled')).toEqual([]);
+    elsewhere = false;
+    await supervisor.tick();
+    expect(launcher.calls.map((call) => [call.request.intentId, call.request.runId])).toEqual([
+      ['g-1#1', 'g-1:run:1'],
+      ['g-1#1', 'g-1:run:1'],
+      ['g-1#1', 'g-1:run:1'],
+    ]);
+    expect((await w.store.intents.get(SCOPE, 'g-1#1'))?.status).toBe('completed');
+    expect((await supervisor.get(SCOPE, 'g-1'))?.runtime).toMatchObject({
+      phase: 'idle',
+      runs: 1,
+      retries: 0,
     });
   });
 
@@ -555,6 +598,82 @@ describe('drain and lease loss', () => {
   });
 });
 
+describe('lease provider restart', () => {
+  /**
+   * Supervisor A drives three legs and holds a fourth (its intent claimed
+   * under token 4), then its process dies; B starts on a fresh lease
+   * provider (tokens from 1 again) over the same goal store.
+   */
+  async function restarted(w: World) {
+    let legs = 0;
+    const before = fakeRunLauncher((request) => {
+      legs++;
+      return legs <= 3
+        ? { runId: request.runId, result: results.completed(request.runId) }
+        : 'hold';
+    });
+    const a = supervisorIn(w, { owner: 'sup-a', launcher: before });
+    await a.supervisor.submit({ goalId: 'g-1', scope: SCOPE, objective: 'x' });
+    for (let index = 0; index < 3; index++) await a.supervisor.tick();
+    void a.supervisor.tick();
+    const held = await before.whenHeld();
+    const intent = (await w.store.intents.get(SCOPE, held.request.intentId))!;
+    expect(intent).toMatchObject({ status: 'claimed', claim: { token: 4 } });
+    const after = fakeRunLauncher();
+    const b = createGoalSupervisor({
+      store: w.store,
+      launcher: after,
+      lease: { provider: createInMemoryLeaseProvider({ clock: w.time.clock }), owner: 'sup-b' },
+      deps: { clock: w.time.clock },
+    });
+    return { b, after, intent, runId: held.request.runId };
+  }
+
+  it('applies a recorded cancel on the first tick after a restart', async () => {
+    const w = world();
+    const { b, intent } = await restarted(w);
+    await b.command(SCOPE, 'g-1', { type: 'cancel' });
+    expect(await b.tick()).toMatchObject({ cancelled: 1 });
+    expect((await b.get(SCOPE, 'g-1'))?.goal.status).toBe('cancelled');
+    expect((await w.store.intents.get(SCOPE, intent.intentId))?.status).toBe('cancelled');
+  });
+
+  it('resumes the same run on the first tick after a restart, under a fresh intent', async () => {
+    const w = world();
+    const { b, after, intent, runId } = await restarted(w);
+    expect(await b.tick()).toMatchObject({ dispatched: 1 });
+    expect(after.calls.map((call) => call.request.runId)).toEqual([runId]);
+    expect(after.calls[0]!.request.intentId).not.toBe(intent.intentId);
+    expect(await w.store.intents.get(SCOPE, intent.intentId)).toMatchObject({
+      status: 'cancelled',
+      outcome: { reason: 'superseded' },
+    });
+    expect((await b.get(SCOPE, 'g-1'))?.runtime).toMatchObject({ runs: 4, phase: 'idle' });
+  });
+
+  it('never takes over a claim of a later holder while its own lease is gone', async () => {
+    const w = world();
+    const { intent } = await restarted(w);
+    // C's renewals answer that C no longer holds the goal: the higher claim
+    // may be a live holder's, so C leaves it alone.
+    const lost = createGoalSupervisor({
+      store: w.store,
+      launcher: fakeRunLauncher(),
+      lease: {
+        provider: {
+          ...createInMemoryLeaseProvider({ clock: w.time.clock }),
+          renew: async () => ({ held: false }),
+        },
+        owner: 'sup-c',
+      },
+      deps: { clock: w.time.clock },
+    });
+    await lost.command(SCOPE, 'g-1', { type: 'cancel' });
+    expect(await lost.tick()).toMatchObject({ cancelled: 0 });
+    expect((await w.store.intents.get(SCOPE, intent.intentId))?.status).toBe('claimed');
+  });
+});
+
 describe('accounting', () => {
   it('charges the run ledger above its watermark once, keeping reservations apart', async () => {
     const w = world();
@@ -652,6 +771,51 @@ describe('accounting', () => {
       skipped: 0,
     });
   });
+
+  it('follows the pending maintenance of a run whose goal stayed active, after a later run completed it', async () => {
+    const w = world();
+    const launcher = fakeRunLauncher((request) => ({
+      runId: request.runId,
+      result: results.completed(request.runId),
+      maintenance: request.runId === 'g-1:run:1' ? 'pending' : 'complete',
+    }));
+    launcher.ledger.set('g-1:run:1', totals({ tokens: 100, usd: 0 }));
+    launcher.upkeep.set('g-1:run:1', 'pending');
+    const { supervisor } = supervisorIn(w, {
+      launcher,
+      verify: ({ runId }) => (runId === 'g-1:run:2' ? passed(runId) : undefined),
+    });
+    await supervisor.submit({ goalId: 'g-1', scope: SCOPE, objective: 'x' });
+    await supervisor.tick();
+    let after = (await supervisor.get(SCOPE, 'g-1'))!;
+    expect(after.goal).toMatchObject({ status: 'active', spent: { tokens: 100 } });
+    expect(after.runtime.maintenance).toEqual({ status: 'pending', runId: 'g-1:run:1' });
+    expect(after.runtime.maintenanceRuns).toEqual(['g-1:run:1']);
+    // Its intent stays open while its maintenance is followed.
+    expect((await w.store.intents.get(SCOPE, 'g-1#1'))?.status).toBe('launched');
+    // Run 1's extraction charges more while run 2 completes the goal; run
+    // 2's settled maintenance does not hide run 1's pending one.
+    launcher.ledger.set('g-1:run:1', totals({ tokens: 300, usd: 0 }));
+    await supervisor.tick();
+    after = (await supervisor.get(SCOPE, 'g-1'))!;
+    expect(launcher.calls.map((call) => call.request.runId)).toEqual(['g-1:run:1', 'g-1:run:2']);
+    expect(after.goal).toMatchObject({ status: 'completed', spent: { tokens: 300 } });
+    expect(after.runtime.maintenance).toEqual({ status: 'pending', runId: 'g-1:run:1' });
+    launcher.ledger.set('g-1:run:1', totals({ tokens: 350, usd: 0 }));
+    launcher.upkeep.set('g-1:run:1', 'complete');
+    await supervisor.tick();
+    after = (await supervisor.get(SCOPE, 'g-1'))!;
+    expect(after.goal).toMatchObject({ status: 'completed', spent: { tokens: 350 } });
+    expect(after.runtime.maintenance).toEqual({ status: 'complete', runId: 'g-1:run:1' });
+    expect(after.runtime.maintenanceRuns).toBeUndefined();
+    expect((await w.store.intents.get(SCOPE, 'g-1#1'))?.status).toBe('completed');
+    expect(await supervisor.tick()).toEqual({
+      applied: 0,
+      dispatched: 0,
+      cancelled: 0,
+      skipped: 0,
+    });
+  });
 });
 
 describe('working memory', () => {
@@ -697,6 +861,53 @@ describe('working memory', () => {
     await supervisor.tick();
     await supervisor.tick();
     expect(launcher.calls[3]?.request.workingMemory).toBeUndefined();
+  });
+
+  it('keeps the generation a run started under when the goal is revised before its resume or retry', async () => {
+    for (const first of ['suspended', 'retryable'] as const) {
+      const w = world();
+      const launcher = fakeRunLauncher((request, kind) => {
+        const result =
+          kind === 'launch' && request.runId === 'g-1:run:1'
+            ? first === 'suspended'
+              ? results.suspended(request.runId)
+              : results.failed(request.runId)
+            : results.completed(request.runId);
+        return {
+          runId: request.runId,
+          result,
+          ...(result.status === 'failed' ? { retryable: true } : {}),
+          workingMemory: snapshot(),
+        };
+      });
+      const { supervisor } = supervisorIn(w, { launcher });
+      await supervisor.submit({ goalId: 'g-1', scope: SCOPE, objective: 'x' });
+      await supervisor.tick();
+      await supervisor.command(SCOPE, 'g-1', { type: 'revise', objective: 'y' });
+      expect((await supervisor.get(SCOPE, 'g-1'))?.goal.specGeneration).toBe(2);
+      if (first === 'suspended')
+        await supervisor.resume(SCOPE, 'g-1', {
+          approvalResponses: [{ approvalId: 'ap-1', approved: true }],
+        });
+      else await w.time.advance(1_000);
+      // The resume or retry leg of run 1, which started under generation 1.
+      await supervisor.tick();
+      expect(launcher.calls[1]?.request).toMatchObject({
+        runId: 'g-1:run:1',
+        goal: { specGeneration: 2 },
+      });
+      expect((await supervisor.get(SCOPE, 'g-1'))?.runtime.workingMemory?.goalRef).toEqual({
+        goalId: 'g-1',
+        specGeneration: 1,
+      });
+      // The next run, under generation 2, inherits nothing from run 1.
+      await supervisor.tick();
+      expect(launcher.calls[2]?.request).toMatchObject({
+        runId: 'g-1:run:2',
+        goal: { specGeneration: 2 },
+      });
+      expect(launcher.calls[2]?.request.workingMemory).toBeUndefined();
+    }
   });
 });
 
@@ -770,6 +981,72 @@ describe('inbox, dependencies and time', () => {
     );
     expect(await supervisor.tick()).toMatchObject({ applied: 1, dispatched: 0 });
     expect((await w.store.inbox.get(SCOPE, entry.id))?.disposition).toBe('unmatched');
+  });
+
+  it('settles entries queued for a goal that already ended as terminal, so their payloads age out', async () => {
+    for (const scopes of [undefined, [SCOPE]]) {
+      const w = world();
+      const { supervisor, seen } = supervisorIn(w, scopes ? { scopes } : {});
+      await supervisor.submit({ goalId: 'g-1', scope: SCOPE, objective: 'x', start: false });
+      await supervisor.command(SCOPE, 'g-1', { type: 'cancel' });
+      await supervisor.tick();
+      expect((await supervisor.get(SCOPE, 'g-1'))?.goal.status).toBe('cancelled');
+      const event = (key: string, notBefore?: number) =>
+        createGoalEvent({
+          scope: SCOPE,
+          goalId: 'g-1',
+          source: { type: 'signal', id: 'hook' },
+          key,
+          at: w.time.clock.now(),
+          ...(notBefore !== undefined ? { notBefore } : {}),
+        });
+      // Straight into the store, as the webhook handler and the scheduler queue theirs.
+      const body = { body: '{"secret":"x"}' };
+      const queued = await w.store.inbox.enqueue({
+        scope: SCOPE,
+        goalId: 'g-1',
+        namespace: 'webhook:hook',
+        deliveryId: 'delivery-1',
+        event: event('delivery-1'),
+        payload: body,
+        digest: await goalDeliveryDigest({
+          scope: SCOPE,
+          goalId: 'g-1',
+          event: event('delivery-1'),
+          payload: body,
+        }),
+      });
+      expect(queued.status).toBe('enqueued');
+      // An early one too: an ended goal takes no event, early or not.
+      await supervisor.dispatch(event('later', w.time.clock.now() + 3_600_000));
+      expect(await supervisor.tick()).toMatchObject({ applied: 2, dispatched: 0 });
+      expect((await w.store.inbox.list({ scope: SCOPE, goalId: 'g-1' })).entries).toEqual([]);
+      const settled = await w.store.inbox.list({
+        scope: SCOPE,
+        goalId: 'g-1',
+        dispositions: ['terminal'],
+      });
+      expect(settled.entries.map((entry) => entry.deliveryId).sort()).toEqual([
+        'delivery-1',
+        'later',
+      ]);
+      expect(seen).toContainEqual({
+        type: 'inbox-applied',
+        scope: SCOPE,
+        goalId: 'g-1',
+        entryId: queued.entry.id,
+        disposition: 'terminal',
+      });
+      expect(await supervisor.get(SCOPE, 'g-1')).toMatchObject({
+        goal: { status: 'cancelled' },
+        runtime: { phase: 'done' },
+      });
+      await w.time.advance(8 * 24 * 60 * 60 * 1_000);
+      expect(
+        await w.store.prunePayloads({ before: w.time.clock.now() - 7 * 24 * 60 * 60 * 1_000 }),
+      ).toBe(1);
+      expect((await w.store.inbox.get(SCOPE, queued.entry.id))?.payloadPruned).toBe(true);
+    }
   });
 
   it('reconciles a dependency wait with dependencies that already finished', async () => {

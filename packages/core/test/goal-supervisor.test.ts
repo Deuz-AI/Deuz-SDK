@@ -22,7 +22,7 @@ import type {
 } from '../src/goal/runtime';
 import { createInMemoryLeaseProvider } from '../src/ops';
 import type { ObserveEvent } from '../src/types/observe';
-import { fakeRunLauncher } from './fixtures/fake-run-launcher';
+import { fakeRunLauncher, results } from './fixtures/fake-run-launcher';
 import { manualClock } from './fixtures/manual-clock';
 
 const T0 = Date.parse('2026-10-15T09:00:00Z');
@@ -297,6 +297,53 @@ describe('command', () => {
       goal: { status: 'failed' },
       runtime: { phase: 'done' },
     });
+  });
+
+  it('marks the runtime done when a command ends a goal whose run no one holds', async () => {
+    // A suspended run, and a failed one waiting for its retry: no intent is
+    // open, so no holder settles the goal's end later.
+    for (const leg of ['suspended', 'retrying'] as const) {
+      const { time, supervisor, launcher } = setup();
+      launcher.script = (request) =>
+        leg === 'suspended'
+          ? { runId: request.runId, result: results.suspended(request.runId) }
+          : { runId: request.runId, result: results.failed(request.runId), retryable: true };
+      await supervisor.submit({ goalId: 'g-1', scope: SCOPE, objective: 'x' });
+      await supervisor.tick();
+      expect((await supervisor.get(SCOPE, 'g-1'))?.runtime).toMatchObject({
+        phase: leg === 'suspended' ? 'idle' : 'retrying',
+        activeRun: { runId: 'g-1:run:1' },
+      });
+      await supervisor.command(SCOPE, 'g-1', { type: 'fail', reason: 'host gave up' });
+      const after = await supervisor.get(SCOPE, 'g-1');
+      expect(after?.goal.status).toBe('failed');
+      expect(after?.runtime.phase).toBe('done');
+      expect(after?.runtime.activeRun).toBeUndefined();
+      expect(after?.runtime.retryAt).toBeUndefined();
+      await time.advance(60_000);
+      expect(await supervisor.tick()).toEqual({
+        applied: 0,
+        dispatched: 0,
+        cancelled: 0,
+        skipped: 0,
+      });
+      expect(launcher.calls).toHaveLength(1);
+    }
+  });
+
+  it('leaves a goal ended under an open intent to the holder, which settles it', async () => {
+    const { supervisor, launcher } = setup();
+    await supervisor.submit({ goalId: 'g-1', scope: SCOPE, objective: 'x' });
+    await supervisor.command(SCOPE, 'g-1', { type: 'fail', reason: 'host gave up' });
+    expect((await supervisor.get(SCOPE, 'g-1'))?.runtime).toMatchObject({
+      phase: 'dispatching',
+      activeRun: { runId: 'g-1:run:1' },
+    });
+    await supervisor.tick();
+    const after = await supervisor.get(SCOPE, 'g-1');
+    expect(after?.runtime.phase).toBe('done');
+    expect(after?.runtime.activeRun).toBeUndefined();
+    expect(launcher.calls).toHaveLength(0);
   });
 
   it('records a cancel and asks the run to stop, leaving the goal for the cancel to apply', async () => {
