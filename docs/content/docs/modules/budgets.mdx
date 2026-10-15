@@ -181,6 +181,61 @@ report is different: its cost is unknown, not zero, so from then on
 `budget.usd` waits instead of stopping the loop, as after a price lookup that
 fails (see [the budget guardrail](/docs/modules/pricing#the-budget-guardrail)).
 
+## Unaccounted calls (2.4)
+
+Before 2.4 several helper calls never reached a ledger: `embed()` only called
+`onUsage`, memory LLM callbacks returned a bare string, the RAG embedder bare
+vectors, and `createVerifier`'s judge call was unbudgeted. 2.4 can charge each
+of them. Nothing changes unless you opt in: without the option below, these
+calls behave and send requests exactly as in 2.3.
+
+| Call | How it is charged |
+| --- | --- |
+| `embed()`, `embedMany()` | `accounting: { execution, requestId, kind?, tokens?, usd? }`; see [Embeddings](/docs/core/embeddings#budget-accounting-24) |
+| RAG `indexChunks`, `retrieve`, `hybridRetrieve` | `{ accounting, onWarning }` as the last argument; see [RAG](/docs/modules/rag#token-counting-and-accounting-24) |
+| Legacy memory callbacks | `MemorySeams.execution`; in a native run, `generateText` or `streamChat` with `execution`, the run's own context; see [Memory](/docs/modules/memory#embedding-mismatch-and-accounting-24) |
+| Versioned memory | `createMemorySession({ execution })`; see [Versioned memory](/docs/modules/versioned-memory#accounting-and-spans) |
+| `createVerifier` | `execution`: each judge call is admitted, reserved and settled; a refused call degrades to `{ ok: true, errorCategory: 'other' }` and never throws |
+
+A call the SDK makes itself (`embed`, `embedMany`, the verifier) reports its
+provider's usage, so its reservation is settled like a model call. A failed
+embedding call that nothing could have billed (a single request answered 400,
+401, 403, 404, 422 or 429) is released; one that may have been billed without
+usage coming back stays `unknown` at its estimate. A request id is charged
+once.
+
+A host callback reports its usage only through its accounted variant, marked
+`accounted: true`: `defineAccountedMemoryLLM(async (prompt) => ({ text, usage,
+modelId }))` for a memory LLM, and an embedder whose answer carries `usage` and
+`modelId` next to its vectors. An unmarked callback is never counted as free.
+Its reservation is flagged `unaccounted`, and what happens depends on the
+budget's `unknownPrice`:
+
+| `unknownPrice` | An unaccounted call |
+| --- | --- |
+| `'warn'` (default) | Is admitted at its estimates, ends `unknown` with the estimate still held, and reports one `unaccounted-usage` warning. `BudgetTotals.unaccounted` (and `BudgetAggregate.unaccounted` after a compact) counts such attempts |
+| `'reject'` | Is refused before the callback runs, with a `BudgetLedgerError` whose code is `unaccounted_call`, whatever the budget bounds |
+
+```ts
+import { createExecutionContext } from '@deuz-sdk/core/agent';
+import { createMemoryVectorStore, retrieve } from '@deuz-sdk/core/rag';
+
+const strict = createExecutionContext({ budget: { tokens: 10_000, unknownPrice: 'reject' } });
+const plain = { dims: 3, embed: async (texts: string[]) => texts.map(() => [0, 0, 1]) };
+
+try {
+  await retrieve('How do I deploy?', { embedder: plain, store: createMemoryVectorStore() }, {
+    accounting: { execution: strict, requestId: 'query-1' },
+  });
+} catch (error) {
+  console.log((error as { code?: string }).code); // unaccounted_call: refused before the embedder ran
+}
+```
+
+The same refusal comes from any budget, scope budget or persistent
+`BudgetStore` scope with `unknownPrice: 'reject'`, so a strict budget needs the
+accounted variant of every callback it admits.
+
 ## When a settlement fails
 
 A billed attempt is settled after the call, and a refused one is released.
