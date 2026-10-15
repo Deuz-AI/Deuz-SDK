@@ -25,6 +25,7 @@ import {
   rmSync,
   statSync,
   writeFileSync,
+  writeSync,
 } from 'node:fs';
 import { join } from 'node:path';
 
@@ -78,7 +79,8 @@ export interface FakeContainer {
 export interface FakeFault {
   /** The subcommand it hits: 'start', 'stop', 'image', 'cp', ... or '*'. */
   command: string;
-  mode: 'unreachable' | 'fail-before' | 'fail-after' | 'hang' | 'noop';
+  /** `trickle` writes a line to stdout every 20 ms for ever: a log too long to read in time. */
+  mode: 'unreachable' | 'fail-before' | 'fail-after' | 'hang' | 'noop' | 'trickle';
   /** How many invocations it hits. Default 1. */
   times?: number;
   stderr?: string;
@@ -793,6 +795,11 @@ function main(): void {
         fail(before.stderr ?? 'Error response from daemon: fake failure', before.code ?? 1);
       case 'hang':
         for (;;) sleepSync(1_000);
+      case 'trickle':
+        for (;;) {
+          writeSync(1, 'trickle trickle trickle\n');
+          sleepSync(20);
+        }
       case 'noop':
         process.exit(0);
     }
@@ -905,8 +912,16 @@ function main(): void {
     }
     case 'logs': {
       const container = needContainer(readState(), rest[rest.length - 1]!);
-      out(container.stdout);
-      err(container.stderr);
+      // `--tail N`: the real daemon counts the merged log; per stream is close enough here.
+      const at = rest.indexOf('--tail');
+      const keep = at === -1 ? undefined : Number(rest[at + 1]);
+      const tail = (text: string) => {
+        if (keep === undefined) return text;
+        const lines = text.match(/[^\n]*\n|[^\n]+$/g) ?? [];
+        return lines.slice(Math.max(0, lines.length - keep)).join('');
+      };
+      out(tail(container.stdout));
+      err(tail(container.stderr));
       return;
     }
     case 'stop':

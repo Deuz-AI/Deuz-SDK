@@ -86,7 +86,12 @@ export interface ResolvedDockerOptions {
   deps: ResolvedDependencies;
   /** The host passed its own clock: timers go through it (else they never hold the process open). */
   customClock: boolean;
+  /** How long one log read may take; internal, for tests (default `LOGS_TIMEOUT_MS`). */
+  logsTimeoutMs?: number;
 }
+
+/** How long one `docker logs` read may take before it is given up. */
+export const LOGS_TIMEOUT_MS = 120_000;
 
 function positiveInteger(value: unknown, name: string): number {
   if (!Number.isSafeInteger(value) || (value as number) <= 0)
@@ -370,7 +375,12 @@ export interface DockerEngine {
   listLabelled(scope?: string): Promise<string[]>;
   /** The labelled volumes no container uses, optionally of one scope. */
   listDanglingVolumes(scope?: string): Promise<string[]>;
-  /** The bounded stdout/stderr tails of `docker logs`. */
+  /**
+   * The bounded stdout/stderr tails of `docker logs`, read from its last
+   * `maxOutputBytes` lines. A read that streams past `LOGS_TIMEOUT_MS` is
+   * `docker_failed` (the log is too large); one that got nothing at all is
+   * `docker_unavailable`.
+   */
   logs(containerId: string): Promise<ProcessOutput>;
   /** The one detached start command (`docker start <id>`). */
   start(containerId: string): Promise<void>;
@@ -659,15 +669,61 @@ export function createDockerEngine(options: ResolvedDockerOptions): DockerEngine
     async logs(containerId) {
       const stdout = new ByteTail(options.maxOutputBytes);
       const stderr = new ByteTail(options.maxOutputBytes);
-      await docker(cli, ['logs', containerId], {
-        timeoutMs: 120_000,
-        onStdout: (chunk) => stdout.push(chunk),
-        onStderr: (chunk) => stderr.push(chunk),
-      });
+      // Every line holds at least one byte, so a stream's last maxOutputBytes
+      // lines hold its whole kept tail; `--tail` spares streaming a huge log.
+      const window = options.maxOutputBytes;
+      let lines = 0;
+      let received = 0;
+      const count = (chunk: Uint8Array): void => {
+        received += chunk.byteLength;
+        for (const byte of chunk) if (byte === 0x0a) lines++;
+      };
+      const timeoutMs = options.logsTimeoutMs ?? LOGS_TIMEOUT_MS;
+      const stop = new AbortController();
+      let timedOut = false;
+      const timer = setTimeout(() => {
+        timedOut = true;
+        stop.abort();
+      }, timeoutMs);
+      let result;
+      try {
+        result = await docker(cli, ['logs', '--tail', String(window), containerId], {
+          timeoutMs: 0,
+          signal: stop.signal,
+          onStdout: (chunk) => {
+            count(chunk);
+            stdout.push(chunk);
+          },
+          onStderr: (chunk) => {
+            count(chunk);
+            stderr.push(chunk);
+          },
+        });
+      } finally {
+        clearTimeout(timer);
+      }
+      if (timedOut && result.stopped) {
+        // Bytes kept coming: the daemon answers, the log is just too large to
+        // read in time. That is no reason to hold up an exit, a cancel or a
+        // dispose, unlike a daemon that sent nothing at all.
+        if (received === 0)
+          throw new DockerSandboxError(
+            'docker_unavailable',
+            `docker logs did not answer within ${timeoutMs} ms`,
+            { command: 'logs' },
+          );
+        throw new DockerSandboxError(
+          'docker_failed',
+          `docker logs did not finish within ${timeoutMs} ms: the log is too large to read.`,
+          { command: 'logs' },
+        );
+      }
+      // A full window: earlier lines, of either stream, may be missing.
+      const full = lines >= window;
       return {
         stdout: stdout.text(),
         stderr: stderr.text(),
-        truncated: { stdout: stdout.truncated, stderr: stderr.truncated },
+        truncated: { stdout: stdout.truncated || full, stderr: stderr.truncated || full },
       };
     },
 

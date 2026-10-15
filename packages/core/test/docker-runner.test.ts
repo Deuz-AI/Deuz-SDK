@@ -15,12 +15,15 @@ import {
   createDockerProcessRunner,
   createDockerSandbox,
   createInMemoryProcessOperationStore,
+  DEFAULT_DOCKER_SANDBOX,
   DockerSandboxError,
   OperationConflictError,
   type ProcessOperationStore,
   type ProcessStartRequest,
   type ProcessState,
 } from '../src/compute/docker';
+import { resolveDockerOptions } from '../src/compute/docker/engine';
+import { createDockerRunnerFromOptions } from '../src/compute/docker/runner';
 import { workspaceDigestEntry } from '../src/internal/digest';
 import { createInMemoryWorkspace } from '../src/workspace';
 import { createMemoryObserver } from '../src/observe';
@@ -625,6 +628,88 @@ describe('createDockerProcessRunner: poll, output and exit', () => {
       code: 'operation_not_found',
     });
     await expect(runner.cancel('tenant-a', 'nope')).rejects.toBeInstanceOf(DockerSandboxError);
+  });
+});
+
+describe('createDockerProcessRunner: a log too large to read (R4-9)', () => {
+  /** A runner whose log reads give up after `logsTimeoutMs` (120 s by default). */
+  function withLogsTimeout(fake: FakeDocker, logsTimeoutMs: number, maxOutputBytes?: number) {
+    const store = createInMemoryProcessOperationStore();
+    const resolved = resolveDockerOptions(
+      {
+        image: FAKE_IMAGE,
+        ...fake.cli,
+        ...(maxOutputBytes !== undefined ? { maxOutputBytes } : {}),
+      },
+      DEFAULT_DOCKER_SANDBOX,
+    );
+    return { store, runner: createDockerRunnerFromOptions({ ...resolved, logsTimeoutMs }, store) };
+  }
+
+  it('reads only a bounded tail of the log', async () => {
+    const fake = await fakeDocker(bundle);
+    const { runner } = setup(fake, { maxOutputBytes: 16 });
+    await runner.start(request({ command: ['echo', 'out', ';', 'emit-err', '64', 'e'] }));
+    const logs = fake.calls().filter((argv) => argv[0] === 'logs');
+    expect(logs.length).toBeGreaterThan(0);
+    for (const argv of logs) expect(argv.slice(0, 3)).toEqual(['logs', '--tail', '16']);
+  });
+
+  it('a full line window says either stream may have lost earlier output', async () => {
+    const fake = await fakeDocker(bundle);
+    const { runner } = setup(fake, { maxOutputBytes: 8 });
+    const flood = Array.from({ length: 12 }, () => ['stderr', 'e', ';']).flat();
+    await runner.start(request({ command: ['echo', 'out', ';', ...flood, 'exit', '0'] }));
+    const output = await runner.readOutput('tenant-a', 'op-1');
+    expect(output.stdout).toBe('out\n');
+    expect(output.truncated).toEqual({ stdout: true, stderr: true });
+    // Fewer lines than the window: exact, nothing flagged.
+    const small = await fakeDocker(bundle);
+    const exact = setup(small, { maxOutputBytes: 8 });
+    await exact.runner.start(request({ command: ['echo', 'out', ';', 'stderr', 'e'] }));
+    expect(await exact.runner.readOutput('tenant-a', 'op-1')).toEqual({
+      stdout: 'out\n',
+      stderr: 'e\n',
+      truncated: { stdout: false, stderr: false },
+    });
+  });
+
+  it('a log that streams past the timeout neither blocks the exit nor the dispose', async () => {
+    const fake = await fakeDocker(bundle);
+    const { runner, store } = withLogsTimeout(fake, 1_500);
+    await runner.start(request());
+    fake.update((state) => {
+      const container = Object.values(state.containers)[0]!;
+      container.state = 'exited';
+      container.exitCode = 0;
+      container.finishedAt = new Date().toISOString();
+    });
+    // `docker logs` keeps streaming: the daemon answers, the log is just too long.
+    fake.fault({ command: 'logs', mode: 'trickle', times: 3 });
+    expect(await runner.poll('tenant-a', 'op-1')).toMatchObject({ state: 'exited', exitCode: 0 });
+    expect((await store.get('tenant-a', 'op-1'))!.output).toBeUndefined();
+    await expect(runner.readOutput('tenant-a', 'op-1')).rejects.toMatchObject({
+      code: 'docker_failed',
+    });
+    await runner.dispose('tenant-a', 'op-1');
+    expect(fake.containers()).toEqual([]);
+    expect((await runner.poll('tenant-a', 'op-1')).state).toBe('disposed');
+  });
+
+  it('a daemon that sends nothing at all is still unavailable', async () => {
+    const fake = await fakeDocker(bundle);
+    const { runner } = withLogsTimeout(fake, 1_500);
+    await runner.start(request());
+    fake.update((state) => {
+      const container = Object.values(state.containers)[0]!;
+      container.state = 'exited';
+      container.finishedAt = new Date().toISOString();
+    });
+    fake.fault({ command: 'logs', mode: 'hang' });
+    await expect(runner.poll('tenant-a', 'op-1')).rejects.toMatchObject({
+      code: 'docker_unavailable',
+    });
+    expect((await runner.poll('tenant-a', 'op-1')).state).toBe('exited');
   });
 });
 
