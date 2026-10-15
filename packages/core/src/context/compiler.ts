@@ -164,8 +164,13 @@ function attributeId(id: string): string {
 /** What one step compiled, kept for an overflow retry of that step. */
 interface StepMemory {
   step: number;
-  placedBefore: ContextPlacedEntry[];
+  /** Everything placed when the step began, its blocks present or not. */
+  placedAtStart: ContextPlacedEntry[];
   results: ContextSourceResult[];
+  /** The sources answered at this step: their answer decides what it holds. */
+  fresh: boolean;
+  /** A refresh was due with nothing to ask: the sources were skipped. */
+  skipped: boolean;
   pass: number;
   fallback?: ContextManifest['fallback'];
   cachePrefixChanged: boolean;
@@ -203,7 +208,9 @@ interface StepMemory {
  *   them).
  * - `onOverflow` recompiles the step's package from the same retrieval
  *   under the smaller `inputTokens` (refresh `'overflow-retry'`), replacing
- *   the overflowed package's placements; mandatory content that does not fit
+ *   the overflowed package's placements. Entries whose blocks the retry's
+ *   compaction removed are placed again as on a reused step (after a fresh
+ *   retrieval, that retrieval decides); mandatory content that does not fit
  *   throws `ContextBudgetExceededError` (phase `'overflow-retry'`).
  * - `usedTokens` is the estimator's count of the messages plus
  *   `overheadTokens`; `inputTokens` is the context window less the output
@@ -329,6 +336,23 @@ export function createContextCompiler(options: CreateContextCompilerOptions): Co
     return sources.flatMap((source) => bySource.get(source.id) ?? []);
   }
 
+  /**
+   * What a step without a fresh retrieval compiles: the entries a compaction
+   * removed, placed again; with `skipped`, every other source is `'skipped'`.
+   */
+  function reuse(dropped: readonly ContextPlacedEntry[], skipped: boolean): ContextSourceResult[] {
+    const again = replacements(dropped);
+    if (!skipped) return again;
+    return sources.map(
+      (source) =>
+        again.find((result) => result.source.id === source.id) ?? {
+          source: describe(source),
+          status: 'skipped' as const,
+          candidates: [],
+        },
+    );
+  }
+
   async function finish(
     input: ContextStepInput,
     pkg: ContextPackage,
@@ -408,7 +432,8 @@ export function createContextCompiler(options: CreateContextCompilerOptions): Co
   async function beforeModelCall(input: ContextStepInput): Promise<ContextPackage> {
     return observeSpan(deps, DEUZ_SPAN.contextCompile, undefined, async (annotate) => {
       const { inputTokens, usedTokens } = checkStep(input);
-      const { kept, dropped } = stillPlaced(state.placed, input.messages);
+      const placedAtStart = state.placed;
+      const { kept, dropped } = stillPlaced(placedAtStart, input.messages);
       const cachePrefixChanged = prefixChanged(input.messages);
       const activeTaskId = input.workingMemory?.tasks?.activeTaskId;
       const requested = state.refreshRequested === true || input.refresh === true;
@@ -439,15 +464,11 @@ export function createContextCompiler(options: CreateContextCompilerOptions): Co
         if (results.some((result) => result.status === 'failed')) fallback = 'source-failed';
       } else if (due !== undefined && !limited) {
         // Nothing to ask yet (no user text, no task): the refresh stays due.
-        results = sources.map((source) => ({
-          source: describe(source),
-          status: 'skipped' as const,
-          candidates: [],
-        }));
+        results = reuse(dropped, true);
         pass = state.passes;
         refresh = 'reused';
       } else {
-        results = replacements(dropped);
+        results = reuse(dropped, false);
         pass = state.passes;
         refresh = 'reused';
         if (limited) fallback = 'pass-limit';
@@ -495,8 +516,10 @@ export function createContextCompiler(options: CreateContextCompilerOptions): Co
             );
       lastStep = {
         step: input.step,
-        placedBefore: kept,
+        placedAtStart,
         results,
+        fresh: answered !== undefined,
+        skipped: answered === undefined && due !== undefined && !limited,
         pass,
         ...(fallback ? { fallback } : {}),
         cachePrefixChanged,
@@ -514,10 +537,15 @@ export function createContextCompiler(options: CreateContextCompilerOptions): Co
       const { usedTokens } = checkStep(input);
       const inputTokens = finite(input.inputTokens, 0, 'inputTokens');
       const memory = lastStep?.step === input.step ? lastStep : undefined;
-      const { kept } = stillPlaced(memory?.placedBefore ?? state.placed, input.messages);
+      // Against what was placed when the step began: the retry's compaction
+      // may have removed blocks the step still carried.
+      const { kept, dropped } = stillPlaced(memory?.placedAtStart ?? state.placed, input.messages);
+      // A fresh retrieval decides what its step holds, as in beforeModelCall;
+      // otherwise what the compactions removed is placed again.
+      const results = memory?.fresh ? memory.results : reuse(dropped, memory?.skipped === true);
       const pkg = compileContext({
         step: input.step,
-        results: memory?.results ?? [],
+        results,
         inputTokens,
         usedTokens,
         ...(options.budget ? { budget: options.budget } : {}),

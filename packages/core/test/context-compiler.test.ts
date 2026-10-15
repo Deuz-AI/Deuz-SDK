@@ -406,6 +406,71 @@ describe('createContextCompiler state, overflow and compaction', () => {
     ).rejects.toBeInstanceOf(ContextBudgetExceededError);
   });
 
+  it('places again on an overflow retry what the retry compaction removed, or refuses it', async () => {
+    // R2-1: the overflow path compacts away an earlier block; its mandatory
+    // entry must come back in the retry (or the retry must throw), never vanish.
+    const body = `SKILL BODY: always cite the page. ${'detail '.repeat(300)}`;
+    const skills = fake('skills', 'skills', [
+      candidate('pdf/SKILL.md', body, 0, { mandatory: true }),
+    ]);
+    const compiler = createContextCompiler({ sources: [skills.source] });
+    const user: Message = { role: 'user', content: 'summarise the pdf' };
+    const first = await compiler.beforeModelCall(step(1, [system, user]));
+    const block = first.blocks[0]!.messages;
+    // Step 2 reuses: the pass-1 block is still in the messages.
+    const reused = await compiler.beforeModelCall(
+      step(2, [
+        system,
+        user,
+        ...block,
+        { role: 'assistant', content: 'ok' },
+        { role: 'user', content: 'go on' },
+      ]),
+    );
+    expect(reused.blocks).toEqual([]);
+    // The model call overflows and the 2.3 compaction removes the pass-1 block.
+    const compacted: Message[] = [
+      system,
+      { role: 'user', content: 'Summary: earlier work' },
+      { role: 'user', content: 'go on' },
+    ];
+    // Too small for the body: the retry refuses instead of dropping it.
+    await expect(
+      compiler.onOverflow({ ...step(2, compacted), inputTokens: 1_000 }),
+    ).rejects.toMatchObject({ name: 'ContextBudgetExceededError', phase: 'overflow-retry' });
+    const retry = await compiler.onOverflow({ ...step(2, compacted), inputTokens: 50_000 });
+    expect(skills.requests).toHaveLength(1);
+    expect(retry.manifest.refresh).toBe('overflow-retry');
+    expect(retry.manifest.entries).toContainEqual(
+      expect.objectContaining({ recordId: 'pdf/SKILL.md', selected: true, reason: 'mandatory' }),
+    );
+    const append = retry.blocks.find((b) => b.placement === 'append');
+    expect(append?.messages[0]!.content).toContain('SKILL BODY: always cite the page');
+    expect(compiler.state().placed.map((entry) => entry.recordId)).toEqual(['pdf/SKILL.md']);
+    // The next step carries the retry's block: nothing is placed twice.
+    const next = await compiler.beforeModelCall(
+      step(3, [...compacted, ...append!.messages, { role: 'assistant', content: 'done' }]),
+    );
+    expect(next.blocks).toEqual([]);
+  });
+
+  it('places again what a compaction removed while a due refresh has nothing to ask', async () => {
+    const memory = fake('memory', 'memory', [candidate('m1', 'Prefers aisle seats', 0.9)]);
+    const compiler = createContextCompiler({ sources: [memory.source] });
+    await compiler.beforeModelCall(step(1, [system, { role: 'user', content: 'book it' }]));
+    compiler.requestRefresh();
+    // The compaction left no user text: the refresh stays due, the block comes back.
+    const pkg = await compiler.beforeModelCall(
+      step(2, [system, { role: 'assistant', content: 'Summary: a booking.' }]),
+    );
+    expect(memory.requests).toHaveLength(1);
+    expect(pkg.manifest.sources).toEqual([
+      expect.objectContaining({ source: 'memory', status: 'ok', selected: 1 }),
+    ]);
+    expect(pkg.blocks[0]!.messages[0]!.content).toContain('Prefers aisle seats');
+    expect(compiler.state().refreshRequested).toBe(true);
+  });
+
   it('places again what a compaction removed, and notes the prefix change', async () => {
     const memory = fake('memory', 'memory', [candidate('m1', 'Prefers aisle seats', 0.9)]);
     const compiler = createContextCompiler({ sources: [memory.source] });
