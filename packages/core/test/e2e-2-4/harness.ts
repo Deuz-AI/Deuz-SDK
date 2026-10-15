@@ -1237,12 +1237,6 @@ export async function putSchedule(proc: HostProcess) {
 // A wire-level client
 // ---------------------------------------------------------------------------
 
-/** One SSE event as it arrived. */
-export interface WireFrame {
-  id?: number;
-  data: string;
-}
-
 /**
  * A client that reads every frame exactly as it arrives, across connections:
  * nothing is deduplicated here, so a frame sent twice shows up twice.
@@ -1350,8 +1344,8 @@ export interface MainFlowFacts {
   last: HostProcess;
 }
 
-const DOCKER_OPERATION = `${RUN_ID}:job-1`;
-export { DOCKER_OPERATION };
+/** The Docker step's operation id: `<runId>:<toolCallId>`. */
+export const DOCKER_OPERATION = `${RUN_ID}:job-1`;
 
 /**
  * The main flow (spec §5.1): schedule → inbox → goal → V3 context and memory
