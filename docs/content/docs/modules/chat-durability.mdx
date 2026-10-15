@@ -197,6 +197,19 @@ over this stream.`, `…the stored stream moved past this producer.`, `…this
 producer lost its lease.` or `…the stream store failed.`. A thrown store or
 lease error goes to `onStoreError` only, never to the client.
 
+A refused durable response never reads its source, so a lazy run behind it
+never starts. A `resumeDeuzChatResponse` continuation leg with `durable` that
+finds another producer holding the stream therefore makes no model call, runs
+no tool and saves no checkpoint; with `durable`, the producer lease replaces
+the app-level one-resumer-per-`runId` lock.
+
+When a lease provider's `prune` removed the stream's key, its tokens start
+again below the stream's stored fence. The lease holder then fences the stream
+at the stored token plus one, and goes on only if a second renewal after that
+open still finds it the holder. A producer whose lease lapsed during the open
+is refused with `…this producer lost its lease.`. Keep the lease provider's
+prune cutoff longer than any producer pause.
+
 A 2.4 `useChat` that reads such a response ends in `status: 'error'`: an error
 frame followed by a clean close is not a drop. Only a transport drop, a read
 that breaks off before the stream ends, continues from `resume.endpoint`.

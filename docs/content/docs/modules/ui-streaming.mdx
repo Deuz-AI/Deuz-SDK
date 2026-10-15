@@ -276,7 +276,10 @@ once, in order, and never one the store lacks. One producer writes a stream at
 a time, fenced by its lease token (key `stream:<streamId>`). Instead of
 degrading, a durable response fails closed: when another producer holds or took
 the stream, the log moved past it, the lease was lost or the store threw, it
-sends one `error` frame without an event id and without `[DONE]`.
+sends one `error` frame without an event id and without `[DONE]`. A refused
+response never reads its source, so the run behind it never starts: a refused
+`resumeDeuzChatResponse` continuation leg makes no model call, runs no tool
+and saves no checkpoint.
 
 **`capabilities: { request, announce? }`** answers a client that lists what it
 understands in an `x-deuz-capabilities` request header (a 2.4 `useChat` does).
