@@ -43,6 +43,7 @@ import {
   transcriptEntries,
   type ResolvedSearchOptions,
 } from '../internal/chat-transcript';
+import { bigintCutoff } from './budget-postgres';
 import type { PostgresConnectionOptions } from './store-connection';
 import type { PgClientLike } from './store-postgres';
 import { assertPgPool, ensurePgSchema, withPgTransaction, type PgPoolLike } from './pg-tx';
@@ -470,7 +471,8 @@ export function createPostgresConditionalChatStore(
         await read()
       ).query(
         `DELETE FROM ${chats} WHERE deleted_at IS NOT NULL AND deleted_at < $1 RETURNING chat_id`,
-        [before],
+        // Whole milliseconds in a bigint column: a fractional cutoff binds as its ceiling.
+        [bigintCutoff(before)],
       );
       return rows.length;
     },
