@@ -9,11 +9,11 @@
 
 **Load when:** a goal (`references/autonomy-workspace.md`, `/goal`) must be driven to completion without a person ticking it — claimed by one process at a time, started and resumed as V3 native runs, retried on transient failures, woken by a durable cron schedule (with a time zone) or a verified webhook, charged exactly once for what its runs spent, and completed only on evidence your verifiers produced.
 
-`@deuz-sdk/core/goal/runtime` is edge-safe and preview where noted; the stores at `@deuz-sdk/core/goal/runtime/sqlite` and `@deuz-sdk/core/goal/runtime/postgres` are Node-only. Everything is a library loop or handler in your process: there is no service, daemon or control server, and nothing runs until you create one. Docs: [/docs/modules/goal-runtime](/docs/modules/goal-runtime) (2.4).
+`@deuz-sdk/core/goal/runtime` is edge-safe and stable; the stores at `@deuz-sdk/core/goal/runtime/sqlite` and `@deuz-sdk/core/goal/runtime/postgres` are Node-only. Everything is a library loop or handler in your process: there is no service, daemon or control server, and nothing runs until you create one. Docs: [/docs/modules/goal-runtime](/docs/modules/goal-runtime) (2.4).
 
 | Piece | What it is |
 | --- | --- |
-| `createGoalSupervisor({ store, launcher, lease, ... })` (preview) | Claims goals, applies their inbox, records run intents, launches/resumes/retries/cancels/drains runs, charges ledgers above a watermark |
+| `createGoalSupervisor({ store, launcher, lease, ... })` | Claims goals, applies their inbox, records run intents, launches/resumes/retries/cancels/drains runs, charges ledgers above a watermark |
 | `createNativeRunLauncher({ store, options, lease? })` | A `RunLauncher` that starts and resumes V3 runs (`references/v3-runs.md`) |
 | `createInMemoryGoalRuntimeStore`, `createSqliteGoalRuntimeStore`, `createPostgresGoalRuntimeStore` | `GoalRuntimeStore`: goals (the first durable `GoalStore`s), inbox, runtime state, schedules, run intents, ledger watermarks under one transaction boundary |
 | `createDurableScheduler({ store, ... })` | Cron schedules with an IANA zone and DST policies whose occurrences enter a goal's inbox in the same write as the cursor |

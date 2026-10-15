@@ -111,7 +111,7 @@ Every peer is optional; install one only when you use it: `zod` + `@standard-com
 
 ## New in 2.4
 
-Every new 2.4 feature is opt-in: without the new options the provider requests and a route's UI wire stay byte for byte what 2.3 sent; the behaviour changes listed below apply to existing code (on the wire, the `useChat` handshake request header is the one default-on difference). Stability labels: `createContextCompiler`, `createGoalSupervisor`, `@deuz-sdk/core/compute/docker` and durable streams are **preview**; `@deuz-sdk/core/skills/learning` is **experimental**; the rest is stable.
+Every new 2.4 feature is opt-in: without the new options the provider requests and a route's UI wire stay byte for byte what 2.3 sent; the behaviour changes listed below apply to existing code (on the wire, the `useChat` handshake request header is the one default-on difference). Stability labels: `createContextCompiler`, `@deuz-sdk/core/compute/docker` and durable streams are **preview**; `@deuz-sdk/core/skills/learning` is **experimental**; the rest is stable.
 
 - **Memory and context.** Versioned, provenance-tracked memory (`/memory/versioned`); one context compiler for memory, RAG, transcript and skills with a manifest of what each step saw, plus structured working memory (`/context`); scope-checked lexical transcript search (`TranscriptIndex`).
 - **Durable work.** V3 native runs (`checkpointVersion: 3`) that checkpoint context, working memory and memory intents; a goal supervisor, durable time-zone scheduler, webhook inbox and evidence-bound acceptance (`/goal/runtime`); a Docker sandbox and reconnectable process runner (`/compute/docker`); accounted helper calls (`embed`, RAG, memory and verifier calls reach the budget ledger).
