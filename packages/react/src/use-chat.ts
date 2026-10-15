@@ -78,9 +78,18 @@ import type {
   UIMessage,
   UIToolCall,
 } from '@deuz-sdk/core/chat';
-import type { DeuzUIPart } from '@deuz-sdk/core/ui';
+import type { DeuzStreamSource, DeuzUIPart } from '@deuz-sdk/core/ui';
 import { connectDeuzStream, readDeuzStream } from '@deuz-sdk/core/ui';
-import { assertChatSnapshot, pairViews, restoreUI } from './chat-snapshot';
+import {
+  CAPABILITIES_HEADER,
+  CLIENT_CAPABILITIES,
+  assertChatSnapshot,
+  capabilitiesFromHeader,
+  capabilitiesOf,
+  normalizeCapabilities,
+  pairViews,
+  restoreUI,
+} from './chat-snapshot';
 import type { ChatSnapshotGateV1, ChatSnapshotV1 } from './chat-snapshot';
 
 /**
@@ -479,7 +488,18 @@ export interface UseChatResumeOptions {
    * factory returning the `Response` for a given cursor. Do NOT point it at
    * the generating POST route — that would re-run the model.
    */
-  endpoint: string | ((ctx: { lastEventId?: string }) => Response | Promise<Response>);
+  endpoint:
+    | string
+    | ((ctx: {
+        lastEventId?: string;
+        /**
+         * The capability handshake's request header value (2.4), absent when
+         * `capabilityHandshake` is false: forward it as the
+         * `x-deuz-capabilities` header, or pass it as
+         * `capabilities.request` to `resumeDeuzStreamResponse`.
+         */
+        capabilities?: string;
+      }) => Response | Promise<Response>);
   /** Cursor to resume from (e.g. persisted across a page reload). */
   lastEventId?: string;
   /**
@@ -599,6 +619,21 @@ export interface UseChatOptions {
   onHttpError?: 'error-part' | 'ignore';
   /** Injectable for tests / custom transports. Defaults to global fetch. */
   fetch?: typeof fetch;
+  /**
+   * The capability handshake (2.4, default `true`). Every POST and resume
+   * read lists what this hook understands in an `x-deuz-capabilities`
+   * request header (`chat-snapshot-v1, durable-stream, message-ids`); a 2.4
+   * route that takes part announces what it supports in the same response
+   * header and a first stream frame, and the hook uses only what was
+   * announced (see `capabilities` on the result). A 2.3 route announces
+   * nothing, so the hook behaves as 2.3 did.
+   *
+   * `false` sends no header and ignores announcements: requests and
+   * behaviour are exactly 2.3's. Use it when a cross-origin `api` answers
+   * preflights with an explicit `Access-Control-Allow-Headers` list that
+   * does not include `x-deuz-capabilities`, or add the header to that list.
+   */
+  capabilityHandshake?: boolean;
 }
 
 export interface UseChatResult {
@@ -763,6 +798,22 @@ export interface UseChatResult {
    */
   reconnect: () => Promise<void>;
   /**
+   * What the server announced in the capability handshake (2.4), sorted:
+   * `message-ids`, `chat-snapshot-v1`, `durable-stream` and any string a newer
+   * server adds. Absent until a response takes part in the handshake (a 2.3
+   * server never does) or a restored snapshot recorded one. Each response that
+   * announces replaces the set; one that announces nothing leaves it. The hook
+   * uses a feature only while it is listed here:
+   *
+   * - `message-ids`: a resume read that delivers a message the history already
+   *   holds (same id) skips it instead of rendering it twice;
+   * - `chat-snapshot-v1`: each request body also carries `messageIds`, aligned
+   *   with `messages`, so the server can store the ids the UI renders;
+   * - `durable-stream`: a POST read that drops before it ends continues from
+   *   `resume.endpoint` instead of ending in `status: 'error'`.
+   */
+  capabilities?: string[];
+  /**
    * Capture the chat as a {@link ChatSnapshotV1} (2.4), to persist and restore
    * with `initialSnapshot`: the canonical history with one id per message
    * (the ids the UI renders, the stream's ids for assistant turns), and
@@ -796,6 +847,8 @@ interface ChatSnapshot {
   finishReason?: FinishReason;
   stopDetails?: UseChatStopDetails;
   agent?: UseChatAgent;
+  /** What the server announced (2.4); chat-scoped like `cost`, so it survives a new turn. */
+  capabilities?: string[];
 }
 
 /**
@@ -820,6 +873,8 @@ function saveCursor(resume: UseChatResumeOptions, id: string): void {
 
 export function useChat(options: UseChatOptions): UseChatResult {
   const genId = options.generateId ?? defaultGenerateId;
+  /** Whether this hook takes part in the capability handshake (2.4). */
+  const handshake = options.capabilityHandshake !== false;
   /** The snapshot this hook was mounted with (2.4), checked once. */
   const [restored] = useState<ChatSnapshotV1 | undefined>(() => {
     const initial = options.initialSnapshot;
@@ -850,6 +905,9 @@ export function useChat(options: UseChatOptions): UseChatResult {
     dataParts: [],
     citations: [],
     activity: [],
+    ...(handshake && restored?.capabilities
+      ? { capabilities: normalizeCapabilities(restored.capabilities) }
+      : {}),
   }));
   /**
    * The id of each canonical message (2.4): the id its UI message renders
@@ -1120,6 +1178,27 @@ export function useChat(options: UseChatOptions): UseChatResult {
       });
     },
     [commit],
+  );
+
+  /**
+   * Take one response's capability announcement (2.4): its header, or its
+   * first frame when the header is not readable. An announcement replaces the
+   * set; `undefined` (the response took no part) leaves it. Nothing changes
+   * when the hook does not take part in the handshake.
+   */
+  const announce = useCallback(
+    (capabilities: string[] | undefined): void => {
+      if (!handshake || capabilities === undefined) return;
+      const previous = snapshotRef.current;
+      const current = previous.capabilities;
+      if (
+        current?.length === capabilities.length &&
+        current.every((capability, index) => capability === capabilities[index])
+      )
+        return;
+      commit({ ...previous, capabilities });
+    },
+    [handshake, commit],
   );
 
   /** Drop every parked gate — the turn they belonged to is no longer current. */
@@ -1412,7 +1491,12 @@ export function useChat(options: UseChatOptions): UseChatResult {
           const doFetch = options.fetch ?? fetch;
           const res = await doFetch(options.api, {
             method: 'POST',
-            headers: { 'content-type': 'application/json', ...options.headers },
+            headers: {
+              'content-type': 'application/json',
+              // The capability handshake (2.4): what this hook understands.
+              ...(handshake ? { [CAPABILITIES_HEADER]: CLIENT_CAPABILITIES } : {}),
+              ...options.headers,
+            },
             body: JSON.stringify({
               messages: snapshotRef.current.history.canonical,
               ...(options.chatId !== undefined ? { chatId: options.chatId } : {}),
@@ -1429,6 +1513,8 @@ export function useChat(options: UseChatOptions): UseChatResult {
             signal: controller.signal,
           });
           continuation = undefined; // consumed by this round only
+          // What the route announces (2.4); its first frame says it again.
+          announce(capabilitiesFromHeader(res.headers?.get(CAPABILITIES_HEADER)));
 
           let turn = createAssistantTurn(genId());
           turnRef.current = turn;
@@ -1460,6 +1546,12 @@ export function useChat(options: UseChatOptions): UseChatResult {
                 }
               : {}),
           })) {
+            // The handshake's frame (2.4) is the hook's, never the turn's.
+            const announced = capabilitiesOf(part);
+            if (announced) {
+              announce(announced);
+              continue;
+            }
             if (resume) recordPart(ledger, turn, part);
             turn = fold(turn, part);
             turnRef.current = turn;
@@ -1525,8 +1617,10 @@ export function useChat(options: UseChatOptions): UseChatResult {
       options.onError,
       options.onHttpError,
       options.resume,
+      announce,
       fold,
       flush,
+      handshake,
       settleClientCalls,
       settleTurn,
       syncTurn,
@@ -1768,7 +1862,31 @@ export function useChat(options: UseChatOptions): UseChatResult {
         // A continued turn keeps what its earlier reads saw.
         const ledger = continuing ? cursorLedgerRef.current : newLedger(cursor);
         cursorLedgerRef.current = ledger;
-        const parts = connectDeuzStream(resume.endpoint, {
+        // The capability handshake (2.4): a URL endpoint gets the request
+        // header and its response header is read on the way through; a
+        // function endpoint gets the value as `ctx.capabilities` and its
+        // `Response` is read the same way. Off, the read is 2.3's.
+        const endpoint = resume.endpoint;
+        const noted = async (response: Response | Promise<Response>): Promise<Response> => {
+          const res = await response;
+          announce(capabilitiesFromHeader(res.headers?.get(CAPABILITIES_HEADER)));
+          return res;
+        };
+        const source: DeuzStreamSource = !handshake
+          ? endpoint
+          : typeof endpoint === 'function'
+            ? (ctx) => noted(endpoint({ ...ctx, capabilities: CLIENT_CAPABILITIES }))
+            : endpoint;
+        const transport: typeof fetch | undefined =
+          handshake && typeof endpoint !== 'function'
+            ? (input, init) =>
+                noted((options.fetch ?? ((i, o) => globalThis.fetch(i, o)))(input, init))
+            : options.fetch;
+        const headers =
+          handshake && typeof endpoint !== 'function'
+            ? { [CAPABILITIES_HEADER]: CLIENT_CAPABILITIES, ...options.headers }
+            : options.headers;
+        const parts = connectDeuzStream(source, {
           ...(cursor !== undefined ? { lastEventId: cursor } : {}),
           onCursor: (id) => {
             ledger.afterCursor ??= isLaterId(id, ledger.cursor);
@@ -1776,10 +1894,17 @@ export function useChat(options: UseChatOptions): UseChatResult {
             saveCursor(resume, id);
           },
           signal: controller.signal,
-          ...(options.fetch ? { fetch: options.fetch } : {}),
-          ...(options.headers ? { headers: options.headers } : {}),
+          ...(transport ? { fetch: transport } : {}),
+          ...(headers ? { headers } : {}),
         });
         for await (const part of parts) {
+          // The handshake's frame (2.4): the hook's, never a part of the turn,
+          // and never content (a caught-up read that sends only it is a no-op).
+          const announced = capabilitiesOf(part);
+          if (announced) {
+            announce(announced);
+            continue;
+          }
           folded++;
           recordPart(ledger, turn, part);
           turn = fold(turn, part);
@@ -1843,6 +1968,8 @@ export function useChat(options: UseChatOptions): UseChatResult {
       options.headers,
       options.generateId,
       options.onError,
+      announce,
+      handshake,
       fold,
       flush,
       run,
@@ -1924,6 +2051,7 @@ export function useChat(options: UseChatOptions): UseChatResult {
           : {}),
       };
     }
+    const capabilities = snapshotRef.current.capabilities;
     return {
       version: 1,
       messages: [...canonical],
@@ -1933,6 +2061,7 @@ export function useChat(options: UseChatOptions): UseChatResult {
       ...(approvals.length > 0 ? { pendingApprovals: [...approvals] } : {}),
       ...(parked.length > 0 ? { pendingToolCalls: [...parked] } : {}),
       ...(gate && Object.keys(gate).length > 0 ? { gate } : {}),
+      ...(capabilities !== undefined ? { capabilities: [...capabilities] } : {}),
     };
   }, [idsFor]);
 
@@ -1958,6 +2087,7 @@ export function useChat(options: UseChatOptions): UseChatResult {
     ...(snapshot.finishReason !== undefined ? { finishReason: snapshot.finishReason } : {}),
     ...(snapshot.stopDetails !== undefined ? { stopDetails: snapshot.stopDetails } : {}),
     ...(snapshot.agent !== undefined ? { agent: snapshot.agent } : {}),
+    ...(snapshot.capabilities !== undefined ? { capabilities: snapshot.capabilities } : {}),
     sendMessage,
     stop,
     regenerate,

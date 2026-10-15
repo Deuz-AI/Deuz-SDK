@@ -104,7 +104,7 @@ export const CLIENT_CAPABILITIES = [
  * A capability list as a sorted array of unique, trimmed, lower-cased
  * tokens; empty items are dropped.
  */
-function normalize(items: Iterable<unknown>): string[] {
+export function normalizeCapabilities(items: Iterable<unknown>): string[] {
   const unique = new Set<string>();
   for (const item of items) {
     if (typeof item !== 'string') continue;
@@ -120,7 +120,7 @@ function normalize(items: Iterable<unknown>): string[] {
  * without `capabilities`, or a cross-origin response that does not expose it).
  */
 export function capabilitiesFromHeader(value: string | null | undefined): string[] | undefined {
-  return value == null ? undefined : normalize(value.split(','));
+  return value == null ? undefined : normalizeCapabilities(value.split(','));
 }
 
 /**
@@ -131,7 +131,7 @@ export function capabilitiesFromHeader(value: string | null | undefined): string
 export function capabilitiesOf(part: { type: string }): string[] | undefined {
   if (part.type !== 'capabilities') return undefined;
   const list = (part as { capabilities?: unknown }).capabilities;
-  return Array.isArray(list) ? normalize(list) : [];
+  return Array.isArray(list) ? normalizeCapabilities(list) : [];
 }
 
 // ---------------------------------------------------------------------------
