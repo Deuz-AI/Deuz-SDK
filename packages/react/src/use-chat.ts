@@ -48,6 +48,20 @@
  * them. A chat route never sends a frame, so its requests are unchanged. No
  * new core export is imported: with a core older than 2.3 there is no
  * `turn.agent`, and the hook behaves as before.
+ *
+ * 2.4 adds chat continuity (spec §3.4), additively and without importing a
+ * core symbol 2.3 lacks (`./chat-snapshot` holds the wire-shaped copies):
+ * - `ChatSnapshotV1` — `initialSnapshot` / `exportSnapshot()` carry the
+ *   history with its message ids (H7: a stored chat renders under the ids the
+ *   server gave it, and equal-text messages stay apart), the resume cursor,
+ *   the turn in progress, pending approvals and parked client calls, all of
+ *   which `setHistory` drops.
+ * - the capability handshake — every request lists what the hook
+ *   understands; a 2.4 route announces what it supports, and the hook uses
+ *   `message-ids` (replay dedupe by id), `chat-snapshot-v1` (`messageIds` in
+ *   the body) and `durable-stream` (a dropped read continues from the resume
+ *   endpoint) only once announced. A 2.3 route announces nothing, and the
+ *   hook behaves as 2.3 did.
  */
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type {
@@ -78,8 +92,20 @@ import type {
   UIMessage,
   UIToolCall,
 } from '@deuz-sdk/core/chat';
-import type { DeuzUIPart } from '@deuz-sdk/core/ui';
+import type { DeuzStreamSource, DeuzUIPart } from '@deuz-sdk/core/ui';
 import { connectDeuzStream, readDeuzStream } from '@deuz-sdk/core/ui';
+import {
+  CAPABILITIES_HEADER,
+  CAPABILITY,
+  CLIENT_CAPABILITIES,
+  assertChatSnapshot,
+  capabilitiesFromHeader,
+  capabilitiesOf,
+  normalizeCapabilities,
+  pairViews,
+  restoreUI,
+} from './chat-snapshot';
+import type { ChatSnapshotGateV1, ChatSnapshotV1 } from './chat-snapshot';
 
 /**
  * Fold one wire part via the core reducer. Current core versions preserve the
@@ -477,7 +503,18 @@ export interface UseChatResumeOptions {
    * factory returning the `Response` for a given cursor. Do NOT point it at
    * the generating POST route — that would re-run the model.
    */
-  endpoint: string | ((ctx: { lastEventId?: string }) => Response | Promise<Response>);
+  endpoint:
+    | string
+    | ((ctx: {
+        lastEventId?: string;
+        /**
+         * The capability handshake's request header value (2.4), absent when
+         * `capabilityHandshake` is false: forward it as the
+         * `x-deuz-capabilities` header, or pass it as
+         * `capabilities.request` to `resumeDeuzStreamResponse`.
+         */
+        capabilities?: string;
+      }) => Response | Promise<Response>);
   /** Cursor to resume from (e.g. persisted across a page reload). */
   lastEventId?: string;
   /**
@@ -524,6 +561,16 @@ export interface UseChatOptions {
    * `setHistory` (both views) or `setMessages` (re-derives canonical).
    */
   initialMessages?: Message[];
+  /**
+   * Restore a chat (2.4): a {@link ChatSnapshotV1} from `exportSnapshot()`,
+   * or one built from a stored `ChatRecord` (`{ version: 1, messages:
+   * record.messages, messageIds: record.messageIds }`). Every message renders
+   * under its stored id (a missing, empty or repeated one gets a fresh id),
+   * so two messages with the same text stay two messages. Takes precedence
+   * over `initialMessages`, and is read once, at mount, like it. Throws a
+   * TypeError for a snapshot whose `version` is not 1.
+   */
+  initialSnapshot?: ChatSnapshotV1;
   headers?: Record<string, string>;
   /** Extra fields merged into every request body. */
   body?: Record<string, unknown>;
@@ -587,6 +634,21 @@ export interface UseChatOptions {
   onHttpError?: 'error-part' | 'ignore';
   /** Injectable for tests / custom transports. Defaults to global fetch. */
   fetch?: typeof fetch;
+  /**
+   * The capability handshake (2.4, default `true`). Every POST and resume
+   * read lists what this hook understands in an `x-deuz-capabilities`
+   * request header (`chat-snapshot-v1, durable-stream, message-ids`); a 2.4
+   * route that takes part announces what it supports in the same response
+   * header and a first stream frame, and the hook uses only what was
+   * announced (see `capabilities` on the result). A 2.3 route announces
+   * nothing, so the hook behaves as 2.3 did.
+   *
+   * `false` sends no header and ignores announcements: requests and
+   * behaviour are exactly 2.3's. Use it when a cross-origin `api` answers
+   * preflights with an explicit `Access-Control-Allow-Headers` list that
+   * does not include `x-deuz-capabilities`, or add the header to that list.
+   */
+  capabilityHandshake?: boolean;
 }
 
 export interface UseChatResult {
@@ -750,6 +812,29 @@ export interface UseChatResult {
    * it and appends nothing the hook already holds.
    */
   reconnect: () => Promise<void>;
+  /**
+   * What the server announced in the capability handshake (2.4), sorted:
+   * `message-ids`, `chat-snapshot-v1`, `durable-stream` and any string a newer
+   * server adds. Absent until a response takes part in the handshake (a 2.3
+   * server never does) or a restored snapshot recorded one. Each response that
+   * announces replaces the set; one that announces nothing leaves it. The hook
+   * uses a feature only while it is listed here:
+   *
+   * - `message-ids`: a resume read that delivers a message the history already
+   *   holds (same id) skips it instead of rendering it twice;
+   * - `chat-snapshot-v1`: each request body also carries `messageIds`, aligned
+   *   with `messages`, so the server can store the ids the UI renders;
+   * - `durable-stream`: a POST read that drops before it ends continues from
+   *   `resume.endpoint` instead of ending in `status: 'error'`.
+   */
+  capabilities?: string[];
+  /**
+   * Capture the chat as a {@link ChatSnapshotV1} (2.4), to persist and restore
+   * with `initialSnapshot`: the canonical history with one id per message
+   * (the ids the UI renders, the stream's ids for assistant turns), and
+   * whatever is still open. Reads the latest state, not the last render.
+   */
+  exportSnapshot: () => ChatSnapshotV1;
 }
 
 /**
@@ -777,6 +862,8 @@ interface ChatSnapshot {
   finishReason?: FinishReason;
   stopDetails?: UseChatStopDetails;
   agent?: UseChatAgent;
+  /** What the server announced (2.4); chat-scoped like `cost`, so it survives a new turn. */
+  capabilities?: string[];
 }
 
 /**
@@ -801,37 +888,103 @@ function saveCursor(resume: UseChatResumeOptions, id: string): void {
 
 export function useChat(options: UseChatOptions): UseChatResult {
   const genId = options.generateId ?? defaultGenerateId;
+  /** Whether this hook takes part in the capability handshake (2.4). */
+  const handshake = options.capabilityHandshake !== false;
+  /** The snapshot this hook was mounted with (2.4), checked once. */
+  const [restored] = useState<ChatSnapshotV1 | undefined>(() => {
+    const initial = options.initialSnapshot;
+    if (initial === undefined) return undefined;
+    assertChatSnapshot(initial);
+    return initial;
+  });
+  /**
+   * Its turn in progress (2.4): the last bubble, continued by the next resume
+   * read. Sealed when there is no resume endpoint to continue it.
+   */
+  const [restoredTurn] = useState<AssistantTurnState | undefined>(() =>
+    restored?.turn && !options.resume ? sealAssistantTurn(restored.turn) : restored?.turn,
+  );
   const [snapshot, setSnapshot] = useState<ChatSnapshot>(() => ({
-    history: {
-      ui: uiFromMessages(options.initialMessages ?? [], genId),
-      canonical: options.initialMessages ? [...options.initialMessages] : [],
-    },
+    history: restored
+      ? {
+          ui: [
+            ...restoreUI(restored.messages, restored.messageIds, genId),
+            ...(restoredTurn ? [restoredTurn.message] : []),
+          ],
+          canonical: [...restored.messages],
+        }
+      : {
+          ui: uiFromMessages(options.initialMessages ?? [], genId),
+          canonical: options.initialMessages ? [...options.initialMessages] : [],
+        },
     dataParts: [],
     citations: [],
     activity: [],
+    ...(handshake && restored?.capabilities
+      ? { capabilities: normalizeCapabilities(restored.capabilities) }
+      : {}),
   }));
+  /**
+   * The id of each canonical message (2.4): the id its UI message renders
+   * under, so `exportSnapshot()` can align `messageIds` with `messages` the
+   * way `ChatRecord` does. Keyed by the message object, which the hook never
+   * mutates and which keeps its identity across every history array. Filled
+   * here from the mounted history (not inside the state initializer, which
+   * StrictMode may run twice with different generated ids), and as messages
+   * join the history: `sendMessage` (the user bubble's id), a settled turn
+   * (the stream's message id) and `setHistory` (paired with the new UI view).
+   */
+  const idsRef = useRef<WeakMap<Message, string> | null>(null);
+  if (idsRef.current === null) {
+    const ids = new WeakMap<Message, string>();
+    idsRef.current = ids;
+    // A message the UI has no bubble for (system, tool) keeps its stored id too.
+    restored?.messages.forEach((message, index) => {
+      const id = restored.messageIds?.[index];
+      if (typeof id === 'string' && id !== '') ids.set(message, id);
+    });
+    pairViews(snapshot.history.canonical, snapshot.history.ui, (message, view) =>
+      ids.set(message, view.id),
+    );
+  }
+  const messageIds = idsRef.current;
   const [status, setStatus] = useState<'idle' | 'streaming' | 'error'>('idle');
   const [error, setError] = useState<Error | undefined>(undefined);
-  const [pendingApprovals, setPendingApprovals] = useState<ToolApprovalRequest[]>([]);
-  const [pendingToolCalls, setPendingToolCalls] = useState<UIToolCall[]>([]);
+  // A restored snapshot's gates (2.4): the chat is still paused on them.
+  const restoredApprovals = restored?.pendingApprovals ?? [];
+  const restoredCalls = restored?.pendingToolCalls ?? [];
+  const restoredGate = restored?.gate;
+  const [pendingApprovals, setPendingApprovals] =
+    useState<ToolApprovalRequest[]>(restoredApprovals);
+  const [pendingToolCalls, setPendingToolCalls] = useState<UIToolCall[]>(restoredCalls);
 
   /** Authoritative snapshot: replaced (never mutated) by `commit`, published to React by `publish`. */
   const snapshotRef = useRef<ChatSnapshot>(snapshot);
   /** The in-flight turn — kept across a drop so `reconnect()` can continue it. */
-  const turnRef = useRef<AssistantTurnState | undefined>(undefined);
+  const turnRef = useRef<AssistantTurnState | undefined>(restoredTurn);
   /** The turn PARKED on client tool results, so `addToolResult` folds into the same one. */
-  const parkedTurnRef = useRef<AssistantTurnState | undefined>(undefined);
-  const clientToolsRef = useRef<UIToolCall[]>([]);
+  const parkedTurnRef = useRef<AssistantTurnState | undefined>(
+    restoredCalls.length > 0 ? restoredGate?.turn : undefined,
+  );
+  const clientToolsRef = useRef<UIToolCall[]>(restoredCalls);
   const toolResultsRef = useRef<Array<{ toolCallId: string; result: unknown; isError?: boolean }>>(
-    [],
+    restoredCalls.length > 0
+      ? (restoredGate?.toolResults ?? []).map((answer) => ({
+          toolCallId: answer.toolCallId,
+          result: answer.output,
+          ...(answer.isError ? { isError: true } : {}),
+        }))
+      : [],
   );
   /**
    * The gate the chat is PAUSED on: the open approvals of the last settled turn
    * (deduplicated, see `openApprovals`). Emptied the moment its verdicts are
    * sent, so a verdict that arrives later answers nothing (2.3, F06).
    */
-  const approvalsRef = useRef<ToolApprovalRequest[]>([]);
-  const verdictsRef = useRef<ToolApprovalResponse[]>([]);
+  const approvalsRef = useRef<ToolApprovalRequest[]>(restoredApprovals);
+  const verdictsRef = useRef<ToolApprovalResponse[]>(
+    restoredApprovals.length > 0 ? (restoredGate?.approvalResponses ?? []) : [],
+  );
   /**
    * A native run paused on approvals (2.3): the turn and the client calls it
    * also waits for. They run once the verdicts are in, and the verdicts ride
@@ -839,9 +992,26 @@ export function useChat(options: UseChatOptions): UseChatResult {
    */
   const nativeGateRef = useRef<
     { runId: string; turn: AssistantTurnState; clientCalls: UIToolCall[] } | undefined
-  >(undefined);
+  >(
+    restoredApprovals.length > 0 && restoredGate?.runId !== undefined && restoredGate.turn
+      ? {
+          runId: restoredGate.runId,
+          turn: restoredGate.turn,
+          clientCalls: restoredGate.clientCalls ?? [],
+        }
+      : undefined,
+  );
   /** The native run (and its verdicts) the parked client calls resume (2.3). */
-  const parkedNativeRef = useRef<NativeResume | undefined>(undefined);
+  const parkedNativeRef = useRef<NativeResume | undefined>(
+    restoredCalls.length > 0 && restoredGate?.runId !== undefined
+      ? {
+          runId: restoredGate.runId,
+          ...(restoredGate.approvalResponses?.length
+            ? { approvalResponses: restoredGate.approvalResponses }
+            : {}),
+        }
+      : undefined,
+  );
   /**
    * Bumped by `clearGates` (2.3). An `onToolCall` batch that started under an
    * older value belongs to a gate that was dropped meanwhile (a new message, a
@@ -865,7 +1035,10 @@ export function useChat(options: UseChatOptions): UseChatResult {
    */
   const executingRef = useRef<Set<string>>(new Set());
   const abortRef = useRef<AbortController | null>(null);
-  const lastEventIdRef = useRef<string | undefined>(options.resume?.lastEventId);
+  /** A restored snapshot's cursor (2.4) beats `resume.lastEventId`: it is the newer of the two. */
+  const lastEventIdRef = useRef<string | undefined>(
+    restored?.cursor ?? options.resume?.lastEventId,
+  );
   /**
    * The turn `lastEventIdRef` is a cursor INTO (2.3). A reconnect may fold
    * into the in-flight turn only when that turn is the one the cursor
@@ -875,16 +1048,22 @@ export function useChat(options: UseChatOptions): UseChatResult {
    * or a core before 2.3) is rebuilt from the cursor instead; folding the
    * replay into it would apply its already-received parts twice.
    */
-  const cursorTurnRef = useRef<AssistantTurnState | undefined>(undefined);
+  const cursorTurnRef = useRef<AssistantTurnState | undefined>(
+    // A restored turn (2.4) was read up to the snapshot's cursor.
+    restored?.cursor !== undefined ? restoredTurn : undefined,
+  );
   /** What the reads of `cursorTurnRef`'s turn saw in arrival order (see `ReplayLedger`). */
-  const cursorLedgerRef = useRef<ReplayLedger>(newLedger());
+  const cursorLedgerRef = useRef<ReplayLedger>(newLedger(restored?.cursor));
   /**
    * The canonical history as it stood when the last replayed turn settled
    * (2.3). Its read ended on the cursor, so a read that resumes after the
    * cursor cannot deliver any of these messages' calls again, and their
    * answers are no evidence about the calls it does deliver.
    */
-  const behindCursorRef = useRef<readonly Message[]>([]);
+  const behindCursorRef = useRef<readonly Message[]>(
+    // A restored history (2.4) was read up to the snapshot's cursor.
+    restored?.cursor !== undefined ? snapshot.history.canonical : [],
+  );
   /**
    * Id of the turn's message AS IT SITS in `ui`. The wire's `start` part
    * RENAMES the message (`applyUIPart`), so the id is not stable across a turn
@@ -893,7 +1072,7 @@ export function useChat(options: UseChatOptions): UseChatResult {
    * mid-stream: 1.8 spliced the LAST element blindly, so replacing the
    * transcript under a live stream clobbered whatever the app had put there.
    */
-  const placedIdRef = useRef<string | undefined>(undefined);
+  const placedIdRef = useRef<string | undefined>(restoredTurn?.message.id);
 
   // --- Commit plumbing: one React update per fold, optionally coalesced ---
 
@@ -1016,6 +1195,62 @@ export function useChat(options: UseChatOptions): UseChatResult {
     [commit],
   );
 
+  /**
+   * Take one response's capability announcement (2.4): its header, or its
+   * first frame when the header is not readable. An announcement replaces the
+   * set; `undefined` (the response took no part) leaves it. Nothing changes
+   * when the hook does not take part in the handshake.
+   */
+  const announce = useCallback(
+    (capabilities: string[] | undefined): void => {
+      if (!handshake || capabilities === undefined) return;
+      const previous = snapshotRef.current;
+      const current = previous.capabilities;
+      if (
+        current?.length === capabilities.length &&
+        current.every((capability, index) => capability === capabilities[index])
+      )
+        return;
+      commit({ ...previous, capabilities });
+    },
+    [handshake, commit],
+  );
+
+  /**
+   * `messageIds` aligned with `history` (2.4). A message with no id yet (a
+   * tool result, a message `setHistory` could not pair) gets a generated one
+   * here and keeps it, so every export names it the same.
+   */
+  const idsFor = useCallback(
+    (history: readonly Message[]): string[] =>
+      history.map((message) => {
+        let id = messageIds.get(message);
+        if (id === undefined) {
+          id = genId();
+          messageIds.set(message, id);
+        }
+        return id;
+      }),
+    [messageIds, options.generateId],
+  );
+
+  /** Whether the server announced `capability` (2.4); never while the handshake is off. */
+  const serverHas = useCallback(
+    (capability: string): boolean =>
+      handshake && (snapshotRef.current.capabilities?.includes(capability) ?? false),
+    [handshake],
+  );
+
+  /** The ids of the messages the canonical history holds (2.4): settled messages. */
+  const settledIds = useCallback((): Set<string> => {
+    const held = new Set<string>();
+    for (const message of snapshotRef.current.history.canonical) {
+      const id = messageIds.get(message);
+      if (id !== undefined) held.add(id);
+    }
+    return held;
+  }, [messageIds]);
+
   /** Drop every parked gate — the turn they belonged to is no longer current. */
   const clearGates = useCallback((): void => {
     gateGenerationRef.current++;
@@ -1076,6 +1311,12 @@ export function useChat(options: UseChatOptions): UseChatResult {
   const stop = useCallback((): void => {
     abortRef.current?.abort();
   }, []);
+
+  /**
+   * The resume read, for `run` (2.4: a dropped durable read continues there).
+   * A ref because `runResume` is defined after `run` and calls it.
+   */
+  const runResumeRef = useRef<((silent: boolean) => Promise<void>) | undefined>(undefined);
 
   /**
    * Run or park the client calls a settled turn waits for. ONE path for a
@@ -1208,8 +1449,11 @@ export function useChat(options: UseChatOptions): UseChatResult {
       );
       priorResultsRef.current = [];
       if (answers.length > 0) appendCanonical(clientToolResultMessage(answers));
-      // Append the canonical assistant turn (client-tools reconstruction).
-      appendCanonical(assistantMessageFromTurn(turn));
+      // Append the canonical assistant turn (client-tools reconstruction),
+      // under the id its bubble renders with (2.4: `exportSnapshot`).
+      const assistant = assistantMessageFromTurn(turn);
+      messageIds.set(assistant, turn.message.id);
+      appendCanonical(assistant);
       // The calls the server ran within this leg (2.3) keep their `tool_use` in
       // that message and their result on the card: it answers them right after
       // it, as `canonicalFromUI` does. Before 2.3 the next request carried them
@@ -1279,7 +1523,7 @@ export function useChat(options: UseChatOptions): UseChatResult {
       }
       return settleClientCalls(turn, clientPending, native ? { runId: native.runId } : undefined);
     },
-    [appendCanonical, settleClientCalls],
+    [appendCanonical, settleClientCalls, messageIds],
   );
 
   const run = useCallback(
@@ -1289,6 +1533,10 @@ export function useChat(options: UseChatOptions): UseChatResult {
       setStatus('streaming');
       setError(undefined);
       let continuation = initial;
+      // A durable stream (2.4): set while a POST read whose response announced
+      // `durable-stream` is in progress, so a drop can continue from the
+      // resume endpoint instead of failing.
+      let durableRead = false;
       try {
         if (gate) {
           // A native gate's client calls (2.3) run as this round's first step,
@@ -1303,9 +1551,18 @@ export function useChat(options: UseChatOptions): UseChatResult {
           const doFetch = options.fetch ?? fetch;
           const res = await doFetch(options.api, {
             method: 'POST',
-            headers: { 'content-type': 'application/json', ...options.headers },
+            headers: {
+              'content-type': 'application/json',
+              // The capability handshake (2.4): what this hook understands.
+              ...(handshake ? { [CAPABILITIES_HEADER]: CLIENT_CAPABILITIES } : {}),
+              ...options.headers,
+            },
             body: JSON.stringify({
               messages: snapshotRef.current.history.canonical,
+              // The server takes the ids the UI renders (2.4, `chat-snapshot-v1`).
+              ...(serverHas(CAPABILITY.chatSnapshot)
+                ? { messageIds: idsFor(snapshotRef.current.history.canonical) }
+                : {}),
               ...(options.chatId !== undefined ? { chatId: options.chatId } : {}),
               ...(continuation?.approvalResponses?.length
                 ? { approvalResponses: continuation.approvalResponses }
@@ -1320,6 +1577,10 @@ export function useChat(options: UseChatOptions): UseChatResult {
             signal: controller.signal,
           });
           continuation = undefined; // consumed by this round only
+          // What the route announces (2.4); its first frame says it again.
+          const heard = capabilitiesFromHeader(res.headers?.get(CAPABILITIES_HEADER));
+          announce(heard);
+          durableRead = handshake && (heard?.includes(CAPABILITY.durableStream) ?? false);
 
           let turn = createAssistantTurn(genId());
           turnRef.current = turn;
@@ -1351,6 +1612,13 @@ export function useChat(options: UseChatOptions): UseChatResult {
                 }
               : {}),
           })) {
+            // The handshake's frame (2.4) is the hook's, never the turn's.
+            const announced = capabilitiesOf(part);
+            if (announced) {
+              announce(announced);
+              durableRead = handshake && announced.includes(CAPABILITY.durableStream);
+              continue;
+            }
             if (resume) recordPart(ledger, turn, part);
             turn = fold(turn, part);
             turnRef.current = turn;
@@ -1364,6 +1632,7 @@ export function useChat(options: UseChatOptions): UseChatResult {
           // leaves the tail text/reasoning part 'streaming' by design — that
           // boundary belongs to the binding, so close it here. Returns the SAME
           // object when there is nothing to seal, hence no wasted render.
+          durableRead = false; // the read ended: what follows is no drop
           const sealed = sealAssistantTurn(turn);
           if (sealed !== turn) {
             turn = sealed;
@@ -1393,6 +1662,21 @@ export function useChat(options: UseChatOptions): UseChatResult {
           }
           return;
         }
+        // The read of a durable stream dropped (2.4, `durable-stream`): the
+        // server committed every frame before sending it and keeps producing
+        // without this client, so the turn continues from the resume endpoint
+        // after what this read delivered, every frame once. Only when the read
+        // moved the cursor, so the continuation addresses this turn; a failed
+        // continuation reports its own error.
+        if (
+          durableRead &&
+          options.resume &&
+          turnRef.current !== undefined &&
+          cursorTurnRef.current === turnRef.current
+        ) {
+          await runResumeRef.current?.(false);
+          return;
+        }
         const e = err instanceof Error ? err : new Error(String(err));
         setError(e);
         setStatus('error');
@@ -1416,8 +1700,12 @@ export function useChat(options: UseChatOptions): UseChatResult {
       options.onError,
       options.onHttpError,
       options.resume,
+      announce,
       fold,
       flush,
+      handshake,
+      idsFor,
+      serverHas,
       settleClientCalls,
       settleTurn,
       syncTurn,
@@ -1433,6 +1721,7 @@ export function useChat(options: UseChatOptions): UseChatResult {
       // prefix does not move when a caller upgrades.
       const message = userMessageFromInput(input);
       const bubble = uiFromMessages([message], genId)[0];
+      if (bubble) messageIds.set(message, bubble.id);
       const previous = snapshotRef.current;
       commit({
         ...previous,
@@ -1445,7 +1734,7 @@ export function useChat(options: UseChatOptions): UseChatResult {
       flush();
       await run();
     },
-    [run, commit, clearGates, flush, options.generateId],
+    [run, commit, clearGates, flush, options.generateId, messageIds],
   );
 
   const regenerate = useCallback(async (): Promise<void> => {
@@ -1482,6 +1771,11 @@ export function useChat(options: UseChatOptions): UseChatResult {
         ...previous,
         history: { ui: [...next.ui], canonical: [...next.canonical] },
       });
+      // A message new to the history takes the id of its UI counterpart (2.4);
+      // one the hook already knows keeps its id, identity being the safer pairing.
+      pairViews(next.canonical, next.ui, (message, view) => {
+        if (!messageIds.has(message)) messageIds.set(message, view.id);
+      });
       clearGates();
       // The in-memory resume cursor (2.3: POST reads move it too) addresses
       // the stream of the transcript just replaced, like the gates. After a
@@ -1495,7 +1789,7 @@ export function useChat(options: UseChatOptions): UseChatResult {
       behindCursorRef.current = [];
       flush();
     },
-    [commit, clearGates, flush],
+    [commit, clearGates, flush, messageIds],
   );
 
   const setMessages = useCallback(
@@ -1653,7 +1947,31 @@ export function useChat(options: UseChatOptions): UseChatResult {
         // A continued turn keeps what its earlier reads saw.
         const ledger = continuing ? cursorLedgerRef.current : newLedger(cursor);
         cursorLedgerRef.current = ledger;
-        const parts = connectDeuzStream(resume.endpoint, {
+        // The capability handshake (2.4): a URL endpoint gets the request
+        // header and its response header is read on the way through; a
+        // function endpoint gets the value as `ctx.capabilities` and its
+        // `Response` is read the same way. Off, the read is 2.3's.
+        const endpoint = resume.endpoint;
+        const noted = async (response: Response | Promise<Response>): Promise<Response> => {
+          const res = await response;
+          announce(capabilitiesFromHeader(res.headers?.get(CAPABILITIES_HEADER)));
+          return res;
+        };
+        const source: DeuzStreamSource = !handshake
+          ? endpoint
+          : typeof endpoint === 'function'
+            ? (ctx) => noted(endpoint({ ...ctx, capabilities: CLIENT_CAPABILITIES }))
+            : endpoint;
+        const transport: typeof fetch | undefined =
+          handshake && typeof endpoint !== 'function'
+            ? (input, init) =>
+                noted((options.fetch ?? ((i, o) => globalThis.fetch(i, o)))(input, init))
+            : options.fetch;
+        const headers =
+          handshake && typeof endpoint !== 'function'
+            ? { [CAPABILITIES_HEADER]: CLIENT_CAPABILITIES, ...options.headers }
+            : options.headers;
+        const parts = connectDeuzStream(source, {
           ...(cursor !== undefined ? { lastEventId: cursor } : {}),
           onCursor: (id) => {
             ledger.afterCursor ??= isLaterId(id, ledger.cursor);
@@ -1661,10 +1979,33 @@ export function useChat(options: UseChatOptions): UseChatResult {
             saveCursor(resume, id);
           },
           signal: controller.signal,
-          ...(options.fetch ? { fetch: options.fetch } : {}),
-          ...(options.headers ? { headers: options.headers } : {}),
+          ...(transport ? { fetch: transport } : {}),
+          ...(headers ? { headers } : {}),
         });
+        // Dedupe by message id (2.4, `message-ids`): set while the read
+        // re-delivers a message the history already holds.
+        let skipping = false;
         for await (const part of parts) {
+          // The handshake's frame (2.4): the hook's, never a part of the turn,
+          // and never content (a caught-up read that sends only it is a no-op).
+          const announced = capabilitiesOf(part);
+          if (announced) {
+            announce(announced);
+            continue;
+          }
+          // A message is every frame from its `start` to the next one. When
+          // the server's ids are stable and unique (`message-ids`), a message
+          // whose id the history already holds was settled before: its frames
+          // are skipped, so a replay that starts over (a lost cursor) renders,
+          // appends and runs nothing twice. Text never counts: two messages
+          // with the same text and their own ids are both kept. Without the
+          // announcement ids may repeat (2.3 routes can name every message
+          // the same), so nothing is skipped. An error frame is the read's
+          // own and is never skipped.
+          if (part.type === 'start')
+            skipping = serverHas(CAPABILITY.messageIds) && settledIds().has(part.messageId);
+          if (skipping && part.type !== 'error') continue;
+          skipping = false;
           folded++;
           recordPart(ledger, turn, part);
           turn = fold(turn, part);
@@ -1728,6 +2069,10 @@ export function useChat(options: UseChatOptions): UseChatResult {
       options.headers,
       options.generateId,
       options.onError,
+      announce,
+      handshake,
+      serverHas,
+      settledIds,
       fold,
       flush,
       run,
@@ -1736,6 +2081,7 @@ export function useChat(options: UseChatOptions): UseChatResult {
     ],
   );
 
+  runResumeRef.current = runResume;
   const reconnect = useCallback((): Promise<void> => runResume(false), [runResume]);
 
   /**
@@ -1750,6 +2096,60 @@ export function useChat(options: UseChatOptions): UseChatResult {
     autoResumedRef.current = true;
     void runResume(true);
   }, [options.resume?.auto, runResume]);
+
+  const exportSnapshot = useCallback((): ChatSnapshotV1 => {
+    const canonical = snapshotRef.current.history.canonical;
+    const cursor = lastEventIdRef.current;
+    const turn = turnRef.current;
+    const approvals = approvalsRef.current;
+    const parked = clientToolsRef.current;
+    // The state behind the gate the chat is paused on, as `useChat` resumes it.
+    let gate: ChatSnapshotGateV1 | undefined;
+    if (approvals.length > 0) {
+      const native = nativeGateRef.current;
+      gate = {
+        ...(verdictsRef.current.length > 0 ? { approvalResponses: verdictsRef.current } : {}),
+        ...(native
+          ? { turn: native.turn, runId: native.runId, clientCalls: native.clientCalls }
+          : {}),
+      };
+    } else if (parked.length > 0) {
+      const native = parkedNativeRef.current;
+      const answers = toolResultsRef.current;
+      gate = {
+        ...(parkedTurnRef.current ? { turn: parkedTurnRef.current } : {}),
+        ...(answers.length > 0
+          ? {
+              toolResults: answers.map((answer) => ({
+                toolCallId: answer.toolCallId,
+                output: answer.result,
+                ...(answer.isError ? { isError: true } : {}),
+              })),
+            }
+          : {}),
+        ...(native
+          ? {
+              runId: native.runId,
+              ...(native.approvalResponses?.length
+                ? { approvalResponses: native.approvalResponses }
+                : {}),
+            }
+          : {}),
+      };
+    }
+    const capabilities = snapshotRef.current.capabilities;
+    return {
+      version: 1,
+      messages: [...canonical],
+      messageIds: idsFor(canonical),
+      ...(cursor !== undefined ? { cursor } : {}),
+      ...(turn ? { turn } : {}),
+      ...(approvals.length > 0 ? { pendingApprovals: [...approvals] } : {}),
+      ...(parked.length > 0 ? { pendingToolCalls: [...parked] } : {}),
+      ...(gate && Object.keys(gate).length > 0 ? { gate } : {}),
+      ...(capabilities !== undefined ? { capabilities: [...capabilities] } : {}),
+    };
+  }, [idsFor]);
 
   return {
     messages: snapshot.history.ui,
@@ -1773,6 +2173,7 @@ export function useChat(options: UseChatOptions): UseChatResult {
     ...(snapshot.finishReason !== undefined ? { finishReason: snapshot.finishReason } : {}),
     ...(snapshot.stopDetails !== undefined ? { stopDetails: snapshot.stopDetails } : {}),
     ...(snapshot.agent !== undefined ? { agent: snapshot.agent } : {}),
+    ...(snapshot.capabilities !== undefined ? { capabilities: snapshot.capabilities } : {}),
     sendMessage,
     stop,
     regenerate,
@@ -1783,5 +2184,6 @@ export function useChat(options: UseChatOptions): UseChatResult {
     clearError,
     addToolApprovalResponse,
     reconnect,
+    exportSnapshot,
   };
 }
