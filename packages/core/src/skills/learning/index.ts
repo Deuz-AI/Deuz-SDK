@@ -124,14 +124,18 @@ export class SkillLearningError extends DeuzError {
  * (`source_not_eligible`), an oversized projection (`source_too_large`) and a
  * draft that fails `parseSkill`, lacks a valid source on a step or suggests a
  * tool the run never used (`invalid_proposal`).
+ *
+ * The one call is made without a transport retry, so a failed attempt
+ * rejects with the provider's error and is the host's to repeat; a budget
+ * that cannot admit it rejects with the ledger's `budget_exceeded` before
+ * the request. A budget needs a `tokens` or `usd` bound (TypeError otherwise).
  */
 export async function proposeSkillFromRun(
   options: ProposeSkillFromRunOptions,
 ): Promise<SkillProposal> {
-  checkOptions(options);
+  const { maxOutputTokens, maxSourceChars } = checkOptions(options);
   const { run } = options;
   assertEligible(run);
-  const maxSourceChars = options.maxSourceChars ?? DEFAULT_MAX_SOURCE_CHARS;
   const projection = await projectRun(run, {
     ...(options.toolSummaries ? { toolSummaries: options.toolSummaries } : {}),
   });
@@ -147,7 +151,7 @@ export async function proposeSkillFromRun(
   const call = await callProposalModel({
     model: options.model,
     messages: proposalMessages(projection, options.instructions),
-    maxOutputTokens: options.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS,
+    maxOutputTokens,
     budget: options.budget,
     ...(options.signal ? { signal: options.signal } : {}),
     ...(options.deps ? { deps: options.deps } : {}),
@@ -201,7 +205,10 @@ function positiveInteger(value: number | undefined, fallback: number, name: stri
 }
 
 /** Malformed options are a caller error (TypeError), never a refusal of the run. */
-function checkOptions(options: ProposeSkillFromRunOptions): void {
+function checkOptions(options: ProposeSkillFromRunOptions): {
+  maxOutputTokens: number;
+  maxSourceChars: number;
+} {
   if (!options || typeof options !== 'object')
     throw new TypeError('proposeSkillFromRun: options are required');
   const run = options.run as Partial<AgentRunEnvelope> | undefined;
@@ -226,8 +233,18 @@ function checkOptions(options: ProposeSkillFromRunOptions): void {
   ] as const)
     if (value !== undefined && (!Number.isFinite(value) || value < 0))
       throw new TypeError(`proposeSkillFromRun: budget.${name} must be a finite number >= 0`);
-  positiveInteger(options.maxOutputTokens, DEFAULT_MAX_OUTPUT_TOKENS, 'maxOutputTokens');
-  positiveInteger(options.maxSourceChars, DEFAULT_MAX_SOURCE_CHARS, 'maxSourceChars');
+  return {
+    maxOutputTokens: positiveInteger(
+      options.maxOutputTokens,
+      DEFAULT_MAX_OUTPUT_TOKENS,
+      'maxOutputTokens',
+    ),
+    maxSourceChars: positiveInteger(
+      options.maxSourceChars,
+      DEFAULT_MAX_SOURCE_CHARS,
+      'maxSourceChars',
+    ),
+  };
 }
 
 /**

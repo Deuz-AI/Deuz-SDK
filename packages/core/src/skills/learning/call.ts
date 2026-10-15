@@ -3,9 +3,10 @@
  * transport retry, no tools, admitted against a ledger of its own built from
  * the mandatory budget. The source run's accounting is never touched.
  *
- * The call goes through the core pipeline (`core/inference.ts`) loaded with a
- * lazy `import()`: `/skills/learning` reaches neither the agentic loops
- * (`inference/**`) nor the provider adapters until a proposal is made, and
+ * The call goes through the core pipeline (`core/inference.ts`), loaded with
+ * the budget ledger by a lazy `import()`: `/skills/learning` reaches neither
+ * the agentic loops (`inference/**`) nor the provider adapters and the ledger
+ * until a proposal is made, and
  * `generateObject` is not used because its repair attempt would be a second
  * call. Edge-safe.
  */
@@ -14,7 +15,6 @@ import type { BudgetLimits } from '../../types/execution';
 import type { Message } from '../../types/message';
 import type { LanguageModel } from '../../types/model';
 import type { FinishReason, Usage } from '../../types/usage';
-import { createExecutionContext } from '../../execution-policy';
 
 export interface ProposalCallInput {
   model: LanguageModel;
@@ -38,10 +38,13 @@ const SCOPE = 'skill-proposal';
 
 export async function callProposalModel(input: ProposalCallInput): Promise<ProposalCallResult> {
   input.signal?.throwIfAborted();
+  const [{ runStream }, { createExecutionContext }] = await Promise.all([
+    import('../../core/inference'),
+    import('../../execution-policy'),
+  ]);
   // A fresh root context per call: its budget bounds this call alone, apart
   // from the closed accounting of the run the skill is learned from.
   const execution = createExecutionContext({ budget: input.budget, scopeId: SCOPE });
-  const { runStream } = await import('../../core/inference');
   const result = runStream(
     {
       model: input.model,
