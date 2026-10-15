@@ -118,6 +118,8 @@ If you would rather own the DDL entirely, the [Postgres schema below](#postgres-
 
 The ops, swarm and budget stores of 2.2 are versioned separately, each with a table of its own; their numbers, the indexes 2.3 adds on first use, and how a Postgres schema is upgraded forward are listed in [Schema versions and upgrades](/docs/modules/operations#schema-versions-and-upgrades).
 
+Since 2.4, `/stores/sqlite` and `/stores/postgres` also export the conditional chat stores, and those two plus `/stores/redis` the durable stream stores. They are separate from the store packs: each keeps its own tables (or Redis keys) and its own version marker, and leaves the packs' tables, `deuz_chats` included, and `PRAGMA user_version` alone. See [Chat and stream durability](/docs/modules/chat-durability).
+
 **Checkpoints carry a version too.** Every legacy checkpoint is written with `version: 1`. Since 2.3, `deserializeCheckpoint` and the resume functions refuse any other version with `CheckpointVersionError` (code `checkpoint_version_unsupported`), so a checkpoint written by a newer SDK is never resumed as if this build understood it. Every store pack's `sessions.load` (Postgres, SQLite and Redis) passes that error on, so the resume reports the version instead of a missing checkpoint; a row that is not a checkpoint at all still reads as missing in the SQLite and Redis packs.
 
 ---
