@@ -844,3 +844,172 @@ describe('start', () => {
     expect(launcher.calls).toHaveLength(2);
   });
 });
+
+describe('edge cases', () => {
+  it('runs nothing for a waiting goal: a recorded start waits until the goal is active again', async () => {
+    const w = world();
+    const { supervisor, launcher } = supervisorIn(w);
+    await supervisor.submit({ goalId: 'g-1', scope: SCOPE, objective: 'x' });
+    await supervisor.command(SCOPE, 'g-1', { type: 'wait', wait: { reason: 'user' } });
+    expect(await supervisor.tick()).toMatchObject({ dispatched: 0, skipped: 0 });
+    expect(launcher.calls).toEqual([]);
+    await supervisor.command(SCOPE, 'g-1', { type: 'resume' });
+    await supervisor.tick();
+    expect(launcher.calls.map((call) => call.request.intentId)).toEqual(['g-1#1']);
+  });
+
+  it('schedules no retry while the goal waits for budget', async () => {
+    const w = world();
+    let failed = false;
+    const launcher = fakeRunLauncher((request) => {
+      if (!failed) {
+        failed = true;
+        return {
+          runId: request.runId,
+          result: results.failed(request.runId, 'overloaded'),
+          retryable: true,
+        };
+      }
+      return { runId: request.runId, result: results.completed(request.runId) };
+    });
+    launcher.ledger.set('g-1:run:1', totals({ tokens: 100, usd: 0 }));
+    const { supervisor } = supervisorIn(w, { launcher });
+    await supervisor.submit({
+      goalId: 'g-1',
+      scope: SCOPE,
+      objective: 'x',
+      budget: { tokens: 50 },
+    });
+    await supervisor.tick();
+    expect((await supervisor.get(SCOPE, 'g-1'))?.goal).toMatchObject({
+      status: 'waiting',
+      waiting: { reason: 'budget', limit: 'tokens' },
+    });
+    await w.time.advance(1_000);
+    await supervisor.tick();
+    expect(launcher.calls).toHaveLength(1);
+    await supervisor.command(SCOPE, 'g-1', { type: 'revise', budget: { tokens: 1_000 } });
+    await supervisor.tick();
+    expect(launcher.calls.map((call) => [call.kind, call.request.kind])).toEqual([
+      ['launch', 'start'],
+      ['resume', 'retry'],
+    ]);
+  });
+
+  it('starts no run when a drain begins while the run is being marked running', async () => {
+    const w = world();
+    let gate: (() => void) | undefined;
+    let reached: (() => void) | undefined;
+    const atGate = new Promise<void>((resolve) => (reached = resolve));
+    const store = w.store;
+    const gated: GoalRuntimeStore = {
+      ...store,
+      runtime: {
+        get: (scope, goalId) => store.runtime.get(scope, goalId),
+        async save(state, goal) {
+          if (state.phase === 'running' && gate === undefined) {
+            await new Promise<void>((resolve) => {
+              gate = resolve;
+              reached!();
+            });
+          }
+          return store.runtime.save(state, goal);
+        },
+      },
+    };
+    const { supervisor, launcher } = supervisorIn({ ...w, store: gated });
+    await supervisor.submit({ goalId: 'g-1', scope: SCOPE, objective: 'x' });
+    const ticking = supervisor.tick();
+    await atGate;
+    const draining = supervisor.drain();
+    gate!();
+    await Promise.all([ticking, draining]);
+    expect(launcher.calls).toEqual([]);
+    expect((await supervisor.get(SCOPE, 'g-1'))?.runtime.phase).toBe('dispatching');
+    const next = supervisorIn(w, { owner: 'sup-b', launcher });
+    await next.supervisor.tick();
+    expect(launcher.calls.map((call) => call.request.runId)).toEqual(['g-1:run:1']);
+  });
+
+  it('asks the verifier once per leg and applies each of its commands once, across a conflict', async () => {
+    const w = world();
+    const store = w.store;
+    let raced = false;
+    const racing: GoalRuntimeStore = {
+      ...store,
+      runtime: {
+        get: (scope, goalId) => store.runtime.get(scope, goalId),
+        async save(state, goal) {
+          if (!raced && goal !== undefined && goal.evidence.length > 0) {
+            raced = true;
+            const current = (await store.runtime.get(state.scope, state.goalId))!;
+            await store.runtime.save({ ...current, revision: current.revision + 1 });
+          }
+          return store.runtime.save(state, goal);
+        },
+      },
+    };
+    let asked = 0;
+    const { supervisor } = supervisorIn(
+      { ...w, store: racing },
+      {
+        verify: ({ runId }) => {
+          asked += 1;
+          return [{ type: 'charge', tokens: 5 }, passed(runId)];
+        },
+      },
+    );
+    await supervisor.submit({ goalId: 'g-1', scope: SCOPE, objective: 'x' });
+    await supervisor.tick();
+    expect(raced).toBe(true);
+    expect(asked).toBe(1);
+    expect((await supervisor.get(SCOPE, 'g-1'))?.goal).toMatchObject({
+      status: 'completed',
+      spent: { tokens: 5 },
+    });
+  });
+
+  it('counts the goal lease lost once renewals fail for a whole TTL', async () => {
+    const w = world();
+    const real = w.provider;
+    let failing = false;
+    const unreachable: LeaseProvider = {
+      acquire: (request) => real.acquire(request),
+      renew: async (lease, ttlMs, options) => {
+        if (failing) throw new Error('lease backend unreachable');
+        return real.renew(lease, ttlMs, options);
+      },
+      release: (lease) => real.release(lease),
+      signal: (key, signal) => real.signal(key, signal),
+    };
+    const launcher = fakeRunLauncher(() => 'hold');
+    const a = supervisorIn({ ...w, provider: unreachable }, { launcher });
+    await a.supervisor.submit({ goalId: 'g-1', scope: SCOPE, objective: 'x' });
+    const ticking = a.supervisor.tick();
+    await launcher.whenHeld();
+    failing = true;
+    await w.time.advance(20_000);
+    expect(launcher.drains).toEqual([]);
+    await w.time.advance(10_000);
+    await ticking;
+    expect(a.seen.some((event) => event.type === 'lease-lost')).toBe(true);
+    expect(launcher.drains).toEqual([{ scope: SCOPE, runId: 'g-1:run:1' }]);
+  });
+
+  it('charges the leg accounting when the launcher has no ledger for the run', async () => {
+    const w = world();
+    const launcher = fakeRunLauncher((request) => ({
+      runId: request.runId,
+      result: { ...results.completed(request.runId), accounting: totals({ tokens: 9, usd: 0 }) },
+    }));
+    const { supervisor } = supervisorIn(w, { launcher });
+    await supervisor.submit({
+      goalId: 'g-1',
+      scope: SCOPE,
+      objective: 'x',
+      policy: { maxRuns: 1 },
+    });
+    await supervisor.tick();
+    expect((await supervisor.get(SCOPE, 'g-1'))?.goal.spent).toEqual({ tokens: 9, usd: 0 });
+  });
+});

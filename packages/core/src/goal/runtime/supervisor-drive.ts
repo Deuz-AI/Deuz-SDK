@@ -27,8 +27,10 @@ import { transitionGoal } from '../transition';
 import type { GoalCommand, GoalRecord, GoalWaitRequest } from '../types';
 import { TERMINAL_STATUSES } from '../validate';
 import { goalDeliveryDigest, goalDependencyEvents, settleGoalEvent } from './delivery';
+import type { GoalInboxSettlement } from './delivery';
 import type {
   GoalInboxApplication,
+  GoalInboxEntry,
   GoalRunIntent,
   GoalRunIntentInput,
   GoalRuntimeState,
@@ -59,6 +61,8 @@ const MAX_STEPS = 200;
 const MAX_CONFLICTS = 5;
 const OPEN_INTENTS: readonly GoalRunIntent['status'][] = ['pending', 'claimed', 'launched'];
 const PAGE = 1000;
+/** Due inbox entries a step looks through for one that settles now. */
+const INBOX_PAGE = 20;
 
 /** What the driver needs from the supervisor. */
 export interface GoalDriverOptions {
@@ -256,12 +260,13 @@ export function createGoalDriver(options: GoalDriverOptions): {
       limit: 1,
     });
     if (due.entries.length > 0) return true;
+    // A waiting goal (for the host, an event, more budget) runs nothing.
+    if (goal.status !== 'active') return false;
     if (open.length > 0) return true;
     if (runtime.phase === 'retrying')
       return runtime.retries < runtime.policy.maxRetries
         ? (runtime.retryAt ?? 0) <= now
         : !limitReported(runtime, 'retries');
-    if (goal.status !== 'active') return false;
     if (runtime.activeRun !== undefined) return true;
     return runtime.runs < runtime.policy.maxRuns || !limitReported(runtime, 'runs');
   }
@@ -276,6 +281,8 @@ export function createGoalDriver(options: GoalDriverOptions): {
     let lost = false;
     let ended = false;
     let cancelTimer: (() => void) | undefined;
+    /** When the lease was last known held: past the TTL without a renewal, it is gone. */
+    let heldAt = clock.now();
     const every = Math.max(1, Math.floor(options.ttlMs / 3));
     const drive: Drive = {
       scope,
@@ -304,8 +311,14 @@ export function createGoalDriver(options: GoalDriverOptions): {
         provider.renew(lease, options.ttlMs),
       );
       if (ended) return;
-      if (renewal === undefined) return schedule();
+      if (renewal === undefined) {
+        // The provider did not answer: the lease may have lapsed meanwhile, and
+        // another supervisor may hold it once the TTL is past.
+        if (clock.now() - heldAt >= options.ttlMs) return onLost(drive);
+        return schedule();
+      }
       if (!renewal.held) return onLost(drive);
+      heldAt = clock.now();
       lease = renewal.lease;
       for (const signal of renewal.signals) {
         if (signal === 'drain') void stopRunning(drive, 'drain');
@@ -569,12 +582,24 @@ export function createGoalDriver(options: GoalDriverOptions): {
       scope: goal.scope,
       goalId: goal.goalId,
       dueBy: now,
-      limit: 1,
+      limit: INBOX_PAGE,
     });
-    const entry = page.entries[0];
-    if (entry === undefined) return undefined;
-    const settlement = settleGoalEvent(goal, entry, { now });
-    if (settlement.disposition === 'pending') return undefined;
+    // The oldest due entry that settles now (an early one stays pending as it is).
+    let found:
+      | {
+          entry: GoalInboxEntry;
+          settlement: Exclude<GoalInboxSettlement, { disposition: 'pending' }>;
+        }
+      | undefined;
+    for (const entry of page.entries) {
+      const settlement = settleGoalEvent(goal, entry, { now });
+      if (settlement.disposition !== 'pending') {
+        found = { entry, settlement };
+        break;
+      }
+    }
+    if (found === undefined) return undefined;
+    const { entry, settlement } = found;
     const after = settlement.goal ?? goal;
     const application: GoalInboxApplication = { ...settlement.application };
     if (startable(after, runtime)) {
@@ -669,9 +694,11 @@ export function createGoalDriver(options: GoalDriverOptions): {
       });
       return written.status === 'conflict' ? 'conflict' : 'continue';
     }
+    // A waiting goal (for the host, an event, more budget) runs nothing: its
+    // intent waits until the goal is active again.
+    if (goal.status !== 'active' || draining) return 'stop';
     const intent = open.find((candidate) => candidate.intentId === active?.intentId);
     if (intent !== undefined) {
-      if (draining) return 'stop';
       if (intent.status === 'pending' && (intent.notBefore ?? 0) > now) return 'stop';
       if (goal.runId !== intent.runId) {
         const linked = transitionGoal(goal, { type: 'link-run', runId: intent.runId }, { now });
@@ -683,7 +710,6 @@ export function createGoalDriver(options: GoalDriverOptions): {
       return launch(drive, view, intent, result);
     }
     if (runtime.phase === 'retrying') return scheduleRetry(view, now);
-    if (goal.status !== 'active' || draining) return 'stop';
     if (active !== undefined) {
       // The host made the goal active again while its run waits: resume it.
       const next = bump(runtime, now);
@@ -740,8 +766,19 @@ export function createGoalDriver(options: GoalDriverOptions): {
     }
     const now = clock.now();
     if (drive.lost) return 'stop';
+    if (draining) return 'stop';
     const running: GoalRuntimeState = { ...bump(runtime, now), phase: 'running' };
     if ((await store.runtime.save(running)).status === 'conflict') return 'conflict';
+    if (drive.lost) return 'stop';
+    if (draining) {
+      // A drain began while the state was written: the run is not started, and
+      // the intent waits, claimed, for the next holder.
+      await quietly(deps.logger, 'goal supervisor: drain write failed', () =>
+        store.runtime.save({ ...bump(running, clock.now()), phase: 'dispatching' }),
+      );
+      return 'stop';
+    }
+    // From here to the launcher call nothing awaits, so a drain either sees this leg or stops it here.
     const workingMemory =
       held.kind === 'start' ? inheritedWorkingMemory(runtime.workingMemory, goal) : undefined;
     const request: RunLaunchRequest = {
@@ -814,58 +851,69 @@ export function createGoalDriver(options: GoalDriverOptions): {
     return transition.changed ? transition.record : goal;
   }
 
-  /**
-   * Applies the host's verification of a completed run, one checked write
-   * per changed command: the goal after it, `'conflict'` (decide again on
-   * fresh state), or `'failed'` when the hook threw or answered a command the
-   * goal refuses as malformed.
-   */
-  async function verified(
-    drive: Drive,
+  function verifyFailed(goal: GoalRecord, runId: string, error: unknown): 'failed' {
+    deps.logger.warn('goal supervisor: run verification failed', {
+      scope: goal.scope,
+      goalId: goal.goalId,
+      runId,
+      error,
+    });
+    return 'failed';
+  }
+
+  /** Asks the host's verifier once per leg for the commands that judge a completed run. */
+  async function askVerifier(
     goal: GoalRecord,
     runId: string,
     result: AgentResult<unknown>,
-  ): Promise<GoalRecord | 'conflict' | 'failed'> {
-    if (!options.verify) return goal;
-    const failed = (error: unknown): 'failed' => {
-      deps.logger.warn('goal supervisor: run verification failed', {
-        scope: goal.scope,
-        goalId: goal.goalId,
-        runId,
-        error,
-      });
-      return 'failed';
-    };
-    let answer: GoalCommand | readonly GoalCommand[] | undefined;
+  ): Promise<readonly GoalCommand[] | 'failed'> {
+    if (!options.verify) return [];
     try {
-      answer = await options.verify({ goal, runId, result });
+      const answer = await options.verify({ goal, runId, result });
+      if (answer === undefined) return [];
+      return Array.isArray(answer) ? (answer as readonly GoalCommand[]) : [answer as GoalCommand];
     } catch (error) {
-      return failed(error);
+      return verifyFailed(goal, runId, error);
     }
-    const commands: readonly GoalCommand[] =
-      answer === undefined
-        ? []
-        : Array.isArray(answer)
-          ? (answer as readonly GoalCommand[])
-          : [answer as GoalCommand];
+  }
+
+  /**
+   * Applies the verifier's commands from `verdicts.next` on, one checked
+   * write per changed command, moving `next` past each one written or found
+   * unchanged, so a command is never applied twice: `'changed'` when it
+   * wrote, `'unchanged'`, `'conflict'` (decide again on fresh state, from
+   * where it stopped) or `'failed'` (a command the goal refuses as malformed).
+   */
+  async function applyVerdicts(
+    drive: Drive,
+    goal: GoalRecord,
+    runId: string,
+    verdicts: { commands: readonly GoalCommand[]; next: number },
+  ): Promise<'changed' | 'unchanged' | 'conflict' | 'failed'> {
     let current = goal;
-    for (const command of commands) {
+    let wrote = false;
+    while (verdicts.next < verdicts.commands.length) {
       if (drive.lost) return 'conflict';
       let transition: ReturnType<typeof transitionGoal>;
       try {
-        transition = transitionGoal(current, command, { now: clock.now() });
+        transition = transitionGoal(current, verdicts.commands[verdicts.next]!, {
+          now: clock.now(),
+        });
       } catch (error) {
-        return failed(error);
+        return verifyFailed(goal, runId, error);
       }
-      if (!transition.changed) continue;
-      const runtime = await store.runtime.get(current.scope, current.goalId);
-      if (!runtime) return 'conflict';
-      const written = await store.runtime.save(bump(runtime, clock.now()), transition.record);
-      if (written.status === 'conflict') return 'conflict';
-      reportGeneration(deps, hub, current, transition.record);
-      current = transition.record;
+      if (transition.changed) {
+        const runtime = await store.runtime.get(current.scope, current.goalId);
+        if (!runtime) return 'conflict';
+        const written = await store.runtime.save(bump(runtime, clock.now()), transition.record);
+        if (written.status === 'conflict') return 'conflict';
+        reportGeneration(deps, hub, current, transition.record);
+        current = transition.record;
+        wrote = true;
+      }
+      verdicts.next++;
     }
-    return current;
+    return wrote ? 'changed' : 'unchanged';
   }
 
   /**
@@ -890,7 +938,8 @@ export function createGoalDriver(options: GoalDriverOptions): {
       runId,
       'ok' in outcome ? outcome.ok.result.accounting : undefined,
     );
-    let verification: 'pending' | 'done' | 'failed' = 'pending';
+    /** The verifier's answer, asked once per leg, and how far it is applied. */
+    let verification: { commands: readonly GoalCommand[]; next: number } | 'failed' | undefined;
     for (let conflicts = 0; conflicts < MAX_CONFLICTS && !drive.lost; conflicts++) {
       const goal0 = await store.load(goalId, { scope });
       const runtime0 = await store.runtime.get(scope, goalId);
@@ -1011,12 +1060,15 @@ export function createGoalDriver(options: GoalDriverOptions): {
       }
       if (res.status === 'completed') {
         const goal = goal0;
-        if (verification === 'pending') {
+        if (verification === undefined) {
+          const commands = await askVerifier(goal0, runId, res);
+          verification = commands === 'failed' ? 'failed' : { commands, next: 0 };
+        }
+        if (verification !== 'failed' && verification.next < verification.commands.length) {
           // Its writes are checked one by one: decide again on what they wrote.
-          const after = await verified(drive, goal0, runId, res);
-          if (after === 'conflict') continue;
-          verification = after === 'failed' ? 'failed' : 'done';
-          if (after !== 'failed' && after !== goal0) continue;
+          const applied = await applyVerdicts(drive, goal0, runId, verification);
+          if (applied === 'failed') verification = 'failed';
+          else if (applied !== 'unchanged') continue;
         }
         if (verification === 'failed') {
           // A verifier that cannot answer never completes a goal, nor starts another run.
@@ -1101,13 +1153,14 @@ export function createGoalDriver(options: GoalDriverOptions): {
     runId: string,
     reported?: BudgetTotals,
   ): Promise<void> {
-    // The durable ledger; a launcher that reads none hands over the leg's own
-    // totals, charged through the same watermark (cumulative, so still once).
-    const totals = launcher.accounting
+    // The durable ledger; when it gives nothing, the leg's own totals, charged
+    // through the same watermark (cumulative, so still once).
+    const durable = launcher.accounting
       ? await quietly(deps.logger, 'goal supervisor: accounting read failed', () =>
           launcher.accounting!({ scope, runId }),
         )
-      : reported;
+      : undefined;
+    const totals = durable ?? reported;
     if (!totals) return;
     for (let conflicts = 0; conflicts < MAX_CONFLICTS; conflicts++) {
       if (drive.lost) return;
