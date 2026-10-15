@@ -5,6 +5,7 @@
   "pages": [
     "observability",
     "autonomy",
+    "docker",
     "evals",
     "native-agents",
     "native-mcp",
