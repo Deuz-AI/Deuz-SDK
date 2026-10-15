@@ -5,6 +5,7 @@
  * record restores under the ids the server gave it (H7), and two messages
  * with the same text stay two messages: ids, never text, tell them apart.
  */
+import { StrictMode, createElement, type ReactNode } from 'react';
 import { describe, expect, it, vi } from 'vitest';
 import { act, renderHook, waitFor } from '@testing-library/react';
 import type { Message } from '@deuz-sdk/core';
@@ -179,6 +180,35 @@ describe('useChat({ initialSnapshot }) — the history', () => {
       'gen-2',
       'gen-3',
     ]);
+  });
+
+  it('exports the ids the UI renders under StrictMode, whose double initializers discard ids', () => {
+    let next = 0;
+    const generateId = () => `gen-${next++}`;
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(StrictMode, null, children);
+    const { result } = renderHook(
+      () => useChat({ api: '/api/chat', fetch: noFetch, generateId, initialMessages: SAME_TWICE }),
+      { wrapper },
+    );
+    expect(result.current.exportSnapshot().messageIds).toEqual(
+      result.current.messages.map((m) => m.id),
+    );
+  });
+
+  it('pairs a history set with setMessages with its UI ids', () => {
+    const { result } = renderHook(() => useChat({ api: '/api/chat', fetch: noFetch }));
+    act(() => {
+      result.current.setMessages([
+        { id: 'x-1', role: 'user', content: 'same' },
+        { id: 'x-2', role: 'assistant', content: 'echo' },
+      ]);
+    });
+    expect(result.current.exportSnapshot()).toEqual({
+      version: 1,
+      messages: SAME_TWICE.slice(0, 2),
+      messageIds: ['x-1', 'x-2'],
+    });
   });
 
   it('prefers initialSnapshot over initialMessages', () => {
