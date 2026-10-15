@@ -987,8 +987,9 @@ function makeAgentStream<T>(
       await saveBookkeeping();
     }
     // A V3 run's versioned extraction (2.4): its intent is durable with the
-    // terminal commit; the plan is saved, the session commits it with its
-    // receipt, and the acknowledgment records the receipt.
+    // terminal commit; the run saves its claim (`planned`), the session
+    // prepares and commits the plan with its receipt in one call, and the
+    // acknowledgment records the receipt.
     if (extractVersioned && nativeV3)
       await nativeV3.settleVersionedExtraction(
         envelope as unknown as AgentRunEnvelopeV3,

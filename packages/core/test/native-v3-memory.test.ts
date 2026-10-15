@@ -2,10 +2,12 @@
  * native-v3-memory.test.ts (2.4, spec §4.1 "Memory/run arasındaki kayıt
  * protokolü") — a V3 run's versioned-memory writes follow durable intent →
  * prepared plan → atomic memory commit with its receipt → native
- * acknowledgment. There is no transaction across the two stores: a lost
- * acknowledgment is settled by reading the receipt (the session replays the
- * operation id), a model call repeated after a crash never applies a memory
- * change again, and a V3 extraction that wrote part of its plan is `partial`.
+ * acknowledgment (the session prepares and commits the plan in one call; the
+ * run saves its claim on the intent before it). There is no transaction
+ * across the two stores: a lost acknowledgment is settled by reading the
+ * receipt (the session replays the operation id), a model call repeated after
+ * a crash never applies a memory change again, and a V3 extraction that wrote
+ * part of its plan is `partial`.
  */
 import { describe, expect, it, vi } from 'vitest';
 import { reconcileAgentRun, resumeAgent, runAgent, streamAgent } from '../src/agent-run';
@@ -128,7 +130,7 @@ describe('versioned memory writes of a V3 run', () => {
 });
 
 describe('versioned memory extraction of a V3 run', () => {
-  it('records the intent in the terminal commit, prepares the plan, commits and acknowledges', async () => {
+  it('records the intent in the terminal commit, claims it, commits and acknowledges', async () => {
     const memory = versioned();
     const store = recordingStoreV3();
     const run = memoryRun([{ text: 'noted' }], memory, {
@@ -143,6 +145,13 @@ describe('versioned memory extraction of a V3 run', () => {
       save.memoryIntents?.length ? [save.memoryIntents[0]!.status] : [],
     );
     expect(statuses).toEqual(['intended', 'planned', 'acknowledged']);
+    // The `planned` save only claims the intent (S1-5): the session prepares
+    // and commits the plan in one call, so no plan, count or digest is saved
+    // before the commit; they are copied from the receipt with the acknowledgment.
+    const planned = store.saves.find((save) => save.memoryIntents?.[0]?.status === 'planned')!;
+    expect(planned.memoryIntents).toEqual([
+      { operationId: expect.any(String), status: 'planned', extraction: { infer: false } },
+    ]);
     const intent = (await store.load('run-mem'))!.memoryIntents![0]!;
     const receipt = (await memory.store.receipt(intent.operationId))!;
     expect(intent).toMatchObject({

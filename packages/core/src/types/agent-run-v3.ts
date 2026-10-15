@@ -53,7 +53,11 @@ export interface AgentRunMemoryStateV3 extends Omit<AgentRunMemoryState, 'extrac
 /**
  * One versioned-memory write of a run (2.4, spec §4.1 protocol): a durable
  * intent, the prepared plan, the atomic memory commit with its receipt, then
- * the run's acknowledgment. There is no transaction across the two
+ * the run's acknowledgment. The memory session prepares the plan and commits
+ * it in one call, so the run record never holds the plan itself: a versioned
+ * extraction saves only its claim on the intent (`planned`) before that call,
+ * and a model tool's write moves with its tool receipt (`intended`,
+ * `committed`, `acknowledged`). There is no transaction across the two
  * databases: when the acknowledgment is lost after the commit, the receipt is
  * read back by `operationId`; a change already applied is never applied
  * again, even if the model call before it repeats.
@@ -61,9 +65,13 @@ export interface AgentRunMemoryStateV3 extends Omit<AgentRunMemoryState, 'extrac
 export interface AgentRunMemoryIntentV3 {
   operationId: string;
   status: 'intended' | 'planned' | 'committed' | 'acknowledged';
-  /** The plan's canonical-JSON digest (the commit's `requestDigest`). */
+  /**
+   * The digest of the memory operation's request (the receipt's
+   * `requestDigest`: the canonical JSON of what was asked, not of the plan),
+   * copied from the receipt with a versioned extraction's acknowledgment.
+   */
   requestDigest?: Sha256Digest;
-  /** Mutations the plan holds. */
+  /** The mutations the commit applied (the receipt's entries), copied with the acknowledgment. */
   planned?: number;
   /** The memory receipt, once committed. */
   receipt?: { scopeRevision: number; committedAt: number };

@@ -316,13 +316,16 @@ export function extractionMessages(
 }
 
 /**
- * Runs a run's versioned extraction under its intent (spec §4.1): the
- * prepared plan is saved first (`planned`), then the session commits it
- * atomically with its receipt under the intent's operation id, and the
- * acknowledgment records the receipt (`acknowledged`). A session that already
- * holds the operation (its acknowledgment was lost) answers from its receipt
- * and applies nothing again. Returns false when a save failed (the intent
- * stays where it was, for `reconcileAgentRun`); throws when the session does.
+ * Runs a run's versioned extraction under its intent (spec §4.1): the run
+ * first saves its claim on the intent (`planned`: the status only, no plan),
+ * then the session prepares the plan and commits it atomically with its
+ * receipt under the intent's operation id, in one call, and the
+ * acknowledgment copies the receipt into the intent (`acknowledged`, with the
+ * mutation count and the request digest). A session that already holds the
+ * operation (its acknowledgment was lost) answers from its receipt and
+ * applies nothing again, whatever plan a new LLM call would give. Returns
+ * false when a save failed (the intent stays where it was, for
+ * `reconcileAgentRun`); throws when the session does.
  */
 export async function runVersionedExtraction(
   session: MemorySession,
