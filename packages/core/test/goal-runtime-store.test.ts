@@ -6,7 +6,8 @@
 import { describe, expect, it } from 'vitest';
 import { createInMemoryGoalStore, transitionGoal } from '../src/goal';
 import { createInMemoryGoalRuntimeStore } from '../src/goal/runtime';
-import { goalRuntimeStoreContracts } from './fixtures/goal-runtime-store-conformance';
+import { checkRuntimeState } from '../src/goal/runtime/store-shared';
+import { goalRuntimeStoreContracts, runtimeState } from './fixtures/goal-runtime-store-conformance';
 import { goalRecord, goalStoreContracts } from './fixtures/goal-store-conformance';
 
 goalStoreContracts('memory goal runtime store (GoalStore)', () => createInMemoryGoalRuntimeStore());
@@ -51,5 +52,30 @@ describe('createInMemoryGoalStore: scope-checked load (2.4)', () => {
     expect((await store.load('g', { scope: 'tenant-a' }))?.goalId).toBe('g');
     expect(await store.load('g', { scope: 'tenant-b' })).toBeUndefined();
     expect((await store.load('g'))?.goalId).toBe('g');
+  });
+});
+
+describe('checkRuntimeState: the 2.4 supervisor fields (GB)', () => {
+  const goal = { goalId: 'g', scope: 'tenant' };
+  const run = { intentId: 'i', runId: 'g:run:1', attempt: 1, startedAt: T0 };
+
+  it('accepts activeRun.specGeneration and maintenanceRuns', () => {
+    const state = runtimeState(goal, 1, {
+      activeRun: { ...run, specGeneration: 2 },
+      maintenanceRuns: ['g:run:1'],
+    });
+    expect(checkRuntimeState(state)).toEqual(state);
+  });
+
+  it('refuses a malformed activeRun.specGeneration or maintenanceRuns', () => {
+    for (const patch of [
+      { activeRun: { ...run, specGeneration: 0 } },
+      { activeRun: { ...run, specGeneration: '2' } },
+      { maintenanceRuns: 'g:run:1' },
+      { maintenanceRuns: [1] },
+    ])
+      expect(() => checkRuntimeState(runtimeState(goal, 1, patch as never))).toThrow(
+        /specGeneration|maintenanceRuns/,
+      );
   });
 });

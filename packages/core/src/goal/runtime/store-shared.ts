@@ -218,6 +218,8 @@ export function checkRuntimeState(value: unknown): GoalRuntimeState {
     check.string(run.runId, 'activeRun.runId');
     check.count(run.attempt, 'activeRun.attempt', 1);
     check.time(run.startedAt, 'activeRun.startedAt');
+    if (run.specGeneration !== undefined)
+      check.count(run.specGeneration, 'activeRun.specGeneration', 1);
   }
   check.count(state.runs, 'runs');
   check.count(state.retries, 'retries');
@@ -232,6 +234,12 @@ export function checkRuntimeState(value: unknown): GoalRuntimeState {
     const maintenance = check.object(state.maintenance, 'maintenance');
     check.oneOf(maintenance.status, ['pending', 'complete', 'failed'], 'maintenance.status');
     check.optionalString(maintenance.runId, 'maintenance.runId');
+  }
+  if (state.maintenanceRuns !== undefined) {
+    if (!Array.isArray(state.maintenanceRuns)) check.fail('maintenanceRuns', 'must be an array');
+    (state.maintenanceRuns as unknown[]).forEach((runId, index) =>
+      check.string(runId, `maintenanceRuns[${index}]`),
+    );
   }
   if (state.workingMemory !== undefined) check.object(state.workingMemory, 'workingMemory');
   check.time(state.createdAt, 'createdAt');
