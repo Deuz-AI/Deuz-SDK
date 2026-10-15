@@ -471,6 +471,50 @@ describe('createContextCompiler state, overflow and compaction', () => {
     expect(compiler.state().refreshRequested).toBe(true);
   });
 
+  it('never places an older revision again after a newer one', async () => {
+    // R2-2: m1@1 (pass 1) is superseded by m1@2 (pass 2).
+    const run = async (keep: 'newer' | 'older') => {
+      let revision = 1;
+      const memory = fake('memory', 'memory', async () =>
+        revision === 1
+          ? [candidate('m1', 'OLD seat preference: window', 0.9, { revision: 1 })]
+          : [candidate('m1', 'NEW seat preference: aisle', 0.9, { revision: 2 })],
+      );
+      const compiler = createContextCompiler({ sources: [memory.source] });
+      const user: Message = { role: 'user', content: 'book my seat' };
+      const block1 = (await compiler.beforeModelCall(step(1, [system, user]))).blocks[0]!.messages;
+      revision = 2;
+      compiler.requestRefresh();
+      const block2 = (
+        await compiler.beforeModelCall(
+          step(2, [system, user, ...block1, { role: 'assistant', content: 'ok' }]),
+        )
+      ).blocks[0]!.messages;
+      expect(JSON.stringify(block2)).toContain('NEW seat preference');
+      // A compaction removes one of the two blocks.
+      const pkg = await compiler.beforeModelCall(
+        step(3, [
+          system,
+          { role: 'user', content: 'Summary: earlier turns' },
+          user,
+          ...(keep === 'newer' ? block2 : block1),
+          { role: 'assistant', content: 'ok 2' },
+        ]),
+      );
+      return { pkg, placed: compiler.state().placed, requests: memory.requests.length };
+    };
+
+    const newer = await run('newer');
+    expect(newer.pkg.blocks).toEqual([]);
+    expect(newer.placed).toEqual([expect.objectContaining({ recordId: 'm1', revision: 2 })]);
+    // Only the older block is left: the newer revision is placed again after it.
+    const older = await run('older');
+    const appended = JSON.stringify(older.pkg.blocks[0]!.messages);
+    expect(appended).toContain('NEW seat preference');
+    expect(appended).not.toContain('OLD seat preference');
+    expect(older.requests).toBe(2);
+  });
+
   it('places again what a compaction removed, and notes the prefix change', async () => {
     const memory = fake('memory', 'memory', [candidate('m1', 'Prefers aisle seats', 0.9)]);
     const compiler = createContextCompiler({ sources: [memory.source] });

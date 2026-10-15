@@ -202,7 +202,9 @@ interface StepMemory {
  * - Between refreshes (`refresh: 'reused'`) nothing new is retrieved. An
  *   entry whose `'append'` block left the messages (a compaction) is placed
  *   again from what this compiler instance retrieved; after a restart it
- *   waits for the next refresh.
+ *   waits for the next refresh. Only a record's latest placement comes back:
+ *   an older revision (or digest) a later pass superseded is never appended
+ *   after the newer one.
  * - `cachePrefixChanged` is true when the messages no longer start with the
  *   previous request's messages and its `'append'` block (placed right after
  *   them).
@@ -339,9 +341,19 @@ export function createContextCompiler(options: CreateContextCompilerOptions): Co
   /**
    * What a step without a fresh retrieval compiles: the entries a compaction
    * removed, placed again; with `skipped`, every other source is `'skipped'`.
+   * Only a record's latest placement (in `placed`, oldest first) comes back:
+   * one a later revision or digest superseded leaves the state instead.
    */
-  function reuse(dropped: readonly ContextPlacedEntry[], skipped: boolean): ContextSourceResult[] {
-    const again = replacements(dropped);
+  function reuse(
+    dropped: readonly ContextPlacedEntry[],
+    placed: readonly ContextPlacedEntry[],
+    skipped: boolean,
+  ): ContextSourceResult[] {
+    const latest = new Map<string, ContextPlacedEntry>();
+    for (const entry of placed) latest.set(`${entry.source}\u0000${entry.recordId}`, entry);
+    const again = replacements(
+      dropped.filter((entry) => latest.get(`${entry.source}\u0000${entry.recordId}`) === entry),
+    );
     if (!skipped) return again;
     return sources.map(
       (source) =>
@@ -464,11 +476,11 @@ export function createContextCompiler(options: CreateContextCompilerOptions): Co
         if (results.some((result) => result.status === 'failed')) fallback = 'source-failed';
       } else if (due !== undefined && !limited) {
         // Nothing to ask yet (no user text, no task): the refresh stays due.
-        results = reuse(dropped, true);
+        results = reuse(dropped, placedAtStart, true);
         pass = state.passes;
         refresh = 'reused';
       } else {
-        results = reuse(dropped, false);
+        results = reuse(dropped, placedAtStart, false);
         pass = state.passes;
         refresh = 'reused';
         if (limited) fallback = 'pass-limit';
@@ -539,10 +551,13 @@ export function createContextCompiler(options: CreateContextCompilerOptions): Co
       const memory = lastStep?.step === input.step ? lastStep : undefined;
       // Against what was placed when the step began: the retry's compaction
       // may have removed blocks the step still carried.
-      const { kept, dropped } = stillPlaced(memory?.placedAtStart ?? state.placed, input.messages);
+      const placedAtStart = memory?.placedAtStart ?? state.placed;
+      const { kept, dropped } = stillPlaced(placedAtStart, input.messages);
       // A fresh retrieval decides what its step holds, as in beforeModelCall;
       // otherwise what the compactions removed is placed again.
-      const results = memory?.fresh ? memory.results : reuse(dropped, memory?.skipped === true);
+      const results = memory?.fresh
+        ? memory.results
+        : reuse(dropped, placedAtStart, memory?.skipped === true);
       const pkg = compileContext({
         step: input.step,
         results,
