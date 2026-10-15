@@ -10,23 +10,32 @@
  *   receipts (content-free) survive `pruneHistory` and a forgotten id's
  *   tombstone survives `pruneOperations`; a V3 store's forget tombstones
  *   survive `prune`, so a package put later is still stored redacted;
- * - `pruneOperations` warns the same way on every backend.
+ * - `pruneOperations` warns the same way on every backend;
+ * - a versioned memory `forget` deletes memory only: the chat a record cites,
+ *   its transcript search hit and the source reference stay, also when the
+ *   chats and the memory share one SQLite database or Postgres schema.
  */
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { PGlite } from '@electric-sql/pglite';
 import pg from 'pg';
 import { createInMemoryAgentRunStoreV3 } from '../src/agent-run-v3-store';
-import { createInMemoryConditionalChatStore } from '../src/chat-conditional';
+import {
+  createInMemoryConditionalChatStore,
+  createInMemoryTranscriptIndex,
+} from '../src/chat-conditional';
 import { createInMemoryProcessOperationStore } from '../src/compute/docker';
 import type { ProcessOperationStore } from '../src/compute/docker/types';
 import { InvalidRequestError } from '../src/errors';
-import { createInMemoryVersionedMemoryStore } from '../src/memory/versioned';
+import { sha256Digest } from '../src/internal/digest';
+import { createInMemoryVersionedMemoryStore, createMemorySession } from '../src/memory/versioned';
+import type { MemorySourceRef, VersionedMemoryStore } from '../src/memory/versioned/types';
 import { createPostgresConditionalChatStore } from '../src/node/chat-conditional-postgres';
 import { createSqliteConditionalChatStore } from '../src/node/chat-conditional-sqlite';
 import type { PgPoolLike } from '../src/node/pg-tx';
 import { createSqliteProcessOperationStore } from '../src/node/process-ops-sqlite';
 import { createPostgresAgentRunStoreV3 } from '../src/node/runs-v3-postgres';
 import { createSqliteAgentRunStoreV3 } from '../src/node/runs-v3-sqlite';
+import type { SqliteDatabaseLike } from '../src/node/store-sqlite';
 import { createPostgresVersionedMemoryStore } from '../src/node/vmem-postgres';
 import { createSqliteVersionedMemoryStore } from '../src/node/vmem-sqlite';
 import {
@@ -34,7 +43,7 @@ import {
   DEFAULT_DURABLE_STREAM_RETAIN_MS,
 } from '../src/stream-durable';
 import type { AgentRunStoreV3 } from '../src/types/agent-run-v3';
-import type { ConditionalChatStore } from '../src/types/chat-conditional';
+import type { ConditionalChatStore, TranscriptIndex } from '../src/types/chat-conditional';
 import type { Clock } from '../src/types/deps';
 import { chat } from './fixtures/conditional-chat-store-conformance';
 import { envelopeV3 } from './fixtures/agent-run-v3';
@@ -246,6 +255,170 @@ describe('versioned memory retention', () => {
 });
 
 // ===================================================================
+// A memory forget leaves chats and the transcript index alone
+// ===================================================================
+
+const SAID = 'The deploy key is under the mat.';
+
+interface ForgetSparesChatsHarness {
+  chats: ConditionalChatStore;
+  transcript: TranscriptIndex;
+  memory: VersionedMemoryStore;
+  /** Every row of every table but the memory store's own, when both share a database. */
+  rows?(): Promise<string[]>;
+  cleanup?(): Promise<void>;
+}
+
+/**
+ * Forgets a record that cites a chat message (spec §2.1: `forget` never
+ * touches chats, the transcript index, host files or exported drafts).
+ */
+async function checkForgetSparesChats(harness: ForgetSparesChatsHarness): Promise<void> {
+  const { chats, transcript, memory } = harness;
+  const said = chat('c-1', [SAID, 'Noted.'], { messageIds: ['m-1', 'm-2'] });
+  expect((await chats.writeChat(said, { expectedRevision: 0 })).status).toBe('committed');
+  const ref: MemorySourceRef = {
+    kind: 'user',
+    chatId: 'c-1',
+    messageId: 'm-1',
+    digest: await sha256Digest(SAID),
+  };
+  const session = createMemorySession({ store: memory, scope: said.scope });
+  const { id } = (await session.remember({ text: SAID, sources: [ref] })).records[0]!;
+  const before = await chats.readChat('c-1');
+  const rowsBefore = await harness.rows?.();
+  if (rowsBefore)
+    expect(rowsBefore.filter((row) => row.startsWith('deuz_chat_transcript '))).toHaveLength(2);
+
+  expect((await session.forget(id)).revisions).toHaveLength(1);
+  expect(await session.history(id)).toEqual([]);
+
+  expect(await chats.readChat('c-1')).toEqual(before);
+  expect(await chats.listChats(said.scope)).toEqual(['c-1']);
+  const hits = await transcript.search(said.scope, 'deploy key');
+  expect(hits.map((hit) => [hit.chatId, hit.messageId])).toEqual([['c-1', 'm-1']]);
+  expect(await transcript.resolveSource(said.scope, ref)).toMatchObject({
+    chatId: 'c-1',
+    messageId: 'm-1',
+    message: { content: SAID },
+  });
+  if (rowsBefore) expect(await harness.rows!()).toEqual(rowsBefore);
+}
+
+function forgetSparesChats(
+  name: string,
+  make: () => Promise<ForgetSparesChatsHarness>,
+  slow = false,
+): void {
+  it(`${name}: the chat and its transcript hit stay`, slow ? SLOW : {}, async () => {
+    const harness = await make();
+    try {
+      await checkForgetSparesChats(harness);
+    } finally {
+      await harness.cleanup?.();
+    }
+  });
+}
+
+/** Neither the memory store's own tables nor SQLite's internal ones. */
+const outsideMemory = (table: string) =>
+  !table.startsWith('deuz_vmem_') && !table.startsWith('sqlite_');
+
+/** The rows of a Postgres schema's tables but the memory store's, sorted. */
+async function pgRowsOutsideMemory(pool: PgPoolLike, schema: string): Promise<string[]> {
+  const { rows: tables } = await pool.query(
+    'SELECT table_name FROM information_schema.tables WHERE table_schema = $1',
+    [schema],
+  );
+  const rows: string[] = [];
+  for (const table of tables.map((row) => String(row.table_name)).filter(outsideMemory))
+    for (const row of (await pool.query(`SELECT * FROM ${schema}.${table}`)).rows)
+      rows.push(`${table} ${JSON.stringify(row)}`);
+  return rows.sort();
+}
+
+type DatabaseSyncConstructor = new (path: string) => SqliteDatabaseLike & { close(): void };
+let DatabaseSync: DatabaseSyncConstructor | undefined;
+try {
+  const mod = (await import('node:sqlite' as string)) as { DatabaseSync?: DatabaseSyncConstructor };
+  DatabaseSync = typeof mod.DatabaseSync === 'function' ? mod.DatabaseSync : undefined;
+} catch {
+  /* runtime without node:sqlite */
+}
+
+describe('a versioned memory forget leaves chats and the transcript index alone', () => {
+  forgetSparesChats('in-memory', async () => {
+    const transcript = createInMemoryTranscriptIndex();
+    return {
+      chats: createInMemoryConditionalChatStore({ transcript }),
+      transcript,
+      memory: createInMemoryVersionedMemoryStore(),
+    };
+  });
+
+  describe.skipIf(!DatabaseSync)('SQLite', () => {
+    forgetSparesChats(
+      'one database',
+      async () => {
+        const db = new DatabaseSync!(':memory:');
+        const chats = createSqliteConditionalChatStore({ database: db });
+        const memory = createSqliteVersionedMemoryStore({ database: db });
+        return {
+          chats,
+          transcript: chats.transcript,
+          memory,
+          async rows() {
+            const tables = db
+              .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+              .all() as { name: string }[];
+            const rows: string[] = [];
+            for (const table of tables.map((row) => row.name).filter(outsideMemory))
+              for (const row of db.prepare(`SELECT * FROM "${table}"`).all())
+                rows.push(`${table} ${JSON.stringify(row)}`);
+            return rows.sort();
+          },
+          async cleanup() {
+            await memory.close();
+            await chats.close();
+            db.close();
+          },
+        };
+      },
+      true,
+    );
+  });
+
+  describe('Postgres (PGlite)', SLOW, () => {
+    const db = new PGlite();
+    beforeAll(() => db.waitReady, SLOW_HOOK_TIMEOUT_MS);
+    afterAll(async () => {
+      await db.close();
+    });
+    const pool = pglitePool(db);
+    forgetSparesChats(
+      'one schema',
+      async () => {
+        const schema = 'he_forget_spares_chats';
+        await pool.query(`CREATE SCHEMA ${schema}`);
+        const chats = createPostgresConditionalChatStore({ pool, schema });
+        const memory = createPostgresVersionedMemoryStore({ pool, schema, pgvector: 'off' });
+        return {
+          chats,
+          transcript: chats.transcript,
+          memory,
+          rows: () => pgRowsOutsideMemory(pool, schema),
+          async cleanup() {
+            await memory.close();
+            await chats.close();
+          },
+        };
+      },
+      true,
+    );
+  });
+});
+
+// ===================================================================
 // V3 runs: forget tombstones outlive prune
 // ===================================================================
 
@@ -336,6 +509,27 @@ describe.skipIf(!liveUrl)('retention on a live Postgres server', () => {
         pool: pool as unknown as PgPoolLike,
         schema: await freshSchema(),
       }),
+    true,
+  );
+
+  forgetSparesChats(
+    'a memory forget in a schema shared with conditional chats',
+    async () => {
+      const schema = await freshSchema();
+      const client = pool as unknown as PgPoolLike;
+      const chats = createPostgresConditionalChatStore({ pool: client, schema });
+      const memory = createPostgresVersionedMemoryStore({ pool: client, schema });
+      return {
+        chats,
+        transcript: chats.transcript,
+        memory,
+        rows: () => pgRowsOutsideMemory(client, schema),
+        async cleanup() {
+          await memory.close();
+          await chats.close();
+        },
+      };
+    },
     true,
   );
 
