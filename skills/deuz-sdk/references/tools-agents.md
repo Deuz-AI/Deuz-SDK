@@ -1,4 +1,4 @@
-<!-- verified: 2026-10-15 against @deuz-sdk/core@2.3.0 · api-contract sha256:03a491b97528
+<!-- verified: 2026-10-15 against @deuz-sdk/core@2.3.0 · api-contract sha256:99750a8aa5fa
      sources: packages/core/src/types/{tool,config,guardrails,stream,message,methods}.ts, packages/core/src/{tool,agent,server-tools}.ts,
      packages/core/src/inference/{agent-tool,handoff,stop,loop-shared,tool-loop,stream-tool-loop}.ts,
      packages/core/src/internal/{usage-cost,stable-prefix}.ts, docs/content/docs/reference/whats-new-2-0.mdx,
