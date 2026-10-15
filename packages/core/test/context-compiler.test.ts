@@ -772,6 +772,16 @@ describe('createContextCompiler state, overflow and compaction', () => {
 });
 
 describe('createContextCompiler telemetry', () => {
+  /** The attributes of every completed deuz.context.compile span, in order. */
+  const compileSpans = (observer: ReturnType<typeof createMemoryObserver>) =>
+    observer
+      .events()
+      .flatMap((event) =>
+        event.type === 'operation.completed' && event.operation === 'deuz.context.compile'
+          ? [event.attributes ?? {}]
+          : [],
+      );
+
   it('reports deuz.context.compile with counts, never content', async () => {
     const observer = createMemoryObserver();
     let ids = 0;
@@ -779,7 +789,7 @@ describe('createContextCompiler telemetry', () => {
       sources: [fake('memory', 'memory', [candidate('m1', 'secret fact', 0.9)]).source],
       deps: { observer, generateId: () => `id-${++ids}`, clock },
     });
-    await compiler.beforeModelCall(step(1, [{ role: 'user', content: 'go' }]));
+    const pkg = await compiler.beforeModelCall(step(1, [{ role: 'user', content: 'go' }]));
     const events = observer.events();
     expect(events.map((event) => event.type)).toEqual(['operation.started', 'operation.completed']);
     const completed = events[1] as Extract<
@@ -797,8 +807,73 @@ describe('createContextCompiler telemetry', () => {
       'deuz.context.source.memory.excluded': 0,
       'deuz.context.manifest_digest': expect.stringMatching(/^sha256:[0-9a-f]{64}$/),
     });
+    // The token counts are the manifest's: the package total and each source's share.
+    const tokens = pkg.manifest.budget.selectedTokens;
+    const sourceTokens = pkg.manifest.sources[0]!.tokens;
+    expect(tokens).toBeGreaterThan(0);
+    expect(sourceTokens).toBeGreaterThan(0);
+    expect(completed.attributes).toMatchObject({
+      'deuz.context.tokens': tokens,
+      'deuz.context.source.memory.tokens': sourceTokens,
+    });
+    // A compile that fell back on nothing carries no fallback attribute.
+    expect(Object.keys(completed.attributes ?? {})).not.toContain('deuz.context.fallback');
     for (const value of Object.values(completed.attributes ?? {}))
       expect(['string', 'number', 'boolean']).toContain(typeof value);
     expect(JSON.stringify(events)).not.toContain('secret fact');
+  });
+
+  it('reports the refresh-limit fallback, and carries it to the overflow retry of that step', async () => {
+    const observer = createMemoryObserver();
+    const memory = fake('memory', 'memory', [candidate('m1', 'fact', 0.5)]);
+    const compiler = createContextCompiler({
+      sources: [memory.source],
+      refresh: { maxPasses: 1 },
+      deps: { observer, clock },
+    });
+    const user: Message = { role: 'user', content: 'go' };
+    await compiler.beforeModelCall(step(1, [user]));
+    const limited = await compiler.beforeModelCall(step(2, [user], { refresh: true }));
+    expect(memory.requests).toHaveLength(1);
+    expect(limited.manifest).toMatchObject({ refresh: 'reused', fallback: 'pass-limit' });
+    const retry = await compiler.onOverflow({ ...step(2, [user]), inputTokens: 50_000 });
+    expect(retry.manifest).toMatchObject({ refresh: 'overflow-retry', fallback: 'pass-limit' });
+
+    const [first, second, third] = compileSpans(observer);
+    expect(Object.keys(first!)).not.toContain('deuz.context.fallback');
+    expect(second).toMatchObject({
+      'deuz.context.refresh_reason': 'reused',
+      'deuz.context.fallback': 'pass-limit',
+      'deuz.context.tokens': limited.manifest.budget.selectedTokens,
+    });
+    expect(third).toMatchObject({
+      'deuz.context.refresh_reason': 'overflow-retry',
+      'deuz.context.fallback': 'pass-limit',
+      'deuz.context.tokens': retry.manifest.budget.selectedTokens,
+    });
+  });
+
+  it('reports the source-failed fallback with the failed source counted empty', async () => {
+    const observer = createMemoryObserver();
+    const broken = fake('docs', 'rag', async () => {
+      throw new TypeError('index offline');
+    });
+    const compiler = createContextCompiler({
+      sources: [broken.source, fake('memory', 'memory', [candidate('m1', 'fact', 0.5)]).source],
+      deps: { observer, clock },
+      onWarning: () => {},
+    });
+    const pkg = await compiler.beforeModelCall(step(1, [{ role: 'user', content: 'go' }]));
+    expect(pkg.manifest.fallback).toBe('source-failed');
+    expect(compileSpans(observer)).toEqual([
+      expect.objectContaining({
+        'deuz.context.refresh_reason': 'initial',
+        'deuz.context.fallback': 'source-failed',
+        'deuz.context.tokens': pkg.manifest.budget.selectedTokens,
+        'deuz.context.source.docs.selected': 0,
+        'deuz.context.source.docs.tokens': 0,
+        'deuz.context.source.memory.selected': 1,
+      }),
+    ]);
   });
 });
