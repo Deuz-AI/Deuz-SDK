@@ -2119,6 +2119,7 @@ export type * from './types/stream-durable';
 export {
   createInMemoryDurableStreamStateStore,
   DEFAULT_DURABLE_STREAM_BATCH,
+  DEFAULT_DURABLE_STREAM_RETAIN_MS,
 } from './stream-durable';
 export {
   DEUZ_CAPABILITIES,

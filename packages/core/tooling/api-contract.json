@@ -1103,6 +1103,7 @@
       "ConnectDeuzStreamOptions",
       "CreateDeuzStreamOptions",
       "DEFAULT_DURABLE_STREAM_BATCH",
+      "DEFAULT_DURABLE_STREAM_RETAIN_MS",
       "DEUZ_CAPABILITIES",
       "DEUZ_CAPABILITIES_HEADER",
       "DEUZ_CAPABILITY",

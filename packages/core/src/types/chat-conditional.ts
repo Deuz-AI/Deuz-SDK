@@ -88,7 +88,12 @@ export interface ConditionalChatStore {
    */
   deleteChat(chatId: string): Promise<void>;
   listChats(scope?: MemoryScope): Promise<string[]>;
-  /** Retention: deletes tombstones older than `before` (epoch ms); a pruned id can be reused. */
+  /**
+   * Retention: deletes tombstones whose `deletedAt` is before `before` (epoch
+   * ms on the store clock; exclusive) and returns how many; a pruned id can
+   * be reused. A malformed `before` throws `InvalidRequestError`. Never
+   * called by the SDK.
+   */
   pruneTombstones(before: number): Promise<number>;
 }
 

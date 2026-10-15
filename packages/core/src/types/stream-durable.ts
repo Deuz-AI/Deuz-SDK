@@ -73,7 +73,8 @@ export interface DurableStreamStateStore {
   /**
    * Retention: deletes terminal streams (with a `done` record) whose last
    * commit is older than `terminalBefore` (epoch ms, store clock). Default
-   * policy in the docs: 24 hours. Answers how many it deleted. The store
+   * policy: `DEFAULT_DURABLE_STREAM_RETAIN_MS` (24 hours). The cutoff is
+   * exclusive. Answers how many it deleted. The store
    * clock is the injected one (memory, SQLite), the database's (Postgres) or
    * the server's `TIME` (Redis). Nothing is deleted in the background.
    */
