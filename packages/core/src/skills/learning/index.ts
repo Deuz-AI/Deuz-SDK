@@ -18,6 +18,7 @@ import type { LanguageModel } from '../../types/model';
 import type { Usage } from '../../types/usage';
 import { DeuzError } from '../../errors';
 import { notImplemented } from '../../internal/not-implemented';
+import { projectRun } from './projection';
 
 /** A reference into the source run that a method step rests on. */
 export interface SkillSourceRef {
@@ -126,7 +127,20 @@ export async function proposeSkillFromRun(
   options: ProposeSkillFromRunOptions,
 ): Promise<SkillProposal> {
   checkOptions(options);
-  assertEligible(options.run);
+  const { run } = options;
+  assertEligible(run);
+  const maxSourceChars = options.maxSourceChars ?? DEFAULT_MAX_SOURCE_CHARS;
+  const projection = await projectRun(run, {
+    ...(options.toolSummaries ? { toolSummaries: options.toolSummaries } : {}),
+  });
+  if (projection.items.length === 0)
+    throw new SkillLearningError('source_not_eligible', `run ${run.runId} has nothing to project`);
+  // Spec §2.6: an oversized source is refused, never cut.
+  if (projection.text.length > maxSourceChars)
+    throw new SkillLearningError(
+      'source_too_large',
+      `the projection of run ${run.runId} has ${projection.text.length} characters; maxSourceChars is ${maxSourceChars}`,
+    );
   return notImplemented('proposeSkillFromRun');
 }
 
