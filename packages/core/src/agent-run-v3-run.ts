@@ -6,8 +6,8 @@
  * context compiler's hook, the working memory and the memory tools — keeping
  * their state in the V3 run record. Edge-safe.
  */
-import { assertAgentRunStoreV3 } from './agent-run-v3';
-import { contextPackageBlob, readContextPackage } from './agent-run-v3-context';
+import { assertAgentRunStoreV3 } from './agent-run-v3-assert';
+import { contextPackageBlob, readContextPackage } from './agent-run-v3-package';
 import { createContextCompiler } from './context/compiler';
 import { estimateRequestOverhead } from './context/count';
 import { isContextMessage, messageText } from './context/render';
@@ -33,7 +33,9 @@ import type {
   LoopContextStep,
 } from './inference/loop-context';
 import { createTokenEstimator, type TokenEstimator } from './internal/estimate-tokens';
+import { claimMemoryScopes, sourceScope } from './internal/memory-scope-claims';
 import { withTelemetryParent } from './internal/native-context';
+import { bindsThinkingToPrefix } from './internal/stable-prefix';
 import type { MemoryCallOptions } from './memory';
 import { createVersionedMemoryTools } from './memory/versioned/tools';
 import type { MemoryExtractionInput, MemorySession } from './memory/versioned/types';
@@ -48,6 +50,7 @@ import type {
 } from './types/agent-run-v3';
 import type { Clock, Logger, ResolvedDependencies } from './types/deps';
 import type { CallWarning } from './types/methods';
+import type { NativeExecutionContext } from './types/execution';
 import type { Message } from './types/message';
 import type { Usage } from './types/usage';
 import type {
@@ -127,6 +130,29 @@ export function assertV3Options(options: AgentRunOptionsV3<unknown>): void {
         `workingMemory belongs to scope ${JSON.stringify(scope)}, not this run's scope ${JSON.stringify(options.session.scope)}.`,
       );
   }
+}
+
+/**
+ * Claims every memory scope a V3 run reads or writes for its execution (spec
+ * §2.3 "child run yalnızca daraltabilecek", §4.5): the legacy `memory` scope,
+ * the versioned memory session's, the compiler's pinned `scope` (when given
+ * as options) and the scope each built-in context source was pinned to. A
+ * nested run's scopes must each lie within one of its parent run's, by the
+ * `claimMemoryScope` / `scopeWithin` rule (a widening throws a TypeError),
+ * and its own claim bounds its children in turn. Returns the release, called
+ * when the executor ends.
+ */
+export function claimV3MemoryScopes(
+  execution: NativeExecutionContext,
+  options: AgentRunOptionsV3<unknown>,
+): () => void {
+  const context = options.context;
+  return claimMemoryScopes(execution, [
+    (options.memory as MemoryCallOptions | undefined)?.scope,
+    options.versionedMemory?.session?.scope,
+    ...(context !== undefined && !isCompiler(context) ? [context.scope] : []),
+    ...(context?.sources ?? []).map((source) => sourceScope(source)),
+  ]);
 }
 
 /**
@@ -294,13 +320,17 @@ export function versionedExtraction(
 
 /**
  * What a versioned extraction reads (spec §2.2): the input's last user turn
- * and the run's own turns, each with a stable id (`<runId>#<index>` in the
- * run's transcript); the SDK's turns and system messages are left out, and
- * the session's extraction policy decides which of the rest it may read.
+ * and the run's own turns; the SDK's turns and system messages are left out,
+ * and the session's extraction policy decides which of the rest it may read.
+ * Each message carries the id the chat projection gives its transcript
+ * position (spec §2.4: `resolveSource` resolves a memory source to it):
+ * `chatIds` (the run's chat state) where it has one, a stored chat's own id
+ * for an input message included, else `<runId>:<index>`.
  */
 export function extractionMessages(
   transcript: AgentRunTranscript,
   runId: string,
+  chatIds: readonly string[] = [],
 ): MemoryExtractionInput['messages'] {
   const internal = new Set(transcript.internal);
   const entries: MemoryExtractionInput['messages'][number][] = [];
@@ -308,7 +338,11 @@ export function extractionMessages(
   for (let index = 0; index < transcript.input; index++)
     if (transcript.messages[index]!.role === 'user') lastUser = index;
   const take = (index: number) =>
-    entries.push({ id: `${runId}#${index}`, message: transcript.messages[index]!, runId });
+    entries.push({
+      id: chatIds[index] ?? `${runId}:${index}`,
+      message: transcript.messages[index]!,
+      runId,
+    });
   if (lastUser >= 0) take(lastUser);
   for (let index = transcript.input; index < transcript.messages.length; index++)
     if (!internal.has(index) && transcript.messages[index]!.role !== 'system') take(index);
@@ -316,13 +350,17 @@ export function extractionMessages(
 }
 
 /**
- * Runs a run's versioned extraction under its intent (spec §4.1): the
- * prepared plan is saved first (`planned`), then the session commits it
- * atomically with its receipt under the intent's operation id, and the
- * acknowledgment records the receipt (`acknowledged`). A session that already
- * holds the operation (its acknowledgment was lost) answers from its receipt
- * and applies nothing again. Returns false when a save failed (the intent
- * stays where it was, for `reconcileAgentRun`); throws when the session does.
+ * Runs a run's versioned extraction under its intent (spec §4.1): the run
+ * first saves its claim on the intent (`planned`, with the ids of the
+ * messages it cites; no plan), then the session prepares the plan and
+ * commits it atomically with its receipt under the intent's operation id, in
+ * one call, and the
+ * acknowledgment copies the receipt into the intent (`acknowledged`, with the
+ * mutation count and the request digest). A session that already holds the
+ * operation (its acknowledgment was lost) answers from its receipt and
+ * applies nothing again, whatever plan a new LLM call would give. Returns
+ * false when a save failed (the intent stays where it was, for
+ * `reconcileAgentRun`); throws when the session does.
  */
 export async function runVersionedExtraction(
   session: MemorySession,
@@ -333,6 +371,7 @@ export async function runVersionedExtraction(
 ): Promise<boolean> {
   if (intent.status === 'intended') {
     intent.status = 'planned';
+    intent.messageIds = input.messages.map((entry) => entry.id);
     if (!(await save())) return false;
     emit?.({ type: 'memory-intent', operationId: intent.operationId, status: 'planned' });
   }
@@ -407,13 +446,36 @@ function inputDigest(messages: readonly Message[]): string {
   );
 }
 
-/** The package's blocks as the loop places them. */
-function placementOf(pkg: ContextPackage): LoopContextPlacement {
+/**
+ * The package's blocks as the loop places them. On a model that binds
+ * preserved thinking to the transcript prefix (`kept`, Claude 5.x) the
+ * working memory block joins the history with the retrieval block once the
+ * call succeeded, after it: the step's thinking was generated right after
+ * it, so every later request must carry it there byte for byte (spec §2.3:
+ * the provider's prefix rules are kept). Each step places the current working
+ * memory again at the end; the block reads as replacing every earlier copy.
+ * On every other model it is the request's tail only, never history.
+ */
+function placementOf(pkg: ContextPackage, kept: boolean): LoopContextPlacement {
+  const append = pkg.blocks
+    .filter((block) => block.placement === 'append')
+    .flatMap((b) => b.messages);
+  const tail = pkg.blocks
+    .filter((block) => block.placement === 'ephemeral-tail')
+    .flatMap((b) => b.messages);
+  return kept ? { append: [...append, ...tail], tail: [] } : { append, tail };
+}
+
+/**
+ * The package with its manifest recording that the working memory block
+ * joins the history (`placement.tailKept`), on a model that binds thinking to
+ * the prefix and when the package has that block.
+ */
+function withKeptTail(pkg: ContextPackage, kept: boolean): ContextPackage {
+  if (!kept || !pkg.manifest.placement.tail) return pkg;
   return {
-    append: pkg.blocks.filter((block) => block.placement === 'append').flatMap((b) => b.messages),
-    tail: pkg.blocks
-      .filter((block) => block.placement === 'ephemeral-tail')
-      .flatMap((b) => b.messages),
+    ...pkg,
+    manifest: { ...pkg.manifest, placement: { ...pkg.manifest.placement, tailKept: true } },
   };
 }
 
@@ -447,7 +509,11 @@ export interface ContextHookInput {
  * a package a `forget` redacted is compiled again (`redacted` in its
  * manifest), the one documented exception. An overflow retry compiles the
  * step again for just under the failed request's estimate (a package that
- * placed nothing, with no compaction, leaves the provider's overflow).
+ * placed nothing, with no compaction, leaves the provider's overflow); its
+ * package replaces the step's, which stays as the step's `firstAttempt`. A
+ * crash during the retry reopens the step from its first attempt's messages
+ * (the compaction was never checkpointed): it sends that package again, and
+ * its retry the recorded one when the compaction gives the same messages.
  */
 export function createContextHook(input: ContextHookInput): LoopContextHook {
   const { compiler, store, runId } = input;
@@ -498,19 +564,41 @@ export function createContextHook(input: ContextHookInput): LoopContextHook {
     );
   };
 
-  /** Writes the package once by digest and the manifest with the run, then saves. */
-  const record = async (step: number, digest: string, pkg: ContextPackage): Promise<void> => {
+  /**
+   * Writes the package once by digest and the manifest with the run, then
+   * saves. An overflow retry's package (`retry`) replaces the step's, which
+   * stays as its `firstAttempt` (the first one only): the compaction during
+   * the step is never checkpointed, so a reopened step starts from there.
+   */
+  const record = async (
+    step: number,
+    digest: string,
+    pkg: ContextPackage,
+    retry = false,
+  ): Promise<void> => {
     const envelope = input.envelope();
     const steps = envelope.context?.steps ?? [];
     const blob = await contextPackageBlob(pkg);
     const ref = { digest: blob.digest, bytes: blob.bytes };
-    if (!steps.some((entry) => entry.blob.digest === blob.digest))
+    if (
+      !steps.some(
+        (entry) =>
+          entry.blob.digest === blob.digest || entry.firstAttempt?.blob.digest === blob.digest,
+      )
+    )
       await store.putBlob({ digest: blob.digest, content: blob.content, records: blob.records });
+    const previous = retry ? steps.find((other) => other.step === step) : undefined;
+    const firstAttempt =
+      previous?.firstAttempt ??
+      (previous?.input !== undefined && previous.input !== digest
+        ? { manifest: previous.manifest, blob: previous.blob, input: previous.input }
+        : undefined);
     const entry: AgentRunContextStepV3 = {
       step,
       manifest: { ...pkg.manifest, blob: ref },
       blob: ref,
       input: digest,
+      ...(firstAttempt ? { firstAttempt } : {}),
     };
     envelope.context = {
       compiler: compiler.compiler.state(),
@@ -527,7 +615,7 @@ export function createContextHook(input: ContextHookInput): LoopContextHook {
     pkg: ContextPackage,
     overheadTokens: number,
   ) => {
-    const placement = placementOf(pkg);
+    const placement = placementOf(pkg, bindsThinkingToPrefix(step.model));
     const request = [...step.messages, ...placement.append, ...placement.tail];
     current = {
       step: number,
@@ -546,22 +634,37 @@ export function createContextHook(input: ContextHookInput): LoopContextHook {
       // Redacted blocks left the history on resume: the next compile retrieves anew.
       let redacted = pendingRedaction;
       pendingRedaction = false;
-      if (!redacted && last && last.input === digest) {
-        // A reopened step: the same context, unless a forget redacted it.
-        const read = await readContextPackage(store, last);
+      // A reopened step: its messages are the ones its package was compiled
+      // for, or those of its first attempt when a crash came during its
+      // overflow retry (the compaction in between was never checkpointed).
+      const first = last?.firstAttempt;
+      const reopened =
+        redacted || !last
+          ? undefined
+          : last.input === digest
+            ? last
+            : first?.input === digest
+              ? { ...first, step: last.step }
+              : undefined;
+      if (reopened) {
+        // The same context, unless a forget redacted it.
+        const read = await readContextPackage(store, reopened);
         if (read.status === 'found')
           return begin(
             step,
-            last.step,
+            reopened.step,
             digest,
             read.package,
-            stepInput(step, last.step).overheadTokens,
+            stepInput(step, reopened.step).overheadTokens,
           );
-        number = last.step;
+        number = reopened.step;
         redacted = read.status === 'redacted';
       }
       const request = stepInput(step, number, redacted ? { redacted: true } : {});
-      const pkg = await compiler.compiler.beforeModelCall(request);
+      const pkg = withKeptTail(
+        await compiler.compiler.beforeModelCall(request),
+        bindsThinkingToPrefix(step.model),
+      );
       await record(number, digest, pkg);
       return begin(step, number, digest, pkg, request.overheadTokens);
     },
@@ -572,6 +675,25 @@ export function createContextHook(input: ContextHookInput): LoopContextHook {
       // The package placed nothing and the history did not shrink: the
       // provider's overflow stands, as in 2.3.
       if (failed.selectedTokens === 0 && !step.compacted) return undefined;
+      const digest = inputDigest(step.messages);
+      // A step reopened from its first attempt overflowed again and the
+      // compaction gave the messages its recorded retry was compiled for: the
+      // retry sends that package again (a compiler restored after a restart
+      // could not place its optional entries again).
+      const recorded = input
+        .envelope()
+        .context?.steps.find((entry) => entry.step === current!.step);
+      if (recorded?.firstAttempt && recorded.input === digest && current.input !== digest) {
+        const read = await readContextPackage(store, recorded);
+        if (read.status === 'found')
+          return begin(
+            step,
+            recorded.step,
+            digest,
+            read.package,
+            stepInput(step, recorded.step).overheadTokens,
+          );
+      }
       // The request that overflowed (as estimated) did not fit: the retry is
       // compiled for less than that, so optional context shrinks to what the
       // added-context share of the gap allows and mandatory content must fit.
@@ -581,12 +703,14 @@ export function createContextHook(input: ContextHookInput): LoopContextHook {
       );
       // Assigned onto the step input, so the span parent it carries stays.
       const request = Object.assign(stepInput(step, current.step), { inputTokens: budget });
-      const pkg = await compiler.compiler.onOverflow(request);
+      const pkg = withKeptTail(
+        await compiler.compiler.onOverflow(request),
+        bindsThinkingToPrefix(step.model),
+      );
       // Nothing shrank: the retry would be refused again.
       if (!step.compacted && pkg.manifest.budget.selectedTokens >= failed.selectedTokens)
         return undefined;
-      const digest = inputDigest(step.messages);
-      await record(current.step, digest, pkg);
+      await record(current.step, digest, pkg, true);
       return begin(step, current.step, digest, pkg, request.overheadTokens);
     },
 
@@ -618,15 +742,18 @@ export async function dropRedactedContext(
 ): Promise<boolean> {
   const markers: string[] = [];
   const seen = new Map<string, boolean>();
-  for (const step of envelope.context?.steps ?? []) {
-    if (!step.manifest.placement.append) continue;
-    let redacted = seen.get(step.blob.digest);
+  // A step's first attempt too: a step reopened from it after a crash sent it.
+  const packages = (envelope.context?.steps ?? []).flatMap((step) =>
+    step.firstAttempt ? [step, step.firstAttempt] : [step],
+  );
+  for (const { manifest, blob } of packages) {
+    if (!manifest.placement.append) continue;
+    let redacted = seen.get(blob.digest);
     if (redacted === undefined) {
-      redacted = (await store.getBlob(step.blob.digest)).status === 'redacted';
-      seen.set(step.blob.digest, redacted);
+      redacted = (await store.getBlob(blob.digest)).status === 'redacted';
+      seen.set(blob.digest, redacted);
     }
-    if (redacted)
-      markers.push(`<deuz_context pass="${step.manifest.pass}" step="${step.manifest.step}">`);
+    if (redacted) markers.push(`<deuz_context pass="${manifest.pass}" step="${manifest.step}">`);
   }
   if (markers.length === 0) return false;
   let dropped = false;
@@ -693,6 +820,22 @@ export async function prepareV3Leg(
   };
 }
 
+/**
+ * The extraction an intent asks the session for: its options and the run's
+ * messages, cited by the ids its claim saved, else by the chat projection's.
+ */
+function extractionInput(
+  envelope: AgentRunEnvelopeV3,
+  transcript: AgentRunTranscript,
+  intent: AgentRunMemoryIntentV3,
+): MemoryExtractionInput {
+  const messages = extractionMessages(transcript, envelope.runId, envelope.chat?.messageIds);
+  const claimed = intent.messageIds;
+  if (claimed && claimed.length === messages.length)
+    messages.forEach((entry, index) => (entry.id = claimed[index]!));
+  return { ...intent.extraction, messages };
+}
+
 /** The extraction intent a V3 run has not acknowledged yet, if any. */
 function pendingExtraction(envelope: AgentRunEnvelopeV3): AgentRunMemoryIntentV3 | undefined {
   return envelope.memoryIntents?.find(
@@ -719,7 +862,7 @@ export async function settleVersionedExtraction(
     await runVersionedExtraction(
       session,
       intent,
-      { ...intent.extraction, messages: extractionMessages(envelope.transcript, envelope.runId) },
+      extractionInput(envelope, envelope.transcript, intent),
       save,
       emit,
     );
@@ -752,7 +895,7 @@ export async function reconcileVersionedIntents(
     await runVersionedExtraction(
       session,
       intent,
-      { ...intent.extraction, messages: extractionMessages(envelope.transcript, envelope.runId) },
+      extractionInput(envelope, envelope.transcript, intent),
       async () => {
         await save();
         return true;

@@ -107,7 +107,7 @@ The working memory block:
 
 ```text
 <deuz_working_memory revision="0">
-Your working memory, current as of this request; it replaces any earlier copy. The host sets the goal and constraints; proposed items are unverified.
+Your working memory at this point; the latest copy replaces every earlier one. The host sets the goal and constraints; proposed items are unverified.
 <goal>Deploy the billing service.</goal>
 <constraints>
 - [constraints-0-0] No deploys on Friday.
@@ -192,6 +192,16 @@ intact:
 - The working memory is one `'ephemeral-tail'` block, placed after the last
   message of each request and never written to history, so the model never
   sees an old version of it.
+- Except on a model that binds preserved thinking to the transcript prefix
+  (Claude Fable 5.1, Opus 5.5, Sonnet 5.5, Haiku 5.5). There the provider's
+  prefix rule wins: a step's thinking was generated right after its working
+  memory block, so a V3 run keeps each step's copy in the history once the
+  call succeeded, right after that step's retrieval block, and the bytes before
+  every replayed thinking block stay the same. The next request ends with the
+  current copy again. Every copy says that the latest copy replaces every
+  earlier one, so the model reads the latest. The manifest
+  records this as `placement.tailKept: true`. If you place blocks yourself on
+  such a model, do the same.
 - Old blocks leave only at a compaction boundary. The working memory is then
   placed again from its durable state, not from a summary.
 - `manifest.cachePrefixChanged` is `true` when the request no longer starts
@@ -456,7 +466,10 @@ this order:
 7. The model is called.
 
 Retrieval enters the history after a successful call and never reaches the
-chat transcript; the working memory tail is never stored in history. On a
+chat transcript; the working memory tail is never stored in history, except
+on a model that binds thinking to the prefix, where each step's copy joins the
+history after the call (see [Placement](#placement-and-the-prompt-cache)) and
+still never reaches the chat transcript. On a
 provider overflow the loop compacts again (without re-running `prepareStep`)
 and the compiler recompiles the step for just under the size of the request that
 overflowed; mandatory content that still does not fit fails the run with

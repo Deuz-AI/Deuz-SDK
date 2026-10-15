@@ -4,15 +4,17 @@
  * revisions it holds, and a checkpointed step reads back the identical
  * package, or learns that a forget redacted it.
  */
+import { readFileSync, readdirSync } from 'node:fs';
+import { join, sep } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import {
   assertBlobInput,
   assertForgetEvent,
-  contextPackageBlob,
   forgetTombstones,
   isForgotten,
-  readContextPackage,
 } from '../src/agent-run-v3-context';
+import { contextPackageBlob, readContextPackage } from '../src/agent-run-v3-package';
 import { canonicalJson, sha256Digest } from '../src/internal/digest';
 import type { ContextBlobRead } from '../src/types/agent-run-v3';
 import { contextPackage } from './fixtures/agent-run-v3';
@@ -153,5 +155,18 @@ describe('blob input and forget events', () => {
     });
     expect(every).toEqual([{ recordId: 'mem-z' }]);
     expect(isForgotten({ recordId: 'mem-z', revision: 9 }, every[0]!)).toBe(true);
+  });
+});
+
+describe('the V3 run-only modules (S1-4)', () => {
+  it('are imported by the lazy V3 run alone, so the eager bundles never carry them', () => {
+    const src = fileURLToPath(new URL('../src/', import.meta.url));
+    const importers = (module: string) =>
+      readdirSync(src, { recursive: true, encoding: 'utf8' })
+        .filter((file) => file.endsWith('.ts'))
+        .filter((file) => readFileSync(join(src, file), 'utf8').includes(`/${module}';`))
+        .map((file) => file.split(sep).join('/'));
+    expect(importers('agent-run-v3-package')).toEqual(['agent-run-v3-run.ts']);
+    expect(importers('agent-run-v3-assert')).toEqual(['agent-run-v3-run.ts']);
   });
 });

@@ -987,8 +987,9 @@ function makeAgentStream<T>(
       await saveBookkeeping();
     }
     // A V3 run's versioned extraction (2.4): its intent is durable with the
-    // terminal commit; the plan is saved, the session commits it with its
-    // receipt, and the acknowledgment records the receipt.
+    // terminal commit; the run saves its claim (`planned`), the session
+    // prepares and commits the plan with its receipt in one call, and the
+    // acknowledgment records the receipt.
     if (extractVersioned && nativeV3)
       await nativeV3.settleVersionedExtraction(
         envelope as unknown as AgentRunEnvelopeV3,
@@ -1259,8 +1260,14 @@ function makeAgentStream<T>(
         // The run owns this ledger, so its sub-agents report a warning once too.
         markRunLedger(common.execution.ledger);
       }
-      // A run under another native run's execution may only narrow its memory scope (2.3).
-      if (options.memory)
+      // A run under another native run's execution may only narrow its memory
+      // scope (2.3); a V3 run's versioned memory and context sources too (2.4).
+      if (nativeV3)
+        releaseMemoryScope = nativeV3.claimV3MemoryScopes(
+          common.execution!,
+          v3Options as AgentRunOptionsV3<unknown>,
+        );
+      else if (options.memory)
         releaseMemoryScope = nativeMemory!.claimMemoryScope(
           common.execution!,
           options.memory.scope,

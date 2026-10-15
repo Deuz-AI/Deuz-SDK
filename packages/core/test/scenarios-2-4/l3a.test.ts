@@ -13,7 +13,7 @@ import { expect } from 'vitest';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { contextPackageBlob, readContextPackage } from '../../src/agent-run-v3-context';
+import { contextPackageBlob, readContextPackage } from '../../src/agent-run-v3-package';
 import { createWorkingMemory } from '../../src/context/working-memory';
 import { canonicalJson } from '../../src/internal/digest';
 import { createSqliteAgentRunStoreV3 } from '../../src/node/runs-v3-sqlite';

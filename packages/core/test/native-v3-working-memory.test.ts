@@ -73,6 +73,19 @@ describe('working memory in the V3 loop', () => {
     expect(wireText(tail)).toMatch(/^<deuz_working_memory /);
     expect(wireText(tail)).toContain('CI is green');
     expect(wireText(tail)).toContain('Deploy');
+    // On a model that does not bind thinking to the prefix the tail never
+    // reaches the history (S1-1): the request carries the current copy only.
+    const copies = run
+      .requests()[1]!
+      .messages.filter((message) => wireText(message).startsWith('<deuz_working_memory '));
+    expect(copies).toEqual([tail]);
+    expect(
+      stored.messages.some((message) => /<deuz_working_memory /.test(JSON.stringify(message))),
+    ).toBe(false);
+    expect(stored.context?.steps.map((step) => step.manifest.placement)).toEqual([
+      { append: false, tail: true },
+      { append: false, tail: true },
+    ]);
   });
 
   it("persists a model's patch in the same save as its tool receipt", async () => {

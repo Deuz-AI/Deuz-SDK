@@ -1,6 +1,8 @@
 /**
  * @internal Context package blobs of the V3 run record (2.4, spec §4.4),
- * shared by the three `AgentRunStoreV3` implementations and the V3 run path:
+ * shared by the three `AgentRunStoreV3` implementations and the V3 run path
+ * (the run alone writes and reads packages: `agent-run-v3-package.ts`, which
+ * only its lazy chunk loads):
  *
  * - a compiled package is stored once, content-addressed: its content is the
  *   canonical JSON of its blocks and its digest the `sha256:` of that, so an
@@ -16,14 +18,9 @@
  * forget of any revision of its id, and a forget that names no revision
  * matches every revision. Edge-safe.
  */
-import type { ContextBlock, ContextPackage } from './context/types';
-import { canonicalJson, isSha256Digest, sha256Digest, type Sha256Digest } from './internal/digest';
+import { isSha256Digest, sha256Digest, type Sha256Digest } from './internal/digest';
 import type { MemoryForgetEvent } from './memory/versioned/types';
-import type {
-  AgentRunContextStepV3,
-  AgentRunEnvelopeV3,
-  AgentRunStoreV3,
-} from './types/agent-run-v3';
+import type { AgentRunEnvelopeV3 } from './types/agent-run-v3';
 
 /** One memory record revision a blob holds; no `revision` when the source has none. */
 export interface ContextBlobRecord {
@@ -31,77 +28,12 @@ export interface ContextBlobRecord {
   revision?: number;
 }
 
-/** What `AgentRunStoreV3.putBlob` takes, plus the byte size for the step's `ContextBlobRef`. */
-export interface ContextPackageBlob {
-  digest: Sha256Digest;
-  content: string;
-  bytes: number;
-  records: ContextBlobRecord[];
-}
-
-/** A checkpointed step's package, read back. */
-export type ContextPackageRead =
-  | { status: 'found'; package: ContextPackage }
-  /** A forget redacted it: compile the step again (refresh reason `'redacted'`). */
-  | { status: 'redacted' }
-  | { status: 'missing' };
-
-const encoder = new TextEncoder();
-
 function isObject(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
 function isCount(value: unknown): value is number {
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
-}
-
-/**
- * The blob of a compiled package: the canonical JSON of its blocks, its
- * digest and byte size, and the memory records its blocks placed (each
- * revision once, in record order).
- */
-export async function contextPackageBlob(pkg: ContextPackage): Promise<ContextPackageBlob> {
-  const content = canonicalJson(pkg.blocks);
-  const placed = new Set<number>(pkg.blocks.flatMap((block) => block.entries));
-  const records = new Map<string, ContextBlobRecord>();
-  pkg.manifest.entries.forEach((entry, index) => {
-    if (entry.kind !== 'memory' || !(placed.has(index) || entry.selected)) return;
-    const record: ContextBlobRecord =
-      entry.revision === undefined
-        ? { recordId: entry.recordId }
-        : { recordId: entry.recordId, revision: entry.revision };
-    records.set(JSON.stringify([record.recordId, record.revision ?? null]), record);
-  });
-  return {
-    digest: await sha256Digest(content),
-    content,
-    bytes: encoder.encode(content).length,
-    records: [...records.values()].sort(
-      (left, right) =>
-        (left.recordId < right.recordId ? -1 : left.recordId > right.recordId ? 1 : 0) ||
-        (left.revision ?? -1) - (right.revision ?? -1),
-    ),
-  };
-}
-
-/**
- * Reads a checkpointed step's package back from the store: the blocks of its
- * blob with the step's manifest. Content that does not hash to the step's
- * digest throws: a store must never hand back another package.
- */
-export async function readContextPackage(
-  store: Pick<AgentRunStoreV3, 'getBlob'>,
-  step: AgentRunContextStepV3,
-): Promise<ContextPackageRead> {
-  const read = await store.getBlob(step.blob.digest);
-  if (read.status !== 'found') return { status: read.status };
-  if ((await sha256Digest(read.content)) !== step.blob.digest)
-    throw new Error(
-      `The context package blob of step ${step.step} does not match its digest ${step.blob.digest}.`,
-    );
-  const blocks = JSON.parse(read.content) as ContextBlock[];
-  return { status: 'found', package: { version: 1, blocks, manifest: step.manifest } };
 }
 
 /**
@@ -168,7 +100,10 @@ export function markRedactedSteps(
   redacted: ReadonlySet<Sha256Digest>,
 ): AgentRunEnvelopeV3 {
   if (redacted.size === 0) return envelope;
-  for (const step of envelope.context?.steps ?? [])
+  for (const step of envelope.context?.steps ?? []) {
     if (redacted.has(step.blob.digest)) step.manifest.redacted = true;
+    if (step.firstAttempt && redacted.has(step.firstAttempt.blob.digest))
+      step.firstAttempt.manifest.redacted = true;
+  }
   return envelope;
 }

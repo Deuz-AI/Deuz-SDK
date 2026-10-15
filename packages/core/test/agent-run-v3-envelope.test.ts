@@ -7,8 +7,8 @@
 import { describe, expect, it } from 'vitest';
 import {
   AGENT_RUN_STORE_BACKEND,
+  agentRunV3BlobDigests,
   assertAgentRunEnvelopeV3,
-  assertAgentRunStoreV3,
   assertEnvelopeRevisionV3,
   markAgentRunStoreBackend,
   decodeAgentRunEnvelopeV3,
@@ -16,6 +16,8 @@ import {
   isAgentRunEnvelopeV3,
 } from '../src/agent-run-v3';
 import { createInMemoryAgentRunStore, reconcileAgentRun, resumeAgent } from '../src/agent-run';
+import { assertAgentRunStoreV3 } from '../src/agent-run-v3-assert';
+import { markRedactedSteps } from '../src/agent-run-v3-context';
 import { RevisionConflictError, UnsupportedStoreError } from '../src/errors';
 import { createRedisOpsStore } from '../src/node/ops-redis';
 import { attachConfig } from '../src/internal/config-symbol';
@@ -68,6 +70,25 @@ describe('V3 envelope validation', () => {
       /digest/,
     ],
     [
+      'a step first attempt without its input',
+      {
+        context: {
+          steps: [
+            {
+              step: 0,
+              manifest: {},
+              blob: { digest: `sha256:${'d'.repeat(64)}`, bytes: 1 },
+              firstAttempt: {
+                manifest: {},
+                blob: { digest: `sha256:${'e'.repeat(64)}`, bytes: 1 },
+              },
+            },
+          ],
+        },
+      },
+      /first attempt/,
+    ],
+    [
       'a working memory of another kind',
       { workingMemory: { kind: 'notes', version: 1 } },
       /working memory/,
@@ -84,6 +105,35 @@ describe('V3 envelope validation', () => {
     expect(() => assertAgentRunEnvelopeV3(envelope)).toThrow(TypeError);
     expect(() => assertAgentRunEnvelopeV3(envelope)).toThrow(message);
     expect(isAgentRunEnvelopeV3(envelope)).toBe(false);
+  });
+
+  it("keeps a step's first attempt (S1-3): retained, redaction marked", () => {
+    const pkg = contextPackage(0);
+    const retry = `sha256:${'d'.repeat(64)}` as const;
+    const first = `sha256:${'e'.repeat(64)}` as const;
+    const envelope = envelopeV3('run', 1, {
+      context: {
+        steps: [
+          {
+            step: 0,
+            manifest: pkg.manifest,
+            blob: { digest: retry, bytes: 10 },
+            input: 'after-compaction',
+            firstAttempt: {
+              manifest: structuredClone(pkg.manifest),
+              blob: { digest: first, bytes: 12 },
+              input: 'before-compaction',
+            },
+          },
+        ],
+      },
+    });
+    expect(() => assertAgentRunEnvelopeV3(envelope)).not.toThrow();
+    expect(decodeAgentRunEnvelopeV3(encodeAgentRunEnvelopeV3(envelope))).toEqual(envelope);
+    expect(agentRunV3BlobDigests(envelope)).toEqual(expect.arrayContaining([retry, first]));
+    const marked = markRedactedSteps(structuredClone(envelope), new Set([first]));
+    expect(marked.context!.steps[0]!.firstAttempt!.manifest.redacted).toBe(true);
+    expect(marked.context!.steps[0]!.manifest.redacted).toBeUndefined();
   });
 
   it('refuses what is not an object', () => {
