@@ -9,6 +9,7 @@ import { StrictMode, createElement, type ReactNode } from 'react';
 import { describe, expect, it, vi } from 'vitest';
 import { act, renderHook, waitFor } from '@testing-library/react';
 import type { Message } from '@deuz-sdk/core';
+import { applyUIPart, createAssistantTurn } from '@deuz-sdk/core/chat';
 import type { DeuzUIPart } from '@deuz-sdk/core/ui';
 import { useChat } from '../src/use-chat';
 import type { ChatSnapshotV1 } from '../src/index';
@@ -328,6 +329,65 @@ describe('useChat({ initialSnapshot }) — the turn in progress and the cursor',
     await waitFor(() => expect(result.current.messages.at(-1)?.content).toBe('Hello, Paris.'));
     expect(wire.cursors).toEqual(['2']);
     expect(result.current.messages).toHaveLength(2);
+  });
+
+  it('settles a restored turn that already had its finish when the endpoint is caught up', async () => {
+    const wire = journal();
+    await wire.leg(PARIS_LEG);
+    // Persisted after `finish` was folded but before `[DONE]` arrived.
+    let turn = createAssistantTurn('m-0');
+    for (const part of PARIS_LEG) turn = applyUIPart(turn, part);
+    const snapshot: ChatSnapshotV1 = {
+      version: 1,
+      messages: [USER],
+      messageIds: ['u-1'],
+      cursor: String(PARIS_LEG.length - 1),
+      turn,
+    };
+    const { result } = renderHook(() =>
+      useChat({
+        api: '/api/chat',
+        fetch: noFetch,
+        resume: { endpoint: wire.endpoint, auto: true },
+        initialSnapshot: JSON.parse(JSON.stringify(snapshot)) as ChatSnapshotV1,
+      }),
+    );
+    await waitFor(() => expect(wire.cursors).toHaveLength(1));
+    await waitFor(() => expect(result.current.status).toBe('idle'));
+    expect(wire.cursors).toEqual([snapshot.cursor]);
+    expect(result.current.messages.map((m) => [m.id, m.content])).toEqual([
+      ['u-1', 'hi'],
+      ['m-1', 'Hello, Paris.'],
+    ]);
+    expect(result.current.history.canonical).toEqual([
+      USER,
+      { role: 'assistant', content: 'Hello, Paris.' },
+    ]);
+    const settled = result.current.exportSnapshot();
+    expect(settled.turn).toBeUndefined();
+    expect(settled.messageIds).toEqual(['u-1', 'm-1']);
+  });
+
+  it('keeps a restored turn without its finish unsettled when the endpoint is caught up', async () => {
+    const wire = journal();
+    const partial = PARIS_LEG.slice(0, 2);
+    await wire.leg(partial);
+    let turn = createAssistantTurn('m-0');
+    for (const part of partial) turn = applyUIPart(turn, part);
+    const { result } = renderHook(() =>
+      useChat({
+        api: '/api/chat',
+        fetch: noFetch,
+        resume: { endpoint: wire.endpoint },
+        initialSnapshot: { version: 1, messages: [USER], cursor: '1', turn },
+      }),
+    );
+    await act(async () => {
+      await result.current.reconnect();
+    });
+    expect(wire.cursors).toEqual(['1']);
+    expect(result.current.history.canonical).toEqual([USER]);
+    expect(result.current.exportSnapshot().turn?.message.content).toBe('Hel');
   });
 
   it('seals the restored turn when nothing can continue it', async () => {

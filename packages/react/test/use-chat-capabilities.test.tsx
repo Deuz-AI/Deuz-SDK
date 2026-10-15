@@ -565,6 +565,60 @@ describe('useChat — features used only when the server announced them', () => 
       expect(result.current.history.canonical).toHaveLength(2);
     });
 
+    it('announced: a drop after the finish frame settles the turn the read already has', async () => {
+      const wire = journal();
+      const errors: string[] = [];
+      // Every frame arrives, then the connection drops before `[DONE]`.
+      const fetchMock: typeof fetch = async () =>
+        announcing(await wire.respondDropping(LEG, LEG.length), 'durable-stream');
+      const { result } = renderHook(() =>
+        useChat({
+          api: '/api/chat',
+          fetch: fetchMock,
+          resume: { endpoint: wire.endpoint },
+          onError: (error) => errors.push(error.message),
+        }),
+      );
+      await act(async () => {
+        await result.current.sendMessage('hi');
+      });
+      await waitFor(() => expect(result.current.status).toBe('idle'));
+      // The continuation is caught up: the endpoint answers `[DONE]` at once.
+      expect(wire.cursors).toEqual(['4']);
+      expect(errors).toEqual([]);
+      expect(result.current.messages.map((m) => [m.id, m.content])).toEqual([
+        [expect.any(String), 'hi'],
+        ['m-1', 'Hello, Paris.'],
+      ]);
+      expect(result.current.history.canonical).toEqual([
+        { role: 'user', content: 'hi' },
+        { role: 'assistant', content: 'Hello, Paris.' },
+      ]);
+      expect(result.current.exportSnapshot().turn).toBeUndefined();
+    });
+
+    it('announced: a drop after an approval leg’s finish still opens the gate', async () => {
+      const wire = journal();
+      const gated = [
+        parts.start('m-1'),
+        parts.toolCall('d1', 'del', { path: '/a' }),
+        parts.approval('ap1', 'd1', 'del', { path: '/a' }),
+        parts.finish(),
+      ];
+      const fetchMock: typeof fetch = async () =>
+        announcing(await wire.respondDropping(gated, gated.length), 'durable-stream');
+      const { result } = renderHook(() =>
+        useChat({ api: '/api/chat', fetch: fetchMock, resume: { endpoint: wire.endpoint } }),
+      );
+      await act(async () => {
+        await result.current.sendMessage('clean up');
+      });
+      await waitFor(() => expect(result.current.status).toBe('idle'));
+      expect(wire.cursors).toEqual(['3']);
+      expect(result.current.pendingApprovals.map((request) => request.approvalId)).toEqual(['ap1']);
+      expect(result.current.history.canonical).toHaveLength(2);
+    });
+
     it('not announced (a 2.3 server): the drop is an error, as in 2.3', async () => {
       const { result, wire, errors } = droppingChat(undefined);
       await act(async () => {
@@ -574,6 +628,27 @@ describe('useChat — features used only when the server announced them', () => 
       expect(wire.cursors).toEqual([]);
       expect(errors).toHaveLength(1);
       expect(result.current.messages.at(-1)?.content).toBe('Hel');
+    });
+
+    it('not announced: reconnect() after a drop past the finish frame settles the turn', async () => {
+      const wire = journal();
+      const fetchMock: typeof fetch = async () => wire.respondDropping(LEG, LEG.length);
+      const { result } = renderHook(() =>
+        useChat({ api: '/api/chat', fetch: fetchMock, resume: { endpoint: wire.endpoint } }),
+      );
+      await act(async () => {
+        await result.current.sendMessage('hi');
+      });
+      await waitFor(() => expect(result.current.status).toBe('error'));
+      await act(async () => {
+        await result.current.reconnect();
+      });
+      expect(wire.cursors).toEqual(['4']);
+      expect(result.current.status).toBe('idle');
+      expect(result.current.history.canonical).toEqual([
+        { role: 'user', content: 'hi' },
+        { role: 'assistant', content: 'Hello, Paris.' },
+      ]);
     });
 
     it('announced but with no resume endpoint: the drop is an error', async () => {

@@ -235,6 +235,13 @@ function opensLeg(part: DeuzUIPart): boolean {
   );
 }
 
+/**
+ * Whether a turn folded a `finish` frame (2.4): only that frame sets the
+ * terminal `usage` and `finishReason`.
+ */
+const hasFinished = (turn: AssistantTurnState): boolean =>
+  turn.usage !== undefined || turn.finishReason !== undefined;
+
 /** How many legs of a replayed turn delivered the call: at least once, as it is in the turn. */
 const deliveries = (ledger: ReplayLedger, key: string): number =>
   Math.max(1, (ledger.legs.get(key) ?? 0) + (ledger.openLeg.has(key) ? 1 : 0));
@@ -2069,7 +2076,14 @@ export function useChat(options: UseChatOptions): UseChatResult {
           cursorTurnRef.current = turn;
           syncTurn(turn);
         }
-        if (folded === 0) {
+        // A continued turn that already folded its `finish` is complete once
+        // the endpoint is caught up (2.4): its read dropped between that frame
+        // and `[DONE]` (a durable read continues here on its own), or a
+        // snapshot was taken there. Nothing follows it, so it settles below as
+        // a read that ends with `[DONE]` settles its turn.
+        const complete =
+          folded === 0 && continuing && hasFinished(turn) && turn.error === undefined;
+        if (folded === 0 && !complete) {
           // Already caught up: nothing arrived, so nothing changed and nothing
           // may be appended to the canonical history (an empty assistant
           // message would poison the next request). Not an error. The turn we
