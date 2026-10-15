@@ -10,6 +10,8 @@ import { pinCompilerScope } from '../internal/memory-scope-claims';
 import { resolveDependencies } from '../internal/resolve-deps';
 import { runExecutionOf, telemetryParentOf } from '../internal/native-context';
 import { DEUZ_ATTR, DEUZ_SPAN, observeSpan, type TelemetryAttributes } from '../internal/telemetry';
+import type { CallAccounting } from '../types/accounting';
+import type { NativeExecutionContext } from '../types/execution';
 import type { Message } from '../types/message';
 import type { CallWarning } from '../types/methods';
 import { compileContext } from './compile';
@@ -296,6 +298,21 @@ export function createContextCompiler(options: CreateContextCompilerOptions): Co
     return ask(sources, query, input, inputTokens, usedTokens);
   }
 
+  /**
+   * One query's accounting on the run's execution context. Its request id
+   * is drawn the first time a source reads it, so a query that charges
+   * nothing costs no `generateId()` draw, and stays the same after that.
+   */
+  function queryAccounting(execution: NativeExecutionContext, sourceId: string): CallAccounting {
+    let requestId: string | undefined;
+    return {
+      execution,
+      get requestId() {
+        return (requestId ??= `${execution.scopeId}/context/${sourceId}/${deps.generateId()}`);
+      },
+    };
+  }
+
   /** Asks `list` for `query`: a required source's failure is thrown, an optional one's recorded. */
   async function ask(
     list: readonly ContextSource[],
@@ -320,10 +337,7 @@ export function createContextCompiler(options: CreateContextCompilerOptions): Co
           ...(input.signal ? { signal: input.signal } : {}),
           ...(execution
             ? {
-                accounting: {
-                  execution,
-                  requestId: `${execution.scopeId}/context/${source.id}/${deps.generateId()}`,
-                },
+                accounting: queryAccounting(execution, source.id),
                 ...(options.onWarning ? { onWarning: options.onWarning } : {}),
               }
             : {}),

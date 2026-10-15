@@ -12,7 +12,10 @@ import { describe, expect, it } from 'vitest';
 import { runAgent, streamAgent } from '../src/agent-run';
 import { createContextCompiler } from '../src/context/compiler';
 import { createRagContextSource } from '../src/context/sources';
+import type { ContextSource, ContextSourceRequest } from '../src/context/types';
+import { createExecutionContext } from '../src/execution-policy';
 import { defineAccountedEmbedder } from '../src/internal/accounting';
+import { withRunExecution } from '../src/internal/native-context';
 import { createMemoryVectorStore, indexChunks, retrieve, type Embedder } from '../src/rag';
 import type { AgentRunOptionsV3 } from '../src/types/agent-run-v3';
 import type { CallWarning } from '../src/types/methods';
@@ -150,6 +153,56 @@ describe('RAG context source accounting in a V3 run', () => {
     for (const entry of embeddings)
       expect(entry).toMatchObject({ state: 'unknown', unaccounted: true });
     expect(warnings.filter((warning) => warning.type === 'unaccounted-usage')).toHaveLength(1);
+  });
+
+  it('draws a request id only for a query that charges a call, one per query', async () => {
+    let draws = 0;
+    const seen: ContextSourceRequest[] = [];
+    const ids: string[] = [];
+    const quiet: ContextSource = {
+      id: 'notes',
+      kind: 'memory',
+      query: async (request) => {
+        seen.push(request);
+        return [];
+      },
+    };
+    const charging: ContextSource = {
+      id: 'docs',
+      kind: 'rag',
+      query: async (request) => {
+        seen.push(request);
+        ids.push(request.accounting!.requestId, request.accounting!.requestId);
+        return [];
+      },
+    };
+    const compiler = createContextCompiler({
+      sources: [quiet, charging],
+      deps: { generateId: () => `id-${++draws}` },
+    });
+    const execution = createExecutionContext({ scopeId: 'run-x' });
+    await compiler.beforeModelCall(
+      withRunExecution(
+        {
+          runId: 'run-x',
+          step: 0,
+          messages: [{ role: 'user', content: 'Deploy the service' }],
+          model: {
+            provider: 'openai',
+            modelId: 'm',
+            contextWindow: 100_000,
+            maxOutputTokens: 1_000,
+          },
+          overheadTokens: 0,
+        },
+        execution,
+      ),
+    );
+    expect(seen).toHaveLength(2);
+    for (const request of seen) expect(request.accounting?.execution).toBe(execution);
+    // The source that never charges draws no id; the one that does keeps its own.
+    expect(draws).toBe(1);
+    expect(ids).toEqual(['run-x/context/docs/id-1', 'run-x/context/docs/id-1']);
   });
 
   it('hands the host retrieve no accounting outside a run, as before', async () => {
