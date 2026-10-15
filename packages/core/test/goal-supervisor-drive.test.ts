@@ -5,7 +5,8 @@
  * application, drain, lease loss, watermark accounting and working memory,
  * on the real in-memory goal runtime store with a scripted launcher.
  */
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+import { createGoalEvent } from '../src/goal';
 import {
   createGoalSupervisor,
   createInMemoryGoalRuntimeStore,
@@ -20,9 +21,10 @@ import { createInMemoryLeaseProvider } from '../src/ops';
 import type { GoalCommand } from '../src/goal';
 import type { LeaseProvider } from '../src/types/lease';
 import type { ObserveEvent } from '../src/types/observe';
-import { fakeRunLauncher, results } from './fixtures/fake-run-launcher';
+import { fakeRunLauncher, results, totals } from './fixtures/fake-run-launcher';
 import type { FakeRunLauncher } from './fixtures/fake-run-launcher';
 import { manualClock } from './fixtures/manual-clock';
+import { createWorkingMemoryFixture } from './fixtures/working-memory';
 
 const T0 = Date.parse('2026-10-15T09:00:00Z');
 const SCOPE = 'tenant-a';
@@ -529,5 +531,272 @@ describe('drain and lease loss', () => {
       claim: { owner: 'sup-b', token: 2 },
     });
     expect((await b.supervisor.get(SCOPE, 'g-1'))?.runtime.runs).toBe(1);
+  });
+});
+
+describe('accounting', () => {
+  it('charges the run ledger above its watermark once, keeping reservations apart', async () => {
+    const w = world();
+    let legs = 0;
+    const launcher = fakeRunLauncher((request) => {
+      legs += 1;
+      return legs === 1
+        ? { runId: request.runId, result: results.suspended(request.runId) }
+        : { runId: request.runId, result: results.completed(request.runId) };
+    });
+    launcher.ledger.set('g-1:run:1', totals({ tokens: 100, usd: 0.5 }, { tokens: 20, usd: 0.1 }));
+    const { supervisor } = supervisorIn(w, { launcher });
+    await supervisor.submit({ goalId: 'g-1', scope: SCOPE, objective: 'x' });
+    await supervisor.tick();
+    expect((await supervisor.get(SCOPE, 'g-1'))?.goal.spent).toEqual({ tokens: 100, usd: 0.5 });
+    expect(await w.store.watermarks.get(SCOPE, 'g-1', 'g-1:run:1')).toMatchObject({
+      tokens: 100,
+      usd: 0.5,
+      reservedTokens: 20,
+      reservedUsd: 0.1,
+      revision: 1,
+    });
+    // The resumed leg settled the reservation: only the difference is charged.
+    launcher.ledger.set('g-1:run:1', totals({ tokens: 130, usd: 0.6 }));
+    await supervisor.resume(SCOPE, 'g-1', {
+      approvalResponses: [{ approvalId: 'ap-1', approved: true }],
+    });
+    await supervisor.tick();
+    const goal = (await supervisor.get(SCOPE, 'g-1'))!.goal;
+    expect(goal.spent.tokens).toBe(130);
+    expect(goal.spent.usd).toBeCloseTo(0.6, 10);
+    expect(goal.charged).toEqual(['ledger:["g-1:run:1",1]', 'ledger:["g-1:run:1",2]']);
+    expect(await w.store.watermarks.get(SCOPE, 'g-1', 'g-1:run:1')).toMatchObject({
+      tokens: 130,
+      reservedTokens: 0,
+      revision: 2,
+    });
+  });
+
+  it('completes a verified goal while its maintenance is pending, then adds a late charge without reopening it', async () => {
+    const w = world();
+    const launcher = fakeRunLauncher((request) => ({
+      runId: request.runId,
+      result: results.completed(request.runId),
+      maintenance: 'pending',
+    }));
+    launcher.ledger.set('g-1:run:1', totals({ tokens: 100, usd: 1 }));
+    launcher.upkeep.set('g-1:run:1', 'pending');
+    const { supervisor } = supervisorIn(w, { launcher, verify: ({ runId }) => passed(runId) });
+    await supervisor.submit({ goalId: 'g-1', scope: SCOPE, objective: 'x' });
+    await supervisor.tick();
+    let after = (await supervisor.get(SCOPE, 'g-1'))!;
+    expect(after.goal).toMatchObject({ status: 'completed', spent: { tokens: 100, usd: 1 } });
+    expect(after.runtime).toMatchObject({
+      phase: 'done',
+      maintenance: { status: 'pending', runId: 'g-1:run:1' },
+    });
+    expect((await w.store.intents.get(SCOPE, 'g-1#1'))?.status).toBe('launched');
+    // The memory extraction charged more afterwards.
+    launcher.ledger.set('g-1:run:1', totals({ tokens: 140, usd: 1.25 }));
+    await supervisor.tick();
+    after = (await supervisor.get(SCOPE, 'g-1'))!;
+    expect(after.goal).toMatchObject({ status: 'completed', spent: { tokens: 140, usd: 1.25 } });
+    expect(after.runtime.maintenance?.status).toBe('pending');
+    launcher.upkeep.set('g-1:run:1', 'complete');
+    await supervisor.tick();
+    after = (await supervisor.get(SCOPE, 'g-1'))!;
+    expect(after.runtime.maintenance).toEqual({ status: 'complete', runId: 'g-1:run:1' });
+    expect((await w.store.intents.get(SCOPE, 'g-1#1'))?.status).toBe('completed');
+    expect(after.goal.status).toBe('completed');
+    expect(launcher.calls).toHaveLength(1);
+    expect(await supervisor.tick()).toEqual({
+      applied: 0,
+      dispatched: 0,
+      cancelled: 0,
+      skipped: 0,
+    });
+  });
+});
+
+describe('working memory', () => {
+  const snapshot = (scope = SCOPE) => createWorkingMemoryFixture({ scope });
+
+  it('hands the last snapshot to the next run of the same scope and spec generation, as it is', async () => {
+    const w = world();
+    const launcher = fakeRunLauncher((request) => ({
+      runId: request.runId,
+      result: results.completed(request.runId),
+      workingMemory: snapshot(),
+    }));
+    const { supervisor } = supervisorIn(w, { launcher });
+    await supervisor.submit({ goalId: 'g-1', scope: SCOPE, objective: 'x' });
+    await supervisor.tick();
+    const kept = (await supervisor.get(SCOPE, 'g-1'))!.runtime.workingMemory;
+    expect(kept).toEqual({ ...snapshot(), goalRef: { goalId: 'g-1', specGeneration: 1 } });
+    await supervisor.tick();
+    expect(launcher.calls[0]?.request.workingMemory).toBeUndefined();
+    const inherited = launcher.calls[1]?.request.workingMemory;
+    expect(inherited).toEqual(kept);
+    expect(inherited?.hypotheses.map((item) => item.status)).toEqual(
+      snapshot().hypotheses.map((item) => item.status),
+    );
+  });
+
+  it('hands nothing over after the spec generation changed, or from another scope', async () => {
+    const w = world();
+    let scope = SCOPE;
+    const launcher = fakeRunLauncher((request) => ({
+      runId: request.runId,
+      result: results.completed(request.runId),
+      workingMemory: snapshot(scope),
+    }));
+    const { supervisor } = supervisorIn(w, { launcher });
+    await supervisor.submit({ goalId: 'g-1', scope: SCOPE, objective: 'x' });
+    await supervisor.tick();
+    await supervisor.command(SCOPE, 'g-1', { type: 'revise', objective: 'y' });
+    await supervisor.tick();
+    expect(launcher.calls[1]?.request.goal.specGeneration).toBe(2);
+    expect(launcher.calls[1]?.request.workingMemory).toBeUndefined();
+    scope = 'tenant-b';
+    await supervisor.tick();
+    await supervisor.tick();
+    expect(launcher.calls[3]?.request.workingMemory).toBeUndefined();
+  });
+});
+
+describe('inbox, dependencies and time', () => {
+  it('settles a due inbox entry and records the run it starts in the same write', async () => {
+    const w = world();
+    const { supervisor, launcher, seen } = supervisorIn(w);
+    await supervisor.submit({ goalId: 'g-1', scope: SCOPE, objective: 'x', start: false });
+    await supervisor.command(SCOPE, 'g-1', {
+      type: 'wait',
+      wait: { reason: 'event', source: { type: 'signal', id: 'ci' } },
+    });
+    const goal = (await supervisor.get(SCOPE, 'g-1'))!.goal;
+    const apply = vi.spyOn(w.store.inbox, 'apply');
+    const early = createGoalEvent({
+      scope: SCOPE,
+      goalId: 'g-1',
+      source: { type: 'signal', id: 'ci' },
+      key: 'later',
+      at: T0,
+      notBefore: T0 + 60_000,
+    });
+    await supervisor.dispatch(early);
+    const { entry } = await supervisor.dispatch(
+      createGoalEvent({
+        scope: SCOPE,
+        goalId: 'g-1',
+        source: { type: 'signal', id: 'ci' },
+        key: 'build-1',
+        at: T0,
+        correlationId: goal.waiting!.id,
+      }),
+    );
+    expect(await supervisor.tick()).toMatchObject({ applied: 1, dispatched: 1 });
+    expect(apply).toHaveBeenCalledTimes(1);
+    const settled = await w.store.inbox.get(SCOPE, entry.id);
+    expect(settled).toMatchObject({ disposition: 'applied' });
+    expect(settled?.intentId).toBeDefined();
+    expect(await w.store.intents.get(SCOPE, settled!.intentId!)).toMatchObject({
+      kind: 'start',
+      cause: { inboxEntryId: entry.id },
+      status: 'completed',
+    });
+    expect(launcher.calls[0]?.request.goal.runId).toBe('g-1:run:1');
+    expect(seen).toContainEqual({
+      type: 'inbox-applied',
+      scope: SCOPE,
+      goalId: 'g-1',
+      entryId: entry.id,
+      disposition: 'applied',
+    });
+    // The early event stays pending, as it was queued.
+    expect((await w.store.inbox.list({ scope: SCOPE, goalId: 'g-1' })).entries).toMatchObject([
+      { deliveryId: 'later', disposition: 'pending' },
+    ]);
+  });
+
+  it('records why an event did not apply', async () => {
+    const w = world();
+    const { supervisor } = supervisorIn(w);
+    await supervisor.submit({ goalId: 'g-1', scope: SCOPE, objective: 'x', start: false });
+    await supervisor.command(SCOPE, 'g-1', { type: 'wait', wait: { reason: 'user' } });
+    const { entry } = await supervisor.dispatch(
+      createGoalEvent({
+        scope: SCOPE,
+        goalId: 'g-1',
+        source: { type: 'schedule' },
+        key: 'tick-1',
+        at: T0,
+      }),
+    );
+    expect(await supervisor.tick()).toMatchObject({ applied: 1, dispatched: 0 });
+    expect((await w.store.inbox.get(SCOPE, entry.id))?.disposition).toBe('unmatched');
+  });
+
+  it('reconciles a dependency wait with dependencies that already finished', async () => {
+    const w = world();
+    const { supervisor, launcher } = supervisorIn(w);
+    await supervisor.submit({ goalId: 'dep', scope: SCOPE, objective: 'x', start: false });
+    await supervisor.command(SCOPE, 'dep', { type: 'fail', reason: 'done elsewhere' });
+    await supervisor.submit({ goalId: 'g-1', scope: SCOPE, objective: 'y', start: false });
+    await supervisor.command(SCOPE, 'g-1', {
+      type: 'wait',
+      wait: { reason: 'dependency', on: [{ kind: 'goal', id: 'dep' }] },
+    });
+    expect(await supervisor.tick()).toMatchObject({ applied: 1, dispatched: 1 });
+    expect((await supervisor.get(SCOPE, 'g-1'))?.goal.status).toBe('active');
+    expect(launcher.calls[0]?.request.goalId).toBe('g-1');
+  });
+
+  it('wakes a goal at its wakeup and fails one at its deadline', async () => {
+    const w = world();
+    const { supervisor, launcher } = supervisorIn(w);
+    await supervisor.submit({ goalId: 'g-1', scope: SCOPE, objective: 'x', start: false });
+    await supervisor.command(SCOPE, 'g-1', {
+      type: 'wait',
+      wait: { reason: 'wakeup', at: T0 + 5_000 },
+    });
+    await supervisor.submit({
+      goalId: 'g-2',
+      scope: SCOPE,
+      objective: 'y',
+      start: false,
+      deadline: T0 + 5_000,
+    });
+    await supervisor.command(SCOPE, 'g-2', { type: 'wait', wait: { reason: 'user' } });
+    await supervisor.tick();
+    expect(launcher.calls).toEqual([]);
+    await w.time.advance(5_000);
+    await supervisor.tick();
+    expect(launcher.calls.map((call) => call.request.goalId)).toEqual(['g-1']);
+    expect(await supervisor.get(SCOPE, 'g-2')).toMatchObject({
+      goal: { status: 'failed', outcome: { reason: 'deadline' } },
+      runtime: { phase: 'done' },
+    });
+  });
+
+  it('only drives the scopes it was given', async () => {
+    const w = world();
+    const { supervisor, launcher } = supervisorIn(w, { scopes: ['tenant-b'] });
+    await supervisor.submit({ goalId: 'g-1', scope: SCOPE, objective: 'x' });
+    await supervisor.submit({ goalId: 'g-2', scope: 'tenant-b', objective: 'y' });
+    await supervisor.tick();
+    expect(launcher.calls.map((call) => call.request.goalId)).toEqual(['g-2']);
+  });
+});
+
+describe('start', () => {
+  it('ticks every pollMs on the injected clock until stopped', async () => {
+    const w = world();
+    const { supervisor, launcher } = supervisorIn(w, { policy: { maxRuns: 3 } });
+    await supervisor.submit({ goalId: 'g-1', scope: SCOPE, objective: 'x' });
+    const loop = supervisor.start();
+    expect(() => supervisor.start()).toThrow();
+    await w.time.advance(0);
+    expect(launcher.calls).toHaveLength(1);
+    await w.time.advance(1_000);
+    expect(launcher.calls).toHaveLength(2);
+    await loop.stop();
+    await w.time.advance(5_000);
+    expect(launcher.calls).toHaveLength(2);
   });
 });
