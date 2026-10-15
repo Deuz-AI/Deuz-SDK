@@ -11,6 +11,7 @@ import { createInMemoryAgentRunStoreV3 } from '../src/agent-run-v3-store';
 import type { AgentResult, AgentRunReconciliation, AgentStream } from '../src/types/agent-run';
 import type { AgentEventV3, AgentStreamV3 } from '../src/types/agent-run-v3';
 import type { LanguageModel } from '../src/types/model';
+import { toDeuzAgentStreamResponse } from '../src/ui';
 import type { StandardSchemaV1 } from '../src/types/schema';
 
 declare const model: LanguageModel;
@@ -60,4 +61,9 @@ test('a V3 run needs a V3 store, and the V3 options need a V3 run', () => {
   void runAgent({ model, prompt: 'x', context: { sources: [] } });
   // @ts-expect-error a V3 run requires its session
   void runAgent({ model, prompt: 'x', checkpointVersion: 3 });
+});
+
+test('the native UI bridge takes a V3 stream', () => {
+  const stream = streamAgent({ model, prompt: 'x', checkpointVersion: 3, session: v3 });
+  expectTypeOf(toDeuzAgentStreamResponse(stream, { runId: 'r' })).toEqualTypeOf<Response>();
 });
