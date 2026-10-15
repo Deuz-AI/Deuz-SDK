@@ -277,9 +277,12 @@ a time, fenced by its lease token (key `stream:<streamId>`). Instead of
 degrading, a durable response fails closed: when another producer holds or took
 the stream, the log moved past it, the lease was lost or the store threw, it
 sends one `error` frame without an event id and without `[DONE]`. A refused
-response never reads its source, so the run behind it never starts: a refused
-`resumeDeuzChatResponse` continuation leg makes no model call, runs no tool
-and saves no checkpoint.
+response never reads a lazy source, so the run behind it never starts: a
+`streamChat` result behind `toDeuzStreamResponse` or `createDeuzStream`, or a
+refused `resumeDeuzChatResponse` continuation leg, makes no model call, runs
+no tool and saves no checkpoint. An agent stream is not lazy: it starts as soon
+as it is passed to `toDeuzAgentStreamResponse`, so for native runs the run's
+own lease, not the stream lease, keeps a second executor out.
 
 **`capabilities: { request, announce? }`** answers a client that lists what it
 understands in an `x-deuz-capabilities` request header (a 2.4 `useChat` does).
