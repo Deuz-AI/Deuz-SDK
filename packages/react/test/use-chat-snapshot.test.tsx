@@ -10,7 +10,7 @@ import { act, renderHook, waitFor } from '@testing-library/react';
 import type { Message } from '@deuz-sdk/core';
 import { useChat } from '../src/use-chat';
 import type { ChatSnapshotV1 } from '../src/index';
-import { parts, postResponse, recordingFetch } from './wire';
+import { journal, parts, postResponse, recordingFetch, stallingResponse } from './wire';
 
 const SAME_TWICE: Message[] = [
   { role: 'user', content: 'same' },
@@ -212,5 +212,178 @@ describe('useChat({ initialSnapshot }) — the history', () => {
     } finally {
       error.mockRestore();
     }
+  });
+});
+
+/** A leg the server journals whole; the POST read may see only its first frames. */
+const PARIS_LEG = [
+  parts.start('m-1'),
+  parts.text('Hel'),
+  parts.text('lo, '),
+  parts.text('Paris.'),
+  parts.finish(),
+];
+
+const USER: Message = { role: 'user', content: 'hi' };
+
+/** A chat whose POST read dropped after `delivered` frames of `PARIS_LEG`; returns its snapshot. */
+async function droppedChat(delivered: number) {
+  const wire = journal();
+  const fetchMock: typeof fetch = async () => wire.respondDropping(PARIS_LEG, delivered);
+  const { result } = renderHook(() =>
+    useChat({ api: '/api/chat', fetch: fetchMock, resume: { endpoint: wire.endpoint } }),
+  );
+  await act(async () => {
+    await result.current.sendMessage('hi');
+  });
+  await waitFor(() => expect(result.current.status).toBe('error'));
+  return { wire, snapshot: result.current.exportSnapshot(), live: result };
+}
+
+describe('useChat({ initialSnapshot }) — the turn in progress and the cursor', () => {
+  it('captures the unsettled turn and the cursor of the last frame read', async () => {
+    const { snapshot, live } = await droppedChat(2);
+    expect(snapshot.messages).toEqual([USER]);
+    expect(snapshot.cursor).toBe('1');
+    expect(snapshot.turn?.message).toEqual(live.current.messages.at(-1));
+    expect(snapshot.turn?.message).toMatchObject({ id: 'm-1', role: 'assistant', content: 'Hel' });
+  });
+
+  it('restores the partial bubble and continues it from the cursor, every frame once', async () => {
+    const { wire, snapshot } = await droppedChat(2);
+    const { result } = renderHook(() =>
+      useChat({
+        api: '/api/chat',
+        fetch: noFetch,
+        resume: { endpoint: wire.endpoint },
+        initialSnapshot: JSON.parse(JSON.stringify(snapshot)) as ChatSnapshotV1,
+      }),
+    );
+    expect(result.current.messages.map((m) => [m.id, m.content])).toEqual([
+      [snapshot.messageIds![0], 'hi'],
+      ['m-1', 'Hel'],
+    ]);
+    expect(result.current.status).toBe('idle');
+
+    await act(async () => {
+      await result.current.reconnect();
+    });
+    await waitFor(() => expect(result.current.status).toBe('idle'));
+    expect(wire.cursors).toEqual(['1']);
+    expect(result.current.messages.map((m) => [m.id, m.content])).toEqual([
+      [snapshot.messageIds![0], 'hi'],
+      ['m-1', 'Hello, Paris.'],
+    ]);
+    expect(result.current.history.canonical).toEqual([
+      USER,
+      { role: 'assistant', content: 'Hello, Paris.' },
+    ]);
+    const settled = result.current.exportSnapshot();
+    expect(settled.turn).toBeUndefined();
+    expect(settled.messageIds).toEqual([snapshot.messageIds![0], 'm-1']);
+    expect(settled.cursor).toBe('4');
+  });
+
+  it('continues with resume.auto on mount', async () => {
+    const { wire, snapshot } = await droppedChat(3);
+    const { result } = renderHook(() =>
+      useChat({
+        api: '/api/chat',
+        fetch: noFetch,
+        resume: { endpoint: wire.endpoint, auto: true },
+        initialSnapshot: snapshot,
+      }),
+    );
+    await waitFor(() => expect(result.current.messages.at(-1)?.content).toBe('Hello, Paris.'));
+    expect(wire.cursors).toEqual(['2']);
+    expect(result.current.messages).toHaveLength(2);
+  });
+
+  it('seals the restored turn when nothing can continue it', async () => {
+    const { snapshot } = await droppedChat(2);
+    expect(snapshot.turn?.message.parts?.at(-1)).toMatchObject({
+      type: 'text',
+      state: 'streaming',
+    });
+    const { result } = renderHook(() =>
+      useChat({ api: '/api/chat', fetch: noFetch, initialSnapshot: snapshot }),
+    );
+    expect(result.current.messages.at(-1)?.parts?.at(-1)).toMatchObject({
+      type: 'text',
+      state: 'done',
+    });
+  });
+
+  it('rebuilds a restored turn that was read without event ids from the start of its stream', async () => {
+    const wire = journal();
+    await wire.leg(PARIS_LEG);
+    // The POST route does not journal: its frames carry no ids, so no cursor.
+    const fetchMock: typeof fetch = async (_url, init) =>
+      stallingResponse(
+        PARIS_LEG.slice(0, 2).map((part) => ({ data: JSON.stringify(part) })),
+        init?.signal,
+      );
+    const live = renderHook(() =>
+      useChat({ api: '/api/chat', fetch: fetchMock, resume: { endpoint: wire.endpoint } }),
+    );
+    let sending!: Promise<void>;
+    act(() => {
+      sending = live.result.current.sendMessage('hi');
+    });
+    await waitFor(() => expect(live.result.current.messages.at(-1)?.content).toBe('Hel'));
+    await act(async () => {
+      live.result.current.stop();
+      await sending;
+    });
+    const snapshot = live.result.current.exportSnapshot();
+    expect(snapshot.cursor).toBeUndefined();
+    expect(snapshot.turn?.message.content).toBe('Hel');
+
+    const { result } = renderHook(() =>
+      useChat({
+        api: '/api/chat',
+        fetch: noFetch,
+        resume: { endpoint: wire.endpoint },
+        initialSnapshot: snapshot,
+      }),
+    );
+    await act(async () => {
+      await result.current.reconnect();
+    });
+    expect(wire.cursors).toEqual([undefined]);
+    expect(result.current.messages.map((m) => [m.id, m.content])).toEqual([
+      [snapshot.messageIds![0], 'hi'],
+      ['m-1', 'Hello, Paris.'],
+    ]);
+  });
+
+  it('resumes a settled chat after its cursor, adding nothing it already holds', async () => {
+    const wire = journal();
+    const fetchMock: typeof fetch = async () => wire.respond(PARIS_LEG);
+    const live = renderHook(() =>
+      useChat({ api: '/api/chat', fetch: fetchMock, resume: { endpoint: wire.endpoint } }),
+    );
+    await act(async () => {
+      await live.result.current.sendMessage('hi');
+    });
+    await waitFor(() => expect(live.result.current.status).toBe('idle'));
+    const snapshot = live.result.current.exportSnapshot();
+    expect(snapshot).toMatchObject({ cursor: '4', messageIds: [expect.any(String), 'm-1'] });
+    expect(snapshot.turn).toBeUndefined();
+
+    const { result } = renderHook(() =>
+      useChat({
+        api: '/api/chat',
+        fetch: noFetch,
+        resume: { endpoint: wire.endpoint },
+        initialSnapshot: snapshot,
+      }),
+    );
+    await act(async () => {
+      await result.current.reconnect();
+    });
+    expect(wire.cursors).toEqual(['4']);
+    expect(result.current.messages.map((m) => m.content)).toEqual(['hi', 'Hello, Paris.']);
+    expect(result.current.history.canonical).toHaveLength(2);
   });
 });

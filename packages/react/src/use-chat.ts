@@ -827,10 +827,20 @@ export function useChat(options: UseChatOptions): UseChatResult {
     assertChatSnapshot(initial);
     return initial;
   });
+  /**
+   * Its turn in progress (2.4): the last bubble, continued by the next resume
+   * read. Sealed when there is no resume endpoint to continue it.
+   */
+  const [restoredTurn] = useState<AssistantTurnState | undefined>(() =>
+    restored?.turn && !options.resume ? sealAssistantTurn(restored.turn) : restored?.turn,
+  );
   const [snapshot, setSnapshot] = useState<ChatSnapshot>(() => ({
     history: restored
       ? {
-          ui: restoreUI(restored.messages, restored.messageIds, genId),
+          ui: [
+            ...restoreUI(restored.messages, restored.messageIds, genId),
+            ...(restoredTurn ? [restoredTurn.message] : []),
+          ],
           canonical: [...restored.messages],
         }
       : {
@@ -873,7 +883,7 @@ export function useChat(options: UseChatOptions): UseChatResult {
   /** Authoritative snapshot: replaced (never mutated) by `commit`, published to React by `publish`. */
   const snapshotRef = useRef<ChatSnapshot>(snapshot);
   /** The in-flight turn — kept across a drop so `reconnect()` can continue it. */
-  const turnRef = useRef<AssistantTurnState | undefined>(undefined);
+  const turnRef = useRef<AssistantTurnState | undefined>(restoredTurn);
   /** The turn PARKED on client tool results, so `addToolResult` folds into the same one. */
   const parkedTurnRef = useRef<AssistantTurnState | undefined>(undefined);
   const clientToolsRef = useRef<UIToolCall[]>([]);
@@ -920,7 +930,10 @@ export function useChat(options: UseChatOptions): UseChatResult {
    */
   const executingRef = useRef<Set<string>>(new Set());
   const abortRef = useRef<AbortController | null>(null);
-  const lastEventIdRef = useRef<string | undefined>(options.resume?.lastEventId);
+  /** A restored snapshot's cursor (2.4) beats `resume.lastEventId`: it is the newer of the two. */
+  const lastEventIdRef = useRef<string | undefined>(
+    restored?.cursor ?? options.resume?.lastEventId,
+  );
   /**
    * The turn `lastEventIdRef` is a cursor INTO (2.3). A reconnect may fold
    * into the in-flight turn only when that turn is the one the cursor
@@ -930,16 +943,22 @@ export function useChat(options: UseChatOptions): UseChatResult {
    * or a core before 2.3) is rebuilt from the cursor instead; folding the
    * replay into it would apply its already-received parts twice.
    */
-  const cursorTurnRef = useRef<AssistantTurnState | undefined>(undefined);
+  const cursorTurnRef = useRef<AssistantTurnState | undefined>(
+    // A restored turn (2.4) was read up to the snapshot's cursor.
+    restored?.cursor !== undefined ? restoredTurn : undefined,
+  );
   /** What the reads of `cursorTurnRef`'s turn saw in arrival order (see `ReplayLedger`). */
-  const cursorLedgerRef = useRef<ReplayLedger>(newLedger());
+  const cursorLedgerRef = useRef<ReplayLedger>(newLedger(restored?.cursor));
   /**
    * The canonical history as it stood when the last replayed turn settled
    * (2.3). Its read ended on the cursor, so a read that resumes after the
    * cursor cannot deliver any of these messages' calls again, and their
    * answers are no evidence about the calls it does deliver.
    */
-  const behindCursorRef = useRef<readonly Message[]>([]);
+  const behindCursorRef = useRef<readonly Message[]>(
+    // A restored history (2.4) was read up to the snapshot's cursor.
+    restored?.cursor !== undefined ? snapshot.history.canonical : [],
+  );
   /**
    * Id of the turn's message AS IT SITS in `ui`. The wire's `start` part
    * RENAMES the message (`applyUIPart`), so the id is not stable across a turn
@@ -948,7 +967,7 @@ export function useChat(options: UseChatOptions): UseChatResult {
    * mid-stream: 1.8 spliced the LAST element blindly, so replacing the
    * transcript under a live stream clobbered whatever the app had put there.
    */
-  const placedIdRef = useRef<string | undefined>(undefined);
+  const placedIdRef = useRef<string | undefined>(restoredTurn?.message.id);
 
   // --- Commit plumbing: one React update per fold, optionally coalesced ---
 
@@ -1835,7 +1854,15 @@ export function useChat(options: UseChatOptions): UseChatResult {
 
   const exportSnapshot = useCallback((): ChatSnapshotV1 => {
     const canonical = snapshotRef.current.history.canonical;
-    return { version: 1, messages: [...canonical], messageIds: idsFor(canonical) };
+    const cursor = lastEventIdRef.current;
+    const turn = turnRef.current;
+    return {
+      version: 1,
+      messages: [...canonical],
+      messageIds: idsFor(canonical),
+      ...(cursor !== undefined ? { cursor } : {}),
+      ...(turn ? { turn } : {}),
+    };
   }, [idsFor]);
 
   return {
