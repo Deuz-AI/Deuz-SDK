@@ -241,22 +241,54 @@ async function attempt(run) {
   }
 }
 
+/** The first call of each store, which opens (or migrates) its schema. */
+const FIRST_CALLS = {
+  pack: (stores) => stores.pack.chats.listChats(USER),
+  ops: (stores) => stores.ops.agentRuns.list(),
+  budget: (stores) => stores.budget.usage(input.budget.key),
+  swarm: (stores) => stores.swarm.load({ scope: TENANT, runId: 'open-probe' }),
+  evolve: (stores) => stores.evolve?.loadRun({ scope: TENANT, runId: 'open-probe' }),
+};
+
+/**
+ * The negative control: a database whose 2.3 schema versions are one ahead,
+ * as a 2.4 that moved them would leave it. Each store's first call, alone:
+ * null when it opened, else the error it refused with.
+ */
+async function probe(backend) {
+  const steps = {};
+  const stores = openLegacy(backend);
+  try {
+    await step(steps, 'probe', async () => {
+      const out = {};
+      for (const [name, first] of Object.entries(FIRST_CALLS)) {
+        if (name === 'evolve' && !stores.evolve) continue;
+        try {
+          await first(stores);
+          out[name] = null;
+        } catch (error) {
+          out[name] = describeError(error);
+        }
+      }
+      return out;
+    });
+  } finally {
+    await step(steps, 'close', () => stores.close());
+  }
+  return steps;
+}
+
 async function smoke(backend) {
   const steps = {};
-  const stores = await step(steps, 'open', async () => {
-    const opened = openLegacy(backend);
-    // The first call of each store opens (or migrates) its schema.
-    await opened.pack.chats.listChats(USER);
-    await opened.ops.agentRuns.list();
-    await opened.budget.usage(input.budget.key);
-    await opened.swarm.load({ scope: TENANT, runId: 'open-probe' });
-    await opened.evolve?.loadRun({ scope: TENANT, runId: 'open-probe' });
-    return opened;
-  });
-  if (!stores) return steps;
+  const stores = openLegacy(backend);
   const ids24 = input.ids24;
   const ids23 = input.ids23;
   try {
+    const opened = await step(steps, 'open', async () => {
+      for (const first of Object.values(FIRST_CALLS)) await first(stores);
+      return true;
+    });
+    if (!opened) return steps;
     // What 2.4 wrote into the 2.3 stores, before 2.3 changes anything.
     await step(steps, 'read24', () => readLegacy(stores, ids24));
     await step(steps, 'write23', () => writeLegacy(stores, ids23, input.records23));
@@ -385,6 +417,9 @@ async function smoke(backend) {
   return steps;
 }
 
-const report = { package: loadedPackage(), backends: {} };
+const report = { package: loadedPackage(), backends: {}, controls: {} };
 for (const backend of input.backends) report.backends[backend.kind] = await smoke(backend);
+for (const backend of input.controls) report.controls[backend.kind] = await probe(backend);
 writeFileSync(outputPath, `${JSON.stringify(report, null, 2)}\n`);
+// Every store was closed above: nothing may keep a failed run waiting for the spec's timeout.
+process.exit(0);

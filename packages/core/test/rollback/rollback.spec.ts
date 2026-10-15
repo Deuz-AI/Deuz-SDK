@@ -27,7 +27,7 @@
 import { spawnSync } from 'node:child_process';
 import { copyFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, relative, resolve } from 'node:path';
+import { isAbsolute, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import pg from 'pg';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -142,9 +142,13 @@ interface StepValues {
 /** One step of the 2.3 worker: its value, or the error it threw. */
 type Step<T = unknown> = { ok: true; value: T } | { ok: false; error: ErrorReport };
 
+/** Each 2.3 store's first call on a database whose 2.3 versions are one ahead: null, or its refusal. */
+type Probe = Partial<Record<'pack' | 'ops' | 'budget' | 'swarm' | 'evolve', ErrorReport | null>>;
+
 interface Report {
   package: { version: string; resolved: Record<string, string> };
   backends: Partial<Record<Backend['kind'], Partial<Record<keyof StepValues, Step>>>>;
+  controls: Partial<Record<Backend['kind'], { probe?: Step<Probe>; close?: Step }>>;
 }
 
 interface BackendRun {
@@ -153,7 +157,7 @@ interface BackendRun {
   /** The 2.4 view of 2.4's legacy records before 2.3 ran. */
   legacyBefore: unknown;
   /** Every 2.4 record before 2.3 ran. */
-  modernBefore: unknown;
+  modernBefore: Awaited<ReturnType<typeof readModern>>;
   /** The current code's stores, opened again after 2.3 ran. */
   after?: CurrentStores;
 }
@@ -163,7 +167,10 @@ let work: string;
 let pool: pg.Pool | undefined;
 let report: Report;
 const runs = new Map<Backend['kind'], BackendRun>();
+/** The negative controls: databases whose 2.3 schema versions are one ahead. */
+const controls = new Map<Backend['kind'], Backend>();
 const schema = `deuz_r1_rollback_${NOW.toString(36)}`;
+const controlSchema = `${schema}_control`;
 
 /** The current code writes everything into one backend and closes its stores. */
 async function prepare(backend: Backend): Promise<BackendRun> {
@@ -183,7 +190,43 @@ async function prepare(backend: Backend): Promise<BackendRun> {
   }
 }
 
-/** Runs the 2.3 worker on every prepared backend. */
+/**
+ * The negative control: the 2.3 stores' schemas, created by the current code,
+ * with every 2.3 version moved one ahead, as a 2.4 that raised them would leave
+ * them. 2.3 must refuse to open them, or this test could not see such a change.
+ */
+async function prepareControl(backend: Backend): Promise<Backend> {
+  const stores = openCurrent(backend);
+  try {
+    await stores.pack.chats.listChats(USER);
+    await stores.ops.agentRuns.list();
+    await stores.budget.usage(BUDGET_KEY);
+    await stores.swarm.load({ scope: TENANT, runId: 'probe' });
+    await stores.evolve?.loadRun({ scope: TENANT, runId: 'probe' });
+  } finally {
+    await stores.close();
+  }
+  if (backend.kind === 'sqlite') {
+    const db = await openSqlite(backend.path);
+    try {
+      for (const table of Object.keys(SQLITE_23_VERSIONS))
+        db.exec(`UPDATE ${table} SET version = version + 1 WHERE singleton = 1`);
+      db.exec('PRAGMA user_version = 2');
+    } finally {
+      db.close();
+    }
+  } else {
+    const at = backend.schema;
+    await backend.pool.query(`UPDATE ${at}.deuz_meta SET value = '2' WHERE key = 'schema_version'`);
+    for (const table of Object.keys(POSTGRES_23_VERSIONS))
+      await backend.pool.query(
+        `UPDATE ${at}.${table} SET version = version + 1 WHERE singleton = 1`,
+      );
+  }
+  return backend;
+}
+
+/** Runs the 2.3 worker on every prepared backend and control. */
 async function runLegacySmoke(): Promise<Report> {
   // In the scratch install, so `@deuz-sdk/core` resolves to 2.3.0, never to the workspace.
   const script = join(install.dir, 'legacy-smoke.mjs');
@@ -220,6 +263,11 @@ async function runLegacySmoke(): Promise<Report> {
       records23: legacyRecords('23', NOW),
       v3RunIds: V3_RUN_IDS,
       backends,
+      controls: [...controls.values()].map((backend) =>
+        backend.kind === 'sqlite'
+          ? { kind: 'sqlite', path: backend.path }
+          : { kind: 'postgres', url: liveUrl, schema: backend.schema },
+      ),
     }),
   );
   const env = { ...process.env };
@@ -240,10 +288,16 @@ beforeAll(async () => {
   install = installLegacyCore();
   work = mkdtempSync(join(tmpdir(), 'deuz-rollback-run-'));
   runs.set('sqlite', await prepare({ kind: 'sqlite', path: join(work, 'rollback.db') }));
+  controls.set('sqlite', await prepareControl({ kind: 'sqlite', path: join(work, 'control.db') }));
   if (liveUrl) {
     pool = new pg.Pool({ connectionString: liveUrl, max: 8 });
     await pool.query(`CREATE SCHEMA ${schema}`);
+    await pool.query(`CREATE SCHEMA ${controlSchema}`);
     runs.set('postgres', await prepare({ kind: 'postgres', pool, schema }));
+    controls.set(
+      'postgres',
+      await prepareControl({ kind: 'postgres', pool, schema: controlSchema }),
+    );
   }
   report = await runLegacySmoke();
   for (const run of runs.values()) run.after = openCurrent(run.backend);
@@ -252,7 +306,8 @@ beforeAll(async () => {
 afterAll(async () => {
   try {
     for (const run of runs.values()) await run.after?.close();
-    if (pool) await pool.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
+    for (const name of [schema, controlSchema])
+      if (pool) await pool.query(`DROP SCHEMA IF EXISTS ${name} CASCADE`);
   } finally {
     await pool?.end();
     if (work) rmSync(work, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
@@ -262,19 +317,33 @@ afterAll(async () => {
 describe(`the 2.3 worker is ${LEGACY_CORE.name}@${LEGACY_CORE.version} from npm`, () => {
   it('loads the published package from the scratch install, never the workspace', () => {
     expect(report.package.version).toBe(LEGACY_CORE.version);
+    const inside = (dir: string, file: string) => {
+      const path = relative(dir, file);
+      return path !== '' && !path.startsWith('..') && !isAbsolute(path);
+    };
     for (const [specifier, file] of Object.entries(report.package.resolved)) {
-      expect(relative(install.dir, file).startsWith('..'), `${specifier}: ${file}`).toBe(false);
-      expect(relative(REPO, file).startsWith('..'), `${specifier}: ${file}`).toBe(true);
+      expect(inside(install.dir, file), `${specifier}: ${file}`).toBe(true);
+      expect(inside(REPO, file), `${specifier}: ${file}`).toBe(false);
     }
   });
 });
 
-const SQLITE_VERSIONS = {
-  // The 2.3 version tables, at their 2.3.0 values (test/compat/schema-pins.test.ts).
+/** The 2.3 version tables, at their 2.3.0 values (test/compat/schema-pins.test.ts). */
+const SQLITE_23_VERSIONS = {
   deuz_ops_schema: 1,
   deuz_budget_schema: 1,
   deuz_swarm_schema: 2,
   deuz_evolve_schema: 1,
+};
+
+const POSTGRES_23_VERSIONS = {
+  deuz_ops_schema: 1,
+  deuz_budget_schema: 1,
+  deuz_swarm_pg_schema: 1,
+};
+
+const SQLITE_VERSIONS = {
+  ...SQLITE_23_VERSIONS,
   // The 2.4 stores' own version tables.
   deuz_vmem_schema: 1,
   deuz_runs_v3_schema: 1,
@@ -285,9 +354,7 @@ const SQLITE_VERSIONS = {
 };
 
 const POSTGRES_VERSIONS = {
-  deuz_ops_schema: 1,
-  deuz_budget_schema: 1,
-  deuz_swarm_pg_schema: 1,
+  ...POSTGRES_23_VERSIONS,
   deuz_vmem_schema: 1,
   deuz_runs_v3_schema: 1,
   deuz_goal_runtime_schema: 1,
@@ -295,12 +362,16 @@ const POSTGRES_VERSIONS = {
   deuz_stream_state_schema: 1,
 };
 
+async function openSqlite(path: string): Promise<SqliteDatabaseLike> {
+  const { DatabaseSync } = (await import('node:sqlite' as string)) as {
+    DatabaseSync: new (path: string) => SqliteDatabaseLike;
+  };
+  return new DatabaseSync(path);
+}
+
 async function schemaVersions(backend: Backend): Promise<Record<string, unknown>> {
   if (backend.kind === 'sqlite') {
-    const { DatabaseSync } = (await import('node:sqlite' as string)) as {
-      DatabaseSync: new (path: string) => SqliteDatabaseLike;
-    };
-    const db = new DatabaseSync(backend.path);
+    const db = await openSqlite(backend.path);
     try {
       const tables = (
         db
@@ -368,6 +439,78 @@ for (const kind of ['sqlite', 'postgres'] as const) {
         throw new Error(`2.3 step ${name} failed: ${result.error.name}: ${result.error.message}`);
       return result.value as StepValues[K];
     };
+
+    it('the current code wrote every kind of 2.4 record beside the 2.3 tables', () => {
+      const modern = run().modernBefore;
+      expect(modern.v3.runs).toMatchObject([
+        { runId: MODERN.v3Suspended, version: 3, result: { status: 'suspended' } },
+        { runId: MODERN.v3Done, version: 3, phase: 'terminal', result: { status: 'completed' } },
+      ]);
+      expect(modern.v3.list.map((summary) => summary.runId).sort()).toEqual([...V3_RUN_IDS].sort());
+      // Content-addressed packages; the forget redacted the ones holding the forgotten record.
+      const blobs = modern.v3.blobs.map(({ blob }) => blob.status);
+      expect(blobs).toContain('found');
+      expect(blobs).toContain('redacted');
+      expect(modern.memory.history.map((revisions) => revisions.length)).toEqual([2, 1]);
+      expect(modern.memory.forgotten).toBeNull();
+      expect(modern.memory.receipts).toEqual([
+        expect.any(Object),
+        expect.any(Object),
+        expect.any(Object),
+        expect.any(Object),
+      ]);
+      expect(modern.goals).toMatchObject({
+        goal: { goalId: MODERN.goal },
+        charged: { goalId: MODERN.chargedGoal },
+        state: { goalId: MODERN.goal },
+        schedule: { scheduleId: MODERN.schedule },
+        intent: { intentId: MODERN.intent },
+        watermark: { runId: MODERN.watermarkRun, tokens: 100 },
+      });
+      // The webhook delivery and the schedule's occurrence.
+      expect(modern.goals.inbox.entries).toHaveLength(2);
+      expect(modern.goals.occurrences?.occurrences).toHaveLength(1);
+      expect(modern.chat).toMatchObject({
+        live: { status: 'found' },
+        projected: { status: 'found' },
+        tombstoned: { status: 'deleted' },
+      });
+      expect(modern.chat.search.length).toBeGreaterThan(0);
+      expect(modern.streams.lastSeq).toEqual([2, 0]);
+      if (kind === 'sqlite')
+        expect(modern.processOps?.record).toMatchObject({
+          operationId: MODERN.processOperation,
+          state: 'recorded',
+        });
+    });
+
+    it('2.3 refuses a schema version it does not know, so this test would see a moved one', () => {
+      const control = report.controls[kind];
+      expect(control?.close?.ok).toBe(true);
+      const probe = control?.probe;
+      if (!probe?.ok) throw new Error(`the control probe failed: ${JSON.stringify(probe)}`);
+      // The SQLite stores throw; the Postgres ones also refuse in the database (RAISE, P0001).
+      const refused = (message: RegExp) =>
+        expect.objectContaining({ message: expect.stringMatching(message) });
+      expect(probe.value).toEqual(
+        kind === 'sqlite'
+          ? {
+              // PRAGMA user_version is no gate: the 2.3 pack skips its migration at a newer
+              // value and opens. test/compat/schema-pins.test.ts pins it all the same.
+              pack: null,
+              ops: refused(/^Unsupported SQLite ops schema version/),
+              budget: refused(/^Unsupported SQLite budget schema version/),
+              swarm: refused(/^Unsupported SQLite swarm schema version/),
+              evolve: refused(/^Unsupported SQLite evolve schema version/),
+            }
+          : {
+              pack: refused(/reports deuz schema_version 2, newer than the 1 /),
+              ops: refused(/^Unsupported Postgres ops schema version 2/),
+              budget: refused(/^Unsupported Postgres budget schema version 2/),
+              swarm: refused(/^Unsupported Postgres swarm schema version 2/),
+            },
+      );
+    });
 
     it('2.3 opens every one of its stores there, and closes them', () => {
       value('open');

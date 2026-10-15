@@ -480,8 +480,8 @@ export async function writeModern(
 // ---------------------------------------------------------------------------
 
 /** JSON as the 2.3 side reports it: `undefined` fields gone, `undefined` itself `null`. */
-export const json = <T>(value: T): unknown =>
-  value === undefined ? null : (JSON.parse(JSON.stringify(value)) as unknown);
+export const json = <T>(value: T): T =>
+  (value === undefined ? null : JSON.parse(JSON.stringify(value))) as T;
 
 /**
  * The legacy records under `ids` as the current code reads them, in the same
@@ -531,7 +531,7 @@ export async function readModern(
       runs,
       list: (await stores.runsV3.list()).runs,
       blobs: await Promise.all(
-        digests.map(async (digest) => [digest, await stores.runsV3.getBlob(digest)]),
+        digests.map(async (digest) => ({ digest, blob: await stores.runsV3.getBlob(digest) })),
       ),
     },
     memory: {
