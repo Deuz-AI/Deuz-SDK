@@ -7,6 +7,9 @@
  * in compute.test.ts; this file pins the spawn options, which nothing else can
  * observe, and which kill a timeout sends once the child already exited.
  */
+import { mkdir, mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join, resolve, sep } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 interface Spawned {
@@ -26,6 +29,20 @@ const spawned: Spawned[] = [];
 let behaviour: 'clean' | 'exit-only' | 'hang' | 'killable' = 'clean';
 /** Ends the last sandbox child the way taskkill /F does. */
 let endLastChild: (() => void) | undefined;
+
+/** How the mocked realpath rewrites a real path; undefined passes it through. */
+let realpathRewrite: ((path: string) => string) | undefined;
+
+vi.mock('node:fs/promises', async (importOriginal) => {
+  const real = await importOriginal<typeof import('node:fs/promises')>();
+  return {
+    ...real,
+    realpath: async (path: string) => {
+      const resolved = await real.realpath(path);
+      return realpathRewrite ? realpathRewrite(resolved) : resolved;
+    },
+  };
+});
 
 vi.mock('node:child_process', () => ({
   spawn: (command: string, args: string[], options: Record<string, unknown>) => {
@@ -66,6 +83,7 @@ const { createNodeSandbox } = await import('../src/node/compute');
 afterEach(() => {
   spawned.length = 0;
   behaviour = 'clean';
+  realpathRewrite = undefined;
   vi.restoreAllMocks();
 });
 
@@ -135,4 +153,36 @@ describe('createNodeSandbox exit code of a killed run', () => {
       expect(res).toMatchObject({ timedOut: true, exitCode: null });
     },
   );
+});
+
+describe('createNodeSandbox runShell cwd (R4-11)', () => {
+  it('spawns in the lexical directory; the real path only decides containment', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'deuz-cwd-'));
+    try {
+      await mkdir(join(root, 'sub'));
+      const real = await import('node:fs/promises').then((fs) => fs.realpath(root));
+      // A mapped network drive: its real path is a UNC path, which cmd.exe
+      // refuses as a working directory (it falls back to C:\Windows).
+      const unc = process.platform === 'win32' ? '\\\\server\\share\\proj' : '/net/server/proj';
+      realpathRewrite = (path) => (path.startsWith(real) ? unc + path.slice(real.length) : path);
+      const res = await createNodeSandbox({ cwd: root }).runShell!({ command: 'cd', cwd: 'sub' });
+      expect(res.exitCode).toBe(0);
+      expect(spawned.at(-1)!.options.cwd).toBe(resolve(root, 'sub'));
+      // The containment check still runs on the real path: a link out is refused.
+      realpathRewrite = (path) =>
+        path.startsWith(real + sep + 'sub')
+          ? `${unc}-elsewhere${sep}sub`
+          : path.startsWith(real)
+            ? unc + path.slice(real.length)
+            : path;
+      const refused = await createNodeSandbox({ cwd: root }).runShell!({
+        command: 'cd',
+        cwd: 'sub',
+      });
+      expect(refused.exitCode).toBeNull();
+      expect(refused.stderr).toMatch(/outside the sandbox root/);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
 });

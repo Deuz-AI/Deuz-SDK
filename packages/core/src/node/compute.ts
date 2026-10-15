@@ -115,7 +115,8 @@ function isWithin(path: NodePath, root: string, target: string): boolean {
  * Resolves a `runShell` cwd against the sandbox root (H3, 2.4): a relative
  * path is taken from the root, an absolute one must lie inside it, and the
  * real path (symlinks and junctions followed) must stay inside the real root.
- * Returns the directory to spawn in, or the refusal to report.
+ * Returns the directory to spawn in (the lexical path, once both checks
+ * pass), or the refusal to report.
  */
 async function resolveShellCwd(
   root: string,
@@ -139,7 +140,10 @@ async function resolveShellCwd(
     return { refusal: `Working directory '${requested}' does not exist in the sandbox root.` };
   }
   if (!isWithin(path, realBase, realTarget)) return { refusal: outside };
-  return { cwd: realTarget };
+  // The real path only decides containment. The spawn gets the lexical path:
+  // the real path of a mapped network drive is a UNC path, which cmd.exe
+  // refuses as a working directory (it runs in C:\Windows instead).
+  return { cwd: target };
 }
 
 /** language id → how to invoke an interpreter with an inline program. */
