@@ -626,6 +626,51 @@ describe('durable mode: one producer, fenced', () => {
     expect((errors[0] as Error).message).toContain('hunter2');
   });
 
+  it('fails closed when the store cannot open the stream to read its last seq (H1), and gives the lease back', async () => {
+    const inner = createInMemoryDurableStreamStateStore();
+    let commits = 0;
+    const store: DurableStreamStateStore = {
+      ...inner,
+      open: async () => {
+        throw new Error('postgres://user:hunter2@db down');
+      },
+      commit: async (batch) => {
+        commits++;
+        return inner.commit(batch);
+      },
+    };
+    const { advance, durable, provider } = setup({ store });
+    const errors: unknown[] = [];
+    const manual = manualResult();
+    const response = toDeuzStreamResponse(manual.result, {
+      durable,
+      streamId: 's',
+      messageId: 'm',
+      onStoreError: (error) => errors.push(error),
+    });
+    const body = bodyReader(response);
+    manual.push(textPart('a'));
+    manual.end();
+    await advance(20);
+    const raw = await body.rest();
+    // One error frame, in the redacted words, and never an `id:` line: the
+    // leg did not number a frame it could not journal (2.3 restarted at 0).
+    expect(raw).toBe(
+      `data: ${JSON.stringify({ type: 'error', message: 'Durable stream: the stream store failed.' })}\n\n`,
+    );
+    expect(sseFrames(raw).every((frame) => frame.id === undefined)).toBe(true);
+    expect(errors).toHaveLength(1);
+    expect((errors[0] as Error).message).toContain('hunter2');
+    expect(commits).toBe(0);
+    expect(await inner.lastSeq('s')).toBeUndefined();
+    // The lease went back: the next producer takes it at once.
+    await settle();
+    expect(provider.granted()).toBe(1);
+    expect(await provider.acquire({ key: 'stream:s', owner: 'b', ttlMs: 1_000 })).toMatchObject({
+      token: 2,
+    });
+  });
+
   it('fails closed when the stored log moved past the producer', async () => {
     const { advance, durable, store } = setup();
     const manual = manualResult();

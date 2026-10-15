@@ -253,6 +253,74 @@ describe('createPostgresVersionedMemoryStore (PGlite)', { timeout: SLOW_TEST_TIM
   });
 });
 
+describe('the candidateLimit bound (PGlite)', { timeout: SLOW_TEST_TIMEOUT_MS }, () => {
+  /**
+   * Three records a second apart; the oldest is the best match for [1, 0, 0]
+   * (cosine 1), then r3 (0.8), then r2 (0.6).
+   */
+  const seeded = async (
+    pool: PgPoolLike,
+    schema: string,
+    extra: { pgvector: 'off' | 'require'; candidateLimit?: number },
+  ) => {
+    let now = 1_000_000;
+    const store = createPostgresVersionedMemoryStore({
+      pool,
+      schema,
+      clock: { now: () => now, setTimeout: () => () => {} },
+      ...extra,
+    });
+    const records: [string, number[]][] = [
+      ['r1', [1, 0, 0]],
+      ['r2', [0.6, 0.8, 0]],
+      ['r3', [0.8, 0, 0.6]],
+    ];
+    for (const [id, vector] of records) {
+      await store.commit(await createOp(`op-${id}`, id, `fact ${id}`, vector));
+      now += 1_000;
+    }
+    return store;
+  };
+  const ranked = async (store: ReturnType<typeof createPostgresVersionedMemoryStore>) =>
+    (
+      await store.search({
+        scope: SCOPE,
+        embedding: { vector: [1, 0, 0], modelId: 'model-a' },
+        topK: 3,
+      })
+    ).map((hit) => hit.record.id);
+
+  it('scores only the newest candidateLimit revisions in process', async () => {
+    const bounded = await seeded(litePool, await liteSchema(), {
+      pgvector: 'off',
+      candidateLimit: 2,
+    });
+    // r1, the best match, is the oldest: past the bound, it is never scored.
+    expect(await ranked(bounded)).toEqual(['r3', 'r2']);
+    await bounded.close();
+
+    const unbounded = await seeded(litePool, await liteSchema(), { pgvector: 'off' });
+    expect(await ranked(unbounded)).toEqual(['r1', 'r3', 'r2']);
+    await unbounded.close();
+  });
+
+  it('leaves the in-database pgvector distance unbounded', async () => {
+    const schema = `vmem_vec_${++emulatedSchemas}`;
+    await emulatedPool.query(`CREATE SCHEMA ${schema}`);
+    const store = await seeded(emulatedPool, schema, { pgvector: 'require', candidateLimit: 2 });
+    expect(await ranked(store)).toEqual(['r1', 'r3', 'r2']);
+    await store.close();
+  });
+
+  it('refuses a candidateLimit that is not a positive integer', () => {
+    for (const candidateLimit of [0, -1, 1.5, Number.NaN])
+      expect(
+        () => createPostgresVersionedMemoryStore({ pool: litePool, candidateLimit }),
+        String(candidateLimit),
+      ).toThrow(/candidateLimit must be a positive integer/);
+  });
+});
+
 // ---------------------------------------------------------------------------
 // A live server
 // ---------------------------------------------------------------------------

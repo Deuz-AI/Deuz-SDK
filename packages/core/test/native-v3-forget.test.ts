@@ -79,7 +79,7 @@ function optionsFor(
 const sent = (request: { messages: { content?: unknown }[] }) =>
   request.messages.map((message) => wireText(message)).join('\n');
 
-function forgetContract(name: string, make: () => Promise<Harness>, slow = false): void {
+function forgetContract(name: string, make: () => Promise<Harness>): void {
   const withHarness = (fn: (harness: Harness) => Promise<void>) => async () => {
     const harness = await make();
     try {
@@ -89,7 +89,10 @@ function forgetContract(name: string, make: () => Promise<Harness>, slow = false
     }
   };
 
-  describe(name, slow ? { timeout: SLOW_TEST_TIMEOUT_MS } : {}, () => {
+  // Every store, the in-memory one included: the file's first run pays for
+  // loading the native V3 path, past vitest's 5 s default on a Linux runner
+  // (5.8 s on node 22).
+  describe(name, { timeout: SLOW_TEST_TIMEOUT_MS }, () => {
     it(
       "leaves no copy of the forgotten record in a terminal run, its result's messages included",
       withHarness(async ({ store }) => {
@@ -181,14 +184,10 @@ forgetContract('in-memory V3 run store', async () => ({
   store: createInMemoryAgentRunStoreV3(),
 }));
 
-forgetContract(
-  'SQLite V3 run store (:memory:)',
-  async () => {
-    const store = createSqliteAgentRunStoreV3({ path: ':memory:' });
-    return { store, cleanup: () => store.close() };
-  },
-  true,
-);
+forgetContract('SQLite V3 run store (:memory:)', async () => {
+  const store = createSqliteAgentRunStoreV3({ path: ':memory:' });
+  return { store, cleanup: () => store.close() };
+});
 
 describe('Postgres V3 run store (PGlite pool)', { timeout: SLOW_TEST_TIMEOUT_MS }, () => {
   const db = new PGlite();
@@ -198,16 +197,12 @@ describe('Postgres V3 run store (PGlite pool)', { timeout: SLOW_TEST_TIMEOUT_MS 
   });
   const pool = pglitePool(db);
   let schemas = 0;
-  forgetContract(
-    'native runs',
-    async () => {
-      const schema = `e2_forget_${++schemas}`;
-      await pool.query(`CREATE SCHEMA ${schema}`);
-      const store = createPostgresAgentRunStoreV3({ pool, schema });
-      return { store, cleanup: () => store.close() };
-    },
-    true,
-  );
+  forgetContract('native runs', async () => {
+    const schema = `e2_forget_${++schemas}`;
+    await pool.query(`CREATE SCHEMA ${schema}`);
+    const store = createPostgresAgentRunStoreV3({ pool, schema });
+    return { store, cleanup: () => store.close() };
+  });
 });
 
 const liveUrl = postgresUrl();
@@ -226,15 +221,11 @@ describe.skipIf(!liveUrl)('Postgres V3 run store (live server)', () => {
       await pool.end();
     }
   }, SLOW_HOOK_TIMEOUT_MS);
-  forgetContract(
-    'native runs',
-    async () => {
-      const schema = `${prefix}_${schemas.length + 1}`;
-      schemas.push(schema);
-      await pool.query(`CREATE SCHEMA ${schema}`);
-      const store = createPostgresAgentRunStoreV3({ pool: pool as unknown as PgPoolLike, schema });
-      return { store, cleanup: () => store.close() };
-    },
-    true,
-  );
+  forgetContract('native runs', async () => {
+    const schema = `${prefix}_${schemas.length + 1}`;
+    schemas.push(schema);
+    await pool.query(`CREATE SCHEMA ${schema}`);
+    const store = createPostgresAgentRunStoreV3({ pool: pool as unknown as PgPoolLike, schema });
+    return { store, cleanup: () => store.close() };
+  });
 });
