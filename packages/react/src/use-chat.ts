@@ -48,6 +48,20 @@
  * them. A chat route never sends a frame, so its requests are unchanged. No
  * new core export is imported: with a core older than 2.3 there is no
  * `turn.agent`, and the hook behaves as before.
+ *
+ * 2.4 adds chat continuity (spec §3.4), additively and without importing a
+ * core symbol 2.3 lacks (`./chat-snapshot` holds the wire-shaped copies):
+ * - `ChatSnapshotV1` — `initialSnapshot` / `exportSnapshot()` carry the
+ *   history with its message ids (H7: a stored chat renders under the ids the
+ *   server gave it, and equal-text messages stay apart), the resume cursor,
+ *   the turn in progress, pending approvals and parked client calls, all of
+ *   which `setHistory` drops.
+ * - the capability handshake — every request lists what the hook
+ *   understands; a 2.4 route announces what it supports, and the hook uses
+ *   `message-ids` (replay dedupe by id), `chat-snapshot-v1` (`messageIds` in
+ *   the body) and `durable-stream` (a dropped read continues from the resume
+ *   endpoint) only once announced. A 2.3 route announces nothing, and the
+ *   hook behaves as 2.3 did.
  */
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type {
