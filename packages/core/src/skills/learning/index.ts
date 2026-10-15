@@ -17,17 +17,28 @@ import type { BudgetLimits } from '../../types/execution';
 import type { LanguageModel } from '../../types/model';
 import type { Usage } from '../../types/usage';
 import { DeuzError } from '../../errors';
-import { notImplemented } from '../../internal/not-implemented';
+import { resolveDependencies } from '../../internal/resolve-deps';
+import { callProposalModel } from './call';
+import { acceptDraft, InvalidDraftError, parseDraft, proposalMessages } from './draft';
+import { projectRun } from './projection';
 
 /** A reference into the source run that a method step rests on. */
 export interface SkillSourceRef {
   runId: string;
-  /** The model step the content came from. */
+  /** The model step the content came from, when a tool receipt records it. */
   modelStep?: number;
-  /** The message (stable id) or tool call it came from. */
+  /**
+   * The message (stable id) or tool call it came from. The message id is
+   * `<runId>:<index>`: its index in the run's transcript, or in its history
+   * for a run without a transcript (the id a run message keeps in the run's
+   * chat projection).
+   */
   messageId?: string;
   toolCallId?: string;
-  /** `sha256:<hex>` of the projected content the step cites. */
+  /**
+   * `sha256:<hex>` of the projected content the step cites: the item's line
+   * as the model read it, after its `[Sn] ` label.
+   */
   digest: Sha256Digest;
 }
 
@@ -62,7 +73,8 @@ export interface SkillProposal {
   limitations: string[];
   /**
    * Suggested `allowed-tools`: always a subset of the tools the source run
-   * really used. The model can never add a tool permission.
+   * really used (called, and answered without an error). The model can never
+   * add a tool permission. Absent when none is suggested.
    */
   allowedTools?: string[];
   /** The source run: its id, scope, revision at the time, and the projection's digest. */
@@ -76,18 +88,21 @@ export interface ProposeSkillFromRunOptions {
   /** The source run: terminal, completed, with `verification: 'verified'`. */
   run: AgentRunEnvelope | AgentRunEnvelopeV3;
   model: LanguageModel;
-  /** Mandatory: the proposal's own budget, separate from the source run's. */
+  /**
+   * Mandatory: the proposal's own budget, separate from the source run's. It
+   * needs a `tokens` or `usd` bound.
+   */
   budget: BudgetLimits;
   /**
    * Host summaries of chosen tool results, by tool call id. Raw tool results
-   * never go to the model by default.
+   * never go to the model: a result without a summary reads `omitted`.
    */
   toolSummaries?: Readonly<Record<string, string>>;
   /** Output tokens at most. Default 2048. */
   maxOutputTokens?: number;
   /** Characters of source projection at most. Default 32 000; more is refused, never cut. */
   maxSourceChars?: number;
-  /** Extra instructions for the proposal. */
+  /** Extra instructions for the proposal, added to its system prompt. */
   instructions?: string;
   signal?: AbortSignal;
   deps?: Dependencies;
@@ -121,9 +136,142 @@ export class SkillLearningError extends DeuzError {
  * (`source_not_eligible`), an oversized projection (`source_too_large`) and a
  * draft that fails `parseSkill`, lacks a valid source on a step or suggests a
  * tool the run never used (`invalid_proposal`).
+ *
+ * The one call is made without a transport retry, so a failed attempt
+ * rejects with the provider's error and is the host's to repeat; a budget
+ * that cannot admit it rejects with the ledger's `budget_exceeded` before
+ * the request. A budget needs a `tokens` or `usd` bound (TypeError otherwise).
  */
 export async function proposeSkillFromRun(
-  _options: ProposeSkillFromRunOptions,
+  options: ProposeSkillFromRunOptions,
 ): Promise<SkillProposal> {
-  return notImplemented('proposeSkillFromRun');
+  const { maxOutputTokens, maxSourceChars } = checkOptions(options);
+  const { run } = options;
+  assertEligible(run);
+  const projection = await projectRun(run, {
+    ...(options.toolSummaries ? { toolSummaries: options.toolSummaries } : {}),
+  });
+  if (projection.items.length === 0)
+    throw new SkillLearningError('source_not_eligible', `run ${run.runId} has nothing to project`);
+  // Spec §2.6: an oversized source is refused, never cut.
+  if (projection.text.length > maxSourceChars)
+    throw new SkillLearningError(
+      'source_too_large',
+      `the projection of run ${run.runId} has ${projection.text.length} characters; maxSourceChars is ${maxSourceChars}`,
+    );
+
+  const call = await callProposalModel({
+    model: options.model,
+    messages: proposalMessages(projection, options.instructions),
+    maxOutputTokens,
+    budget: options.budget,
+    ...(options.signal ? { signal: options.signal } : {}),
+    ...(options.deps ? { deps: options.deps } : {}),
+  });
+  const revision = run.revision ?? 0;
+  let accepted: ReturnType<typeof acceptDraft>;
+  try {
+    if (call.finishReason === 'length')
+      throw new InvalidDraftError('the draft was cut off at maxOutputTokens');
+    if (call.finishReason === 'content_filter')
+      throw new InvalidDraftError('the model refused to draft');
+    accepted = acceptDraft(parseDraft(call.text), { runId: run.runId, revision, projection });
+  } catch (error) {
+    if (error instanceof InvalidDraftError)
+      throw new SkillLearningError(
+        'invalid_proposal',
+        `the proposal for run ${run.runId} was refused: ${error.message}`,
+      );
+    throw error;
+  }
+  return {
+    kind: 'deuz-skill-proposal',
+    version: 1,
+    status: 'proposed',
+    evaluation: 'not-evaluated',
+    skillMd: accepted.skillMd,
+    manifest: accepted.manifest,
+    steps: accepted.steps,
+    limitations: accepted.limitations,
+    ...(accepted.allowedTools ? { allowedTools: accepted.allowedTools } : {}),
+    source: { runId: run.runId, scope: run.scope, revision, digest: projection.digest },
+    cost: {
+      modelId: options.model.modelId,
+      usage: call.usage,
+      ...(call.costUsd !== undefined ? { costUsd: call.costUsd } : {}),
+    },
+    createdAt: resolveDependencies(options.deps).clock.now(),
+  };
+}
+
+/** Default output tokens of the proposal call. */
+const DEFAULT_MAX_OUTPUT_TOKENS = 2048;
+/** Default characters of source projection. */
+const DEFAULT_MAX_SOURCE_CHARS = 32_000;
+
+function positiveInteger(value: number | undefined, fallback: number, name: string): number {
+  if (value === undefined) return fallback;
+  if (!Number.isSafeInteger(value) || value < 1)
+    throw new TypeError(`proposeSkillFromRun: ${name} must be a positive integer`);
+  return value;
+}
+
+/** Malformed options are a caller error (TypeError), never a refusal of the run. */
+function checkOptions(options: ProposeSkillFromRunOptions): {
+  maxOutputTokens: number;
+  maxSourceChars: number;
+} {
+  if (!options || typeof options !== 'object')
+    throw new TypeError('proposeSkillFromRun: options are required');
+  const run = options.run as Partial<AgentRunEnvelope> | undefined;
+  if (
+    !run ||
+    run.kind !== 'deuz-agent-run' ||
+    typeof run.runId !== 'string' ||
+    typeof run.scope !== 'string' ||
+    !Array.isArray(run.messages)
+  )
+    throw new TypeError('proposeSkillFromRun: run must be a native agent run envelope');
+  if (!options.model || typeof options.model !== 'object')
+    throw new TypeError('proposeSkillFromRun: model is required');
+  const budget = options.budget;
+  if (!budget || typeof budget !== 'object')
+    throw new TypeError('proposeSkillFromRun: budget is required (spec §2.6)');
+  if (budget.tokens === undefined && budget.usd === undefined)
+    throw new TypeError('proposeSkillFromRun: budget needs a tokens or usd bound');
+  for (const [name, value] of [
+    ['tokens', budget.tokens],
+    ['usd', budget.usd],
+  ] as const)
+    if (value !== undefined && (!Number.isFinite(value) || value < 0))
+      throw new TypeError(`proposeSkillFromRun: budget.${name} must be a finite number >= 0`);
+  return {
+    maxOutputTokens: positiveInteger(
+      options.maxOutputTokens,
+      DEFAULT_MAX_OUTPUT_TOKENS,
+      'maxOutputTokens',
+    ),
+    maxSourceChars: positiveInteger(
+      options.maxSourceChars,
+      DEFAULT_MAX_SOURCE_CHARS,
+      'maxSourceChars',
+    ),
+  };
+}
+
+/**
+ * The source condition (spec §2.6): terminal, completed, and verified by the
+ * run's own verifier (`verification === 'verified'`). It speaks about the
+ * source task, never about the skill drafted from it.
+ */
+function assertEligible(run: AgentRunEnvelope | AgentRunEnvelopeV3): void {
+  if (run.phase !== 'terminal')
+    throw new SkillLearningError('source_not_eligible', `run ${run.runId} is not terminal`);
+  if (run.result?.status !== 'completed')
+    throw new SkillLearningError('source_not_eligible', `run ${run.runId} did not complete`);
+  if (run.verification !== 'verified')
+    throw new SkillLearningError(
+      'source_not_eligible',
+      `run ${run.runId} is not verified (verification: ${run.verification ?? 'none'})`,
+    );
 }
