@@ -120,6 +120,12 @@ export function assertV3Options(options: AgentRunOptionsV3<unknown>): void {
       throw new TypeError(
         'workingMemory takes a snapshot to continue or what to create, not both.',
       );
+    // A run never reads or writes another tenant's working memory.
+    const scope = working.snapshot?.scope ?? working.create?.scope;
+    if (scope !== undefined && scope !== options.session.scope)
+      throw new TypeError(
+        `workingMemory belongs to scope ${JSON.stringify(scope)}, not this run's scope ${JSON.stringify(options.session.scope)}.`,
+      );
   }
 }
 

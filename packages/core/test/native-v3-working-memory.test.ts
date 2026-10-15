@@ -10,6 +10,7 @@
 import { describe, expect, it } from 'vitest';
 import { resumeAgent, runAgent } from '../src/agent-run';
 import { createInMemoryAgentRunStoreV3 } from '../src/agent-run-v3-store';
+import { createWorkingMemory } from '../src/context/working-memory';
 import type { AgentRunOptionsV3, AgentRunStoreV3 } from '../src/types/agent-run-v3';
 import { recordingStoreV3, scriptedModel, wireText, type ScriptedCall } from './fixtures/native-v3';
 
@@ -159,5 +160,24 @@ describe('working memory in the V3 loop', () => {
     const result = await runAgent(run.options(store));
     expect(result).toMatchObject({ status: 'failed', error: { name: 'TypeError' } });
     expect(run.fetch).not.toHaveBeenCalled();
+  });
+});
+
+describe('the working memory scope of a V3 run', () => {
+  it("refuses a snapshot or a creation for another scope than the run's", async () => {
+    for (const workingMemory of [
+      { create: { scope: 'other-tenant', goal: 'Ship', now: 1 } },
+      { snapshot: createWorkingMemory({ scope: 'other-tenant', goal: 'Ship', now: 1 }) },
+    ]) {
+      const store = recordingStoreV3();
+      const run = wmRun([{ text: 'never' }], { workingMemory });
+      const result = await runAgent(run.options(store));
+      expect(result).toMatchObject({
+        status: 'failed',
+        error: { name: 'TypeError', message: expect.stringMatching(/scope/) },
+      });
+      expect(run.fetch).not.toHaveBeenCalled();
+      expect(store.saves).toEqual([]);
+    }
   });
 });
