@@ -11,10 +11,37 @@ description: Supported runtimes, package formats, browser/edge guarantees, and t
 | ESM (`import`) | Every exported JavaScript target is imported from the built package |
 | CommonJS (`require`) | Every exported CJS target is required from the built package |
 | TypeScript bundler / Node resolution | Checked by publint and Are the Types Wrong |
-| Browser / edge bundlers | Consumers of the root, `/edge`, the Anthropic and OpenAI factories, `/agent`, `/swarm`, `/ops`, `/goal`, `/evolve`, `/schedule`, `/mcp/server`, `/realtime`, `/batch`, `/a2a` and `/testing` bundle with esbuild `platform: 'browser'`; the swarm, ops and evolve store entries, `/mcp/server/stdio` and `/headless` must fail that boundary |
+| Browser / edge bundlers | Consumers of the root, `/edge`, the Anthropic and OpenAI factories, `/agent`, `/swarm`, `/ops`, `/goal`, `/evolve`, `/schedule`, `/mcp/server`, `/realtime`, `/batch`, `/a2a`, `/testing`, `/skills`, and the 2.4 entries `/memory/versioned`, `/context`, `/goal/runtime` and `/skills/learning` and the 2.4 parts of `/chat` and `/ui` bundle with esbuild `platform: 'browser'`; the swarm, ops and evolve store entries, `/mcp/server/stdio`, `/headless`, `/skills/node` and the five Node-only 2.4 entries must fail that boundary |
 | React 18 / 19 | `@deuz-sdk/react` and the frozen `@deuz-sdk/core/react` hook are typechecked and tested on React 19 in every check run, and on React 18 in a CI job of their own (2.3) |
-| Redis 7 / Postgres 16 | The Redis stores and the Postgres stores run against real servers in a CI job (2.3); without a server those tests skip |
+| Redis 7 / Postgres 16 | The Redis stores and the Postgres stores run against real servers in a CI job (2.3; the 2.4 stores too); without a server those tests skip |
+| Docker | The Docker runner's tests run against a real Docker Engine with Linux containers in a CI job of their own (2.4); elsewhere they run against a scripted Docker CLI, and against a real Engine only with `DEUZ_TEST_DOCKER=1` |
 | Windows / Linux | Runtime suite runs on both operating systems |
+
+## What changed in 2.4
+
+`engines` is still `node >= 22`, every 2.3 subpath is still exported, the package still has no runtime `dependencies`, and no peer is added or changed. Every 2.4 feature is off until you configure it. [What is new in 2.4](/docs/reference/whats-new-2-4) has the features, the behaviour changes and the upgrade notes.
+
+**New subpaths.** Four are edge-safe and five are Node-only. The release gate bundles each edge-safe one for the browser and checks that each Node-only one fails that boundary. [Edge & Runtimes](/docs/advanced/edge#the-24-subpaths) lists what each holds.
+
+| Subpath | Runtime | Needs |
+| --- | --- | --- |
+| `@deuz-sdk/core/memory/versioned` | edge-safe | nothing |
+| `@deuz-sdk/core/memory/versioned/sqlite` | Node-only | `node:sqlite`, or a database handle you pass in |
+| `@deuz-sdk/core/memory/versioned/postgres` | Node-only | a pool with `connect()` you pass in (`pg.Pool` or compatible), or the optional peer `pg`; pgvector when it is installed, else cosine in the process |
+| `@deuz-sdk/core/context` | edge-safe | nothing |
+| `@deuz-sdk/core/goal/runtime` | edge-safe | nothing; the native run launcher loads the native executor lazily |
+| `@deuz-sdk/core/goal/runtime/sqlite` | Node-only | `node:sqlite`, or a database handle you pass in |
+| `@deuz-sdk/core/goal/runtime/postgres` | Node-only | a pool with `connect()` you pass in (`pg.Pool` or compatible), or the optional peer `pg` |
+| `@deuz-sdk/core/compute/docker` | Node-only, a 2.4 preview | `node:child_process`, the Docker CLI and a Docker Engine running Linux containers; `node:sqlite` for its SQLite process store |
+| `@deuz-sdk/core/skills/learning` | edge-safe, experimental | nothing |
+
+**Existing subpaths.** `/agent`, `/chat`, `/ui`, `/schedule` (and so `/edge`) and `/workspace` gain edge-safe 2.4 surface. `/ops/sqlite`, `/ops/postgres`, `/stores/sqlite`, `/stores/postgres` and `/stores/redis` gain Node-only 2.4 stores: V3 run stores, conditional chat stores with their transcript indexes, and durable stream stores (the only 2.4 store on Redis, which needs Redis 7 or later like the other Redis stores).
+
+**Databases shared with 2.3.** Every 2.4 store keeps its data in new tables with a schema version table of its own, and no existing schema version moves, so a 2.3 process keeps opening a database that 2.4 wrote. See [Sharing a database with 2.3 processes](/docs/reference/whats-new-2-4#sharing-a-database-with-23-processes).
+
+**React.** `@deuz-sdk/react` 2.4.0 keeps its `@deuz-sdk/core: ^2.0.0` peer range and `react: ^18.0.0 || ^19.0.0`. Chat snapshots work with any core 2.x: the hook applies stored message ids itself next to a 2.3 core. Replay by message id, `messageIds` in request bodies and the automatic resume of a dropped read wait until a 2.4 route announces them through the [capability handshake](/docs/reference/stream-protocol#the-capability-handshake-24). The frozen `@deuz-sdk/core/react` hook is deprecated in favour of `@deuz-sdk/react` and will be removed in 3.0; its behaviour is unchanged, and a development build logs one console warning per page.
+
+**Backends in CI.** The integration job runs the 2.4 PostgreSQL and Redis stores against Postgres 16 and Redis 7, next to the 2.3 ones; the SQLite stores run in every check run. Without those servers, the PostgreSQL stores run against PGlite and the Redis stream store against ioredis-mock, so the check runs stay offline. The pgvector path of the versioned PostgreSQL store was checked only against an emulated `vector` type in PGlite. A Docker job runs the Docker runner's tests against the Docker Engine of GitHub's ubuntu runner (`DEUZ_TEST_DOCKER=1`); they were also run locally against Docker Desktop on Windows 11.
 
 ## What changed in 2.3
 

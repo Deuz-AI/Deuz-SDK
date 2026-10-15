@@ -1,7 +1,9 @@
 /**
  * Goal, wakeup and event contracts (2.3, roadmap 23.6): plain, versioned JSON
  * a host persists and moves forward with pure transitions. Nothing here runs a
- * model, a timer or a service; a 2.4 supervisor builds on these records.
+ * model, a timer or a service. The 2.4 goal runtime (`@deuz-sdk/core/goal/runtime`:
+ * the supervisor, the durable scheduler and the webhook handler) builds on these
+ * records.
  */
 
 /** Where a goal stands. A goal no model call works on is never done by that alone. */

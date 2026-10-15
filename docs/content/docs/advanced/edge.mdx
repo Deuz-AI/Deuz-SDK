@@ -55,7 +55,7 @@ It exports exactly these values, and the types named below:
 | `DeuzError`, `isDeuzError`, `NoObjectGeneratedError`, `BreakerOpenError`, `CheckpointNotFoundError`, `CheckpointVersionError`, `UnpricedModelError` | error classes and the `isDeuzError` guard (`CheckpointVersionError` and `UnpricedModelError`, 2.3) |
 | `createInMemoryLeaseProvider`, `agentRunLeaseKey`, `findStaleAgentRuns` | everything `@deuz-sdk/core/ops` exports (2.2; the last two, 2.3) |
 | `evolve`, `resumeEvolve`, `createInMemoryPopulationStore`, `evolveCandidateId`, `parseEvolveBlocks`, `parseSearchReplace`, `applySearchReplace`, `extractFullRewrite`, `buildMutationPrompt`, `EvolvePatchError`, `EvolveConflictError`, `EvolveLeaseError` | everything `@deuz-sdk/core/evolve` exports (2.2) |
-| `createScheduler`, `createInMemoryClaim`, `parseCron`, `nextOccurrence`, `previousOccurrence`, `occurrencesBetween`, `handleSignal`, `verifyGitHubWebhook`, `verifySlackRequest`, `verifyHmacSignature` | everything `@deuz-sdk/core/schedule` exports (2.2) |
+| `createScheduler`, `createInMemoryClaim`, `parseCron`, `nextOccurrence`, `previousOccurrence`, `occurrencesBetween`, `handleSignal`, `verifyGitHubWebhook`, `verifySlackRequest`, `verifyHmacSignature`, `zonedOccurrencesBetween`, `nextZonedOccurrence`, `timeZoneOffset`, `assertTimeZone` | everything `@deuz-sdk/core/schedule` exports (2.2; the time zone helpers, 2.4) |
 | `AgentToolDef`, `HandoffAgentDef`, `HandoffOptions`, `InferToolInput`, `InferToolOutput`, `ModelCapabilities`, `ModelProfile` and its parts, `DeuzClient`, `AgentDef`, `DeuzAgent`, `AgentCallOptions`, `AgentObjectCallOptions`, `ResumeOptions`, `ResumeDeuzChatOptions`, `SignedApprovalPayload`, `CreateApprovalSignerOptions`, `ApprovalSigner`, `DeuzErrorJSON`, the chat types (`UIMessage`, `ChatRecord`, `ChatStore`, …), `DeuzChatRequest`, `ValidateChatOptions`, `ValidateChatResult`, `MemoryObserver`, `RunSummary`, `OtelTracerOptions`, and the types of `/ops`, `/evolve` and `/schedule` | types |
 | everything from the canonical types (`Message`, `Part`, `Usage`, `StreamPart`, `LanguageModel`, `CommonCallOptions`, `AgentCheckpoint`, `SessionStore`, …) | `export type *` |
 
@@ -93,12 +93,32 @@ A few feature surfaces genuinely need the filesystem, a child process, or a Node
 | `@deuz-sdk/core/swarm/postgres` · `/ops/postgres` | an injected `PgClientLike` | a TCP client |
 | `@deuz-sdk/core/mcp/server/stdio` | lazy `@modelcontextprotocol/server` + `process.stdin` / `process.stdout` | serves MCP over a process's standard streams (2.3) |
 | `@deuz-sdk/core/headless` | lazy `node:fs/promises`, `node:path`, `node:process` | project instructions, skill folders, the doctor's environment and Node version (2.3 preview) |
+| `@deuz-sdk/core/memory/versioned/sqlite` · `/goal/runtime/sqlite` | lazy `node:sqlite` (or an injected handle) | a database file (2.4) |
+| `@deuz-sdk/core/memory/versioned/postgres` · `/goal/runtime/postgres` | a pool with `connect()` you pass in (`pg.Pool` or compatible), or the lazy `pg` peer with `connectionString` | a TCP client (2.4) |
+| `@deuz-sdk/core/compute/docker` | lazy `node:child_process`, the Docker CLI (`dockerPath`, default `docker`); its SQLite process store, lazy `node:sqlite` | starts and inspects local Docker containers (2.4 preview) |
 
 The edge-safe counterparts of these features stay on the Web-APIs-only path: `@deuz-sdk/core/rag` (text/markdown/CSV parsing in core), `@deuz-sdk/core/skills` (parse `SKILL.md` you already loaded), `@deuz-sdk/core/memory` (the cosine vector backend), and `@deuz-sdk/core/mcp` (HTTP/SSE transport). Use those at the edge and reserve the `…/node` subpaths for your Node server.
 
 The two store packs that take an **injected client** (`stores/redis`, `stores/postgres`) still import a Node-only module path, so they stay on this list — but the seam itself (`RedisClientLike`, or `RedisScriptClient` for the Redis ops and swarm stores, and `PgClientLike`) is a plain object, which is how an HTTP-driver-backed store reaches an edge runtime: implement the seam against your driver and keep it in your own module.
 
 2.0's edge-safe additions: `handoff()` plus `promptInjectionGuardrail` / `maxOutputLength` are re-exported from `@deuz-sdk/core/edge` (all three are pure construction — no clock, no randomness, no I/O), and the `@deuz-sdk/core/guardrails` subpath itself imports types only. `@deuz-sdk/core/speech`, `/transcription` and `/video` are edge-safe too: `/speech` and `/transcription` are `deps.fetch` and nothing else, and `/video` adds only `deps.clock.setTimeout` for its poll — never an ambient timer. `compactMessages` ships from the root entry rather than `/edge`, and is pure unless you hand it a summarizer.
+
+## The 2.4 subpaths
+
+2.4 adds nine subpaths: four edge-safe, five Node-only (in the table above). `npm run verify:runtime` bundles a consumer of each edge-safe one with esbuild's browser platform and fails if the graph reaches a Node-only module, and it checks that each Node-only one fails that boundary. None of them is re-exported from `/edge`; import each from its own subpath.
+
+| Edge-safe subpath | What it holds |
+| --- | --- |
+| `@deuz-sdk/core/memory/versioned` | `createMemorySession`, `createVersionedMemoryTools`, `importLegacyMemory`, `createInMemoryVersionedMemoryStore`, `defineAccountedMemoryLLM`, the errors and the types. Its SQLite and PostgreSQL stores are `/memory/versioned/sqlite` and `/memory/versioned/postgres` |
+| `@deuz-sdk/core/context` | `compileContext`, `createContextCompiler` (preview), the memory, RAG, transcript and skills sources, `createWorkingMemory`, `applyWorkingMemoryPatch`, `workingMemoryTools` and the token estimator |
+| `@deuz-sdk/core/goal/runtime` | `createGoalSupervisor`, `createNativeRunLauncher`, `createDurableScheduler`, `createWebhookHandler`, `toNodeHandler`, `verifyGoalAcceptance` and `createInMemoryGoalRuntimeStore`. Its SQLite and PostgreSQL stores are `/goal/runtime/sqlite` and `/goal/runtime/postgres` |
+| `@deuz-sdk/core/skills/learning` | `proposeSkillFromRun` (experimental) |
+
+- **`/goal/runtime`.** `createNativeRunLauncher` loads the native executor with a lazy `import()`, so the entry does not bundle it. `createWebhookHandler` returns a Fetch handler, `(request: Request) => Promise<Response>`, that verifies signatures with WebCrypto. `toNodeHandler` imports nothing from `node:http`; it adapts that handler to Node's `http` server or Express when you serve it from Node. The supervisor and the durable scheduler each have `start()`, a loop on `deps.clock` timers, and `tick()`, one pass; on a runtime without a long-lived process, call `tick()` from a scheduled trigger.
+- **Existing edge-safe entries grow.** `/agent` adds `createInMemoryAgentRunStoreV3` and the V3 types, `/chat` the in-memory conditional chat store and transcript index, `/ui` the in-memory durable stream store and the capability handshake helpers, `/schedule` (and so `/edge`) the time zone helpers, and `/workspace` `digestWorkspace`, which hashes with WebCrypto. All of it stays edge-safe.
+- **Existing Node-only entries grow.** `/ops/sqlite` and `/ops/postgres` add the V3 run stores, `/stores/sqlite` and `/stores/postgres` the conditional chat stores (each with its transcript index) and the durable stream stores, and `/stores/redis` the Redis durable stream store. Each new store borrows a handle, pool or client you pass in, or opens its own from a path, connection string or URL (lazy `node:sqlite`, or the `pg` or `redis` peer).
+
+The durable stores of every 2.4 feature are on Node-only subpaths, and the edge-safe entries ship only in-memory stores, which live as long as the isolate. The store contracts (`VersionedMemoryStore`, `GoalRuntimeStore`, `AgentRunStoreV3`, `ConditionalChatStore`, `TranscriptIndex`, `DurableStreamStateStore`) are plain interfaces: a store backed by a driver your edge runtime has can implement one in your own module, as the injected-client paragraph above describes for the 2.3 stores.
 
 ## Per-runtime notes
 
