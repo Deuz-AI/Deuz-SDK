@@ -87,6 +87,9 @@ How a message matches:
 - Indexed text: string content, text parts and string tool results. Reasoning,
   tool inputs, images and structured tool results are not searched. System
   messages are not indexed at all.
+- Only the first 256 KiB of a message's text (UTF-8, after folding) is
+  indexed, in every backend, so a longer message, such as a log dump in a tool
+  result, is not found by terms past that point.
 
 The scope filter matches every field set in `scope`, as `listChats(scope)`
 does. An empty scope matches every chat, so always pass at least a `userId`.
