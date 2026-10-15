@@ -31,6 +31,12 @@ Versioned memory plugs into the rest of 2.4: the
 revisions and origin labels, and a [V3 native run](/docs/modules/native-agents#v3-runs-checkpointversion-3)
 writes it through durable intents (`versionedMemory`).
 
+[`examples/21-versioned-memory-context`](https://github.com/Deuz-AI/Deuz-SDK/tree/main/examples/21-versioned-memory-context)
+runs it without a key: host-asserted records with sources, a revise that
+refuses a stale second writer, a V3 run whose compiler places the records and whose model
+writes one through `memory_remember`, then a `forget` that redacts the stored
+context package before the run resumes.
+
 ## A session
 
 ```ts
@@ -551,12 +557,18 @@ The SDK never deletes memory in the background.
 
 - `store.pruneHistory({ olderThan, scope? })` deletes the non-current revisions,
   recorded before `olderThan`, of records whose current revision is retracted
-  or expired. The current revision and the receipts stay.
+  or expired. The current revision and the receipts stay, and the receipts
+  keep deduplicating: a redelivered operation still replays.
 - `store.pruneOperations({ olderThan })` deletes receipts committed before
   `olderThan`. Those operation ids no longer deduplicate (a redelivery is
-  applied again), so the store warns through its logger.
+  applied again), so the store warns through its logger. Every store (in
+  memory, SQLite and PostgreSQL) logs the same warning with
+  `{ count, olderThan }`; the logger is silent by default.
 
-Both return how many rows they removed. Schedule them with a
+A forgotten id stays forgotten after `pruneOperations`, even when the forget's
+own receipt is gone: its tombstone is not a receipt. Both cutoffs are
+exclusive (a row stamped exactly at `olderThan` stays), and both calls return
+how many rows they removed. Schedule them with a
 [durable scheduler](/docs/modules/goal-runtime#durable-scheduler) if you need a
 retention window; see [Retention and forget](/docs/modules/retention).
 
