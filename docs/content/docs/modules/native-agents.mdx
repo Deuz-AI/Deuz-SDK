@@ -989,7 +989,7 @@ fields:
 | --- | --- |
 | `context` | The compiler's state and, per model step, the manifest, the package's blob reference and a digest of the messages it was compiled for |
 | `workingMemory` | The `WorkingMemorySnapshot`, with the task list itself and the active task, so the active task survives a restart |
-| `memoryIntents` | One entry per versioned-memory write: its `operationId`, `status` (`intended`, `planned`, `committed`, `acknowledged`), plan digest, planned count and receipt |
+| `memoryIntents` | One entry per versioned-memory write: its `operationId`, `status` (`intended`, `planned`, `committed`, `acknowledged`) and, for a versioned extraction, the cited message ids, the request digest, the applied mutation count and the receipt (a tool write records its model step and tool call id) |
 | `memory` | The 2.3 memory state; its extraction status adds `'partial'` |
 
 `streamAgent` and `resumeStreamAgent` return an `AgentStreamV3`. It is still an
@@ -1046,9 +1046,11 @@ after a crash.
   one, `acknowledged` with the completed one) under the session's operation id.
 - `extract` (off by default; `true` or the extraction options without
   `messages`) extracts the completed run's turns into the session. The intent is
-  saved in the terminal commit, the plan before the memory commit, and the
-  acknowledgment records `{ requestDigest, planned, receipt: { scopeRevision,
-  committedAt } }`. The extraction reads the input's last user turn and the
+  saved in the terminal commit. The run then saves its claim (`planned`, with
+  the cited message ids and no plan), and the session prepares and commits the
+  plan with its receipt in one call. The acknowledgment copies `requestDigest`
+  (the request's digest) and `planned` (the mutation count) from the receipt,
+  with `receipt: { scopeRevision, committedAt }`. The extraction reads the input's last user turn and the
   run's own turns, under the session's extraction policy.
 
 ```ts
