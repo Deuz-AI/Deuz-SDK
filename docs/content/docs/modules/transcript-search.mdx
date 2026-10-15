@@ -1,0 +1,173 @@
+---
+title: Transcript search
+description: Lexical search over past chat messages within a scope, the messages around each hit, and the resolution of a memory source reference to its message (2.4).
+---
+
+A `TranscriptIndex` (2.4) searches past chat messages by their words, inside
+one memory scope and never across one. Each hit carries the message's stable
+id, so the same message can be rendered in a UI, cited by a memory record and
+offered to the [context compiler](/docs/modules/context#sources). The search is
+lexical only: no embeddings in 2.4.
+
+| Piece | Import | What it is |
+| --- | --- | --- |
+| `TranscriptIndex` | `@deuz-sdk/core/chat` (type) | `index`, `remove`, `search`, `resolveSource` |
+| `createInMemoryTranscriptIndex({ deps? })` | `@deuz-sdk/core/chat` | The in-memory index |
+| `store.transcript` | `createSqliteConditionalChatStore`, `createPostgresConditionalChatStore` | The SQL conditional chat stores' own index, updated in the same transaction as each chat write |
+| `indexChat(index, record)` | `@deuz-sdk/core/chat` | Indexes a chat saved through a legacy `ChatStore` |
+| `createTranscriptContextSource` | `@deuz-sdk/core/context` | The index as a context source (off unless configured) |
+
+## Searching
+
+```ts
+import {
+  createInMemoryConditionalChatStore,
+  createInMemoryTranscriptIndex,
+  createInMemoryChatStore,
+  indexChat,
+} from '@deuz-sdk/core/chat';
+
+const transcript = createInMemoryTranscriptIndex();
+const chats = createInMemoryConditionalChatStore({ transcript });
+
+await chats.writeChat(
+  {
+    chatId: 'chat-1',
+    scope: { userId: 'ada' },
+    messages: [
+      { role: 'user', content: 'Book the flight to İzmir.' },
+      { role: 'assistant', content: 'Booked: Friday, 09:40.' },
+    ],
+    messageIds: ['m-1', 'm-2'],
+    updatedAt: Date.now(),
+  },
+  { expectedRevision: 0 },
+);
+
+const hits = await transcript.search({ userId: 'ada' }, 'izmir flight', { around: 1 });
+console.log(hits.map((h) => [h.messageId, h.score, h.around?.map((m) => m.messageId)]));
+// [ [ 'm-1', 1, [ 'm-2' ] ] ]
+console.log((await transcript.search({ userId: 'bob' }, 'izmir')).length); // 0
+
+await chats.deleteChat('chat-1');
+console.log((await transcript.search({ userId: 'ada' }, 'izmir')).length); // 0
+
+// A chat saved through a legacy ChatStore is indexed explicitly.
+const legacy = createInMemoryChatStore();
+await legacy.saveChat({
+  chatId: 'chat-2',
+  scope: { userId: 'ada' },
+  messages: [{ role: 'user', content: 'Cancel the hotel.' }],
+  updatedAt: Date.now(),
+});
+await indexChat(transcript, (await legacy.loadChat('chat-2'))!);
+console.log((await transcript.search({ userId: 'ada' }, 'hotel'))[0]?.messageId); // chat-2:0
+```
+
+`search(scope, query, options?)` returns `TranscriptHit`s, best first: the
+`chatId`, `messageId`, the message's `index` in its chat, the `message`, a
+`score` (the best hit scores 1) and, with `around`, the messages on each side.
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `limit` | `10` | Hits at most; `0` returns nothing, a negative value throws |
+| `around` | `0` | Indexed messages to return on each side of a hit, in order, the hit excluded; absent when 0 |
+| `chatIds` | all | Only these chats |
+| `before`, `after` | none | Only messages first indexed before or after this time (epoch ms, strict). Indexing a chat again keeps each message id's first time |
+| `signal` | none | Aborts the search |
+
+How a message matches:
+
+- A message matches when it holds **any** of the query's terms. Terms are runs
+  of letters and digits, case and diacritics folded (`İzmir`, `izmir` and
+  `IZMIR` are the same term), at most 32 per query.
+- Whole words match in memory, in SQLite FTS5 and in PostgreSQL (`simple`
+  configuration). The SQLite `LIKE` fallback, used where FTS5 is missing,
+  matches substrings.
+- Indexed text: string content, text parts and string tool results. Reasoning,
+  tool inputs, images and structured tool results are not searched. System
+  messages are not indexed at all.
+
+The scope filter matches every field set in `scope`, as `listChats(scope)`
+does. An empty scope matches every chat, so always pass at least a `userId`.
+
+## Keeping the index current
+
+The in-memory conditional chat store updates the index you give it
+(`createInMemoryConditionalChatStore({ transcript })`) with every committed write
+and removes a chat when it is tombstoned; if the index throws, the write commits
+nothing. The SQLite and PostgreSQL conditional stores carry their own index as
+`store.transcript` and update it in the same transaction as the chat write:
+
+| Store | Index |
+| --- | --- |
+| `createSqliteConditionalChatStore` | FTS5 table `deuz_chat_transcript_fts` over `deuz_chat_transcript`, with a `LIKE` fallback (`fts: false`, or a SQLite build without FTS5) |
+| `createPostgresConditionalChatStore` | `deuz_chat_transcript` with `to_tsvector('simple', body)` and a GIN index |
+
+A tombstoned chat leaves the index at once. For chats saved through a legacy
+`ChatStore`, call `indexChat(index, record)`: it hands `index.index()` a record
+whose missing, empty or repeated message ids are filled in as
+`<chatId>:<index>`. The SQL stores' `store.transcript.index()` skips a chat
+that has a tombstone in that store, so a backfill never brings deleted content
+back into search. Copying legacy `deuz_chats` rows into the conditional tables
+is not automatic; see [Chat and stream durability](/docs/modules/chat-durability#moving-from-a-legacy-chat-store).
+
+## Resolving memory sources
+
+A [versioned memory](/docs/modules/versioned-memory#records-and-provenance)
+record cites the messages it rests on (`MemorySourceRef` with `chatId` and
+`messageId`). `resolveSource(scope, ref)` returns that message as
+`{ chatId, messageId, index, message }`, only when the chat's scope matches
+`scope`; otherwise `undefined` (an unknown, removed or tombstoned chat, an
+unknown message, or a chat of another scope).
+
+```ts
+import { createInMemoryTranscriptIndex } from '@deuz-sdk/core/chat';
+
+const transcript = createInMemoryTranscriptIndex();
+await transcript.index({
+  chatId: 'chat-1',
+  scope: { userId: 'ada' },
+  messages: [{ role: 'user', content: 'Book the flight to İzmir.' }],
+  messageIds: ['m-1'],
+  updatedAt: Date.now(),
+});
+
+const ref = {
+  kind: 'user' as const,
+  chatId: 'chat-1',
+  messageId: 'm-1',
+  digest: 'sha256:0000000000000000000000000000000000000000000000000000000000000000' as const,
+};
+console.log((await transcript.resolveSource({ userId: 'ada' }, ref))?.index); // 0
+console.log(await transcript.resolveSource({ userId: 'bob' }, ref)); // undefined
+```
+
+The stored message ids of a native run's chat projection (`ChatRecord.messageIds`,
+`<runId>:<n>`) survive every conditional store, and
+`uiFromMessages(messages, generateId, { messageIds })` renders a chat under the
+same ids, so a hit, a memory source and a UI message can name the same message.
+A [V3 run's versioned extraction](/docs/modules/native-agents#versioned-memory-intent-commit-acknowledgment)
+cites transcript positions (`<runId>#<index>`) instead, which `resolveSource`
+does not resolve to chat messages.
+
+## As a context source
+
+`createTranscriptContextSource({ index, scope, chatIds?, around?, refs? })`
+offers past messages to the context compiler, as `role: text` lines.
+`refs` returns message references, for example those that recalled memory
+records cite; each is resolved through `resolveSource` under the same scope and
+ranked above the search hits (`match: 'source-ref'`). The source is off unless
+you configure it, and its budget share (transcript 1) counts only when it
+returns candidates. See [Context compiler](/docs/modules/context#sources).
+
+## Limits
+
+- Lexical only. A query must share a word with the message; there is no
+  semantic search over transcripts in 2.4.
+- No backend stems words: `deploy` does not match `deploys`, except through
+  the substring match of the SQLite `LIKE` fallback.
+- No span is emitted for transcript search or chat writes: spec 3.6 defines none
+  for this subsystem.
+- A versioned memory `forget` does not remove messages from the index; delete or
+  tombstone the chat for that.

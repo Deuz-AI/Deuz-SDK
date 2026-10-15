@@ -1,0 +1,421 @@
+---
+title: Chat and stream durability
+description: Compare-and-set chat stores with tombstones, durable UI streams that persist every frame before it is sent, producer fencing, the capability handshake and React chat snapshots (2.4).
+---
+
+2.3 made chats and streams resumable: `StreamStateStore`, Last-Event-ID replay,
+`connectDeuzStream`, `resumeDeuzChatResponse` and the native chat repair. 2.4
+closes the gaps those left. Each piece is a new capability beside the 2.3
+interfaces, which stay as they are.
+
+| Piece | Import | What it adds | Stability |
+| --- | --- | --- | --- |
+| `ConditionalChatStore` | `@deuz-sdk/core/chat`, `/stores/sqlite`, `/stores/postgres` | Chat writes at an expected revision, deletes that leave a tombstone | Stable |
+| `DurableStreamStateStore` and `durable` | `@deuz-sdk/core/ui`, `/stores/sqlite`, `/stores/postgres`, `/stores/redis` | Persist before publish, batched commits, one fenced producer per stream | Preview |
+| Capability handshake | `@deuz-sdk/core/ui`, `@deuz-sdk/react` | The server announces what it supports; the client uses only that | Stable |
+| `ChatSnapshotV1` | `@deuz-sdk/react` | A chat with its ids, cursor, open turn and paused gates, as plain data | Stable |
+
+## Conditional chat stores
+
+A `ConditionalChatStore` is still a `ChatStore`, so it goes wherever one goes,
+and it adds `conditional: true` and a revision on every chat: 1 for a new chat,
+plus one per committed write.
+
+| Factory | Import | Notes |
+| --- | --- | --- |
+| `createInMemoryConditionalChatStore({ transcript?, deps? })` | `@deuz-sdk/core/chat` | `transcript` is a [`TranscriptIndex`](/docs/modules/transcript-search) updated with every committed write; `deps.clock` stamps `deletedAt` |
+| `createSqliteConditionalChatStore({ path \| database, wal?, fts?, clock? })` | `@deuz-sdk/core/stores/sqlite` | Returns the store plus `transcript` and `close()`; each write is one `BEGIN IMMEDIATE` transaction, safe across processes sharing the file |
+| `createPostgresConditionalChatStore({ pool \| connectionString, schema?, clock? })` | `@deuz-sdk/core/stores/postgres` | Returns the store plus `transcript`, `migrate()` and `close()`; needs a pool with `connect()`; each write takes a per-chat advisory lock in one transaction |
+
+```ts
+import { RevisionConflictError, updateConditionalChat } from '@deuz-sdk/core/chat';
+import { createSqliteConditionalChatStore } from '@deuz-sdk/core/stores/sqlite';
+
+const chats = createSqliteConditionalChatStore({ path: ':memory:' });
+const scope = { userId: 'ada' };
+
+const first = await chats.writeChat(
+  { chatId: 'chat-1', scope, messages: [{ role: 'user', content: 'Hi!' }], updatedAt: Date.now() },
+  { expectedRevision: 0 },
+);
+console.log(first.status, first.status === 'committed' && first.record.revision); // committed 1
+
+// A writer that read revision 0 is refused and told what is stored.
+const stale = await chats.writeChat(
+  { chatId: 'chat-1', scope, messages: [], updatedAt: Date.now() },
+  { expectedRevision: 0 },
+);
+console.log(stale.status); // conflict
+
+// Read, merge, write; on a conflict it reads and merges again (3 attempts by default).
+const merged = await updateConditionalChat(chats, 'chat-1', (current) =>
+  current.status === 'found'
+    ? {
+        ...current.record,
+        messages: [...current.record.messages, { role: 'assistant', content: 'Hello, Ada.' }],
+        updatedAt: Date.now(),
+      }
+    : undefined,
+);
+console.log(merged?.revision, merged?.messages.length); // 2 2
+
+// A delete leaves a tombstone that no later write goes over.
+await chats.deleteChat('chat-1');
+console.log((await chats.readChat('chat-1')).status); // deleted
+await chats.saveChat({ chatId: 'chat-1', scope, messages: [], updatedAt: Date.now() }).catch((error) => {
+  console.log(error instanceof RevisionConflictError); // true
+});
+console.log((await chats.transcript.search(scope, 'hello')).length); // 0
+await chats.close();
+```
+
+| Method | Behaviour |
+| --- | --- |
+| `readChat(chatId)` | `{ status: 'found', record }` (with `revision`), `{ status: 'missing' }` or `{ status: 'deleted', tombstone: { chatId, scope, revision, deletedAt } }` |
+| `writeChat(record, { expectedRevision })` | Writes only at the expected revision (0: the chat must not exist and must not be a tombstone), as `expectedRevision + 1`; otherwise `{ status: 'conflict', current }` and nothing is written. A `revision` on the input record is ignored; a non-integer or negative `expectedRevision` throws `InvalidRequestError` |
+| `tombstoneChat(chatId, { expectedRevision })` | Replaces the chat by a tombstone and drops it from the index; conflicts when the revision moved or it already is a tombstone |
+| `deleteChat(chatId)` | Tombstones at whatever revision is stored; a no-op on a tombstone |
+| `saveChat(record)` | The legacy write: last writer wins at the stored revision plus one, never over a tombstone (`RevisionConflictError`) |
+| `loadChat(chatId)` | The record with its revision, or `undefined` for a missing or deleted chat |
+| `listChats(scope?)` | Live chats only, most recently updated first, then by `chatId` |
+| `pruneTombstones(before)` | Deletes tombstones with `deletedAt < before` and returns the count; the id can be reused after that |
+
+A tombstone is final: `writeChat` and `tombstoneChat` conflict, `saveChat`
+throws, and `deleteChat` does nothing. Deleting or tombstoning
+(`expectedRevision: 0`) a chat that was never written also leaves a tombstone,
+with an empty scope, so a first write that arrives late cannot create it. The
+SDK never prunes tombstones on its own.
+
+`updateConditionalChat(store, chatId, merge, { attempts = 3 })` calls
+`merge(current, attempt)` with the chat as stored now; `merge` returns the record
+to write, or `undefined` to write nothing. On a conflict it reads again and
+merges again; after `attempts` conflicts it throws `RevisionConflictError`
+(`code: 'revision_conflict'`, `subsystem: 'chat'`, with `key`,
+`expectedRevision`, `actualRevision` and `attempts`). When the chat is a
+tombstone and `merge` still returns a record, it throws at once. `merge` runs
+again on every conflict, so it must not have side effects of its own.
+`isConditionalChatStore(store)` tells a conditional store from a legacy one.
+
+Native runs whose `chat.store` is conditional write their projection with
+`writeChat` at the revision they read; see
+[Chat projection](/docs/modules/native-agents#chat-projection). The legacy chat
+stores (memory, JSONL file, SQLite, PostgreSQL, Redis) are unchanged.
+
+### Tables
+
+The SQLite store keeps `deuz_chat_conditional`, `deuz_chat_transcript`,
+`deuz_chat_transcript_fts` and `deuz_chat_conditional_state`; the PostgreSQL
+store keeps `<schema>.deuz_chat_conditional` and `<schema>.deuz_chat_transcript`.
+Both track their version in their own `deuz_chat_conditional_schema` table
+(version 1). They never touch `deuz_chats`, `PRAGMA user_version` or the legacy
+migrate versions, so `@deuz-sdk/core` 2.3 still opens the same file or schema;
+it just does not see the conditional chats. A store borrows a `database` or
+`pool` you pass in and closes only what it opened itself.
+
+### Moving from a legacy chat store
+
+Nothing moves rows from `deuz_chats` into the conditional tables for you. Stop
+the legacy writers of the scopes you move first, then copy each chat with
+`writeChat(record, { expectedRevision: 0 })`. A chat written that way keeps its
+`messageIds`.
+
+## Durable streams (preview)
+
+In 2.3 a resumable response appended frames to its `StreamStateStore` without
+waiting, and a store failure was silent. The `durable` option (on
+`toDeuzStreamResponse`, `toDeuzObjectStreamResponse`, `toDeuzAgentStreamResponse`
+and `createDeuzStream`) commits every frame to a `DurableStreamStateStore`
+before it is sent, so a client that reconnects gets every frame once, in order,
+and never a frame the store lacks.
+
+```ts
+import { streamChat } from '@deuz-sdk/core';
+import { createInMemoryLeaseProvider } from '@deuz-sdk/core/ops';
+import { createMockModel } from '@deuz-sdk/core/testing';
+import {
+  DEUZ_CAPABILITY,
+  createInMemoryDurableStreamStateStore,
+  resumeDeuzStreamResponse,
+  toDeuzStreamResponse,
+} from '@deuz-sdk/core/ui';
+
+const store = createInMemoryDurableStreamStateStore();
+const leases = createInMemoryLeaseProvider();
+// What a 2.4 useChat sends.
+const request = new Request('https://app.example/api/chat', {
+  method: 'POST',
+  headers: { 'x-deuz-capabilities': 'chat-snapshot-v1, durable-stream, message-ids' },
+});
+
+const result = streamChat({
+  model: createMockModel({ responses: [{ text: 'Hello, Ada.' }] }),
+  messages: [{ role: 'user', content: 'Hi!' }],
+});
+const response = toDeuzStreamResponse(result, {
+  streamId: 'chat-1:turn-3',
+  durable: { store, lease: { provider: leases } },
+  capabilities: { request, announce: [DEUZ_CAPABILITY.messageIds, DEUZ_CAPABILITY.chatSnapshot] },
+});
+console.log(response.headers.get('x-deuz-capabilities')); // chat-snapshot-v1, durable-stream, message-ids
+const live = await response.text();
+console.log(live.split('\n\n')[0]);
+// data: {"type":"capabilities","capabilities":["chat-snapshot-v1","durable-stream","message-ids"]}
+
+// A client that lost the connection after event 1 reconnects.
+const replay = await resumeDeuzStreamResponse(store, 'chat-1:turn-3', { lastEventId: '1' }).text();
+console.log(replay.match(/^id: \d+/gm)); // [ 'id: 2', 'id: 3', 'id: 4', 'id: 5' ]
+```
+
+| `durable` field | Default | Meaning |
+| --- | --- | --- |
+| `store` | required | A `DurableStreamStateStore`; a `store` option, if also set, must be the same object |
+| `lease.provider` | required | A `LeaseProvider`; the lease key is `stream:<streamId>` and its token is the fencing token |
+| `lease.owner` | a random id | The producer's lease owner |
+| `lease.ttlMs` | `30000` | An integer of at least 3; renewed every `ttlMs / 3`, released at the end |
+| `batch.maxDelayMs` | `20` | How long a batch's first frame waits for more (0 or more) |
+| `batch.maxBytes` | `16384` | The encoded size that commits a batch at once |
+| `deps` | host clock | Clock, observer (spans) and `generateId` (the default owner) |
+
+`streamId` is required. A misconfiguration throws a `TypeError` when the
+response is built. How a durable response runs:
+
+- A batch commits when it reaches `maxBytes` or `maxDelayMs` after its first
+  frame, whichever comes first, so a token is not a database round trip. One
+  commit is in flight at a time, and a batch is written to the wire only after
+  it committed. The last batch, with the `done` sentinel, commits before
+  `[DONE]`.
+- Transient `writeData` parts keep their order and are never journaled.
+- When the client leaves, the commits go on, so a reconnect finds the turn.
+
+It fails closed instead of degrading. When another producer holds the lease,
+a newer producer took over, the stored log moved past this producer, its lease
+was lost, or the store threw, the response sends one `error` frame with no event
+id and no `[DONE]`, and stops reading its source. The frame's message is one of
+`Durable stream: another producer holds this stream.`, `…a newer producer took
+over this stream.`, `…the stored stream moved past this producer.`, `…this
+producer lost its lease.` or `…the stream store failed.`. A thrown store or
+lease error goes to `onStoreError` only, never to the client.
+
+### Durable stores
+
+| Factory | Import | Notes |
+| --- | --- | --- |
+| `createInMemoryDurableStreamStateStore({ deps? })` | `@deuz-sdk/core/ui` | One process |
+| `createSqliteDurableStreamStateStore({ path \| database, wal?, clock? })` | `@deuz-sdk/core/stores/sqlite` | `close()` closes only a handle it opened |
+| `createPostgresDurableStreamStateStore({ pool \| connectionString, schema? })` | `@deuz-sdk/core/stores/postgres` | Needs `pool.connect()`; `migrate()`; `close()` ends only its own pool |
+| `createRedisDurableStreamStateStore({ client \| url, prefix? })` | `@deuz-sdk/core/stores/redis` | Redis 7+, a client with `eval` (ioredis through `wrapIoredisClient`); `prefix` defaults to `'deuz'`. The only 2.4 store on Redis |
+
+Every durable store is also a `StreamStateStore`, so `resumeDeuzStreamResponse`
+reads it unchanged. The rules they share:
+
+- `open(streamId, token)` and `commit({ streamId, token, records })` refuse a
+  token lower than the stream's highest (`fenced`, with that token). An equal
+  token opens again; a commit with a higher one raises the fence.
+- A batch holds consecutive seqs (a `TypeError` otherwise) starting at the
+  stored last seq plus one (`conflict` otherwise, nothing stored), and is stored
+  whole or not at all.
+- Parts are stored as JSON text, so a replay sends the bytes the live response
+  sent.
+- The legacy `append` replaces a record with the same seq and is not fenced;
+  the durable serializer never calls it.
+
+The SQL stores use `deuz_stream_state_streams` and `deuz_stream_state_records`
+with their own version table, `deuz_stream_state_schema` (version 1). Redis keeps
+each stream under its own hash tag: `{<prefix>:stream:<id>}:head` and `:log`,
+plus `{<prefix>:streams}:ix` and `:schema`.
+
+### Retention
+
+`prune({ terminalBefore })` deletes finished streams (their last record is the
+`done` sentinel) whose last open, commit or append is older than the cutoff, on
+the store's clock (the injected clock for memory and SQLite, `clock_timestamp()`
+for PostgreSQL, the server `TIME` for Redis), and returns the count. A stream
+opened again for a new leg counts as active. A pruned stream forgets its fence,
+so prune only streams no producer will continue. Nothing is deleted in the
+background; 24 hours (`terminalBefore: now - 86_400_000`) on a
+[durable scheduler](/docs/modules/goal-runtime#durable-scheduler) is a good
+default.
+
+### The legacy store, when it fails
+
+The non-durable `store` option changed in 2.4 (a behaviour change listed in the
+migration notes):
+
+- A store that cannot report its last seq no longer makes the response number
+  its frames from 0 over the frames already stored. That response is not
+  journaled at all (no records, no `id:` lines), `onStoreError` fires, and a
+  wire v2 client gets a `warning` part of type `'stream-store-error'`: "The
+  stream store failed: this response is not journaled and cannot be resumed."
+- Appends are still not awaited, but the first failed append stops journaling
+  that leg, fires `onStoreError` once and sends the same warning, so the log
+  never holds a gap a replay would skip without a word.
+
+Such a response cannot be resumed. Use durable mode when it must be.
+
+## The capability handshake
+
+A 2.4 server and a 2.4 client agree on features without breaking older ones.
+The client lists what it understands in an `x-deuz-capabilities` request
+header. Only then does the server answer, in the same response header and in a
+first stream frame `{ type: 'capabilities', capabilities: [...] }` (no event id,
+never journaled, not sent on wire v1). A request without the header, which is
+every 2.3 client, gets a response byte-identical to 2.3's.
+
+| Capability (`DEUZ_CAPABILITY`) | Announced when | What a 2.4 `useChat` does with it |
+| --- | --- | --- |
+| `'message-ids'` (`messageIds`) | You announce it | A resume read that delivers a message the history already holds skips it, so a replay renders, appends and runs nothing twice |
+| `'chat-snapshot-v1'` (`chatSnapshot`) | You announce it | POST bodies gain `messageIds` aligned with `messages` |
+| `'durable-stream'` (`durableStream`) | Automatically, for a durable response or on a resume endpoint over a durable store | A POST read that drops before it ends continues from `resume.endpoint` instead of ending in `status: 'error'` |
+| `'conditional-chat'` (`conditionalChat`) | You announce it | Nothing yet; the client does not ask for it |
+
+On the server, pass `capabilities: { request, announce? }` to
+`toDeuzStreamResponse`, `createDeuzStream`, `toDeuzAgentStreamResponse` or
+`resumeDeuzStreamResponse`. `request` is the `Request`, its `Headers` or the
+header string. Announce strings must be lower-case tokens (a `TypeError`
+otherwise, checked even when the request did not ask). The response header is
+sorted and `', '`-joined, and empty when nothing is announced.
+`formatDeuzCapabilities` and `parseDeuzCapabilities` read and write the header
+value for your own code; `DEUZ_CAPABILITIES_HEADER` is its name.
+
+```ts
+import { streamChat } from '@deuz-sdk/core';
+import { validateChatRequest } from '@deuz-sdk/core/chat';
+import { createInMemoryLeaseProvider } from '@deuz-sdk/core/ops';
+import { createMockModel } from '@deuz-sdk/core/testing';
+import {
+  DEUZ_CAPABILITY,
+  createInMemoryDurableStreamStateStore,
+  resumeDeuzStreamResponse,
+  toDeuzStreamResponse,
+} from '@deuz-sdk/core/ui';
+
+const streams = createInMemoryDurableStreamStateStore();
+const leases = createInMemoryLeaseProvider();
+const announce = [DEUZ_CAPABILITY.messageIds, DEUZ_CAPABILITY.chatSnapshot];
+
+// POST /api/chat
+export async function POST(request: Request): Promise<Response> {
+  const parsed = validateChatRequest(await request.json());
+  if (!parsed.ok) return Response.json({ issues: parsed.issues }, { status: 400 });
+  const chatId = parsed.request.chatId ?? crypto.randomUUID();
+
+  const result = streamChat({
+    model: createMockModel({ responses: [{ text: 'Hello, Ada.' }] }),
+    messages: parsed.request.messages,
+    signal: request.signal,
+  });
+  return toDeuzStreamResponse(result, {
+    streamId: chatId,
+    durable: { store: streams, lease: { provider: leases } },
+    capabilities: { request, announce },
+  });
+}
+
+// GET /api/chat/:chatId/stream
+export function GET(request: Request, chatId: string): Response {
+  return resumeDeuzStreamResponse(streams, chatId, {
+    lastEventId: request.headers.get('last-event-id') ?? undefined,
+    capabilities: { request, announce },
+  });
+}
+```
+
+A route that announces `chat-snapshot-v1` should store the ids the client
+renders. The client then posts `messageIds` aligned with `messages`;
+`validateChatRequest` leaves that field in `parsed.request.rest` unchecked, so
+check that it is an array of strings as long as `messages` before you save it
+as `ChatRecord.messageIds`. Use the stream's `messageId` as the stored id of the
+assistant message the response produced.
+
+The handshake adds a request header. A cross-origin chat API whose preflight
+lists allowed headers explicitly must add `x-deuz-capabilities`, or the app sets
+`capabilityHandshake: false` in `useChat`. To let the browser read the response
+header, add `Access-Control-Expose-Headers: x-deuz-capabilities`; otherwise the
+hook reads the announcement from the first stream frame.
+
+## React chat snapshots
+
+`ChatSnapshotV1` (a type exported from `@deuz-sdk/react`, with
+`ChatSnapshotGateV1`) is a chat as `useChat` holds it, as plain data you can
+persist with `JSON.stringify`:
+
+| Field | Meaning |
+| --- | --- |
+| `version` | Always `1`; another value is refused when restoring |
+| `messages` | The canonical history, the one a request posts |
+| `messageIds` | One id per message, aligned like `ChatRecord.messageIds` |
+| `cursor` | The last stream event id the chat read |
+| `turn` | The assistant turn that was still streaming, not yet in `messages` |
+| `pendingApprovals`, `pendingToolCalls` | The approvals the chat is paused on and the client calls it is parked on |
+| `gate` | How that gate resumes: verdicts and tool results already given, a native run's `runId` and client calls |
+| `capabilities` | What the server announced |
+
+Only `version` and `messages` are required. The type lives in React, not in
+core, because the React package accepts any `@deuz-sdk/core` 2.x as its peer.
+
+```tsx
+import { useChat } from '@deuz-sdk/react';
+import type { ChatSnapshotV1 } from '@deuz-sdk/react';
+
+export function Chat({ chatId, saved }: { chatId: string; saved?: ChatSnapshotV1 }) {
+  const chat = useChat({
+    api: '/api/chat',
+    chatId,
+    initialSnapshot: saved,
+    resume: { endpoint: `/api/chat/${chatId}/stream`, auto: true },
+  });
+
+  const save = () =>
+    localStorage.setItem(`chat:${chatId}`, JSON.stringify(chat.exportSnapshot()));
+
+  return (
+    <div>
+      {chat.messages.map((message) => (
+        <p key={message.id}>{message.role}</p>
+      ))}
+      <button onClick={save}>Save</button>
+      <small>{chat.capabilities?.join(', ') ?? 'no handshake'}</small>
+    </div>
+  );
+}
+```
+
+`initialSnapshot` is read once at mount, like `initialMessages`, and takes
+precedence over it. It restores the messages under their stored ids (a missing,
+empty or repeated id gets a fresh one from `generateId`), the open turn as the
+last bubble, the cursor (it beats `resume.lastEventId`), pending approvals with
+the verdicts already given, parked client calls with the results already given,
+a native run's gate and the recorded capabilities. `reconnect()` or
+`resume.auto` continues the restored turn from the cursor, every frame once; a
+turn saved without a cursor is rebuilt from the start of its stream, as in 2.3.
+Without `resume`, the restored turn is sealed. A malformed snapshot (a `version`
+other than 1, or a non-array `messages`, `messageIds`, `pendingApprovals`,
+`pendingToolCalls` or `capabilities`) throws a `TypeError`. `setHistory` still
+drops the gates and the cursor.
+
+A stored chat restores as `{ version: 1, messages: record.messages, messageIds:
+record.messageIds }`. This works next to a 2.3 core too: the hook applies the
+ids itself when `uiFromMessages` ignores its third argument. More on the hook's
+side on [React hooks](/docs/modules/react-hooks#snapshots-and-the-handshake-24).
+
+## Telemetry
+
+A durable response reports `deuz.stream.batch` per commit (subsystem
+`'stream'`): its started event carries `deuz.stream.batch_frames` and
+`deuz.stream.batch_bytes`, its completed event `deuz.stream.commit_ms`. A fenced
+producer reports a zero-length `deuz.stream.fenced` span with
+`deuz.stream.fencing_token`. Attributes carry counts, bytes, milliseconds and
+tokens, never content. No span is emitted for chat writes.
+
+## Limits
+
+- Durable streams and their stores are a preview API; the stored record format
+  is versioned.
+- Durable mode costs one store write per batch and one lease renewal every
+  `ttlMs / 3`; the defaults trade at most 20 ms of added latency per batch for
+  fewer writes.
+- There is no transaction between a chat store and a stream store. A chat write
+  and the stream of the same turn can disagree after a crash; the native run's
+  chat repair settles its own projection.
+- Redis has a durable stream store only; there is no Redis conditional chat
+  store or transcript index in 2.4.
