@@ -685,6 +685,9 @@ export function citationsFromHits(
  * unchanged.
  */
 export { cosineSimilarity } from './internal/vector';
+/** Marks an embedder whose calls report their usage, so RAG charges them (2.4). */
+export { defineAccountedEmbedder } from './internal/accounting';
+export type { AccountedEmbedder, AccountedEmbeddings } from './types/accounting';
 
 /** Pure in-memory cosine vector store — reference impl for tests/examples ONLY. */
 export function createMemoryVectorStore(): VectorStore {

@@ -194,6 +194,8 @@ await memory.forget(fact.id);
 console.log((await runs.getBlob(step.blob.digest)).status); // redacted
 ```
 
+See [Versioned memory](/docs/modules/versioned-memory).
+
 ## Context compiler and working memory
 
 `@deuz-sdk/core/context` chooses what a model call sees beyond the
@@ -251,6 +253,8 @@ or confirms a hypothesis or accepts a decision; what a model adds stays
 `'proposed'`. `workingMemoryTools` gives the model `working_memory_read`,
 `working_memory_add` and `working_memory_update`.
 
+See [Context compiler and working memory](/docs/modules/context).
+
 ## Transcript search
 
 A `TranscriptIndex` searches past messages lexically within a memory scope,
@@ -265,6 +269,8 @@ PostgreSQL conditional chat stores carry their own as `store.transcript`
 the same transaction as every chat write, and `indexChat` backfills a chat
 saved through a legacy `ChatStore`. There are no embeddings in transcript
 search in 2.4.
+
+See [Transcript search](/docs/modules/transcript-search).
 
 ## Native runs: the V3 record
 
@@ -318,6 +324,8 @@ time with `UnsupportedStoreError` (`unsupported_store`).
 Without `checkpointVersion: 3` a run takes the 2.3 path, and version 1 and 2
 records are never converted.
 
+See [Native agents](/docs/modules/native-agents).
+
 ## Goal runtime: supervisor, scheduler and webhooks
 
 `@deuz-sdk/core/goal/runtime` drives the 2.3 goal records. Everything in it is
@@ -369,6 +377,8 @@ runs until you create it.
   entries: an early event stays pending, and an event is never re-dated onto a
   wait that began after it.
 
+See [Goal runtime](/docs/modules/goal-runtime).
+
 ## Acceptance evidence
 
 - **Evidence bound to its source.** `GoalEvidence` gains `criterionId`,
@@ -390,6 +400,8 @@ runs until you create it.
 - **`digestWorkspace(workspace, { include, exclude })`** returns the
   `deuz-workspace-v1` digest of a workspace's files, computed with WebCrypto.
   The Docker runner's artifacts use the same format.
+
+See [Goal runtime](/docs/modules/goal-runtime).
 
 ## Docker sandbox and process runner (preview)
 
@@ -420,6 +432,8 @@ runs until you create it.
 - **Stores.** `createInMemoryProcessOperationStore` and
   `createSqliteProcessOperationStore`, which adds its own tables with a
   `deuz_process_ops_schema` version table.
+
+See [Docker sandbox](/docs/modules/docker).
 
 ## Chat and stream continuity
 
@@ -465,6 +479,8 @@ runs until you create it.
   tool calls the chat is paused on, with what was already answered.
   `useChat({ initialSnapshot })` restores all of it at mount, so a page reload
   resumes the chat as it was.
+
+See [Chat and stream durability](/docs/modules/chat-durability).
 
 ## Skill proposals (experimental)
 
@@ -522,6 +538,8 @@ and small enums under `deuz.<subsystem>.*` keys, never content.
 Chat writes and transcript searches report no span. The attribute keys of
 each subsystem are listed in [Observation events](/docs/reference/observe-events#24-spans).
 
+See [Observability](/docs/modules/observability).
+
 ## Retention
 
 The SDK deletes nothing in the background. Every cleanup is a call you make,
@@ -535,6 +553,8 @@ which you can run from a durable schedule.
 | Process operations       | `prune({ terminalBefore })` removes finished records; `dispose` removes a container                                                                                                       |
 | V3 runs                  | `prune({ terminalBefore })` deletes terminal runs and the context packages only they used                                                                                                 |
 | Conditional chats        | `pruneTombstones(before)` removes old tombstones, after which a chat id can be used again                                                                                                  |
+
+See [Retention](/docs/modules/retention).
 
 ## Bug fixes
 
@@ -589,6 +609,8 @@ the [behaviour changes](#behaviour-changes) below, and read the section of each
 2.4 feature before you turn it on.
 
 ### Sharing a database with 2.3 processes
+
+The rollback test proves this on every change: `npm run test:rollback -w @deuz-sdk/core`, also a CI job, installs `@deuz-sdk/core@2.3.0` from npm, opens the SQLite file and the PostgreSQL schema 2.4 wrote, continues the legacy work in them and refuses the V3 runs without calling a model.
 
 - **No existing schema version moves.** Every 2.4 store keeps its data in new
   tables with a version table of its own: `deuz_vmem_schema`,
