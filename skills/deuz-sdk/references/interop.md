@@ -1,4 +1,4 @@
-<!-- verified: 2026-10-15 against @deuz-sdk/core@2.3.0 · api-contract sha256:03a491b97528
+<!-- verified: 2026-10-15 against @deuz-sdk/core@2.3.0 · api-contract sha256:99750a8aa5fa
      sources: packages/core/src/mcp/server.ts, packages/core/src/mcp/server-internals.ts,
      packages/core/src/node/mcp-server.ts, packages/core/src/a2a/{index,agent,client,handler,runtime,protocol,errors,task-store,types}.ts,
      docs/content/docs/modules/{mcp-server,a2a}.mdx -->

@@ -1,4 +1,4 @@
-<!-- verified: 2026-10-15 against @deuz-sdk/core@2.3.0 · api-contract sha256:03a491b97528
+<!-- verified: 2026-10-15 against @deuz-sdk/core@2.3.0 · api-contract sha256:99750a8aa5fa
      sources: packages/core/src/{providers-compat,providers,openai,anthropic,google,xai,azure,bedrock,vertex,voyage,yunwu,model-profile}.ts,
      packages/core/src/adapters/{anthropic,openai-responses,openai-compatible,google-native}.ts,
      packages/core/src/internal/{stable-prefix,stop-details}.ts, packages/core/src/core/request-rules.ts,

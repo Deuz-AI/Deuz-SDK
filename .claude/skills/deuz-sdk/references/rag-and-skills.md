@@ -1,12 +1,13 @@
-<!-- verified: 2026-10-15 against @deuz-sdk/core@2.3.0 · api-contract sha256:03a491b97528
+<!-- verified: 2026-10-15 against @deuz-sdk/core@2.3.0 · api-contract sha256:99750a8aa5fa
      sources: packages/core/src/{rag.ts, rag-node.ts, skills.ts, skills/node.ts, parts.ts, ui.ts, voyage.ts, node/store-postgres.ts},
      packages/core/src/internal/rerank-http.ts, packages/core/src/node/headless.ts,
      packages/core/src/types/{tool.ts, stream.ts, methods.ts, message.ts},
-     docs/content/docs/modules/{rag.mdx, skills.mdx} -->
+     docs/content/docs/modules/{rag.mdx, skills.mdx}, packages/core/src/skills/learning/*.ts,
+     packages/core/src/internal/{estimate-tokens,accounting}.ts, .changeset/{2-4-l2,2-4-l8}.md -->
 
 # RAG pipelines, and giving an agent skills
 
-**Load when:** building document Q&A or retrieval over your own corpus (parsing uploads, chunking, embedding, vector or hybrid search, citations in the UI), deciding whether to retrieve at all versus attach the file to the message, or packaging reusable instructions as progressive-disclosure Agent Skills the model loads on demand.
+**Load when:** building document Q&A or retrieval over your own corpus (parsing uploads, chunking, embedding, vector or hybrid search, citations in the UI), deciding whether to retrieve at all versus attach the file to the message, or packaging reusable instructions as progressive-disclosure Agent Skills the model loads on demand. Since 2.4, RAG hits and the skill catalog can share one token budget with memory through the context compiler (`createRagContextSource`, `createSkillsContextSource`: `references/context-working-memory.md`), and a verified run can be turned into a draft skill (`@deuz-sdk/core/skills/learning`, experimental, at the end of this page).
 
 Two modules, one shared idea: **every stateful stage is an injected seam**, and the heavy/Node-only half sits behind a `/node` subpath so the core stays edge-safe.
 
@@ -16,6 +17,7 @@ Two modules, one shared idea: **every stateful stage is an injected seam**, and 
 | `@deuz-sdk/core/rag/node` | Node only | `pdfParser`, `docxParser`, `xlsxParser`, `htmlToBlocks`, `defaultNodeParserRegistry` |
 | `@deuz-sdk/core/skills` | edge-safe, zero-dep | `SKILL.md` parsing, registry, sources, matchers, catalog rendering, tool scoping |
 | `@deuz-sdk/core/skills/node` | Node only | `nodeSkillSource` (walks directories for `<id>/SKILL.md`) |
+| `@deuz-sdk/core/skills/learning` | edge-safe, experimental (2.4) | `proposeSkillFromRun`, `SkillLearningError` |
 
 ---
 
@@ -125,7 +127,7 @@ export async function summarizePdf(bytes: Uint8Array): Promise<string> {
 | `chunkRecursive` | `text` | **Default.** Splits on `DEFAULT_SEPARATORS` (`'\n\n\n'`, `'\n\n'`, `'\n'`, `'. '`, `' '`, `''`) only when a piece exceeds the budget, then packs and adds overlap. Pass `separators` for domain markup. |
 | `chunkBlocks` | `DocBlock[]` | You have `doc.structure` (DOCX, your own HTML) — it flushes before every `heading`, so a section never bleeds into the next. |
 
-`ChunkOptions` is shared: `size` (default `512`), `overlap` (default `64`), `countTokens` (default `approxCountTokens`, ~len/4). `DEFAULT_CHUNK_OPTIONS` exposes `{ size: 512, overlap: 64 }`. Only `chunkFixed` records offsets; `chunkRecursive` and `chunkBlocks` do not.
+`ChunkOptions` is shared: `size` (default `512`), `overlap` (default `64`), `countTokens` (default `approxCountTokens`, ~len/4), and since 2.4 `estimator` (a `TokenEstimator` from `createTokenEstimator` in `@deuz-sdk/core/context`) to count through the same estimator as the context compiler; `countTokensWith(estimator)` returns a `CountTokens` and `estimateTokens(text, estimator)` accepts one. Without them the count stays 4 chars/token, so 2.3 chunk boundaries do not move. `DEFAULT_CHUNK_OPTIONS` exposes `{ size: 512, overlap: 64 }`. Only `chunkFixed` records offsets; `chunkRecursive` and `chunkBlocks` do not.
 
 > **`Chunk.index` is the identity key.** RRF fuses rankings by `index`, `citationsFromHits` reports it as `chunkIndex`, and the BM25 index is built over a chunk array positionally. Build the vector index and the BM25 index from the **same array**, and never renumber after indexing. Put stable provenance (`meta.id`, `meta.sourceId`, `meta.url`, `meta.title`) on `chunk.meta` before indexing — those four keys are exactly what citations read back.
 
@@ -135,7 +137,9 @@ RAG's `Embedder` is deliberately **not** an `EmbeddingModel`. It is `{ embed(tex
 
 ## Index, retrieve, hybrid
 
-`indexChunks(chunks, { embedder, store })` embeds every chunk's text and upserts. `retrieve(query, { embedder, store, reranker? }, { topK?, topN? })` embeds the query, pulls `topK` from the store (default `8`), reranks to `topN` (default `topK`).
+`indexChunks(chunks, { embedder, store }, options?)` embeds every chunk's text and upserts. `retrieve(query, { embedder, store, reranker? }, { topK?, topN? })` embeds the query, pulls `topK` from the store (default `8`), reranks to `topN` (default `topK`).
+
+**Budgeted embeddings (2.4).** `retrieve`, `hybridRetrieve` and `indexChunks` take `accounting` (`CallAccounting`: `{ execution, requestId, kind?, tokens?, usd? }`) and `onWarning`. Each embedding call is then reserved on the execution context before it runs (kind `'embedding'`, tokens estimated from the inputs, unpriced unless you give `usd`). An accounted embedder — `{ embed, dims, accounted: true }` whose `embed` returns `{ vectors, usage, modelId }` — is settled with its reported usage; a plain one is held as unknown (never free) and reports an `unaccounted-usage` warning; a failed call is marked unknown and rethrown. Without `accounting` these functions behave as in 2.3. The same contract on `embed` / `embedMany` is `EmbedOptions.accounting` (`references/core-calls.md`).
 
 `hybridRetrieve` runs the dense and BM25 stages in parallel and fuses their **rankings** with Reciprocal Rank Fusion — raw cosine and BM25 scores are on incomparable scales, so only rank order is used. It adds `perStageK` (candidates from each stage, default `topK`) and `rrfK` (RRF damping, default `60`) to `RetrieveOptions`. Reach for it whenever queries mix natural language with exact tokens ("clause 17", a SKU, a person's name) — pure dense search blurs rare terms. If nothing is indexed densely yet it degrades to lexical-only rather than returning nothing.
 
@@ -413,12 +417,44 @@ export async function toolsForSkill(id: string): Promise<ToolSet> {
 - `nodeSkillSource` and every `*/node` subpath throw on Edge/Workers; use `fetchSkillSource` there.
 - `parseSkill` never throws on bad content — an invalid skill loads silently unless you read `issues`.
 - The bundled YAML parser is a subset; anchors, nested maps and multi-line flow collections need an injected `parseYaml`.
-- `registry.match` never triggers anything, and `renderSkillCatalog` never loads a body — Level 2 only happens because a tool called `trigger`.
+- `registry.match` never triggers anything, and `renderSkillCatalog` never loads a body — Level 2 only happens because a tool called `trigger`. The 2.4 skills context source keeps that rule: it budgets catalog lines and bodies the model already loaded, and never injects a body because retrieval matched it.
+
+## A draft skill from a verified run (2.4, experimental)
+
+`proposeSkillFromRun(options)` (`@deuz-sdk/core/skills/learning`, edge-safe) drafts an Agent Skill from **one** native run that is terminal, completed and `verification: 'verified'` (a 2.3 or V3 envelope). The draft is inert: `status: 'proposed'`, `evaluation: 'not-evaluated'`; the run's verification describes the task, never the skill. It writes no file, changes no registry and activates nothing — storing, reviewing and testing it is yours.
+
+```ts
+import type { LanguageModel } from '@deuz-sdk/core';
+import type { AgentRunEnvelope } from '@deuz-sdk/core/agent';
+import { SkillLearningError, proposeSkillFromRun } from '@deuz-sdk/core/skills/learning';
+
+declare const model: LanguageModel;
+declare const run: AgentRunEnvelope; // terminal, completed, verification 'verified'
+
+try {
+  const proposal = await proposeSkillFromRun({
+    run,
+    model,
+    budget: { usd: 0.05 }, // required: its own ledger, separate from the run's accounting
+    toolSummaries: { call_1: 'Fetched the three failing tests.' }, // raw tool results never reach the model
+  });
+  console.log(proposal.status, proposal.evaluation, proposal.steps.length); // proposed not-evaluated n
+  console.log(proposal.skillMd); // a SKILL.md draft with Method, Limitations and Sources sections
+} catch (error) {
+  if (error instanceof SkillLearningError) console.log(error.code); // source_not_eligible | source_too_large | invalid_proposal
+  else throw error;
+}
+```
+
+- **What the model sees.** A numbered projection (`S1`, `S2`, …) of the run's user-facing turns: no system messages, reasoning (plain, encrypted or redacted), provider metadata, images, compiled context blocks, compaction summaries or SDK-internal turns, and every raw tool result shown as `omitted` unless `toolSummaries` names it. A projection over `maxSourceChars` (32 000) is refused (`source_too_large`), never cut.
+- **One call.** No tools, no transport retry, at most `maxOutputTokens` (2048), optional `instructions`; `budget` needs a `tokens` or `usd` bound and a budget too small for the reservation rejects with `BudgetLedgerError` `budget_exceeded` before any request. `cost` has the model id, usage and `costUsd` when `deps.priceProvider` prices the model. A repeated call costs again: no exactly-once.
+- **Checked, never repaired.** Every step must cite at least one projection item and none it lacks (each source carries the run id, `messageId` `<runId>:<index>`, tool call id and model step when known, and a `sha256:` digest); `allowedTools` must be a subset of tools the run called successfully; `skillMd` must pass `parseSkill`. Anything else, or a cut-off or refused answer, is `invalid_proposal`.
 
 ## Deep dive
 
 - [/docs/modules/rag](/docs/modules/rag) — the full RAG pipeline in prose, with the parser, chunker, retrieval and native-document sections.
 - [/docs/modules/skills](/docs/modules/skills) — Agent Skills end to end: format, registry, sources, matchers, tool scoping, path safety.
+- `/docs/reference/whats-new-2-4` (2.4) — the skill proposal and its limits.
 - [/docs/core/embeddings](/docs/core/embeddings) — `embed` / `embedMany`, the `EmbeddingModel` kind, `taskType` and dimension truncation.
 - [/docs/modules/ui-streaming](/docs/modules/ui-streaming) — the `citation` and `data-{name}` wire parts and how a client reads them.
 - [/docs/agents/tool-loop](/docs/agents/tool-loop) — how `maxSteps` and tool execution work around a retrieval or skill-loading tool.

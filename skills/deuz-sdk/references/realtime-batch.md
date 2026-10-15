@@ -1,4 +1,4 @@
-<!-- verified: 2026-10-15 against @deuz-sdk/core@2.3.0 · api-contract sha256:03a491b97528
+<!-- verified: 2026-10-15 against @deuz-sdk/core@2.3.0 · api-contract sha256:99750a8aa5fa
      sources: packages/core/src/realtime/{index,session,types,models,tokens,tools,usage,errors,websocket}.ts,
      packages/core/src/batch/{index,client,types,budget,store,errors,prepare,parse}.ts, packages/core/src/pricing.ts,
      docs/content/docs/modules/{realtime,batch,pricing,budgets}.mdx -->
@@ -19,7 +19,7 @@
 
 ## Realtime voice
 
-`createRealtimeSession(options)` opens a session against a model from `createOpenAIRealtime(settings)(modelId)` or `createGeminiLive(settings)(modelId)` (settings: `apiKey`, `baseURL`, `headers`, `provider`; Gemini also `apiVersion` and `apiKeyLocation`). One normalized event model covers both wires. WebRTC (2.4), Vertex AI Live, OpenAI transcription-only sessions and SIP are not covered.
+`createRealtimeSession(options)` opens a session against a model from `createOpenAIRealtime(settings)(modelId)` or `createGeminiLive(settings)(modelId)` (settings: `apiKey`, `baseURL`, `headers`, `provider`; Gemini also `apiVersion` and `apiKeyLocation`). One normalized event model covers both wires. WebRTC (a 2.5 target), Vertex AI Live, OpenAI transcription-only sessions and SIP are not covered.
 
 ```ts
 import { createOpenAIRealtime, createRealtimeSession } from '@deuz-sdk/core/realtime';

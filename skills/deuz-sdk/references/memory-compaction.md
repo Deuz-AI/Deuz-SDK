@@ -1,9 +1,11 @@
-<!-- verified: 2026-10-15 against @deuz-sdk/core@2.3.0 · api-contract sha256:03a491b97528
+<!-- verified: 2026-10-15 against @deuz-sdk/core@2.3.0 · api-contract sha256:99750a8aa5fa
      sources: packages/core/src/{memory.ts, memory-markdown.ts, compaction.ts, chat-request.ts,
      inference/compaction.ts, inference/loop-shared.ts, internal/stable-prefix.ts, internal/native-memory.ts,
      types/config.ts, types/methods.ts, types/message.ts, node/store-sqlite.ts},
      docs/content/docs/modules/{memory.mdx, compaction.mdx}, docs/content/docs/core/compaction.mdx,
-     docs/content/docs/agents/preserved-thinking.mdx, docs/content/docs/reference/whats-new-2-0.mdx -->
+     docs/content/docs/agents/preserved-thinking.mdx, docs/content/docs/reference/whats-new-2-0.mdx,
+     packages/core/src/internal/{memory-vectors,accounting}.ts, packages/core/src/types/accounting.ts,
+     .changeset/{2-4-l1b,2-4-w0e,2-4-fa}.md -->
 
 # Memory across sessions, and surviving long conversations
 
@@ -21,6 +23,8 @@ Two mechanisms that people conflate. They solve opposite problems and compose.
 
 A long-lived assistant wants both. Neither is on by default.
 
+Memory you must correct, audit, share between writers or forget on request — stable ids with revisions, a source and an `asserted | inferred` origin per fact, idempotent operations with receipts — is the 2.4 `@deuz-sdk/core/memory/versioned` API in `references/versioned-memory.md`; this page's API is unchanged beside it. To put memory, RAG hits and the skill catalog into one token budget, see `references/context-working-memory.md`.
+
 # Part 1 — Memory
 
 ## The pipeline
@@ -31,7 +35,7 @@ A long-lived assistant wants both. Neither is on by default.
 2. **Extract** — one `MemoryLLM` call built by `buildExtractionPrompt`. Asks for `{"facts":[{"text","importance","kind"}]}` (plus `links` when `opts.links`). `parseFacts` strips fences, validates each field independently, returns `[]` on garbage instead of throwing. **Zero facts ⇒ `remember` returns immediately** — no embed, no search, no decision call.
 3. **Embed + search** — all fact texts in **one** `Embedder.embed(texts, 'add')` batch, then one `store.search` **per fact** (topK each, deduped by record id).
 4. **Reconcile** — one `MemoryLLM` call built by `buildDecisionPrompt`. Existing records are shown with **temporary integer ids** (`'0'`, `'1'`, …), never real ids, so a hallucinated id is detectable: `parseDecision` drops any id not in the map. Output is `ADD` / `UPDATE` / `DELETE` / `NOOP`.
-5. **Apply** — importance/links copied onto `ADD` events by exact text match, duplicate hashes dropped, `applyEvents` reduces to `MemoryMutation[]`, and (unless `apply: false`) writes them. `planMemory(...)` is exactly `remember` with `apply: false`, for when the write must join a transaction you own.
+5. **Apply** — importance/links copied onto `ADD` events by exact text match, duplicate hashes dropped, `applyEvents` reduces to `MemoryMutation[]`, and (unless `apply: false`) writes them. `planMemory(...)` is exactly `remember` with `apply: false`, for when the write must join a transaction you own; `applyMutations(store, mutations)` (2.4) applies such a plan exactly as `remember` would (every upsert in one call, then every delete, then each invalidation).
 
 ## The seams — one object, wired once
 
@@ -45,7 +49,9 @@ A long-lived assistant wants both. Neither is on by default.
 | `generateId` | `() => string` | yes | New record ids. |
 | `embedder` | `Embedder` | no | `embed(texts, 'add' \| 'search' \| 'update')`. Needed for cosine recall; without it both reference stores fall back to substring matching. |
 | `hashFn` | `HashFn` | no | Content hash for dedup. Default `defaultHashFn` (WebCrypto SHA-256 hex). |
-| `logger` | `{ warn(m, f?) }` | no | Currently only link expansion warns here. |
+| `logger` | `{ warn(m, f?) }` | no | Link expansion warns here, and (2.4) an `embedding-mismatch` or `unaccounted-usage` notice when no `onWarning` takes it. |
+| `accountedLlm` | `AccountedMemoryLLM` | no | 2.4: built with `defineAccountedMemoryLLM(fn)` (it returns `{ text, usage, modelId }`); when set, every memory LLM call goes to it instead of `llm`, whose type stays the 2.3 `MemoryLLM`. `embedder` likewise accepts an embedder marked `accounted: true` that returns its usage with the vectors. |
+| `execution` | `NativeExecutionContext` | no | 2.4: charges each memory LLM call (prompt + 1024 output tokens estimated, kind `'memory-llm'`) and embedder call (kind `'memory-embedding'`) to this context's ledger before it runs. An accounted callback settles its reported usage; an unmarked one stays held as unaccounted (never free) with one `unaccounted-usage` warning, and `unknownPrice: 'reject'` refuses it. Native runs charge their own execution context unless you set this. |
 
 ```ts
 // memory-seams.ts — build once at startup, reuse everywhere.
@@ -81,6 +87,8 @@ export const seams: MemorySeams = {
   generateId: () => crypto.randomUUID(),
 };
 ```
+
+**Vectors and model ids (2.4 behaviour change, every built-in store).** A vector query no longer fills its results with records that have no vector at score 0, and a record whose stored vector has another length or another `embeddingModelId` is left out of the vector ranking; both are still found by their text. `recall` names the embedder's model on the query (`MemoryQuery.embeddingModelId`) and reports such records as an `embedding-mismatch` `CallWarning` (`recall(query, seams, { onWarning })`, `RememberOptions.onWarning`, else one logger line); a custom `search` can do the same with `MemoryQuery.onEmbeddingMismatch`. The PostgreSQL store no longer tops up a short pgvector page with unembedded rows.
 
 Already have a RAG embedder? `memoryEmbedderFromRag(ragEmbedder, { modelId })` adapts the `@deuz-sdk/core/rag` `Embedder` shape (`embed(texts) => number[][]`) to this one. The task `action` is dropped, so prefer `createEmbedder` when your provider distinguishes query from document embeddings (Gemini does). Without `modelId`, written records are pinned to `embeddingModelId: 'unknown'`.
 
@@ -201,7 +209,7 @@ export async function onSessionEnd(transcript: Message[]): Promise<void> {
 }
 ```
 
-`createMemoryTools({ scope, seams })` returns a `ToolSet` — `memory_append`, `memory_search`, `memory_update`, `memory_delete`, `memory_view` — so the model curates memory itself. It **bypasses the pipeline**: no extraction, no reconciliation, no hash dedup, and **no embedding**, so appended records score `0` against every embedded query and effectively never surface again on a vector store. `memory_update` rewrites `text` and `hash` but leaves the old vector, making the record findable by the wrong meaning. Use it on a lexically-searched store (a markdown vault), or hand the model only the read half:
+`createMemoryTools({ scope, seams })` returns a `ToolSet` — `memory_append`, `memory_search`, `memory_update`, `memory_delete`, `memory_view` — so the model curates memory itself. It **bypasses the pipeline**: no extraction, no reconciliation, no hash dedup, and **no embedding**, so appended records never enter a vector query's ranking and come back only when the query text matches them. **Behaviour change (2.4):** `memory_update` drops the record's vector and `embeddingModelId` (computed from the old text), and every built-in store's `update` drops them when the text changes without a new embedding; the record is found by text until it is embedded again, and no embedding call is added. Use it on a lexically-searched store (a markdown vault), or hand the model only the read half:
 
 ```ts no-verify
 const memoryTools = createMemoryTools({ scope, seams });
@@ -229,7 +237,7 @@ Writing your own `MemoryStore`: `search`/`list`/`findByHash` must exclude soft-d
 | Nothing was written on serverless | The extract pass runs after the response body ends | Keep `result.memory` alive (`after` / `waitUntil`), or `await` it |
 | `expandLinks` does nothing | The chat option's extract never passes `links: true` | Write links via `remember(..., { links: true })` or a vault |
 | Store grows despite `ttlMs` | `expiresAt` only hides at read time | `sweep: 'on-extract'`, or `sweepExpired` from a cron |
-| Old memories vanished after a model swap | `cosineSimilarity` returns `0` on dimension mismatch, silently; `embeddingModelId` is recorded but never validated | Re-embed, or version the scope |
+| Old memories stopped matching by meaning after a model swap | Since 2.4 records whose vector has another size or `embeddingModelId` are left out of the vector ranking (still found by text) and reported as `embedding-mismatch` | Re-embed (versioned memory's `reembed` does it without downtime), or version the scope |
 | `defaultMemoryScorer` ranks a trivial new fact first | Weights are fixed at `1/1/1`, `importance` defaults to `0`, and `lastAccessedAt` is never written | Implement your own one-method `MemoryScorer` |
 | `result.memory` missing on `generateText` | A suppressing `writePolicy` means no pass started | Read the resolved array, not the field |
 
