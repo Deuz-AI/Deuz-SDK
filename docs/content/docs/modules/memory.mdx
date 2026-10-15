@@ -426,6 +426,7 @@ Note that the reconciliation pass is scoped too: facts extracted in one scope ar
 | --- | --- | --- | --- |
 | `store` | `MemoryStore` | yes | The only stateful seam — vector store, markdown vault, or a DB. |
 | `llm` | `MemoryLLM` | yes | `(prompt: { system, user }) => Promise<string>`. Used for extraction + reconciliation. |
+| `accountedLlm` | `AccountedMemoryLLM` | no | 2.4: built with `defineAccountedMemoryLLM`. When set, every memory LLM call goes to it and `llm` is never called. |
 | `clock` | `Clock` | yes | `{ now, setTimeout }`. Time source for timestamps / TTL. |
 | `generateId` | `() => string` | yes | New record ids. |
 | `embedder` | `Embedder` | no | Needed only when a vector store searches by embedding and the query has none. 2.4 also accepts an accounted embedder. |
@@ -506,6 +507,8 @@ const llm = defineAccountedMemoryLLM(async ({ system, user }) => {
 });
 console.log(llm.accounted); // true
 ```
+
+Pass the accounted LLM as `seams.accountedLlm`. `seams.llm` keeps the 2.3 `MemoryLLM` type and is still required; when `accountedLlm` is set, every memory LLM call goes to it and `llm` is never called.
 
 The built-in `memory` option charges these calls for you: a [native run](/docs/modules/native-agents#memory) charges them to the run's execution context unless `seams.execution` is set, and reports `embedding-mismatch` and `unaccounted-usage` as warning parts on its stream; `generateText` and `streamChat` put the same warnings in `warnings` and charge `options.execution` when the call has one.
 

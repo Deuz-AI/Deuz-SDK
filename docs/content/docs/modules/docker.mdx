@@ -26,6 +26,11 @@ CI with a real Docker engine and was verified on Windows 11 with Docker
 Desktop 29.8 (Linux containers, containerd image store). Only the Docker CLI is
 tested; `dockerPath` can name another binary, at your own risk.
 
+[`examples/23-docker-runner`](https://github.com/Deuz-AI/Deuz-SDK/tree/main/examples/23-docker-runner)
+runs both parts on a pinned alpine image without a key: sandbox runs under the
+defaults, a process with a staged file and a checked artifact, a host restart
+that reconnects instead of starting again, a cancel, and the cleanup calls.
+
 ## The sandbox
 
 ```ts
@@ -97,7 +102,8 @@ Pass the sandbox to `codeActTool(sandbox)` and `shellTool(sandbox)` from
 | `deps` | host defaults | Clock, ids, logger and observer (`deuz.process.*` spans) |
 
 Every container also gets `--cap-drop ALL`, `--security-opt
-no-new-privileges`, `--restart no` and the labels `deuz.operation-id`,
+no-new-privileges`, `--restart no`, `--entrypoint=` (the image's `ENTRYPOINT`
+is reset, so the argv runs exactly as given) and the labels `deuz.operation-id`,
 `deuz.scope`, `deuz.sdk-version` and `deuz.kind` (`process`, `sandbox` or
 `staging`), plus `deuz.run-timeout-ms` on sandbox runs and
 `deuz.request-digest` on runner operations. No host directory and no Docker
@@ -254,14 +260,21 @@ Nothing is deleted in the background.
   30 minutes past its start plus its run timeout.
 - `store.prune({ terminalBefore })` deletes the records of terminal operations
   (`exited`, `cancelled`, `lost`, `failed`, `disposed`) last updated before the
-  cutoff and returns the count.
+  cutoff and returns the count. The cutoff is exclusive: a record updated
+  exactly at it stays. A malformed `terminalBefore` throws a `TypeError`
+  before anything is deleted.
 
 ### Operation stores
 
 A `ProcessOperationStore` keeps one record per scope and operation id, with a
-`revision` that every update compares and sets. `list({ scope?, states?, limit?,
-cursor? })` orders by `createdAt`, then scope, then operation id, with `limit`
-from 1 to 1000 (default 100).
+`revision` that every update compares and sets. `update` applies its changes
+only at `expectedRevision`; a key set to `undefined` removes that field. It
+never changes `operationId`, `scope` or `createdAt`, and `updatedAt` comes from
+the store's clock. `list({ scope?, states?, limit?, cursor? })` orders by
+`createdAt`, then scope, then operation id (both in UTF-8 byte order), with
+`limit` from 1 to 1000 (default 100). It returns `{ records, cursor? }`: the
+cursor is opaque and set only when more records remain, and a malformed one
+throws a `TypeError`.
 
 The SQLite store uses the table `deuz_process_ops` and its own version table
 `deuz_process_ops_schema` (version 1); `PRAGMA user_version` and every existing
@@ -301,7 +314,8 @@ local development, not an isolation boundary. 2.4 fixes it in four ways:
   symlink or junction pointing out, or a missing directory is refused with
   `exitCode: null` and the reason in `stderr`, and nothing runs. This is a
   behaviour change: a 2.3 call that relied on a `cwd` outside the root now
-  fails.
+  fails. The `shellTool` `cwd` description the model sees now reads "Working
+  directory relative to the sandbox root; paths outside it are refused."
 - `CodeExecutionResult.truncated?: { stdout, stderr }` is set when a stream was
   cut at `maxOutputBytes`. The Node sandbox keeps the head of each stream; the
   Docker sandbox keeps the tail.

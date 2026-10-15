@@ -25,7 +25,7 @@ plus one per committed write.
 | --- | --- | --- |
 | `createInMemoryConditionalChatStore({ transcript?, deps? })` | `@deuz-sdk/core/chat` | `transcript` is a [`TranscriptIndex`](/docs/modules/transcript-search) updated with every committed write; `deps.clock` stamps `deletedAt` |
 | `createSqliteConditionalChatStore({ path \| database, wal?, fts?, clock? })` | `@deuz-sdk/core/stores/sqlite` | Returns the store plus `transcript` and `close()`; each write is one `BEGIN IMMEDIATE` transaction, safe across processes sharing the file |
-| `createPostgresConditionalChatStore({ pool \| connectionString, schema?, clock? })` | `@deuz-sdk/core/stores/postgres` | Returns the store plus `transcript`, `migrate()` and `close()`; needs a pool with `connect()`; each write takes a per-chat advisory lock in one transaction |
+| `createPostgresConditionalChatStore({ pool \| connectionString, schema?, clock? })` | `@deuz-sdk/core/stores/postgres` | Returns the store plus `transcript`, `migrate()` and `close()`; `schema` defaults to `'public'`; needs a pool with `connect()`; each write takes a per-chat advisory lock in one transaction |
 
 ```ts
 import { RevisionConflictError, updateConditionalChat } from '@deuz-sdk/core/chat';
@@ -78,13 +78,13 @@ await chats.close();
 | `saveChat(record)` | The legacy write: last writer wins at the stored revision plus one, never over a tombstone (`RevisionConflictError`) |
 | `loadChat(chatId)` | The record with its revision, or `undefined` for a missing or deleted chat |
 | `listChats(scope?)` | Live chats only, most recently updated first, then by `chatId` |
-| `pruneTombstones(before)` | Deletes tombstones with `deletedAt < before` and returns the count; the id can be reused after that |
+| `pruneTombstones(before)` | Deletes tombstones with `deletedAt < before` (exclusive: one deleted exactly at `before` stays) and returns the count; the id can be reused after that. A `before` that is not a finite number throws `InvalidRequestError` before anything is deleted |
 
 A tombstone is final: `writeChat` and `tombstoneChat` conflict, `saveChat`
 throws, and `deleteChat` does nothing. Deleting or tombstoning
 (`expectedRevision: 0`) a chat that was never written also leaves a tombstone,
 with an empty scope, so a first write that arrives late cannot create it. The
-SDK never prunes tombstones on its own.
+SDK never calls `pruneTombstones` on its own.
 
 `updateConditionalChat(store, chatId, merge, { attempts = 3 })` calls
 `merge(current, attempt)` with the chat as stored now; `merge` returns the record
@@ -94,7 +94,8 @@ merges again; after `attempts` conflicts it throws `RevisionConflictError`
 `expectedRevision`, `actualRevision` and `attempts`). When the chat is a
 tombstone and `merge` still returns a record, it throws at once. `merge` runs
 again on every conflict, so it must not have side effects of its own.
-`isConditionalChatStore(store)` tells a conditional store from a legacy one.
+`isConditionalChatStore(store)` tells a conditional store from a legacy one: it
+is true when the store has `conditional === true`, `readChat` and `writeChat`.
 
 Native runs whose `chat.store` is conditional write their projection with
 `writeChat` at the revision they read; see
@@ -196,13 +197,17 @@ over this stream.`, `…the stored stream moved past this producer.`, `…this
 producer lost its lease.` or `…the stream store failed.`. A thrown store or
 lease error goes to `onStoreError` only, never to the client.
 
+A 2.4 `useChat` that reads such a response ends in `status: 'error'`: an error
+frame followed by a clean close is not a drop. Only a transport drop, a read
+that breaks off before the stream ends, continues from `resume.endpoint`.
+
 ### Durable stores
 
 | Factory | Import | Notes |
 | --- | --- | --- |
 | `createInMemoryDurableStreamStateStore({ deps? })` | `@deuz-sdk/core/ui` | One process |
 | `createSqliteDurableStreamStateStore({ path \| database, wal?, clock? })` | `@deuz-sdk/core/stores/sqlite` | `close()` closes only a handle it opened |
-| `createPostgresDurableStreamStateStore({ pool \| connectionString, schema? })` | `@deuz-sdk/core/stores/postgres` | Needs `pool.connect()`; `migrate()`; `close()` ends only its own pool |
+| `createPostgresDurableStreamStateStore({ pool \| connectionString, schema? })` | `@deuz-sdk/core/stores/postgres` | `schema` defaults to `'public'`; needs `pool.connect()`; `migrate()`; `close()` ends only its own pool |
 | `createRedisDurableStreamStateStore({ client \| url, prefix? })` | `@deuz-sdk/core/stores/redis` | Redis 7+, a client with `eval` (ioredis through `wrapIoredisClient`); `prefix` defaults to `'deuz'`. The only 2.4 store on Redis |
 
 Every durable store is also a `StreamStateStore`, so `resumeDeuzStreamResponse`
@@ -221,20 +226,22 @@ reads it unchanged. The rules they share:
 
 The SQL stores use `deuz_stream_state_streams` and `deuz_stream_state_records`
 with their own version table, `deuz_stream_state_schema` (version 1). Redis keeps
-each stream under its own hash tag: `{<prefix>:stream:<id>}:head` and `:log`,
-plus `{<prefix>:streams}:ix` and `:schema`.
+each stream under its own hash tag: `{<prefix>:stream:<id>}:head` and `:log`
+(the stream id is `encodeURIComponent`-encoded), plus `{<prefix>:streams}:ix`
+and `:schema`.
 
 ### Retention
 
 `prune({ terminalBefore })` deletes finished streams (their last record is the
 `done` sentinel) whose last open, commit or append is older than the cutoff, on
 the store's clock (the injected clock for memory and SQLite, `clock_timestamp()`
-for PostgreSQL, the server `TIME` for Redis), and returns the count. A stream
-opened again for a new leg counts as active. A pruned stream forgets its fence,
-so prune only streams no producer will continue. Nothing is deleted in the
-background; 24 hours (`terminalBefore: now - 86_400_000`) on a
-[durable scheduler](/docs/modules/goal-runtime#durable-scheduler) is a good
-default.
+for PostgreSQL, the server `TIME` for Redis), and returns the count. The cutoff
+is exclusive. A stream opened again for a new leg counts as active. A pruned
+stream forgets its fence, so prune only streams no producer will continue.
+Nothing is deleted in the background. The default window is
+`DEFAULT_DURABLE_STREAM_RETAIN_MS` (24 hours, from `@deuz-sdk/core/ui`):
+`terminalBefore: now - DEFAULT_DURABLE_STREAM_RETAIN_MS` on a
+[durable scheduler](/docs/modules/goal-runtime#durable-scheduler).
 
 ### The legacy store, when it fails
 
@@ -350,7 +357,9 @@ persist with `JSON.stringify`:
 | `gate` | How that gate resumes: verdicts and tool results already given, a native run's `runId` and client calls |
 | `capabilities` | What the server announced |
 
-Only `version` and `messages` are required. The type lives in React, not in
+Only `version` and `messages` are required. Treat a snapshot as read-only. Its
+`gate` (`ChatSnapshotGateV1`) holds `turn`, `approvalResponses`, `toolResults`
+(`{ toolCallId, output, isError? }[]`), `runId` and `clientCalls`. The type lives in React, not in
 core, because the React package accepts any `@deuz-sdk/core` 2.x as its peer.
 
 ```tsx
@@ -392,6 +401,11 @@ Without `resume`, the restored turn is sealed. A malformed snapshot (a `version`
 other than 1, or a non-array `messages`, `messageIds`, `pendingApprovals`,
 `pendingToolCalls` or `capabilities`) throws a `TypeError`. `setHistory` still
 drops the gates and the cursor.
+
+A snapshot you build yourself for a native run paused on approvals must set
+`gate.turn` (the paused turn) as well as `gate.runId`. With `gate.runId` alone,
+`useChat` drops the run id, and the verdict POST carries no `runId`.
+`exportSnapshot()` writes both.
 
 A stored chat restores as `{ version: 1, messages: record.messages, messageIds:
 record.messageIds }`. This works next to a 2.3 core too: the hook applies the

@@ -13,7 +13,7 @@ Everything is in `@deuz-sdk/core/context` (edge-safe, off unless configured). `c
 | Piece | What it does |
 | --- | --- |
 | `compileContext(input)` | Pure and deterministic: gathered source results + budget → a `ContextPackage` (blocks + `ContextManifest`) |
-| `createContextCompiler({ sources, budget?, refresh?, scope?, estimator?, state?, deps?, onWarning? })` | Queries the sources when a refresh is due, then compiles; `beforeModelCall`, `onOverflow`, `requestRefresh()`, `state()` |
+| `createContextCompiler({ sources, budget?, refresh?, scope?, estimator?, estimatorKind?, state?, deps?, onWarning? })` | Queries the sources when a refresh is due, then compiles; `beforeModelCall`, `onOverflow`, `requestRefresh()`, `state()` |
 | `createMemoryContextSource`, `createRagContextSource`, `createTranscriptContextSource`, `createSkillsContextSource` | The built-in `ContextSource`s |
 | `createWorkingMemory`, `applyWorkingMemoryPatch`, `workingMemoryTools` | Structured working memory: a plain-JSON snapshot, schema-checked patches, the model's tools |
 | `createTokenEstimator`, `estimateTextTokens`, `estimateRequestTokens`, `estimateRequestOverhead`, `ANTHROPIC_TOOL_FRAMING_TOKENS` | The one token estimator (about 3.6 chars/token, calibrated by real usage, or your tokenizer) |

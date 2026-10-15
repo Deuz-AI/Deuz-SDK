@@ -71,7 +71,7 @@ console.log((await transcript.search({ userId: 'ada' }, 'hotel'))[0]?.messageId)
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `limit` | `10` | Hits at most; `0` returns nothing, a negative value throws |
-| `around` | `0` | Indexed messages to return on each side of a hit, in order, the hit excluded; absent when 0 |
+| `around` | `0` | Indexed messages to return on each side of a hit, in order, the hit excluded; absent when 0. A negative or non-finite value throws `InvalidRequestError`, as a bad `limit` does |
 | `chatIds` | all | Only these chats |
 | `before`, `after` | none | Only messages first indexed before or after this time (epoch ms, strict). Indexing a chat again keeps each message id's first time |
 | `signal` | none | Aborts the search |

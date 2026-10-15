@@ -137,7 +137,8 @@ execution? })` gives one scope `remember`, `extract`, `recall`, `revise`,
   keeps its history; `recall({ recordedAsOf })` answers what the store knew at
   a time. `forget` deletes the content, every revision and every vector, keeps
   the receipts without content, and then calls every `onForget` listener, so a
-  V3 run store can redact the context packages that held the record.
+  V3 run store can redact the context packages that held the record and the
+  runs' stored copies of their retrieval blocks.
 - **Tools.** `createVersionedMemoryTools(session)` gives the model
   `memory_remember`, `memory_recall`, `memory_revise` and `memory_retract`,
   bound to the session's scope. There is no forget tool, the tools never change
@@ -305,7 +306,9 @@ time with `UnsupportedStoreError` (`unsupported_store`).
   compiled again (`redacted: true` in its manifest), the one case where a
   reopened step does not reuse its stored context, and a resumed run drops the
   retrieval blocks of redacted packages from its history before the next
-  request.
+  request. The store already rewrote the stored copies of those blocks
+  (history, checkpoints, `result.messages`, a terminal run included) into
+  stand-ins with no record when the forget landed.
 - **`workingMemory: { snapshot?, create?, tools? }`** keeps the snapshot, with
   the task list and the active task, in the V3 record, so the active task
   survives a restart. A model's patch becomes durable in the same save as its
@@ -511,7 +514,8 @@ Several calls of 2.3 never reached a budget ledger. In 2.4:
   a versioned memory session (`execution`), are reserved before they run. A
   callback marked as accounted settles the usage it reports
   (`defineAccountedMemoryLLM`, or an embedder object with `accounted: true`
-  whose `embed` returns the usage with the vectors). An unmarked one is held at
+  whose `embed` returns the usage with the vectors). In `MemorySeams` the
+  accounted LLM goes in `seams.accountedLlm`; `seams.llm` keeps the 2.3 type. An unmarked one is held at
   its estimate as unaccounted, never treated as free, and reports one
   `unaccounted-usage` warning. A budget with `unknownPrice: 'reject'` refuses
   an unaccounted call with `BudgetLedgerError` code `'unaccounted_call'`.
@@ -552,12 +556,17 @@ which you can run from a durable schedule.
 | ------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Versioned memory         | `pruneHistory({ olderThan })` deletes past revisions of retracted or expired records; receipts stay. `pruneOperations({ olderThan })` deletes old receipts and warns that those operation ids lose their dedupe protection |
 | Goal runtime             | `prunePayloads({ before })` replaces the payloads of settled inbox entries with content-free tombstones (ids stay, so dedupe holds; the policy's `retainPayloadMs` is 7 days). `pruneInbox`, `pruneOccurrences` and `pruneIntents` delete settled entries, occurrence records and finished intents |
-| Durable streams          | `prune({ terminalBefore })` deletes finished streams; 24 hours is a good retention                                                                                                       |
+| Durable streams          | `prune({ terminalBefore })` deletes finished streams; `DEFAULT_DURABLE_STREAM_RETAIN_MS` (24 hours, from `/ui`) is the default window                                                    |
 | Process operations       | `prune({ terminalBefore })` removes finished records; `dispose` removes a container                                                                                                       |
 | V3 runs                  | `prune({ terminalBefore })` deletes terminal runs and the context packages only they used                                                                                                 |
 | Conditional chats        | `pruneTombstones(before)` removes old tombstones, after which a chat id can be used again                                                                                                  |
 
-See [Retention](/docs/modules/retention).
+Every cutoff is exclusive: a record stamped exactly at it stays. A forget also
+reaches the V3 run stores subscribed to it: they redact the context packages
+that held the record and rewrite the runs' stored copies of their retrieval
+blocks, a terminal run's `result.messages` included (see
+[Known limits](#known-limits) for what it does not reach). See
+[Retention](/docs/modules/retention).
 
 ## Bug fixes
 
@@ -693,8 +702,8 @@ The rollback test proves this on every change: `npm run test:rollback -w @deuz-s
 - A durable response fails closed instead of degrading. Keep the legacy `store`
   mode where a best-effort journal is enough; its failures now warn (see
   [UI wire](#ui-wire)).
-- Prune finished streams with `prune({ terminalBefore })`, for example 24
-  hours back, from a durable schedule.
+- Prune finished streams with `prune({ terminalBefore })`, for example
+  `now - DEFAULT_DURABLE_STREAM_RETAIN_MS` (24 hours), from a durable schedule.
 
 ### The capability handshake in routes
 
@@ -858,7 +867,7 @@ types (`AgentRunEnvelopeV3`, `AgentEventV3`).
 
 Calling code is unaffected. The new members are optional:
 `AgentRunMemoryExtraction.planned`, `AgentRunReconciliation.warnings`,
-`CodeExecutionResult.truncated`, `MemorySeams.execution`,
+`CodeExecutionResult.truncated`, `MemorySeams.execution` and `accountedLlm`,
 `MemoryQuery.embeddingModelId` and `onEmbeddingMismatch`,
 `BudgetReservation.unaccounted`, `BudgetTotals.unaccounted` and
 `BudgetAggregate.unaccounted`, and the five `GoalEvidence` fields. A store or
@@ -877,12 +886,16 @@ the 2.3 one goes: a `ConditionalChatStore` is a `ChatStore`, a
 - **The context compiler runs in V3 native runs only.** `generateText`,
   `streamChat` and 2.3 native runs take no `context` option; call
   `compileContext` yourself there.
-- **Forget and finished runs.** A forget redacts every stored context package
-  that held the record, and a run resumed afterwards drops those retrieval
-  blocks from its history. A V3 run that had already finished keeps its stored
-  `result.messages`, the model history in which the retrieval blocks are user
-  messages. The chat projection and the transcript never hold them, so render
-  those.
+- **What a forget reaches in V3 runs.** A forget redacts every stored context
+  package that held the record, and the run store rewrites, in place, each
+  stored copy of those packages' retrieval blocks (history, checkpoints and
+  stored result messages, a finished run's `result.messages` included) into a
+  stand-in that keeps the marker and holds no record. It does not reach text
+  the model wrote from a block (assistant turns, `result.text`, a compaction
+  summary), memory tool results (`memory_recall` output in tool messages, the
+  run transcript, a chat store), the in-memory history of a leg running at
+  forget time until it ends or is resumed, or run stores not subscribed
+  through `onForget`.
 - **pgvector.** The versioned PostgreSQL store's pgvector path was checked only
   against an emulated `vector` type in PGlite. Without pgvector, cosine runs in
   the process over the freshest `candidateLimit` rows (default 1000).
