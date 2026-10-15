@@ -27,21 +27,36 @@ the PostgreSQL V3 run and durable stream stores the database clock, the Redis
 stream store the server time, and the PostgreSQL goal runtime and versioned
 memory stores their `clock` option.
 
+Every cutoff is exclusive: a record stamped exactly at it stays. A malformed
+cutoff is refused before anything is deleted: `ProcessOperationStore.prune`
+throws a `TypeError` for a bad `terminalBefore`, and `pruneTombstones` throws
+`InvalidRequestError` for a bad `before`.
+
+Every versioned memory store (in-memory, SQLite and PostgreSQL) logs the same
+warning when `pruneOperations` deletes receipts, with `{ count, olderThan }`.
+It goes through the store's logger (`deps.logger` in memory, `logger` on the
+SQL stores), which is silent by default.
+
 ## Suggested windows
 
-Only one window is an SDK default: `DEFAULT_GOAL_RUNTIME_POLICY.retainPayloadMs`
-(7 days) for inbox payloads. For the rest, pick what your audit and support
-needs require. As a starting point:
+Two windows are SDK defaults: `DEFAULT_GOAL_RUNTIME_POLICY.retainPayloadMs`
+(7 days) for inbox payloads, and `DEFAULT_DURABLE_STREAM_RETAIN_MS` (24 hours,
+exported from `@deuz-sdk/core/ui`) for finished durable streams. For the rest,
+pick what your audit and support needs require. As a starting point:
 
 | Data | Window | Why |
 | --- | --- | --- |
 | Inbox payloads | 7 days (`retainPayloadMs`) | Webhook bodies can hold personal data; the ids keep dedupe |
-| Finished durable streams | 24 hours | Long enough for a client to reconnect and replay a turn |
+| Finished durable streams | 24 hours (`DEFAULT_DURABLE_STREAM_RETAIN_MS`) | Long enough for a client to reconnect and replay a turn |
 | Terminal process records | days | Only needed to read output and artifacts after exit |
 | Terminal V3 runs | your audit window | They hold transcripts, checkpoints and context packages |
 | Memory history | your audit window | Past revisions of retracted or expired records |
 | Memory receipts | keep, or longer than any retry | Without them a redelivered operation is applied again |
 | Inbox entries and ids | keep, unless you want a dedupe window | Without them a repeated delivery is queued again |
+
+`prunePayloads` cuts per store or per scope, not per goal. When goals in one
+scope carry different `retainPayloadMs` values, pass the largest window: a
+payload may then outlive its own goal's window, never the reverse.
 
 ## A retention pass
 
@@ -52,7 +67,7 @@ import { createInMemoryProcessOperationStore } from '@deuz-sdk/core/compute/dock
 import { DEFAULT_GOAL_RUNTIME_POLICY, createInMemoryGoalRuntimeStore } from '@deuz-sdk/core/goal/runtime';
 import { createInMemoryVersionedMemoryStore } from '@deuz-sdk/core/memory/versioned';
 import { createScheduler } from '@deuz-sdk/core/schedule';
-import { createInMemoryDurableStreamStateStore } from '@deuz-sdk/core/ui';
+import { DEFAULT_DURABLE_STREAM_RETAIN_MS, createInMemoryDurableStreamStateStore } from '@deuz-sdk/core/ui';
 
 const DAY = 86_400_000;
 const memory = createInMemoryVersionedMemoryStore();
@@ -62,14 +77,14 @@ const processes = createInMemoryProcessOperationStore();
 const runs = createInMemoryAgentRunStoreV3();
 const chats = createInMemoryConditionalChatStore();
 
-/** One retention pass. The windows are examples; only retainPayloadMs is an SDK default. */
+/** One retention pass. The windows are examples; only the two DEFAULT_* windows are SDK defaults. */
 async function prune(now: number) {
   return {
     memoryHistory: await memory.pruneHistory({ olderThan: now - 90 * DAY }),
     inboxPayloads: await goals.prunePayloads({ before: now - DEFAULT_GOAL_RUNTIME_POLICY.retainPayloadMs }),
     occurrences: await goals.pruneOccurrences({ before: now - 30 * DAY }),
     intents: await goals.pruneIntents({ before: now - 30 * DAY }),
-    streams: await streams.prune({ terminalBefore: now - DAY }),
+    streams: await streams.prune({ terminalBefore: now - DEFAULT_DURABLE_STREAM_RETAIN_MS }),
     processes: await processes.prune({ terminalBefore: now - 7 * DAY }),
     runs: await runs.prune({ terminalBefore: now - 30 * DAY }),
     tombstones: await chats.pruneTombstones(now - 365 * DAY),
@@ -145,6 +160,15 @@ console.log((await runs.getBlob(blob.digest)).status); // redacted
   revision matches any forgotten revision of its id, and a forget with no
   revisions matches them all. The store also remembers the forget, so a
   package written later with the same record is stored redacted.
+- `redactForgotten(event)` also rewrites the runs that point to a redacted
+  package. Every stored copy of its retrieval block (the
+  `<deuz_context pass="P" step="S">` message) in the run's history, in every
+  checkpoint and in the stored result's messages, a terminal run's
+  `result.messages` included, becomes a stand-in that keeps the marker and
+  holds no record. Message count, roles and order stay the same. The rewrite
+  is in place: the run keeps its revision and its last-save time, so its
+  retention window does not move, and a repeated forget changes nothing. A
+  later save of such a run is stored the same way.
 - `getBlob(digest)` then answers `{ status: 'redacted' }`, and the step
   manifests that point to it load with `redacted: true`.
 - The forget's `redaction` is `'failed'` when a listener threw. The forget
@@ -155,8 +179,8 @@ A redacted package changes one rule of V3 recovery. A step reopened after a
 restart normally reuses its stored package, so the model sees the same context
 again. When that package was redacted, the step is compiled again instead
 (refresh `'redacted'`, `manifest.redacted: true`); on resume, the retrieval
-blocks of redacted packages are removed from the run's history and
-checkpoints, and the manifest records `cachePrefixChanged: true`. This is the
+blocks of redacted packages (stand-ins included) are removed from the run's
+history and checkpoints, and the manifest records `cachePrefixChanged: true`. This is the
 only case in which a resumed step does not reuse its context.
 
 The forget records the run store keeps hold record ids and revisions, never
@@ -165,14 +189,22 @@ text. The SQLite and PostgreSQL V3 stores keep them in `deuz_runs_v3_forgotten`.
 ## What a forget does not reach
 
 A versioned memory forget deletes the record's content, revisions and vectors
-and, with the listener above, the context packages that hold it. It does not
-touch:
+and, with the listener above, the context packages that hold it and the
+stored copies of their retrieval blocks. It does not touch:
 
 - chat records and the [transcript index](/docs/modules/transcript-search):
   delete or tombstone the chat;
 - the legacy `MemoryStore`: delete the record there;
-- goal inbox payloads, durable stream logs, process output tails and V3 run
-  transcripts or tool results that quote the text: prune or delete them;
+- goal inbox payloads, durable stream logs and process output tails that
+  quote the text: prune or delete them;
+- text the model wrote from a block: assistant turns, `result.text`, a
+  compaction summary;
+- memory tool results: `memory_recall` output in tool messages, in the run
+  transcript and in a chat store;
+- the in-memory history of a leg that is running when the forget lands: it
+  keeps the block and can still send it until the leg ends or the run is
+  resumed;
+- run stores not subscribed through `onForget`;
 - observability backends: 2.4 spans carry ids, counts and digests, never
   content, but your own logs may;
 - files, exports and model provider logs outside the SDK.
@@ -191,6 +223,7 @@ observer. The other prune calls report no span. See
   bound.
 - `pruneOperations` and `pruneInbox` trade deduplication for space. Keep their
   windows longer than any retry or redelivery you expect.
-- Redaction covers the context packages of V3 runs in a store that subscribes
-  to the forget. Packages in a store that was not subscribed, or copies you
-  made, are not redacted.
+- Redaction covers the context packages of V3 runs, and the runs' stored
+  copies of their retrieval blocks, in a store that subscribes to the forget.
+  Packages in a store that was not subscribed, or copies you made, are not
+  redacted.
