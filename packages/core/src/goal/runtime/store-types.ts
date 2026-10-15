@@ -46,7 +46,11 @@ export interface GoalRuntimePolicy {
   maxRetries: number;
   /** Waits before each retry, in ms. Default `[1000, 5000, 30000]`. */
   retryDelaysMs: number[];
-  /** How long an applied or disposed inbox payload is kept before its tombstone. Default 7 days. */
+  /**
+   * How long an applied or disposed inbox payload is kept before its
+   * tombstone. Default 7 days. Nothing prunes on its own: the host passes
+   * `now - retainPayloadMs` to the store's `prunePayloads`.
+   */
   retainPayloadMs: number;
 }
 
@@ -678,7 +682,10 @@ export interface GoalRuntimeStore extends GoalStore {
   /**
    * Replaces the payloads of entries settled before `before` with content-free
    * tombstones (`payloadPruned`); ids stay, so dedupe holds. Returns how many
-   * payloads it dropped. The host passes `now - policy.retainPayloadMs`.
+   * payloads it dropped. The host passes `now - policy.retainPayloadMs`. The
+   * cut is per store or per scope, not per goal: when goals of one scope
+   * carry different `retainPayloadMs` values, pass the largest window (a
+   * payload may then outlive its own goal's window, never the reverse).
    */
   prunePayloads(options: GoalRuntimePruneOptions): Promise<number>;
   /**
