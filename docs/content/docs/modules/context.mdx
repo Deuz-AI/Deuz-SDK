@@ -27,6 +27,12 @@ it yourself. Preview means the `createContextCompiler` API may still change in
 2.5; the recorded formats (`ContextManifest`, `ContextCompilerState`) are
 versioned either way.
 
+[`examples/21-versioned-memory-context`](https://github.com/Deuz-AI/Deuz-SDK/tree/main/examples/21-versioned-memory-context)
+runs the compiler in a V3 run without a key: a memory source placed as one
+`<deuz_context>` block with its manifest, a step that reuses its package,
+working memory at the end of every request, and a step compiled again after a
+`forget` redacted its package.
+
 ## A compile
 
 ```ts
