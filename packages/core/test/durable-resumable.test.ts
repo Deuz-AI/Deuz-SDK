@@ -83,6 +83,51 @@ const FINAL = sseEvents([
   { event: 'message_stop', data: { type: 'message_stop' } },
 ]);
 
+/** A model turn that calls `search` under `id`. */
+const toolCall = (id: string) =>
+  sseEvents([
+    {
+      event: 'message_start',
+      data: { type: 'message_start', message: { usage: { input_tokens: 10, output_tokens: 1 } } },
+    },
+    {
+      event: 'content_block_start',
+      data: {
+        type: 'content_block_start',
+        index: 0,
+        content_block: { type: 'tool_use', id, name: 'search' },
+      },
+    },
+    {
+      event: 'content_block_delta',
+      data: {
+        type: 'content_block_delta',
+        index: 0,
+        delta: { type: 'input_json_delta', partial_json: '{"q":"x"}' },
+      },
+    },
+    { event: 'content_block_stop', data: { type: 'content_block_stop', index: 0 } },
+    {
+      event: 'message_delta',
+      data: {
+        type: 'message_delta',
+        delta: { stop_reason: 'tool_use' },
+        usage: { output_tokens: 5 },
+      },
+    },
+    { event: 'message_stop', data: { type: 'message_stop' } },
+  ]);
+
+const ZERO_USAGE = {
+  inputTokens: 0,
+  outputTokens: 0,
+  reasoningTokens: 0,
+  cachedReadTokens: 0,
+  cacheWriteTokens: 0,
+  cacheWrite1hTokens: 0,
+  totalTokens: 0,
+};
+
 /** Real 0ms macrotask timer — fast polls without starving the event loop. */
 const instantClock = {
   setTimeout: (fn: () => void, _ms: number) => {
@@ -314,6 +359,25 @@ describe('durable × resumable over a DurableStreamStateStore (2.4)', () => {
     sourceA.push(textPart('a1'));
     sourceA.push(textPart('a2'));
     await a.until('"a2"');
+    // A's run has a checkpoint, so a leg that started would load it and call the model.
+    await sessionStore.save({
+      version: 1,
+      runId: 'run-3',
+      stepId: 'run-3#1',
+      stepIndex: 1,
+      status: 'running',
+      messages: [
+        { role: 'user', content: 'find x' },
+        {
+          role: 'assistant',
+          content: [{ type: 'tool_use', id: 'toolu_1', name: 'search', input: { q: 'x' } }],
+        },
+        { role: 'tool', content: [{ type: 'tool_result', toolUseId: 'toolu_1', result: 'found' }] },
+      ],
+      usage: ZERO_USAGE,
+      createdAt: 0,
+    });
+    const checkpoint = JSON.stringify(await sessionStore.load('run-3'));
 
     // The client reconnects; the probe hears silence and starts a continuation leg.
     const spyFetch = vi.fn();
@@ -343,6 +407,68 @@ describe('durable × resumable over a DurableStreamStateStore (2.4)', () => {
     expect(rawA).toContain('[DONE]');
     expect(await texts(store, 'run-3')).toEqual(['start', 'a1', 'a2', 'a3', 'done']);
     expect(spyFetch).not.toHaveBeenCalled();
+    expect(JSON.stringify(await sessionStore.load('run-3'))).toBe(checkpoint);
+  });
+
+  it('a refused continuation leg never re-drives the run: no model call, no tool, no checkpoint', async () => {
+    const sessionStore = createInMemorySessionStore();
+    const store = createInMemoryDurableStreamStateStore();
+    const provider = createInMemoryLeaseProvider();
+    // Producer A: step 1's tool completes (checkpointed); step 2's tool runs long (A alive, quiet).
+    const executeA = vi.fn(async () =>
+      executeA.mock.calls.length === 1 ? 'found-1' : new Promise<string>(() => {}),
+    );
+    const leg1 = mockFetchSequence([
+      () => sseResponse([toolCall('toolu_1')]),
+      () => sseResponse([toolCall('toolu_2')]),
+    ]);
+    const result1 = streamChat({
+      model: createAnthropic({ apiKey: 'k', fetch: leg1.fetch })('claude-opus-4-8'),
+      messages: [{ role: 'user', content: 'find x' }],
+      tools: { search: { parameters: SCHEMA, execute: executeA } },
+      maxSteps: 5,
+      session: { store: sessionStore, runId: 'run-7' },
+    });
+    const live = bodyReader(
+      toDeuzStreamResponse(result1, {
+        durable: { store, lease: { provider, owner: 'a' }, batch: { maxDelayMs: 0 } },
+        streamId: 'run-7',
+        messageId: 'm1',
+      }),
+    );
+    await live.until('toolu_2');
+    while (executeA.mock.calls.length < 2) await new Promise((r) => setTimeout(r, 5));
+    await new Promise((r) => setTimeout(r, 20));
+    expect(leg1.calls.length).toBe(2);
+    const before = JSON.stringify(await sessionStore.load('run-7'));
+    expect(before).toContain('toolu_1');
+
+    // The resumer's model would ask for the same tool again, as A's step 2 did.
+    const leg2 = mockFetchSequence([
+      () => sseResponse([toolCall('toolu_B')]),
+      () => new Promise<Response>(() => {}) as never,
+    ]);
+    const executeB = vi.fn(async () => 'found-by-B');
+    const text = await resumeDeuzChatResponse({
+      sessionStore,
+      streamStateStore: store,
+      durable: { store, lease: { provider, owner: 'resumer' } },
+      runId: 'run-7',
+      streamId: 'run-7',
+      lastEventId: '1',
+      call: {
+        model: createAnthropic({ apiKey: 'k', fetch: leg2.fetch })('claude-opus-4-8'),
+        tools: { search: { parameters: SCHEMA, execute: executeB } },
+      },
+      liveProbeMs: 10,
+      pollIntervalMs: 2,
+      clock: instantClock,
+    }).text();
+    expect(text).toContain('Durable stream: another producer holds this stream.');
+    await new Promise((r) => setTimeout(r, 100));
+    expect(leg2.calls.length).toBe(0);
+    expect(executeB).not.toHaveBeenCalled();
+    expect(JSON.stringify(await sessionStore.load('run-7'))).toBe(before);
   });
 
   it('continues a crashed durable producer once its lease lapsed, gapless and durable', async () => {

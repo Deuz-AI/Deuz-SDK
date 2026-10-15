@@ -427,7 +427,19 @@ describe('durable mode: one producer, fenced', () => {
     ).toBeTruthy();
     const errors: unknown[] = [];
     const manual = manualResult();
-    const response = toDeuzStreamResponse(manual.result, {
+    // A lazy source (a resumed run, a `streamChat`) starts on its first read.
+    let reads = 0;
+    const source = manual.result.fullStream;
+    const result = {
+      ...manual.result,
+      fullStream: {
+        [Symbol.asyncIterator]() {
+          reads++;
+          return source[Symbol.asyncIterator]();
+        },
+      },
+    };
+    const response = toDeuzStreamResponse(result, {
       durable,
       streamId: 's',
       messageId: 'm',
@@ -440,7 +452,8 @@ describe('durable mode: one producer, fenced', () => {
     expect(await store.lastSeq('s')).toBeUndefined();
     expect(errors).toEqual([]);
     await settle();
-    expect(manual.returned()).toBe(true);
+    // The refused producer never read its source, so a lazy run never started.
+    expect(reads).toBe(0);
   });
 
   it('fails closed when the lease is lost, and stops committing', async () => {

@@ -1130,11 +1130,16 @@ function deuzSSEResponse(
       }
       if (unreadable) warnStoreFailure();
       try {
-        await produce(
-          send,
-          () => seq,
-          () => stopped,
-        );
+        // A refused durable leg (2.4) never reads its source. Its first pull
+        // would start a lazy run (a resumed checkpoint, a `streamChat`): a
+        // model call, tool executions and a checkpoint save while the producer
+        // that holds the stream lives.
+        if (!stopped)
+          await produce(
+            send,
+            () => seq,
+            () => stopped,
+          );
       } catch (error) {
         // Durable: a producer that throws still ends its journal (what is
         // queued is committed and sent, the lease renewal stops and the lease
