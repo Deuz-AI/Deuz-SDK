@@ -57,7 +57,7 @@ export function unaccountedWarning(kind: MemoryCallKind): CallWarning {
     message:
       `The ${what} reports no usage, so its calls are counted as unaccounted, never as free. ` +
       (kind === 'memory-llm'
-        ? 'Wrap it with defineAccountedMemoryLLM to have them settled.'
+        ? 'Wrap it with defineAccountedMemoryLLM and pass it as the seams `accountedLlm`, not `llm`, to have them settled.'
         : 'Give it `accounted: true` and return the usage with the vectors to have them settled.'),
   };
 }

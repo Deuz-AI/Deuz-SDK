@@ -56,8 +56,9 @@ export interface AccountedMemoryLLMResult extends AccountedUsage {
 
 /**
  * The accounted variant of `MemoryLLM` (2.4): the same prompt in, the text and
- * the call's usage out. Accepted wherever a `MemoryLLM` is; build one with
- * `defineAccountedMemoryLLM`.
+ * the call's usage out. Build one with `defineAccountedMemoryLLM` and pass it
+ * as `MemorySeams.accountedLlm` (`MemorySeams.llm` stays a plain `MemoryLLM`)
+ * or as a versioned memory session's `llm`.
  */
 export interface AccountedMemoryLLM {
   (prompt: { system: string; user: string }): Promise<AccountedMemoryLLMResult>;

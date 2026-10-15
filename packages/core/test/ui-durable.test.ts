@@ -427,7 +427,19 @@ describe('durable mode: one producer, fenced', () => {
     ).toBeTruthy();
     const errors: unknown[] = [];
     const manual = manualResult();
-    const response = toDeuzStreamResponse(manual.result, {
+    // A lazy source (a resumed run, a `streamChat`) starts on its first read.
+    let reads = 0;
+    const source = manual.result.fullStream;
+    const result = {
+      ...manual.result,
+      fullStream: {
+        [Symbol.asyncIterator]() {
+          reads++;
+          return source[Symbol.asyncIterator]();
+        },
+      },
+    };
+    const response = toDeuzStreamResponse(result, {
       durable,
       streamId: 's',
       messageId: 'm',
@@ -440,7 +452,8 @@ describe('durable mode: one producer, fenced', () => {
     expect(await store.lastSeq('s')).toBeUndefined();
     expect(errors).toEqual([]);
     await settle();
-    expect(manual.returned()).toBe(true);
+    // The refused producer never read its source, so a lazy run never started.
+    expect(reads).toBe(0);
   });
 
   it('fails closed when the lease is lost, and stops committing', async () => {
@@ -769,6 +782,82 @@ describe('durable mode: the lease across legs', () => {
     await time.advance(20);
     expect(await b.rest()).toContain('[DONE]');
     expect(await texts(store)).toEqual(['one', 'two', 'a1', 'b1']);
+  });
+
+  it('refuses a producer whose lease lapsed between its renewal and its derived open', async () => {
+    // Earlier legs fenced the stream at 4; the lease key was pruned since (tokens restart at 1).
+    const inner = createInMemoryDurableStreamStateStore();
+    await inner.open('s', 4);
+    let opens = 0;
+    let letOpen: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => (letOpen = resolve));
+    let reached: (() => void) | undefined;
+    const reachedGate = new Promise<void>((resolve) => (reached = resolve));
+    const store: DurableStreamStateStore = {
+      ...inner,
+      async open(streamId, token) {
+        // C's derived open(5) waits (a pool wait, a pause past its lease).
+        if (++opens === 2) {
+          reached!();
+          await gate;
+        }
+        return inner.open(streamId, token);
+      },
+    };
+    let providerNow = 1_700_000_000_000;
+    const deadClock = { now: () => providerNow, setTimeout: () => () => {} };
+    const provider = createInMemoryLeaseProvider({ clock: deadClock });
+    const durable = (owner: string): DurableStreamOptions => ({
+      store,
+      lease: { provider, owner, ttlMs: 300 },
+      // Every frame commits at once; no timer fires (no window, no renewal).
+      batch: { maxBytes: 1 },
+      deps: { clock: deadClock },
+    });
+
+    const sourceC = manualResult();
+    const c = toDeuzStreamResponse(sourceC.result, {
+      durable: durable('c'),
+      streamId: 's',
+      messageId: 'mc',
+    });
+    const cText = c.text();
+    await reachedGate;
+    providerNow += 1_000; // C's lease lapses while its open(5) waits
+
+    // D takes the key (token 2), renews, derives the same fence (5) and commits.
+    const sourceD = manualResult();
+    const d = bodyReader(
+      toDeuzStreamResponse(sourceD.result, {
+        durable: durable('d'),
+        streamId: 's',
+        messageId: 'md',
+      }),
+    );
+    sourceD.push(textPart('d1'));
+    await d.until('"d1"');
+
+    // C's open(5) lands: C no longer holds the lease, so it is refused and commits nothing.
+    letOpen!();
+    sourceC.push(textPart('stale-c1'));
+    sourceC.end();
+    const rawC = await cText;
+    expect(rawC).not.toContain('stale-c1');
+    expect(rawC).toBe(
+      `data: ${JSON.stringify({ type: 'error', message: 'Durable stream: this producer lost its lease.' })}\n\n`,
+    );
+    sourceD.push(textPart('d2'));
+    sourceD.end();
+    const rawD = await d.rest();
+    expect(rawD).toContain('"d2"');
+    expect(rawD).toContain('[DONE]');
+    expect(
+      (await readAll(inner, 's')).map((record) =>
+        record.part.type === 'text-delta'
+          ? (record.part as { text: string }).text
+          : record.part.type,
+      ),
+    ).toEqual(['start', 'd1', 'd2', 'done']);
   });
 
   it('still refuses a producer whose lease changed hands before it opened the stream', async () => {

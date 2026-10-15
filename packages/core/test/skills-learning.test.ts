@@ -15,6 +15,11 @@ import { createPriceProvider } from '../src/pricing';
 import { readConfig } from '../src/internal/config-symbol';
 import { isSha256Digest, sha256Digest } from '../src/internal/digest';
 import type { AgentRunEnvelope } from '../src/types/agent-run';
+import type { Message } from '../src/types/message';
+import { createInMemoryAgentRunStore, runAgent } from '../src/agent-run';
+import { createInMemoryChatStore } from '../src/chat';
+import { createMockModel } from '../src/testing';
+import { tool } from '../src/tool';
 import {
   FINALIZE_PROMPT,
   SECRETS,
@@ -461,5 +466,188 @@ describe('proposeSkillFromRun: source references', () => {
     expect(body).toContain('Proposed from run `run-billing` (revision 7)');
     expect(body).toContain('- S3: tool call `call_1` (get_version), message `run-billing:2`');
     expect(body).not.toContain('- S1:');
+  });
+});
+
+describe('the source projection of a real run', () => {
+  /** A conversation whose earlier turn called a tool the current run never calls. */
+  const history: Message[] = [
+    { role: 'user', content: 'Clean up the staging database.' },
+    {
+      role: 'assistant',
+      content: [{ type: 'tool_use', id: 'old_1', name: 'drop_table', input: { table: 'tmp' } }],
+    },
+    { role: 'tool', content: [{ type: 'tool_result', toolUseId: 'old_1', result: 'dropped' }] },
+    { role: 'assistant', content: 'Dropped the tmp table.' },
+    { role: 'user', content: 'What is the capital of France?' },
+  ];
+
+  for (const withChat of [false, true])
+    it(`never counts a tool only the input history called as used (chat: ${withChat})`, async () => {
+      const store = createInMemoryAgentRunStore();
+      const result = await runAgent({
+        model: createMockModel({ responses: [{ text: 'Paris.' }] }),
+        messages: history,
+        verify: () => ({ status: 'verified' as const }),
+        session: { store, runId: 'run-x', scope: 'tenant' },
+        ...(withChat
+          ? { chat: { store: createInMemoryChatStore(), chatId: 'c', scope: { userId: 'u' } } }
+          : {}),
+      });
+      expect(result.status).toBe('completed');
+      const run = (await store.load('run-x'))!;
+      expect(Object.keys(run.toolResults ?? {})).toEqual([]); // the run executed no tool
+      const projection = await projectRun(run);
+      // Spec §2.6: allowed-tools is a subset of the tools the source run really used.
+      expect(projection.usedTools).toEqual([]);
+      expect(projection.text).toContain('tool call drop_table (old_1)');
+      expect(projection.items.find((item) => item.toolCallId === 'old_1')!.modelStep).toBe(
+        undefined,
+      );
+      const draft = JSON.stringify({
+        name: 'answer-capitals',
+        description: 'Answers capital questions.',
+        steps: [{ text: 'Answer.', sources: [projection.items.at(-1)!.id] }],
+        limitations: [],
+        allowedTools: ['drop_table'],
+      });
+      const error = await refusal(
+        proposeSkillFromRun({
+          run,
+          model: createMockModel({ responses: [{ text: draft }] }),
+          budget: BUDGET,
+        }),
+      );
+      expect(error.code).toBe('invalid_proposal');
+    });
+
+  it('counts a tool the run called as used only when its receipt records a completed call', async () => {
+    const run = verifiedRun();
+    // The history answers call_2 without an error, but no receipt records its execution.
+    delete run.toolResults!['2:call_2'];
+    expect((await projectRun(run)).usedTools).toEqual(['get_version', 'health_check']);
+    // A receipt for another tool under the same id does not vouch for it either.
+    run.toolResults!['2:call_2'] = {
+      ...run.toolResults!['1:call_1']!,
+      modelStep: 2,
+      toolCallId: 'call_2',
+    };
+    expect((await projectRun(run)).usedTools).toEqual(['get_version', 'health_check']);
+  });
+
+  it('counts the tools a real run executed', async () => {
+    const store = createInMemoryAgentRunStore();
+    const result = await runAgent({
+      model: createMockModel({
+        responses: [
+          { toolCalls: [{ id: 'call_a', toolName: 'lookup', args: { q: 'x' } }] },
+          { text: 'Found it.' },
+        ],
+      }),
+      prompt: 'Look x up.',
+      tools: {
+        lookup: tool({
+          description: 'Looks a thing up.',
+          parameters: { type: 'object', properties: { q: { type: 'string' } } },
+          execute: async () => 'x is 42',
+        }),
+      },
+      verify: () => ({ status: 'verified' as const }),
+      session: { store, runId: 'run-t', scope: 'tenant' },
+    });
+    expect(result.status).toBe('completed');
+    const projection = await projectRun((await store.load('run-t'))!);
+    expect(projection.usedTools).toEqual(['lookup']);
+  });
+
+  it('drops custom verifier feedback from a run without a transcript', async () => {
+    const store = createInMemoryAgentRunStore();
+    let calls = 0;
+    const result = await runAgent({
+      model: createMockModel({ responses: [{ text: 'first' }, { text: 'second' }] }),
+      prompt: 'Say something.',
+      verify: () =>
+        ++calls === 1
+          ? { status: 'rejected' as const, feedback: 'INTERNAL-VERIFIER-NOTE: be nicer.' }
+          : { status: 'verified' as const },
+      session: { store, runId: 'run-v', scope: 'tenant' },
+    });
+    expect(result.status).toBe('completed');
+    const run = (await store.load('run-v'))!;
+    expect(run.verification).toBe('verified');
+    expect(run.transcript).toBeUndefined();
+    const projection = await projectRun(run);
+    expect(projection.text).not.toContain('INTERNAL-VERIFIER-NOTE');
+    expect(projection.items[0]).toMatchObject({ kind: 'task', content: 'task: Say something.' });
+    expect(projection.items.map((item) => item.kind)).not.toContain('user');
+  });
+
+  it('keeps a multi-turn input as the task and drops the feedback after it (no transcript)', async () => {
+    const store = createInMemoryAgentRunStore();
+    let calls = 0;
+    await runAgent({
+      model: createMockModel({ responses: [{ text: 'first' }, { text: 'second' }] }),
+      messages: [
+        { role: 'user', content: 'We talk about France.' },
+        { role: 'assistant', content: 'Sure.' },
+        { role: 'user', content: 'Name its capital.' },
+      ],
+      verify: () =>
+        ++calls === 1
+          ? { status: 'rejected' as const, feedback: 'INTERNAL-VERIFIER-NOTE: be brief.' }
+          : { status: 'verified' as const },
+      session: { store, runId: 'run-m', scope: 'tenant' },
+    });
+    const run = (await store.load('run-m'))!;
+    expect(run.verification).toBe('verified');
+    expect(run.transcript).toBeUndefined();
+    const projection = await projectRun(run);
+    expect(projection.text).not.toContain('INTERNAL-VERIFIER-NOTE');
+    expect(
+      projection.items.filter((item) => item.kind === 'task').map((item) => item.content),
+    ).toEqual(['task: We talk about France.', 'task: Name its capital.']);
+  });
+
+  it('cites a carried-over input message by the id it keeps in the run chat projection', async () => {
+    const chats = createInMemoryChatStore();
+    const store = createInMemoryAgentRunStore();
+    const chat = { store: chats, chatId: 'c', scope: { userId: 'u' } };
+    await runAgent({
+      model: createMockModel({ responses: [{ text: 'Hello.' }] }),
+      prompt: 'Greet me.',
+      chat,
+      session: { store, runId: 'run-1', scope: 'tenant' },
+    });
+    const stored = (await chats.loadChat('c'))!;
+    expect(stored.messageIds?.[0]).toBe('run-1:0');
+    const result = await runAgent({
+      model: createMockModel({ responses: [{ text: 'Paris.' }] }),
+      messages: [...stored.messages, { role: 'user', content: 'Capital of France?' }],
+      chat,
+      verify: () => ({ status: 'verified' as const }),
+      session: { store, runId: 'run-2', scope: 'tenant' },
+    });
+    expect(result.status).toBe('completed');
+    const run2 = (await store.load('run-2'))!;
+    expect(run2.chat?.messageIds[0]).toBe('run-1:0');
+    const projection = await projectRun(run2);
+    const first = projection.items[0]!;
+    expect(first.kind).toBe('task');
+    expect(first.messageId).toBe('run-1:0');
+    // A message of this run keeps `<runId>:<index>`, as in the chat projection.
+    expect(projection.items.at(-1)!.messageId).toBe(run2.chat!.messageIds.at(-1));
+    expect(projection.items.at(-1)!.messageId).toMatch(/^run-2:/);
+    const draft = JSON.stringify({
+      name: 'answer-capitals',
+      description: 'Answers capital questions.',
+      steps: [{ text: 'Answer.', sources: [first.id] }],
+      limitations: [],
+    });
+    const proposal = await proposeSkillFromRun({
+      run: run2,
+      model: createMockModel({ responses: [{ text: draft }] }),
+      budget: BUDGET,
+    });
+    expect(run2.chat!.messageIds).toContain(proposal.steps[0]!.sources[0]!.messageId);
   });
 });

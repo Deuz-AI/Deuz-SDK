@@ -7,7 +7,9 @@
  *   the lease token (its fencing token), renews the lease every `ttlMs / 3`
  *   and gives it back at the end. When a lease prune restarted the key's
  *   tokens below the stream's stored one, the lease's holder (a renewal
- *   proves it) fences the stream one past the stored token instead.
+ *   proves it) fences the stream one past the stored token instead, and goes
+ *   on only when a second renewal, after that open landed, still finds it
+ *   the holder.
  * - Frames are queued and committed in batches: when the queue reaches
  *   `maxBytes` (encoded), or `maxDelayMs` after its first frame, whichever
  *   comes first. One commit is in flight at a time; what arrives meanwhile
@@ -137,6 +139,19 @@ export async function openDurableJournal(host: DurableJournalHost): Promise<Dura
         lease = renewal.lease;
         fence = opened.token + 1;
         opened = await store.open(streamId, fence);
+        // A store accepts an equal token, and the next holder derives its
+        // fence the same way: a producer whose lease lapsed before this open
+        // landed could share the fence with it. Only the holder at the time
+        // the open landed may go on: a renewal after it proves it, and a
+        // later holder then finds this fence stored and derives a higher one.
+        if (opened.status === 'opened') {
+          const after = await provider.renew(lease, ttlMs);
+          if (!after.held) {
+            await releaseLease(lease);
+            return { status: 'refused', message: DURABLE_STREAM_MESSAGES.leaseLost };
+          }
+          lease = after.lease;
+        }
       }
     }
     if (opened.status === 'fenced') {

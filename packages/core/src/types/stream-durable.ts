@@ -109,10 +109,11 @@ export interface DurableStreamOptions {
    * When the provider's `prune` removed the released key since the stream's
    * last leg, its tokens start again at 1, below the stream's fence: the
    * lease's holder (a renewal proves it still holds it) then fences the
-   * stream one past the stored token, and a producer whose lease changed
-   * hands is refused as before. A producer cut off past the prune cutoff
-   * can hold the same token as the next holder: keep the lease retention
-   * longer than any producer pause.
+   * stream one past the stored token, and goes on only when a renewal after
+   * that open still finds it the holder. A producer whose lease changed
+   * hands, before or during that open, is refused as before. A producer cut
+   * off past the prune cutoff can hold the same token as the next holder:
+   * keep the lease retention longer than any producer pause.
    */
   lease: { provider: LeaseProvider; owner?: string; ttlMs?: number };
   batch?: DurableStreamBatchOptions;

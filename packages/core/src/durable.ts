@@ -325,9 +325,10 @@ export interface ResumeDeuzChatOptions {
    * How long the live-producer probe tolerates SILENCE before declaring the
    * run dead and re-driving it from the checkpoint (ms, default 1500). A
    * refreshed tab whose original producer is still draining server-side just
-   * tails; only a killed process triggers a continuation leg. Run at-most-one
-   * resumer per runId (app-level lock) — two continuation legs would double
-   * the model call and interleave seqs.
+   * tails; only a killed process triggers a continuation leg. Without
+   * `durable`, run at-most-one resumer per runId (app-level lock) — two
+   * continuation legs would double the model call and interleave seqs; with
+   * it, the producer lease refuses the second leg before its run starts.
    */
   liveProbeMs?: number;
   /** Poll cadence during replay/tail (ms, default 150). */
@@ -344,7 +345,8 @@ export interface ResumeDeuzChatOptions {
    * leg then takes the producer lease and commits before it sends, so a
    * producer that only went quiet past `liveProbeMs` keeps the stream (the
    * leg fails closed with 'another producer holds this stream', and
-   * reconnecting tails it), and so do two concurrent resumers. Without it the
+   * reconnecting tails it), and so do two concurrent resumers. A refused leg
+   * never starts the run: no model call, no tool, no checkpoint. Without it the
    * leg is a legacy one: its writes are not fenced, and it can take over seqs
    * such a producer goes on to commit.
    */

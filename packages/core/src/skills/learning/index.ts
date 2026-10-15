@@ -28,10 +28,12 @@ export interface SkillSourceRef {
   /** The model step the content came from, when a tool receipt records it. */
   modelStep?: number;
   /**
-   * The message (stable id) or tool call it came from. The message id is
-   * `<runId>:<index>`: its index in the run's transcript, or in its history
-   * for a run without a transcript (the id a run message keeps in the run's
-   * chat projection).
+   * The message (stable id) or tool call it came from. The message id is the
+   * one the message keeps in the run's chat projection
+   * (`AgentRunChatState.messageIds`: an input message carried over from the
+   * stored chat keeps that chat's id); for a run without one it is
+   * `<runId>:<index>`, its index in the run's transcript, or in its history
+   * for a run without a transcript.
    */
   messageId?: string;
   toolCallId?: string;
@@ -73,8 +75,9 @@ export interface SkillProposal {
   limitations: string[];
   /**
    * Suggested `allowed-tools`: always a subset of the tools the source run
-   * really used (called, and answered without an error). The model can never
-   * add a tool permission. Absent when none is suggested.
+   * really used (called by the run itself, never by its input history, with a
+   * receipt that records the call completed, and answered without an error).
+   * The model can never add a tool permission. Absent when none is suggested.
    */
   allowedTools?: string[];
   /** The source run: its id, scope, revision at the time, and the projection's digest. */
