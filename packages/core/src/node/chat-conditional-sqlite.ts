@@ -40,6 +40,7 @@ import {
   type RankedMessage,
   type ResolvedSearchOptions,
 } from '../internal/chat-transcript';
+import { assertTombstoneCutoff } from '../chat-conditional';
 import type { SqliteConnectionOptions } from './store-connection';
 import type { SqliteDatabaseLike } from './store-sqlite';
 import {
@@ -547,7 +548,8 @@ export function createSqliteConditionalChatStore(
       });
     },
 
-    pruneTombstones(before) {
+    async pruneTombstones(before) {
+      assertTombstoneCutoff(before);
       return write((s) =>
         run(
           s,

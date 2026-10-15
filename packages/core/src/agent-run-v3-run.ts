@@ -7,10 +7,11 @@
  * their state in the V3 run record. Edge-safe.
  */
 import { assertAgentRunStoreV3 } from './agent-run-v3-assert';
+import { isBlockOf, retrievalBlockMarker } from './agent-run-v3-context';
 import { contextPackageBlob, readContextPackage } from './agent-run-v3-package';
 import { createContextCompiler } from './context/compiler';
 import { estimateRequestOverhead } from './context/count';
-import { isContextMessage, messageText } from './context/render';
+import { isContextMessage } from './context/render';
 import { sha256DigestSync } from './context/sha256';
 import type {
   ContextCompiler,
@@ -753,16 +754,13 @@ export async function dropRedactedContext(
       redacted = (await store.getBlob(blob.digest)).status === 'redacted';
       seen.set(blob.digest, redacted);
     }
-    if (redacted) markers.push(`<deuz_context pass="${manifest.pass}" step="${manifest.step}">`);
+    if (redacted) markers.push(retrievalBlockMarker(manifest.pass, manifest.step));
   }
   if (markers.length === 0) return false;
   let dropped = false;
   const keep = (messages: Message[]): Message[] => {
-    const kept = messages.filter(
-      (message) =>
-        message.role !== 'user' ||
-        !markers.some((marker) => messageText(message).trimStart().startsWith(marker)),
-    );
+    // A stand-in a forget left in the stored record carries the marker too.
+    const kept = messages.filter((message) => isBlockOf(message, markers) === undefined);
     if (kept.length !== messages.length) dropped = true;
     return kept;
   };

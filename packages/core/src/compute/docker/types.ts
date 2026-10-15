@@ -258,7 +258,13 @@ export interface ProcessOperationStore {
   list(
     query?: ProcessOperationQuery,
   ): Promise<{ records: ProcessOperationRecord[]; cursor?: string }>;
-  /** Retention: deletes terminal records updated before `terminalBefore`. */
+  /**
+   * Retention: deletes terminal records (exited, cancelled, lost, failed,
+   * disposed) last updated before `terminalBefore` (epoch ms on the store
+   * clock; a record updated exactly then stays) and returns how many. A
+   * malformed cutoff throws a TypeError. Containers are removed by
+   * `dispose`, not here; nothing is deleted in the background.
+   */
   prune(options: { terminalBefore: number }): Promise<number>;
   close?(): Promise<void>;
 }

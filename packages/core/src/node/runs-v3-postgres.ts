@@ -16,6 +16,12 @@
  * prune is retried). Only a put made before such a run's last save is not
  * protected: if the writer saves after the prune, its reopened step finds
  * the package missing and compiles that step again.
+ *
+ * A forget also rewrites the stored copies of a redacted package's
+ * retrieval block in the runs that point to it (history, checkpoints, result
+ * messages; same revision and `updated_at`), and a later save of such a run
+ * is stored with them replaced; both read the blob state in their
+ * SERIALIZABLE transaction, so a save racing the forget is retried.
  */
 import {
   agentRunV3BlobDigests,
@@ -29,6 +35,7 @@ import {
   assertForgetEvent,
   forgetTombstones,
   markRedactedSteps,
+  redactedPayload,
 } from '../agent-run-v3-context';
 import { InvalidRequestError, RevisionConflictError } from '../errors';
 import { agentRunListPage, planAgentRunList, summarizeAgentRun } from '../internal/agent-run-list';
@@ -180,6 +187,18 @@ export function createPostgresAgentRunStoreV3(
   };
   const rows = async (client: PgClientLike, sql: string, params: unknown[] = []) =>
     (await client.query(sql, params)).rows;
+  /** The redacted blobs a run points to. */
+  const redactedOf = async (client: PgClientLike, runId: string): Promise<Set<Sha256Digest>> =>
+    new Set(
+      (
+        await rows(
+          client,
+          `SELECT b.digest FROM ${refs} f JOIN ${blobs} b ON b.digest = f.digest
+           WHERE f.run_id = $1 AND b.redacted`,
+          [runId],
+        )
+      ).map((blob) => String(blob.digest) as Sha256Digest),
+    );
 
   return {
     checkpointVersion: 3,
@@ -187,32 +206,40 @@ export function createPostgresAgentRunStoreV3(
       const client = await use();
       const [row] = await rows(client, `SELECT payload FROM ${runs} WHERE run_id = $1`, [runId]);
       if (!row) return undefined;
-      const redacted = await rows(
-        client,
-        `SELECT b.digest FROM ${refs} f JOIN ${blobs} b ON b.digest = f.digest
-         WHERE f.run_id = $1 AND b.redacted`,
-        [runId],
-      );
       return markRedactedSteps(
         decodeAgentRunEnvelopeV3(String(row.payload)),
-        new Set(redacted.map((blob) => String(blob.digest) as Sha256Digest)),
+        await redactedOf(client, runId),
       );
     },
     async save(envelope) {
-      const payload = encodeAgentRunEnvelopeV3(envelope);
+      const encoded = encodeAgentRunEnvelopeV3(envelope);
       const digests = agentRunV3BlobDigests(envelope);
       const revision = envelope.revision!;
-      const columns = [
-        envelope.runId,
-        envelope.scope,
-        revision,
-        envelope.phase,
-        envelope.result?.status ?? null,
-        payload,
-      ];
       await withPgTransaction(
         await use(),
         async (tx) => {
+          // A leg that ran through a forget still holds the block: stored
+          // redacted. SERIALIZABLE: a forget racing this save is retried.
+          const redacted =
+            digests.length === 0
+              ? new Set<Sha256Digest>()
+              : new Set(
+                  (
+                    await rows(
+                      tx,
+                      `SELECT digest FROM ${blobs} WHERE redacted AND digest = ANY($1::text[])`,
+                      [digests],
+                    )
+                  ).map((blob) => String(blob.digest) as Sha256Digest),
+                );
+          const columns = [
+            envelope.runId,
+            envelope.scope,
+            revision,
+            envelope.phase,
+            envelope.result?.status ?? null,
+            redactedPayload(encoded, redacted),
+          ];
           // A new run starts at 1; a stored one advances by exactly one.
           const saved =
             revision === 1
@@ -365,6 +392,27 @@ export function createPostgresAgentRunStoreV3(
              RETURNING digest`,
             [event.recordId],
           );
+          // The runs' stored copies of those blocks go too, in place: same
+          // revision and last-save time (a retry finds nothing left to change).
+          const affected = await rows(
+            tx,
+            `SELECT DISTINCT f.run_id FROM ${refs} f JOIN ${records} r ON r.digest = f.digest
+             WHERE r.record_id = $1 AND ${forgottenRecord}`,
+            [event.recordId],
+          );
+          for (const { run_id: runId } of affected) {
+            const [row] = await rows(tx, `SELECT payload FROM ${runs} WHERE run_id = $1`, [
+              String(runId),
+            ]);
+            if (!row) continue;
+            const payload = String(row.payload);
+            const next = redactedPayload(payload, await redactedOf(tx, String(runId)));
+            if (next !== payload)
+              await tx.query(`UPDATE ${runs} SET payload = $2 WHERE run_id = $1`, [
+                String(runId),
+                next,
+              ]);
+          }
           return redacted.length;
         },
         SERIALIZABLE,

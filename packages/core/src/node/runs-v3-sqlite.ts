@@ -13,7 +13,13 @@
  * - `_blob_records`: the memory record revisions each blob holds (`-1`: none);
  * - `_blob_refs`: which runs point to which blobs, for retention;
  * - `_forgotten`: forget tombstones (ids only, `-1`: every revision), so a
- *   package put after its forget is stored redacted.
+ *   package put after its forget is stored redacted. Retention never deletes
+ *   them.
+ *
+ * A forget also rewrites the stored copies of a redacted package's
+ * retrieval block in the runs that point to it (history, checkpoints, result
+ * messages; same revision and `updated_at`), and a later save of such a run
+ * is stored with them replaced (`redactRetrievalBlocks`).
  *
  * Every write is one `BEGIN IMMEDIATE` transaction with no await inside it;
  * digests (async WebCrypto) are computed before it starts.
@@ -30,6 +36,7 @@ import {
   assertForgetEvent,
   forgetTombstones,
   markRedactedSteps,
+  redactedPayload,
 } from '../agent-run-v3-context';
 import { agentRunListPage, planAgentRunList, summarizeAgentRun } from '../internal/agent-run-list';
 import type { Sha256Digest } from '../internal/digest';
@@ -146,6 +153,32 @@ function run(s: State, sql: string, params: SqlValue[] = []): void {
   s.statement(s.db, sql).run(...params);
 }
 
+/** The redacted blobs a run points to. */
+function redactedOf(s: State, runId: string): Set<Sha256Digest> {
+  return new Set(
+    all(
+      s,
+      `SELECT b.digest FROM deuz_runs_v3_blob_refs f
+       JOIN deuz_runs_v3_blobs b ON b.digest = f.digest
+       WHERE f.run_id = ? AND b.redacted = 1`,
+      [runId],
+    ).map((blob) => String(blob.digest) as Sha256Digest),
+  );
+}
+
+/** The redacted blobs among `digests`. */
+function redactedAmong(s: State, digests: readonly Sha256Digest[]): Set<Sha256Digest> {
+  if (digests.length === 0) return new Set();
+  return new Set(
+    all(
+      s,
+      `SELECT digest FROM deuz_runs_v3_blobs
+       WHERE redacted = 1 AND digest IN (${digests.map(() => '?').join(', ')})`,
+      [...digests],
+    ).map((blob) => String(blob.digest) as Sha256Digest),
+  );
+}
+
 /** The SQLite V3 run store (2.4); `close()` closes only a connection it opened. */
 export function createSqliteAgentRunStoreV3(
   options: SqliteAgentRunStoreV3Options,
@@ -179,18 +212,14 @@ export function createSqliteAgentRunStoreV3(
       return use((s) => {
         const row = one(s, 'SELECT payload FROM deuz_runs_v3 WHERE run_id = ?', [runId]);
         if (!row) return undefined;
-        const redacted = all(
-          s,
-          `SELECT b.digest FROM deuz_runs_v3_blob_refs f
-           JOIN deuz_runs_v3_blobs b ON b.digest = f.digest
-           WHERE f.run_id = ? AND b.redacted = 1`,
-          [runId],
-        ).map((blob) => String(blob.digest) as Sha256Digest);
-        return markRedactedSteps(decodeAgentRunEnvelopeV3(String(row.payload)), new Set(redacted));
+        return markRedactedSteps(
+          decodeAgentRunEnvelopeV3(String(row.payload)),
+          redactedOf(s, runId),
+        );
       });
     },
     async save(envelope) {
-      const payload = encodeAgentRunEnvelopeV3(envelope);
+      const encoded = encodeAgentRunEnvelopeV3(envelope);
       const digests = agentRunV3BlobDigests(envelope);
       await use((s) =>
         transaction(s, () => {
@@ -198,6 +227,8 @@ export function createSqliteAgentRunStoreV3(
             envelope.runId,
           ]);
           assertEnvelopeRevisionV3(row ? { revision: Number(row.revision) } : undefined, envelope);
+          // A leg that ran through a forget still holds the block: stored redacted.
+          const payload = redactedPayload(encoded, redactedAmong(s, digests));
           run(
             s,
             `INSERT INTO deuz_runs_v3 (run_id, scope, revision, phase, status, payload, updated_at)
@@ -324,7 +355,7 @@ export function createSqliteAgentRunStoreV3(
               [tombstone.recordId, tombstone.revision ?? NO_REVISION, clock.now()],
             );
           // RETURNING counts what changed, which an injected driver's run() may not report.
-          return all(
+          const redacted = all(
             s,
             `UPDATE deuz_runs_v3_blobs SET content = NULL, redacted = 1
              WHERE redacted = 0 AND digest IN (
@@ -333,6 +364,26 @@ export function createSqliteAgentRunStoreV3(
              RETURNING digest`,
             [event.recordId],
           ).length;
+          // The runs' stored copies of those blocks go too, in place: same
+          // revision and last-save time (a retry finds nothing left to change).
+          const affected = all(
+            s,
+            `SELECT DISTINCT f.run_id FROM deuz_runs_v3_blob_refs f
+             JOIN deuz_runs_v3_blob_records r ON r.digest = f.digest
+             WHERE r.record_id = ? AND ${FORGOTTEN_RECORD}`,
+            [event.recordId],
+          );
+          for (const { run_id: runId } of affected) {
+            const row = one(s, 'SELECT payload FROM deuz_runs_v3 WHERE run_id = ?', [
+              String(runId),
+            ]);
+            if (!row) continue;
+            const payload = String(row.payload);
+            const next = redactedPayload(payload, redactedOf(s, String(runId)));
+            if (next !== payload)
+              run(s, 'UPDATE deuz_runs_v3 SET payload = ? WHERE run_id = ?', [next, String(runId)]);
+          }
+          return redacted;
         }),
       );
     },

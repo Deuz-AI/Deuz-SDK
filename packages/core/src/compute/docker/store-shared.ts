@@ -166,6 +166,20 @@ export function decodeCursor(cursor: string): ProcessOperationCursor {
   return { createdAt: value[0] as number, scope: value[1], operationId: value[2] };
 }
 
+/**
+ * `prune`'s argument, checked before anything is deleted: returns its
+ * `terminalBefore`, a finite epoch-ms time on the store clock. A TypeError
+ * otherwise, as the other 2.4 stores' `prune({ terminalBefore })` throw.
+ */
+export function checkTerminalBefore(options: unknown): number {
+  const value = (options as { terminalBefore?: unknown } | null | undefined)?.terminalBefore;
+  if (typeof value !== 'number' || !Number.isFinite(value))
+    throw new TypeError(
+      'prune needs { terminalBefore }: a finite epoch-ms time on the store clock.',
+    );
+  return value;
+}
+
 /** A validated query: limit 1..1000 (default 100), states known, cursor decoded. */
 export interface ResolvedProcessQuery {
   scope?: string;

@@ -22,6 +22,7 @@ import {
   isMemoryKind,
   lexicalScore,
   isOrigin,
+  pruneOperationsWarning,
   recordDigest,
   scopeKey,
   textDigest,
@@ -784,10 +785,7 @@ export function createInMemoryVersionedMemoryStore(options?: {
             removed++;
           }
         if (removed > 0)
-          deps.logger.warn(
-            `pruneOperations removed ${removed} versioned memory receipt(s): those operation ids lose their dedupe protection, and a redelivered operation with one of them is applied again.`,
-            { removed, olderThan },
-          );
+          deps.logger.warn(pruneOperationsWarning(removed), { count: removed, olderThan });
         return removed;
       });
     },

@@ -30,6 +30,7 @@ import type {
   TranscriptIndex,
 } from '../types/chat-conditional';
 import type { Clock } from '../types/deps';
+import { assertTombstoneCutoff } from '../chat-conditional';
 import { InvalidRequestError } from '../errors';
 import {
   assertExpectedRevision,
@@ -464,6 +465,7 @@ export function createPostgresConditionalChatStore(
     },
 
     async pruneTombstones(before) {
+      assertTombstoneCutoff(before);
       const { rows } = await (
         await read()
       ).query(

@@ -167,7 +167,8 @@ export function createInMemoryConditionalChatStore(
         .map((record) => record.chatId);
     },
 
-    pruneTombstones(before) {
+    async pruneTombstones(before) {
+      assertTombstoneCutoff(before);
       return serialize(async () => {
         let pruned = 0;
         for (const [chatId, stored] of chats)
@@ -179,6 +180,18 @@ export function createInMemoryConditionalChatStore(
       });
     },
   };
+}
+
+/**
+ * `pruneTombstones`' cutoff, checked before anything is deleted: a finite
+ * epoch-ms time on the store clock, else `InvalidRequestError`, as the
+ * conditional chat stores refuse other malformed arguments.
+ */
+export function assertTombstoneCutoff(before: unknown): asserts before is number {
+  if (typeof before !== 'number' || !Number.isFinite(before))
+    throw new InvalidRequestError({
+      message: `ConditionalChatStore.pruneTombstones: before must be a finite epoch-ms time, got ${String(before)}.`,
+    });
 }
 
 /** True for a store with the conditional surface (`conditional: true`, `readChat`, `writeChat`). */

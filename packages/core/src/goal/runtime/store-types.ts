@@ -46,7 +46,11 @@ export interface GoalRuntimePolicy {
   maxRetries: number;
   /** Waits before each retry, in ms. Default `[1000, 5000, 30000]`. */
   retryDelaysMs: number[];
-  /** How long an applied or disposed inbox payload is kept before its tombstone. Default 7 days. */
+  /**
+   * How long an applied or disposed inbox payload is kept before its
+   * tombstone. Default 7 days. Nothing prunes on its own: the host passes
+   * `now - retainPayloadMs` to the store's `prunePayloads`.
+   */
   retainPayloadMs: number;
 }
 
@@ -483,13 +487,19 @@ export type GoalRuntimeCommitResult =
         | 'scope-mismatch';
     };
 
-/** Retention options; times are epoch ms on the store's clock. */
+/**
+ * Retention options (spec §4.4); times are epoch ms on the store's clock.
+ * Retention is always an explicit call (the host may schedule it on the
+ * durable scheduler): no store deletes anything in the background.
+ */
 export interface GoalRuntimePruneOptions {
   /**
-   * Delete before this time: an entry's `settledAt`, an occurrence record's
-   * `recordedAt`, an intent's `updatedAt`.
+   * Delete before this time (exclusive: a record stamped exactly then
+   * stays): an entry's `settledAt`, an occurrence record's `recordedAt`, an
+   * intent's `updatedAt`. The spec's `olderThan` for `pruneOccurrences`.
    */
   before: number;
+  /** Only this tenancy scope; every scope when absent. */
   scope?: string;
 }
 
@@ -672,7 +682,10 @@ export interface GoalRuntimeStore extends GoalStore {
   /**
    * Replaces the payloads of entries settled before `before` with content-free
    * tombstones (`payloadPruned`); ids stay, so dedupe holds. Returns how many
-   * payloads it dropped. The host passes `now - policy.retainPayloadMs`.
+   * payloads it dropped. The host passes `now - policy.retainPayloadMs`. The
+   * cut is per store or per scope, not per goal: when goals of one scope
+   * carry different `retainPayloadMs` values, pass the largest window (a
+   * payload may then outlive its own goal's window, never the reverse).
    */
   prunePayloads(options: GoalRuntimePruneOptions): Promise<number>;
   /**
@@ -681,9 +694,13 @@ export interface GoalRuntimeStore extends GoalStore {
    * window. Returns how many.
    */
   pruneInbox(options: GoalRuntimePruneOptions): Promise<number>;
-  /** Deletes occurrence records before `before` (`pruneOccurrences({ olderThan })`). */
+  /**
+   * Deletes occurrence records recorded before `before` (the spec's
+   * `pruneOccurrences({ olderThan })`). The schedules and their cursors
+   * stay. Returns how many.
+   */
   pruneOccurrences(options: GoalRuntimePruneOptions): Promise<number>;
-  /** Deletes completed, failed and cancelled intents updated before `before`. */
+  /** Deletes completed, failed and cancelled intents updated before `before`. Returns how many. */
   pruneIntents(options: GoalRuntimePruneOptions): Promise<number>;
   /** Releases a connection the store opened itself; a borrowed one stays open. */
   close?(): Promise<void>;

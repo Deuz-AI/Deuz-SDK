@@ -118,6 +118,17 @@ export function checkImportance(value: unknown, what: string): number | undefine
   return value;
 }
 
+/**
+ * The warning every versioned memory store logs when `pruneOperations`
+ * deleted receipts (with `{ count, olderThan }`): those ids lose dedupe.
+ */
+export function pruneOperationsWarning(count: number): string {
+  return (
+    `Versioned memory: pruned ${count} operation receipt(s). Their operation ids no longer ` +
+    'deduplicate: a redelivery of one of them is applied again.'
+  );
+}
+
 export function checkTime(value: unknown, what: string): number | undefined {
   if (value === undefined) return undefined;
   if (typeof value !== 'number' || !Number.isFinite(value))
