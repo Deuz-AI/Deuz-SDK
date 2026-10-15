@@ -280,4 +280,46 @@ describe('createNativeRunLauncher', () => {
     expect(await launcher.accounting!({ scope: 'other', runId: 'g-1:run:1' })).toBeUndefined();
     expect(await launcher.accounting!({ scope: SCOPE, runId: 'missing' })).toBeUndefined();
   });
+
+  it('reads the maintenance of versioned extractions, never of a model tool write (T2-1)', async () => {
+    const store = createInMemoryAgentRunStoreV3();
+    const launcher = createNativeRunLauncher({ store, options: () => ({}) as never });
+    const extraction = { infer: true };
+    const cases: [AgentRunEnvelopeV3['memoryIntents'], string | undefined][] = [
+      // A model tool's write is settled inside the run: no upkeep.
+      [[{ operationId: 'tool', status: 'acknowledged', toolCallId: 'm-1' }], undefined],
+      [[{ operationId: 'x', status: 'intended', extraction }], 'pending'],
+      [[{ operationId: 'x', status: 'planned', extraction }], 'pending'],
+      [[{ operationId: 'x', status: 'acknowledged', extraction }], 'complete'],
+      [
+        [
+          {
+            operationId: 'x',
+            status: 'planned',
+            extraction,
+            error: { name: 'Error', message: 'down' },
+          },
+        ],
+        'failed',
+      ],
+      // Pending wins over a failure: the run is still doing upkeep.
+      [
+        [
+          {
+            operationId: 'x',
+            status: 'planned',
+            extraction,
+            error: { name: 'Error', message: 'down' },
+          },
+          { operationId: 'y', status: 'planned', extraction },
+        ],
+        'pending',
+      ],
+    ];
+    for (const [index, [memoryIntents, expected]] of cases.entries()) {
+      const runId = `g-1:run:${index + 1}`;
+      await store.save(envelopeV3(runId, 1, { scope: SCOPE, phase: 'terminal', memoryIntents }));
+      expect(await launcher.maintenance!({ scope: SCOPE, runId }), runId).toBe(expected);
+    }
+  });
 });

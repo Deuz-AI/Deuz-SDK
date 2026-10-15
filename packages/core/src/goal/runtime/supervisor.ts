@@ -318,14 +318,16 @@ export interface GoalSupervisor {
  * executor), applies due inbox entries with `transitionGoal` and
  * `store.inbox.apply`, records a run intent before every launch, launches at
  * most `policy.maxRuns` automatic runs and `policy.maxRetries` retries of a
- * retryable failure (1/5/30 s apart; `policy_limit` once spent), hands the
- * last working memory to the next run only when scope and `specGeneration`
- * match, retries an approval-gated call with its stored verdict, and charges
- * ledger differences above the run's watermark once (unknown amounts held as
+ * retryable failure (1/5/30 s apart; once spent it reports a `policy-limit`
+ * event and leaves the goal as it is), hands the last working memory to the
+ * next run only when scope and `specGeneration` match, retries an
+ * approval-gated call with its stored verdict, and charges ledger
+ * differences above the run's watermark once (unknown amounts held as
  * reservations; a late charge never reopens a completed goal). On lease loss
- * it drains the native run it started and starts nothing new
- * (`lease_lost`). A cancel is recorded first and applied at the run's next
- * claim, so an idle run's cancel is never lost.
+ * it reports a `lease-lost` event, drains the native run it started and
+ * starts nothing new. A cancel is recorded first and applied at the run's
+ * next claim, so an idle run's cancel is never lost. A command or resume
+ * that another writer overtook throws `GoalError('revision_conflict')`.
  */
 export function createGoalSupervisor(options: GoalSupervisorOptions): GoalSupervisor {
   const { store, launcher } = options;
@@ -343,7 +345,8 @@ export function createGoalSupervisor(options: GoalSupervisorOptions): GoalSuperv
     return { goal, runtime };
   }
 
-  function stale(goal: GoalRecord, expected: number): GoalError {
+  /** A command or resume another writer overtook (2.3 semantics). */
+  function overtaken(goal: GoalRecord, expected: number): GoalError {
     return new GoalError(
       'revision_conflict',
       `Goal ${goal.goalId} is at revision ${goal.revision}, not ${expected}.`,
@@ -551,7 +554,7 @@ export function createGoalSupervisor(options: GoalSupervisorOptions): GoalSuperv
       const expected = commandOptions?.expectedRevision;
       for (let attempt = 1; ; attempt++) {
         const { goal, runtime } = await supervised(scope, goalId);
-        if (expected !== undefined && goal.revision !== expected) throw stale(goal, expected);
+        if (expected !== undefined && goal.revision !== expected) throw overtaken(goal, expected);
         const now = deps.clock.now();
         const outcome =
           command?.type === 'cancel'
@@ -559,7 +562,7 @@ export function createGoalSupervisor(options: GoalSupervisorOptions): GoalSuperv
             : await applyCommand(goal, runtime, command, now);
         if (outcome !== 'conflict') return outcome;
         // Another writer moved the goal or its state: decide again on what it wrote.
-        if (attempt >= WRITE_ATTEMPTS) throw stale(goal, expected ?? goal.revision);
+        if (attempt >= WRITE_ATTEMPTS) throw overtaken(goal, expected ?? goal.revision);
       }
     },
 
@@ -620,7 +623,7 @@ export function createGoalSupervisor(options: GoalSupervisorOptions): GoalSuperv
           },
         );
         if (written.status === 'committed') return;
-        if (attempt >= WRITE_ATTEMPTS) throw stale(goal, goal.revision);
+        if (attempt >= WRITE_ATTEMPTS) throw overtaken(goal, goal.revision);
       }
     },
 
@@ -706,7 +709,8 @@ export function createGoalSupervisor(options: GoalSupervisorOptions): GoalSuperv
  * without `lease`, the launcher takes the lease provider and TTL of the first
  * supervisor it is given to (false before that). `accounting` reads the
  * ledger of the run's last checkpoint and `maintenance` its memory
- * extraction.
+ * extraction (the 2.3 `memory` one or the 2.4 `versionedMemory.extract`
+ * one): a run with either reports its leg once its outcome is durable.
  */
 export function createNativeRunLauncher(options: NativeRunLauncherOptions): RunLauncher {
   return createNative(options);

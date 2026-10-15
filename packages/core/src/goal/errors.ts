@@ -13,19 +13,24 @@ export type GoalErrorCode =
   /** An event addressed to another goal or scope. */
   | 'scope_mismatch'
   /**
-   * The supervisor lost the goal's lease (2.4): it stops writing, drains the
-   * native run it started, and starts no new one.
+   * Reserved (2.4): nothing throws it yet. A supervisor that loses a goal's
+   * lease never throws: it reports a `lease-lost` event, stops writing,
+   * drains the native run it started and starts no new one.
    */
   | 'lease_lost'
   /**
-   * A write from a view the store has moved past (2.4): a supervisor whose
-   * lease token or goal revision is older than the stored one, or a command
-   * for an older `specGeneration`. Nothing was written; read the goal again.
+   * Reserved (2.4): nothing throws it yet. A write from a view the store has
+   * moved past is refused as `revision_conflict` (an `expectedRevision`
+   * another writer overtook) or a store's `{ status: 'conflict' }`, and an
+   * event for an older wait or `specGeneration` is recorded with the inbox
+   * disposition `'stale'`. Nothing was written; read the goal again.
    */
   | 'stale'
   /**
-   * A goal policy limit was reached (2.4): its automatic runs or retries. Only
-   * a revision-checked `updatePolicy` by the host raises it.
+   * Reserved (2.4): nothing throws it yet. A goal whose automatic runs or
+   * retries are spent stays as it is, and the supervisor reports a
+   * `policy-limit` event; only a revision-checked `updatePolicy` by the host
+   * raises the limits.
    */
   | 'policy_limit'
   /**

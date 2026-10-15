@@ -4,6 +4,7 @@
  * goal runtime store with a scripted launcher. How a tick drives a goal is in
  * `goal-supervisor-drive.test.ts`.
  */
+import { readdir, readFile } from 'node:fs/promises';
 import { describe, expect, it, vi } from 'vitest';
 import { GoalError, createGoalEvent } from '../src/goal';
 import type { GoalCommand, GoalEvent } from '../src/goal';
@@ -428,5 +429,50 @@ describe('updatePolicy', () => {
       { expectedRevision: 2 },
     );
     expect(updated.cancel).toEqual({ requestedAt: T0 });
+  });
+});
+
+describe('error codes (T5-3)', () => {
+  /** The JSDoc right above `| '<code>'` in the GoalErrorCode union. */
+  function docOf(source: string, code: string): string {
+    const at = source.indexOf(`| '${code}'`);
+    expect(at, code).toBeGreaterThan(0);
+    const before = source.slice(0, at);
+    return before.slice(before.lastIndexOf('/**'));
+  }
+
+  it('marks the codes nothing raises as reserved, and raises none of them', async () => {
+    const errors = await readFile(new URL('../src/goal/errors.ts', import.meta.url), 'utf8');
+    const sources: string[] = [];
+    for (const file of await readdir(new URL('../src/goal/', import.meta.url), {
+      recursive: true,
+    }))
+      if (file.endsWith('.ts'))
+        sources.push(await readFile(new URL(`../src/goal/${file}`, import.meta.url), 'utf8'));
+    for (const code of ['lease_lost', 'stale', 'policy_limit']) {
+      expect(docOf(errors, code), code).toMatch(/Reserved \(2\.4\)/);
+      for (const source of sources) expect(source).not.toContain(`GoalError('${code}'`);
+    }
+    // The supervisor reports what the reserved codes describe as events and conflicts.
+    const supervisor = await readFile(
+      new URL('../src/goal/runtime/supervisor.ts', import.meta.url),
+      'utf8',
+    );
+    expect(supervisor).not.toMatch(/`(lease_lost|policy_limit|stale)`/);
+  });
+
+  it('refuses a command at a stale expected revision as a revision conflict', async () => {
+    const { supervisor } = setup();
+    await supervisor.submit({ goalId: 'g-1', scope: SCOPE, objective: 'x', start: false });
+    await expect(
+      supervisor.command(
+        SCOPE,
+        'g-1',
+        { type: 'wait', wait: { reason: 'user' } },
+        {
+          expectedRevision: 9,
+        },
+      ),
+    ).rejects.toMatchObject({ name: 'GoalError', code: 'revision_conflict' });
   });
 });
