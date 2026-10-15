@@ -10,6 +10,7 @@ import { createGoalEvent } from '../src/goal';
 import {
   createGoalSupervisor,
   createInMemoryGoalRuntimeStore,
+  goalDeliveryDigest,
   goalLeaseKey,
 } from '../src/goal/runtime';
 import type {
@@ -770,6 +771,72 @@ describe('inbox, dependencies and time', () => {
     );
     expect(await supervisor.tick()).toMatchObject({ applied: 1, dispatched: 0 });
     expect((await w.store.inbox.get(SCOPE, entry.id))?.disposition).toBe('unmatched');
+  });
+
+  it('settles entries queued for a goal that already ended as terminal, so their payloads age out', async () => {
+    for (const scopes of [undefined, [SCOPE]]) {
+      const w = world();
+      const { supervisor, seen } = supervisorIn(w, scopes ? { scopes } : {});
+      await supervisor.submit({ goalId: 'g-1', scope: SCOPE, objective: 'x', start: false });
+      await supervisor.command(SCOPE, 'g-1', { type: 'cancel' });
+      await supervisor.tick();
+      expect((await supervisor.get(SCOPE, 'g-1'))?.goal.status).toBe('cancelled');
+      const event = (key: string, notBefore?: number) =>
+        createGoalEvent({
+          scope: SCOPE,
+          goalId: 'g-1',
+          source: { type: 'signal', id: 'hook' },
+          key,
+          at: w.time.clock.now(),
+          ...(notBefore !== undefined ? { notBefore } : {}),
+        });
+      // Straight into the store, as the webhook handler and the scheduler queue theirs.
+      const body = { body: '{"secret":"x"}' };
+      const queued = await w.store.inbox.enqueue({
+        scope: SCOPE,
+        goalId: 'g-1',
+        namespace: 'webhook:hook',
+        deliveryId: 'delivery-1',
+        event: event('delivery-1'),
+        payload: body,
+        digest: await goalDeliveryDigest({
+          scope: SCOPE,
+          goalId: 'g-1',
+          event: event('delivery-1'),
+          payload: body,
+        }),
+      });
+      expect(queued.status).toBe('enqueued');
+      // An early one too: an ended goal takes no event, early or not.
+      await supervisor.dispatch(event('later', w.time.clock.now() + 3_600_000));
+      expect(await supervisor.tick()).toMatchObject({ applied: 2, dispatched: 0 });
+      expect((await w.store.inbox.list({ scope: SCOPE, goalId: 'g-1' })).entries).toEqual([]);
+      const settled = await w.store.inbox.list({
+        scope: SCOPE,
+        goalId: 'g-1',
+        dispositions: ['terminal'],
+      });
+      expect(settled.entries.map((entry) => entry.deliveryId).sort()).toEqual([
+        'delivery-1',
+        'later',
+      ]);
+      expect(seen).toContainEqual({
+        type: 'inbox-applied',
+        scope: SCOPE,
+        goalId: 'g-1',
+        entryId: queued.entry.id,
+        disposition: 'terminal',
+      });
+      expect(await supervisor.get(SCOPE, 'g-1')).toMatchObject({
+        goal: { status: 'cancelled' },
+        runtime: { phase: 'done' },
+      });
+      await w.time.advance(8 * 24 * 60 * 60 * 1_000);
+      expect(
+        await w.store.prunePayloads({ before: w.time.clock.now() - 7 * 24 * 60 * 60 * 1_000 }),
+      ).toBe(1);
+      expect((await w.store.inbox.get(SCOPE, queued.entry.id))?.payloadPruned).toBe(true);
+    }
   });
 
   it('reconciles a dependency wait with dependencies that already finished', async () => {

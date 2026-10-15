@@ -4,13 +4,14 @@
  * active executor per goal) with at most `concurrency` drives at once.
  *
  * A drive takes one step at a time on freshly read state, each step one
- * checked write, in this order: apply a recorded cancel; close what a goal
- * that ended left open (and follow its maintenance); apply time (a passed
- * deadline, a due wakeup); reconcile a dependency wait; settle a due inbox
- * entry; close an intent its state no longer names; launch the intent the
- * state names (claimed with the lease token, which fences out every earlier
- * holder); record a due retry; resume a run the host made active again;
- * start an automatic run. Every intent is recorded with a runtime state
+ * checked write, in this order: apply a recorded cancel; settle what was
+ * queued for a goal that ended (`'terminal'`), then close what it left open
+ * (and follow its maintenance); apply time (a passed deadline, a due
+ * wakeup); reconcile a dependency wait; settle a due inbox entry; close an
+ * intent its state no longer names; launch the intent the state names
+ * (claimed with the lease token, which fences out every earlier holder);
+ * record a due retry; resume a run the host made active again; start an
+ * automatic run. Every intent is recorded with a runtime state
  * whose `activeRun` names it, so every crash between two steps leaves a
  * state the next drive continues from. Fencing is the store's revision CAS:
  * the lease is liveness only. A drive that loses its lease drains the run it
@@ -64,6 +65,8 @@ const OPEN_INTENTS: readonly GoalRunIntent['status'][] = ['pending', 'claimed', 
 const PAGE = 1000;
 /** Due inbox entries a step looks through for one that settles now. */
 const INBOX_PAGE = 20;
+/** Ended goals an unscoped supervisor reads per tick to learn their scopes. */
+const SWEEP_PAGE = 100;
 
 /** What the driver needs from the supervisor. */
 export interface GoalDriverOptions {
@@ -161,6 +164,10 @@ export function createGoalDriver(options: GoalDriverOptions): {
   const drives = new Set<Promise<void>>();
   /** Limits already reported, so a parked goal reports its limit once. */
   const limits = new Set<string>();
+  /** The scopes an unscoped supervisor has seen: their inbox entries are swept. */
+  const seenScopes = new Set<string>();
+  /** Where the sweep that learns the scopes of ended goals goes on. */
+  let endedCursor: string | undefined;
 
   const emit = (event: GoalSupervisorEvent): void => hub.emit(event);
 
@@ -207,9 +214,19 @@ export function createGoalDriver(options: GoalDriverOptions): {
     return { goal, runtime, open: await openIntents(scope, goalId) };
   }
 
-  /** The goals a tick looks at: unfinished ones, and ones with open intents. */
-  async function candidates(): Promise<{ scope: string; goalId: string }[]> {
+  /**
+   * The goals a tick looks at: unfinished ones, ones with open intents, and
+   * ones with a due inbox entry, an ended goal's included (it settles the
+   * entry as `'terminal'`, spec §3.2). Inbox entries are listed per scope: an
+   * unscoped supervisor sweeps the scopes it has seen, and learns the scopes
+   * of ended goals a page per tick.
+   */
+  async function candidates(now: number): Promise<{ scope: string; goalId: string }[]> {
     const found = new Map<string, { scope: string; goalId: string }>();
+    const add = (scope: string, goalId: string): void => {
+      found.set(goalId, { scope, goalId });
+      if (options.scopes === undefined) seenScopes.add(scope);
+    };
     for (const scope of options.scopes ?? [undefined]) {
       let cursor: string | undefined;
       do {
@@ -219,8 +236,7 @@ export function createGoalDriver(options: GoalDriverOptions): {
           ...(scope !== undefined ? { scope } : {}),
           ...(cursor !== undefined ? { cursor } : {}),
         });
-        for (const goal of page.goals)
-          found.set(goal.goalId, { scope: goal.scope, goalId: goal.goalId });
+        for (const goal of page.goals) add(goal.scope, goal.goalId);
         cursor = page.cursor;
       } while (cursor !== undefined);
       do {
@@ -230,10 +246,23 @@ export function createGoalDriver(options: GoalDriverOptions): {
           ...(scope !== undefined ? { scope } : {}),
           ...(cursor !== undefined ? { cursor } : {}),
         });
-        for (const intent of page.intents)
-          found.set(intent.goalId, { scope: intent.scope, goalId: intent.goalId });
+        for (const intent of page.intents) add(intent.scope, intent.goalId);
         cursor = page.cursor;
       } while (cursor !== undefined);
+    }
+    if (options.scopes === undefined) {
+      const ended = await store.list({
+        statuses: TERMINAL_STATUSES,
+        limit: SWEEP_PAGE,
+        ...(endedCursor !== undefined ? { cursor: endedCursor } : {}),
+      });
+      for (const goal of ended.goals) seenScopes.add(goal.scope);
+      endedCursor = ended.cursor;
+    }
+    for (const scope of options.scopes ?? [...seenScopes]) {
+      // One page per scope and tick: an entry behind it is found once these settle.
+      const due = await store.inbox.list({ scope, dueBy: now, limit: PAGE });
+      for (const entry of due.entries) add(entry.scope, entry.goalId);
     }
     return [...found.values()];
   }
@@ -242,7 +271,14 @@ export function createGoalDriver(options: GoalDriverOptions): {
   async function wanted(view: View, now: number): Promise<boolean> {
     const { goal, runtime, open } = view;
     if (runtime.cancel !== undefined && runtime.cancel.appliedAt === undefined) return true;
-    if (isTerminal(goal)) return open.length > 0 || runtime.phase !== 'done';
+    if (isTerminal(goal))
+      return (
+        open.length > 0 ||
+        runtime.phase !== 'done' ||
+        // An entry queued after the end, early or not, settles as 'terminal'.
+        (await store.inbox.list({ scope: goal.scope, goalId: goal.goalId, limit: 1 })).entries
+          .length > 0
+      );
     if (goal.deadline !== undefined && goal.deadline <= now) return true;
     const wait = answerable(goal);
     if (wait?.reason === 'wakeup' && wait.at <= now) return true;
@@ -576,7 +612,8 @@ export function createGoalDriver(options: GoalDriverOptions): {
     const page = await store.inbox.list({
       scope: goal.scope,
       goalId: goal.goalId,
-      dueBy: now,
+      // An ended goal settles every entry as 'terminal', an early one too.
+      ...(isTerminal(goal) ? {} : { dueBy: now }),
       limit: INBOX_PAGE,
     });
     // The oldest due entry that settles now (an early one stays pending as it is).
@@ -665,7 +702,11 @@ export function createGoalDriver(options: GoalDriverOptions): {
     const now = Math.max(state.floor, clock.now());
     if (runtime.cancel !== undefined && runtime.cancel.appliedAt === undefined)
       return applyCancel(drive, view, result);
-    if (isTerminal(goal)) return settleEnded(drive, view);
+    if (isTerminal(goal)) {
+      // What was queued for it settles as 'terminal' (spec §3.2), so its payload ages out.
+      const settled = await settleInbox(view, now, result);
+      return settled ?? settleEnded(drive, view);
+    }
     const timed = await applyTime(view, now);
     if (timed !== undefined) return timed;
     if (!state.reconciled) {
@@ -1258,7 +1299,7 @@ export function createGoalDriver(options: GoalDriverOptions): {
         skipped: 0,
       };
       if (draining) return result;
-      const queue = await candidates();
+      const queue = await candidates(now);
       let next = 0;
       const worker = async (): Promise<void> => {
         while (next < queue.length && !draining && signal?.aborted !== true) {
