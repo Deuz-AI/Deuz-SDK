@@ -6,8 +6,8 @@
  * context compiler's hook, the working memory and the memory tools — keeping
  * their state in the V3 run record. Edge-safe.
  */
-import { assertAgentRunStoreV3 } from './agent-run-v3';
-import { contextPackageBlob, readContextPackage } from './agent-run-v3-context';
+import { assertAgentRunStoreV3 } from './agent-run-v3-assert';
+import { contextPackageBlob, readContextPackage } from './agent-run-v3-package';
 import { createContextCompiler } from './context/compiler';
 import { estimateRequestOverhead } from './context/count';
 import { isContextMessage, messageText } from './context/render';

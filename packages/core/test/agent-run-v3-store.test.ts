@@ -12,7 +12,7 @@ import { join } from 'node:path';
 import { PGlite } from '@electric-sql/pglite';
 import pg from 'pg';
 import { createInMemoryAgentRunStoreV3 } from '../src/agent-run-v3-store';
-import { contextPackageBlob } from '../src/agent-run-v3-context';
+import { contextPackageBlob } from '../src/agent-run-v3-package';
 import { RevisionConflictError } from '../src/errors';
 import { createPostgresOpsStore } from '../src/node/ops-postgres';
 import type { PgPoolLike } from '../src/node/pg-tx';

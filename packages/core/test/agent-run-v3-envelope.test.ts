@@ -9,7 +9,6 @@ import {
   AGENT_RUN_STORE_BACKEND,
   agentRunV3BlobDigests,
   assertAgentRunEnvelopeV3,
-  assertAgentRunStoreV3,
   assertEnvelopeRevisionV3,
   markAgentRunStoreBackend,
   decodeAgentRunEnvelopeV3,
@@ -17,6 +16,7 @@ import {
   isAgentRunEnvelopeV3,
 } from '../src/agent-run-v3';
 import { createInMemoryAgentRunStore, reconcileAgentRun, resumeAgent } from '../src/agent-run';
+import { assertAgentRunStoreV3 } from '../src/agent-run-v3-assert';
 import { markRedactedSteps } from '../src/agent-run-v3-context';
 import { RevisionConflictError, UnsupportedStoreError } from '../src/errors';
 import { createRedisOpsStore } from '../src/node/ops-redis';

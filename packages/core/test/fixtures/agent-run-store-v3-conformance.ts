@@ -16,12 +16,12 @@
  * `now` reads it.
  */
 import { describe, expect, it } from 'vitest';
-import { assertAgentRunStoreV3 } from '../../src/agent-run-v3';
+import { assertAgentRunStoreV3 } from '../../src/agent-run-v3-assert';
 import {
   contextPackageBlob,
   readContextPackage,
   type ContextPackageBlob,
-} from '../../src/agent-run-v3-context';
+} from '../../src/agent-run-v3-package';
 import { RevisionConflictError } from '../../src/errors';
 import { sha256Digest } from '../../src/internal/digest';
 import type { AgentResult } from '../../src/types/agent-run';
