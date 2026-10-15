@@ -93,6 +93,14 @@ export interface AgentRunMemoryIntentV3 {
    * same operation. Absent for a model tool's write.
    */
   extraction?: Omit<MemoryExtractionInput, 'messages'>;
+  /**
+   * Why the run's own pass at its versioned extraction failed (2.4), saved
+   * after the outcome: the intent keeps its status, so `reconcileAgentRun`
+   * may still settle it (and clears this with the acknowledgment), while
+   * the goal supervisor reports the run's maintenance as `'failed'` instead
+   * of following it as pending.
+   */
+  error?: { name: string; message: string; code?: string };
 }
 
 /** The compiled context of one model step: its manifest and its package blob. */

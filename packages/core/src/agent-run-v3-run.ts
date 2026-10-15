@@ -378,6 +378,8 @@ export async function runVersionedExtraction(
   }
   const result = await session.extract(input, { operationId: intent.operationId });
   intent.status = 'acknowledged';
+  // A pass that failed earlier is settled now.
+  delete intent.error;
   intent.requestDigest = result.receipt.requestDigest;
   intent.planned = result.receipt.entries.length;
   intent.receipt = {
@@ -845,7 +847,8 @@ function pendingExtraction(envelope: AgentRunEnvelopeV3): AgentRunMemoryIntentV3
  * Runs a completed V3 run's versioned extraction after its outcome (spec
  * §4.1), under the intent its terminal commit recorded. Never throws: a
  * failure is reported through `fail`, and the intent stays where it was for
- * `reconcileAgentRun`.
+ * `reconcileAgentRun`, with the failure saved on it (`error`) so the run's
+ * maintenance reads as failed rather than pending.
  */
 export async function settleVersionedExtraction(
   envelope: AgentRunEnvelopeV3,
@@ -866,6 +869,14 @@ export async function settleVersionedExtraction(
     );
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
+    const code = (error as { code?: unknown } | null)?.code;
+    intent.error = {
+      name: error instanceof Error ? error.name : 'Error',
+      message: reason,
+      ...(typeof code === 'string' ? { code } : {}),
+    };
+    // Best effort: a record that cannot be saved keeps the intent pending.
+    await save().catch(() => false);
     fail(
       `The versioned memory extraction of run ${envelope.runId} failed (${reason}); the run's outcome stands, and reconcileAgentRun settles it.`,
       error,

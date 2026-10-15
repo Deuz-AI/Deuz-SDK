@@ -5,6 +5,7 @@
  * real runAgent/resumeAgent V3 overloads and a real in-memory V3 store.
  */
 import { describe, expect, it } from 'vitest';
+import { reconcileAgentRun } from '../src/agent-run';
 import { createInMemoryAgentRunStoreV3 } from '../src/agent-run-v3-store';
 import { createGoal } from '../src/goal';
 import type { GoalCommand } from '../src/goal';
@@ -17,6 +18,7 @@ import type { RunLaunchRequest } from '../src/goal/runtime';
 import { createDeferred } from '../src/internal/async-iter';
 import { createInMemoryMemoryStore } from '../src/memory';
 import type { MemorySeams } from '../src/memory';
+import { createInMemoryVersionedMemoryStore, createMemorySession } from '../src/memory/versioned';
 import { agentRunLeaseKey, createInMemoryLeaseProvider } from '../src/ops';
 import { createMockModel } from '../src/testing';
 import type { AgentToolSet } from '../src/types/agent-run';
@@ -78,6 +80,24 @@ function heldExtraction() {
     hashFn: async (text) => `h:${text}`,
   };
   return { seams, release: () => gate.resolve(), calls: () => calls };
+}
+
+/** A versioned memory session whose extraction LLM waits until the test releases it (or fails). */
+function heldVersionedExtraction(
+  answer: () => string = () => '{"facts":[{"text":"prefers tea"}]}',
+) {
+  const gate = createDeferred<void>();
+  let calls = 0;
+  const session = createMemorySession({
+    store: createInMemoryVersionedMemoryStore(),
+    scope: { userId: 'ada' },
+    llm: async () => {
+      calls++;
+      await gate.promise;
+      return answer();
+    },
+  });
+  return { session, release: () => gate.resolve(), calls: () => calls };
 }
 
 function request(patch: Partial<RunLaunchRequest> = {}): RunLaunchRequest {
@@ -273,6 +293,121 @@ describe('createNativeRunLauncher on the real V3 executor', () => {
     expect(ticked).toBe('ticked');
     // The run's own outcome was saved before its lease went back.
     expect(await runs.load('g:run:1')).toMatchObject({ phase: 'terminal' });
+  }, 30_000);
+
+  it('completes a verified goal while its versioned extraction is still running, then follows it (T2-1)', async () => {
+    const extraction = heldVersionedExtraction();
+    const goals = createInMemoryGoalRuntimeStore();
+    const runs = createInMemoryAgentRunStoreV3();
+    const provider = createInMemoryLeaseProvider();
+    const model = createMockModel({ responses: [{ text: 'done' }] });
+    const launcher = createNativeRunLauncher({
+      store: runs,
+      options: () => ({
+        model,
+        prompt: 'I prefer tea',
+        versionedMemory: {
+          session: extraction.session,
+          extract: { infer: true, supersede: 'add' },
+        },
+      }),
+    });
+    const supervisor = createGoalSupervisor({
+      store: goals,
+      launcher,
+      lease: { provider, owner: 'sup' },
+      verify: ({ runId }) => passed(runId),
+    });
+    await supervisor.submit({ goalId: 'g', scope: SCOPE, objective: 'x' });
+    // The tick returns while the extraction LLM is still held.
+    const ticked = await Promise.race([
+      supervisor.tick().then(() => 'ticked' as const),
+      pause(10_000).then(() => 'timed out' as const),
+    ]);
+    if (ticked !== 'ticked') extraction.release();
+    expect(ticked).toBe('ticked');
+    const mid = (await supervisor.get(SCOPE, 'g'))!;
+    expect(mid.goal.status).toBe('completed');
+    expect(mid.runtime.maintenance).toEqual({ status: 'pending', runId: 'g:run:1' });
+    const stored = await runs.load('g:run:1');
+    expect(stored).toMatchObject({ phase: 'terminal', result: { status: 'completed' } });
+    expect(stored?.memoryIntents?.map((intent) => intent.status)).not.toContain('acknowledged');
+    // Once the extraction ends, the next tick sees its maintenance settle.
+    for (let wait = 0; wait < 200 && extraction.calls() === 0; wait++) await pause(25);
+    extraction.release();
+    for (let wait = 0; wait < 200; wait++) {
+      const intents = (await runs.load('g:run:1'))?.memoryIntents ?? [];
+      if (intents.every((intent) => intent.status === 'acknowledged')) break;
+      await pause(25);
+    }
+    expect(extraction.calls()).toBeGreaterThan(0);
+    await supervisor.tick();
+    const end = (await supervisor.get(SCOPE, 'g'))!;
+    expect(end.goal.status).toBe('completed');
+    expect(end.runtime.maintenance).toEqual({ status: 'complete', runId: 'g:run:1' });
+    expect(end.runtime.maintenanceRuns).toBeUndefined();
+    expect((await goals.intents.get(SCOPE, 'g#1'))?.status).toBe('completed');
+  }, 30_000);
+
+  it('reports a versioned extraction that failed as failed maintenance, its intent kept for reconcileAgentRun (T2-1)', async () => {
+    let down = true;
+    const extraction = heldVersionedExtraction(() => {
+      if (down) throw new Error('the memory LLM is down');
+      return '{"facts":[{"text":"prefers tea"}]}';
+    });
+    const goals = createInMemoryGoalRuntimeStore();
+    const runs = createInMemoryAgentRunStoreV3();
+    const provider = createInMemoryLeaseProvider();
+    const model = createMockModel({ responses: [{ text: 'done' }] });
+    const launcher = createNativeRunLauncher({
+      store: runs,
+      options: () => ({
+        model,
+        prompt: 'I prefer tea',
+        versionedMemory: {
+          session: extraction.session,
+          extract: { infer: true, supersede: 'add' },
+        },
+      }),
+    });
+    const supervisor = createGoalSupervisor({
+      store: goals,
+      launcher,
+      lease: { provider, owner: 'sup' },
+      verify: ({ runId }) => passed(runId),
+    });
+    await supervisor.submit({ goalId: 'g', scope: SCOPE, objective: 'x' });
+    await supervisor.tick();
+    expect((await supervisor.get(SCOPE, 'g'))!.runtime.maintenance).toEqual({
+      status: 'pending',
+      runId: 'g:run:1',
+    });
+    for (let wait = 0; wait < 200 && extraction.calls() === 0; wait++) await pause(25);
+    extraction.release();
+    let failed: { status: string; error?: { message: string } } | undefined;
+    for (let wait = 0; wait < 200 && failed?.error === undefined; wait++) {
+      failed = (await runs.load('g:run:1'))?.memoryIntents?.find((intent) => intent.extraction);
+      if (failed?.error === undefined) await pause(25);
+    }
+    // Not acknowledged: reconcileAgentRun may still settle it.
+    expect(failed).toMatchObject({ status: 'planned', error: { message: expect.any(String) } });
+    expect(await launcher.maintenance!({ scope: SCOPE, runId: 'g:run:1' })).toBe('failed');
+    await supervisor.tick();
+    const end = (await supervisor.get(SCOPE, 'g'))!;
+    expect(end.goal.status).toBe('completed');
+    expect(end.runtime.maintenance).toEqual({ status: 'failed', runId: 'g:run:1' });
+    expect(end.runtime.maintenanceRuns).toBeUndefined();
+    // The host settles it later: the acknowledgment clears the failure.
+    down = false;
+    await reconcileAgentRun({
+      checkpointVersion: 3,
+      session: { store: runs, runId: 'g:run:1', scope: SCOPE },
+      versionedMemory: { session: extraction.session },
+    });
+    const settled = (await runs.load('g:run:1'))?.memoryIntents?.find((i) => i.extraction);
+    expect(settled?.status).toBe('acknowledged');
+    expect(settled?.error).toBeUndefined();
+    expect(await launcher.maintenance!({ scope: SCOPE, runId: 'g:run:1' })).toBe('complete');
   }, 30_000);
 
   it('completes a verified goal while its memory extraction is still running, then follows it', async () => {

@@ -706,7 +706,8 @@ export function createGoalSupervisor(options: GoalSupervisorOptions): GoalSuperv
  * without `lease`, the launcher takes the lease provider and TTL of the first
  * supervisor it is given to (false before that). `accounting` reads the
  * ledger of the run's last checkpoint and `maintenance` its memory
- * extraction.
+ * extraction (the 2.3 `memory` one or the 2.4 `versionedMemory.extract`
+ * one): a run with either reports its leg once its outcome is durable.
  */
 export function createNativeRunLauncher(options: NativeRunLauncherOptions): RunLauncher {
   return createNative(options);

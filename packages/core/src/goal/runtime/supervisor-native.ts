@@ -44,14 +44,31 @@ type StreamV3 = (options: AgentRunOptionsV3<unknown>) => AgentStreamV3<unknown>;
 /** How often, at most, a finalizing run's store is read for its terminal commit. */
 const COMMIT_POLL_MS = 250;
 
-/** A run's after-verdict work, as the supervisor follows it. */
+/**
+ * A run's after-verdict work, as the supervisor follows it: its 2.3 memory
+ * extraction and its versioned extractions (2.4), pending while any is,
+ * else failed when any failed. A model tool's memory write is not upkeep:
+ * the run settles it before its outcome.
+ */
 function maintenanceOf(
   envelope: AgentRunEnvelopeV3 | undefined,
 ): RunLaunchResult['maintenance'] | undefined {
+  const states: NonNullable<RunLaunchResult['maintenance']>[] = [];
   const status = envelope?.memory?.extraction?.status;
-  if (status === undefined) return undefined;
-  if (status === 'pending') return 'pending';
-  return status === 'completed' ? 'complete' : 'failed';
+  if (status !== undefined)
+    states.push(status === 'pending' ? 'pending' : status === 'completed' ? 'complete' : 'failed');
+  for (const intent of envelope?.memoryIntents ?? [])
+    if (intent.extraction !== undefined)
+      states.push(
+        intent.status === 'acknowledged'
+          ? 'complete'
+          : intent.error !== undefined
+            ? 'failed'
+            : 'pending',
+      );
+  if (states.length === 0) return undefined;
+  if (states.includes('pending')) return 'pending';
+  return states.includes('failed') ? 'failed' : 'complete';
 }
 
 /** Native launchers created without `lease`, and how a supervisor gives them one. */
@@ -174,11 +191,12 @@ export function createNativeRunLauncher(options: NativeRunLauncherOptions): RunL
     executor ??= import('../../agent-run');
     const native = await executor;
     const fresh = before === undefined;
-    // A run that extracts memory after its outcome (2.3 `memory`) is
-    // reported once that outcome is durable, its maintenance pending: a
-    // verified goal never waits for the extraction (spec §3.1).
+    // A run that extracts memory after its outcome (2.3 `memory`, or the 2.4
+    // `versionedMemory.extract`) is reported once that outcome is durable,
+    // its maintenance pending: a verified goal never waits for the
+    // extraction (spec §3.1).
     const { result, envelope } =
-      base.memory !== undefined
+      base.memory !== undefined || base.versionedMemory?.extract !== undefined
         ? await durableOutcome(
             ((fresh ? native.streamAgent : native.resumeStreamAgent) as unknown as StreamV3)(
               runOptions,
