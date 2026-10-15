@@ -32,6 +32,14 @@ const ATTACH_GRACE_MS = 5_000;
 
 const encoder = new TextEncoder();
 
+/** The result of a run whose signal fired before its container started. */
+const abortedBeforeStart = (): CodeExecutionResult => ({
+  stdout: '',
+  stderr: 'Aborted before start.',
+  exitCode: null,
+  timedOut: true,
+});
+
 interface RunInput {
   command: readonly string[];
   cwd?: string;
@@ -47,13 +55,15 @@ export function createDockerSandboxFromOptions(options: ResolvedDockerOptions): 
   const scope = options.scope ?? 'default';
 
   async function run(input: RunInput): Promise<CodeExecutionResult> {
-    if (input.signal?.aborted)
-      return { stdout: '', stderr: 'Aborted before start.', exitCode: null, timedOut: true };
+    if (input.signal?.aborted) return abortedBeforeStart();
     assertEnv(input.env);
     const startedAt = deps.clock.now();
     const files = await collectStageFiles(options);
     const imageId = await engine.resolveImage();
+    // An abort while the workspace was read or the image resolved: nothing is made.
+    if (input.signal?.aborted) return abortedBeforeStart();
     const operationId = deps.generateId();
+    const timeoutMs = input.timeoutMs ?? DEFAULT_DOCKER_RUN_TIMEOUT_MS;
     const spec: ContainerSpec = {
       name: `deuz-sbx-${safeName(operationId)}`,
       kind: 'sandbox',
@@ -63,6 +73,7 @@ export function createDockerSandboxFromOptions(options: ResolvedDockerOptions): 
       interactive: input.stdin !== undefined,
       ...(input.env !== undefined ? { env: input.env } : {}),
       ...(input.cwd !== undefined ? { cwd: input.cwd } : {}),
+      runTimeoutMs: timeoutMs,
     };
     let containerId: string | undefined;
     try {
@@ -78,6 +89,10 @@ export function createDockerSandboxFromOptions(options: ResolvedDockerOptions): 
         },
       );
       const id = containerId;
+      // An abort during create or staging: the container is removed (finally)
+      // without ever starting. Checked right before the listener goes on, so
+      // no abort falls between the two.
+      if (input.signal?.aborted) return abortedBeforeStart();
       const stdout = new ByteTail(options.maxOutputBytes);
       const stderr = new ByteTail(options.maxOutputBytes);
       let timedOut = false;
@@ -91,10 +106,7 @@ export function createDockerSandboxFromOptions(options: ResolvedDockerOptions): 
         engine.kill(id).catch(() => {});
         graceTimer = deps.clock.setTimeout(() => attach.abort(), ATTACH_GRACE_MS);
       };
-      const cancelTimeout = deps.clock.setTimeout(
-        kill,
-        input.timeoutMs ?? DEFAULT_DOCKER_RUN_TIMEOUT_MS,
-      );
+      const cancelTimeout = deps.clock.setTimeout(kill, timeoutMs);
       input.signal?.addEventListener('abort', kill, { once: true });
       let result;
       try {

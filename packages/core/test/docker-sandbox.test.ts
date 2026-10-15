@@ -184,6 +184,43 @@ describe('createDockerSandbox', () => {
     expect(aborted).toMatchObject({ exitCode: null, timedOut: true });
   }, 20_000);
 
+  it('an abort while the run is still preparing keeps the command from starting (R4-1)', async () => {
+    const fake = await fakeDocker(bundle);
+    const controller = new AbortController();
+    const inner = createInMemoryWorkspace();
+    // Aborted while the workspace is listed for staging, before create.
+    const listing = {
+      ...inner,
+      async list(...args: Parameters<typeof inner.list>) {
+        controller.abort();
+        return inner.list(...args);
+      },
+    };
+    const early = createDockerSandbox({ image: FAKE_IMAGE, ...fake.cli, workspace: listing });
+    const res = await early.runShell!({ command: 'echo ran', signal: controller.signal });
+    expect({ stdout: res.stdout, exitCode: res.exitCode, timedOut: res.timedOut }).toEqual({
+      stdout: '',
+      exitCode: null,
+      timedOut: true,
+    });
+    expect(fake.subcommands()).not.toContain('start');
+    expect(fake.containers()).toEqual([]);
+  });
+
+  it('an abort that lands during create or staging removes the container unstarted (R4-1)', async () => {
+    const fake = await fakeDocker(bundle);
+    const controller = new AbortController();
+    const sandbox = createDockerSandbox({ image: FAKE_IMAGE, ...fake.cli });
+    const pending = sandbox.runShell!({ command: 'echo ran', signal: controller.signal });
+    for (let i = 0; i < 400 && !fake.subcommands().includes('create'); i++)
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    controller.abort();
+    const res = await pending;
+    expect(res).toMatchObject({ stdout: '', exitCode: null, timedOut: true });
+    expect(fake.subcommands()).not.toContain('start');
+    expect(fake.containers()).toEqual([]);
+  });
+
   it('keeps the tail of a long output and says which stream was cut', async () => {
     const fake = await fakeDocker(bundle);
     const sandbox = createDockerSandbox({ image: FAKE_IMAGE, maxOutputBytes: 8, ...fake.cli });
@@ -269,6 +306,20 @@ describe('createDockerSandbox', () => {
       .runCode({ language: 'sh', code: 'echo x' })
       .catch((e: unknown) => e);
     expect(error).toMatchObject({ code: 'docker_unavailable' });
+  });
+
+  it('a program too long for the command line is docker_failed, not an unreachable daemon (R4-7)', async () => {
+    const fake = await fakeDocker(bundle);
+    const sandbox = createDockerSandbox({ image: FAKE_IMAGE, ...fake.cli });
+    // Past the whole command line on Windows (32 KiB), past one argument on Linux (128 KiB).
+    const size = process.platform === 'win32' ? 40_000 : 200_000;
+    const error = await sandbox
+      .runCode({ language: 'sh', code: `echo ${'x'.repeat(size)}` })
+      .catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(DockerSandboxError);
+    expect(error).toMatchObject({ code: 'docker_failed', command: 'create' });
+    expect((error as Error).message).toMatch(/too long/);
+    expect(fake.containers()).toEqual([]);
   });
 
   it('takes custom limits, the writable-layer size and extra labels', async () => {

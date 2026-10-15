@@ -13,13 +13,17 @@
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import {
   createDockerProcessRunner,
+  createDockerSandbox,
   createInMemoryProcessOperationStore,
+  DEFAULT_DOCKER_SANDBOX,
   DockerSandboxError,
   OperationConflictError,
   type ProcessOperationStore,
   type ProcessStartRequest,
   type ProcessState,
 } from '../src/compute/docker';
+import { resolveDockerOptions } from '../src/compute/docker/engine';
+import { createDockerRunnerFromOptions } from '../src/compute/docker/runner';
 import { workspaceDigestEntry } from '../src/internal/digest';
 import { createInMemoryWorkspace } from '../src/workspace';
 import { createMemoryObserver } from '../src/observe';
@@ -29,6 +33,7 @@ import {
   FAKE_IMAGE,
   FAKE_IMAGE_ID,
   fakeDocker,
+  type FakeContainer,
   type FakeDocker,
   type FakeDockerBundle,
 } from './fixtures/fake-docker';
@@ -69,6 +74,21 @@ function crashingStore(
       }
       return inner.update(scope, id, changes, options);
     },
+  };
+}
+
+/** A store whose host crashes right after it records a new operation, before anything else. */
+function recordThenCrash(inner: ProcessOperationStore): ProcessOperationStore {
+  return {
+    ...inner,
+    async create(record) {
+      await inner.create(record);
+      throw new HostCrash('crash after recorded');
+    },
+    get: (scope, id) => inner.get(scope, id),
+    list: (query) => inner.list(query),
+    update: (scope, id, changes, options) => inner.update(scope, id, changes, options),
+    prune: (options) => inner.prune(options),
   };
 }
 
@@ -132,6 +152,37 @@ function setup(
     },
   });
   return { store, runner };
+}
+
+/** Puts a container straight into the fake daemon, as another host would have left it. */
+function seedContainer(
+  fake: FakeDocker,
+  id: string,
+  overrides: Partial<FakeContainer> & { labels: Record<string, string> },
+): void {
+  fake.update((state) => {
+    state.containers[id] = {
+      id,
+      name: `seed-${id.slice(0, 8)}`,
+      image: FAKE_IMAGE_ID,
+      command: ['sleep'],
+      user: '10001:10001',
+      workdir: '/workspace',
+      env: {},
+      createArgs: [],
+      interactive: false,
+      readOnly: false,
+      mounts: [],
+      state: 'created',
+      exitCode: 0,
+      startCount: 0,
+      stdout: '',
+      stderr: '',
+      files: {},
+      created: new Date().toISOString(),
+      ...overrides,
+    };
+  });
 }
 
 const count = (fake: FakeDocker, sub: string) => fake.subcommands().filter((s) => s === sub).length;
@@ -247,6 +298,56 @@ describe('createDockerProcessRunner: start', () => {
     ]);
     expect(startCount(fake)).toBe(0);
     expect((await runner.start(request())).state).toBe('failed');
+    expect(startCount(fake)).toBe(0);
+  });
+
+  it('a new record never adopts a container an earlier operation under the same id left (R4-4)', async () => {
+    const fake = await fakeDocker(bundle);
+    const { runner, store } = setup(fake);
+    const old = await runner.start(request({ command: ['echo', 'old', ';', 'exit', '7'] }));
+    expect(old.state).toBe('exited');
+    // Retention drops the record, but nothing removed the container.
+    expect(await store.prune({ terminalBefore: Date.now() + 1_000 })).toBe(1);
+    const reused = await runner.start(request({ command: ['echo', 'new', ';', 'exit', '0'] }));
+    expect(reused).toMatchObject({ state: 'failed', error: { code: 'container_conflict' } });
+    expect(reused.exitCode).not.toBe(7);
+    expect(reused.containerId).toBeUndefined();
+    expect(startCount(fake)).toBe(1);
+    expect(fake.containers()).toHaveLength(1);
+    expect((await runner.readOutput('tenant-a', 'op-1')).stdout).toBe('');
+    // Disposing the refused operation removes the leftover; the id is then free again.
+    await runner.dispose('tenant-a', 'op-1');
+    expect(fake.containers()).toEqual([]);
+    expect(await store.prune({ terminalBefore: Date.now() + 1_000 })).toBe(1);
+    const fresh = await runner.start(request({ command: ['echo', 'new', ';', 'exit', '0'] }));
+    expect(fresh).toMatchObject({ state: 'exited', exitCode: 0 });
+    expect((await runner.readOutput('tenant-a', 'op-1')).stdout).toBe('new\n');
+  });
+
+  it('a never-started leftover with another request is not adopted either, by start or reconcile (R4-4)', async () => {
+    const fake = await fakeDocker(bundle);
+    const time = manualClock(Date.now());
+    const store = createInMemoryProcessOperationStore({ deps: { clock: time.clock } });
+    const { runner } = setup(fake, { store, clock: time.clock });
+    fake.fault({ command: 'start', mode: 'unreachable' });
+    expect((await runner.start(request({ command: ['echo', 'old'] }))).state).toBe(
+      'needs-reconcile',
+    );
+    await time.advance(60_000);
+    expect((await runner.reconcile()).matched.map((s) => s.state)).toEqual(['failed']);
+    expect(await store.prune({ terminalBefore: time.clock.now() + 1_000 })).toBe(1);
+    // A host that crashed right after recording the new request: reconcile sees it first.
+    const crashOnCreate = recordThenCrash(store);
+    const crashed = setup(fake, { store: crashOnCreate, clock: time.clock });
+    await expect(crashed.runner.start(request({ command: ['echo', 'new'] }))).rejects.toThrow(
+      HostCrash,
+    );
+    const report = await runner.reconcile();
+    expect(report.matched).toMatchObject([
+      { operationId: 'op-1', state: 'failed', error: { code: 'container_conflict' } },
+    ]);
+    expect(startCount(fake)).toBe(0);
+    expect((await runner.start(request({ command: ['echo', 'new'] }))).state).toBe('failed');
     expect(startCount(fake)).toBe(0);
   });
 
@@ -432,6 +533,78 @@ describe('createDockerProcessRunner: poll, output and exit', () => {
     expect(count(fake, 'stop')).toBe(1);
   });
 
+  it('a start past its deadline never starts the container (R4-6)', async () => {
+    const fake = await fakeDocker(bundle);
+    const { runner } = setup(fake);
+    const session = await runner.start(
+      request({ command: ['echo', 'ran', ';', 'exit', '0'], deadlineAt: Date.now() - 60_000 }),
+    );
+    expect(session.state).toBe('cancelled');
+    expect(startCount(fake)).toBe(0);
+    expect(count(fake, 'start')).toBe(0);
+    expect(fake.containers()).toEqual([]);
+  });
+
+  it('a pre-start operation past its deadline is cancelled at the next poll or reconcile (R4-6)', async () => {
+    const fake = await fakeDocker(bundle);
+    const time = manualClock(100_000);
+    const durable = createInMemoryProcessOperationStore({ deps: { clock: time.clock } });
+    const hostDown = { now: time.clock.now, setTimeout: () => () => {} };
+    // Each host crashes just before its start-dispatched record: 'staged'.
+    for (const operationId of ['polled', 'reconciled']) {
+      const crashed = setup(fake, {
+        store: crashingStore(durable, { state: 'start-dispatched', when: 'before' }),
+        clock: hostDown,
+      });
+      await expect(
+        crashed.runner.start(request({ operationId, deadlineAt: 101_000 })),
+      ).rejects.toThrow(HostCrash);
+    }
+    // A host that recorded the request and stopped before creating anything.
+    const recordOnly = recordThenCrash(durable);
+    await expect(
+      setup(fake, { store: recordOnly, clock: hostDown }).runner.start(
+        request({ operationId: 'recorded', deadlineAt: 101_000 }),
+      ),
+    ).rejects.toThrow(HostCrash);
+    await time.advance(5_000);
+    const restarted = setup(fake, { store: durable, clock: time.clock });
+    expect((await restarted.runner.poll('tenant-a', 'polled')).state).toBe('cancelled');
+    expect((await restarted.runner.poll('tenant-a', 'recorded')).state).toBe('cancelled');
+    const report = await restarted.runner.reconcile();
+    expect(report.matched.map((s) => [s.operationId, s.state])).toEqual([
+      ['reconciled', 'cancelled'],
+    ]);
+    expect(startCount(fake)).toBe(0);
+    expect(fake.containers()).toEqual([]);
+  });
+
+  it('a cancel of a fresh record never touches an earlier operation left under its name (R4-6)', async () => {
+    const fake = await fakeDocker(bundle);
+    const { runner, store } = setup(fake);
+    await runner.start(request({ command: ['echo', 'old', ';', 'exit', '7'] }));
+    expect(await store.prune({ terminalBefore: Date.now() + 1_000 })).toBe(1);
+    const late = await runner.start(
+      request({ command: ['echo', 'new'], deadlineAt: Date.now() - 1_000 }),
+    );
+    expect(late).toMatchObject({ state: 'cancelled' });
+    expect(late.exitCode ?? null).toBeNull();
+    expect(late.containerId).toBeUndefined();
+    expect((await runner.readOutput('tenant-a', 'op-1')).stdout).toBe('');
+    expect(fake.containers().map((c) => c.state)).toEqual(['exited']);
+    // The same for a plain cancel of a record whose host stopped before create.
+    expect(await store.prune({ terminalBefore: Date.now() + 1_000 })).toBe(1);
+    const recordOnly = recordThenCrash(store);
+    await expect(
+      setup(fake, { store: recordOnly }).runner.start(request({ command: ['echo', 'other'] })),
+    ).rejects.toThrow(HostCrash);
+    const cancelled = await runner.cancel('tenant-a', 'op-1');
+    expect(cancelled).toMatchObject({ state: 'cancelled' });
+    expect(cancelled.exitCode ?? null).toBeNull();
+    expect(cancelled.containerId).toBeUndefined();
+    expect(fake.containers().map((c) => c.state)).toEqual(['exited']);
+  });
+
   it('while the host is up, the deadline cancels by itself', async () => {
     const fake = await fakeDocker(bundle);
     const time = manualClock(100_000);
@@ -455,6 +628,88 @@ describe('createDockerProcessRunner: poll, output and exit', () => {
       code: 'operation_not_found',
     });
     await expect(runner.cancel('tenant-a', 'nope')).rejects.toBeInstanceOf(DockerSandboxError);
+  });
+});
+
+describe('createDockerProcessRunner: a log too large to read (R4-9)', () => {
+  /** A runner whose log reads give up after `logsTimeoutMs` (120 s by default). */
+  function withLogsTimeout(fake: FakeDocker, logsTimeoutMs: number, maxOutputBytes?: number) {
+    const store = createInMemoryProcessOperationStore();
+    const resolved = resolveDockerOptions(
+      {
+        image: FAKE_IMAGE,
+        ...fake.cli,
+        ...(maxOutputBytes !== undefined ? { maxOutputBytes } : {}),
+      },
+      DEFAULT_DOCKER_SANDBOX,
+    );
+    return { store, runner: createDockerRunnerFromOptions({ ...resolved, logsTimeoutMs }, store) };
+  }
+
+  it('reads only a bounded tail of the log', async () => {
+    const fake = await fakeDocker(bundle);
+    const { runner } = setup(fake, { maxOutputBytes: 16 });
+    await runner.start(request({ command: ['echo', 'out', ';', 'emit-err', '64', 'e'] }));
+    const logs = fake.calls().filter((argv) => argv[0] === 'logs');
+    expect(logs.length).toBeGreaterThan(0);
+    for (const argv of logs) expect(argv.slice(0, 3)).toEqual(['logs', '--tail', '16']);
+  });
+
+  it('a full line window says either stream may have lost earlier output', async () => {
+    const fake = await fakeDocker(bundle);
+    const { runner } = setup(fake, { maxOutputBytes: 8 });
+    const flood = Array.from({ length: 12 }, () => ['stderr', 'e', ';']).flat();
+    await runner.start(request({ command: ['echo', 'out', ';', ...flood, 'exit', '0'] }));
+    const output = await runner.readOutput('tenant-a', 'op-1');
+    expect(output.stdout).toBe('out\n');
+    expect(output.truncated).toEqual({ stdout: true, stderr: true });
+    // Fewer lines than the window: exact, nothing flagged.
+    const small = await fakeDocker(bundle);
+    const exact = setup(small, { maxOutputBytes: 8 });
+    await exact.runner.start(request({ command: ['echo', 'out', ';', 'stderr', 'e'] }));
+    expect(await exact.runner.readOutput('tenant-a', 'op-1')).toEqual({
+      stdout: 'out\n',
+      stderr: 'e\n',
+      truncated: { stdout: false, stderr: false },
+    });
+  });
+
+  it('a log that streams past the timeout neither blocks the exit nor the dispose', async () => {
+    const fake = await fakeDocker(bundle);
+    const { runner, store } = withLogsTimeout(fake, 1_500);
+    await runner.start(request());
+    fake.update((state) => {
+      const container = Object.values(state.containers)[0]!;
+      container.state = 'exited';
+      container.exitCode = 0;
+      container.finishedAt = new Date().toISOString();
+    });
+    // `docker logs` keeps streaming: the daemon answers, the log is just too long.
+    fake.fault({ command: 'logs', mode: 'trickle', times: 3 });
+    expect(await runner.poll('tenant-a', 'op-1')).toMatchObject({ state: 'exited', exitCode: 0 });
+    expect((await store.get('tenant-a', 'op-1'))!.output).toBeUndefined();
+    await expect(runner.readOutput('tenant-a', 'op-1')).rejects.toMatchObject({
+      code: 'docker_failed',
+    });
+    await runner.dispose('tenant-a', 'op-1');
+    expect(fake.containers()).toEqual([]);
+    expect((await runner.poll('tenant-a', 'op-1')).state).toBe('disposed');
+  });
+
+  it('a daemon that sends nothing at all is still unavailable', async () => {
+    const fake = await fakeDocker(bundle);
+    const { runner } = withLogsTimeout(fake, 1_500);
+    await runner.start(request());
+    fake.update((state) => {
+      const container = Object.values(state.containers)[0]!;
+      container.state = 'exited';
+      container.finishedAt = new Date().toISOString();
+    });
+    fake.fault({ command: 'logs', mode: 'hang' });
+    await expect(runner.poll('tenant-a', 'op-1')).rejects.toMatchObject({
+      code: 'docker_unavailable',
+    });
+    expect((await runner.poll('tenant-a', 'op-1')).state).toBe('exited');
   });
 });
 
@@ -534,6 +789,47 @@ describe('createDockerProcessRunner: cancel', () => {
     expect((await runner.cancel('tenant-a', 'op-1')).state).toBe('cancelled');
     expect((await runner.start(request())).state).toBe('cancelled');
     expect(startCount(fake)).toBe(0);
+  });
+
+  it('a cancel between start-dispatched and the docker start leaves nothing a late start can run (R4-10)', async () => {
+    const fake = await fakeDocker(bundle);
+    const durable = createInMemoryProcessOperationStore();
+    const hostB = setup(fake, { store: durable });
+    let dispatched = false;
+    let crashed = false;
+    // Host A records start-dispatched; host B cancels before A's docker start
+    // lands; A then crashes before it reads the record again.
+    const storeA: ProcessOperationStore = {
+      ...durable,
+      create: (r) => durable.create(r),
+      list: (q) => durable.list(q),
+      prune: (o) => durable.prune(o),
+      async get(s, id) {
+        if (dispatched && !crashed) {
+          crashed = true;
+          throw new HostCrash('crash after docker start');
+        }
+        return durable.get(s, id);
+      },
+      async update(s, id, changes, o) {
+        const result = await durable.update(s, id, changes, o);
+        if (changes.state === 'start-dispatched' && result.status === 'committed') {
+          expect((await hostB.runner.cancel(s, id)).state).toBe('cancelled');
+          dispatched = true;
+        }
+        return result;
+      },
+    };
+    const hostA = setup(fake, { store: storeA });
+    await expect(hostA.runner.start(request())).rejects.toThrow(HostCrash);
+    const hostC = setup(fake, { store: durable });
+    expect((await hostC.runner.poll('tenant-a', 'op-1')).state).toBe('cancelled');
+    expect(fake.containers().filter((c) => c.state === 'running')).toEqual([]);
+    expect(startCount(fake)).toBe(0);
+    expect((await hostC.runner.reconcile()).orphans).toEqual([]);
+    // Dispose of the cancelled operation is still clean.
+    await hostC.runner.dispose('tenant-a', 'op-1');
+    expect((await hostC.runner.poll('tenant-a', 'op-1')).state).toBe('disposed');
   });
 });
 
@@ -648,6 +944,138 @@ describe('createDockerProcessRunner: reconcile', () => {
     expect(fake.container(orphan.containerId!)).toBeUndefined();
     expect(fake.container(alive.containerId!)).toBeDefined();
     expect((await runner.reconcile({ scope: 'tenant-b' })).matched).toEqual([]);
+  });
+
+  it('leaves a live sandbox run alone: reconcile({ removeOrphans }) never kills it (R4-2)', async () => {
+    const fake = await fakeDocker(bundle);
+    const sandbox = createDockerSandbox({ image: FAKE_IMAGE, ...fake.cli });
+    const { runner } = setup(fake);
+    // The run ends by its own timeout: the test never writes the fake's state meanwhile.
+    const pending = sandbox.runShell!({ command: 'echo started ; sleep', timeoutMs: 6_000 });
+    let live: FakeContainer | undefined;
+    for (let i = 0; i < 200 && !live; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      live = fake.containers().find((c) => c.state === 'running');
+    }
+    expect(live?.labels['deuz.kind']).toBe('sandbox');
+    const report = await runner.reconcile({ removeOrphans: true });
+    const res = await pending;
+    expect(report.orphans).toEqual([]);
+    expect(report.removed).toEqual([]);
+    // Killed by its own timeout, not removed under it.
+    expect(res).toMatchObject({ stdout: 'started\n', exitCode: null, timedOut: true });
+    expect(res.stderr).not.toContain('docker start failed');
+    expect(fake.containers()).toEqual([]);
+  });
+
+  it('reports sandbox containers and staging helpers only once no run can still be using them (R4-2)', async () => {
+    const fake = await fakeDocker(bundle);
+    const { runner } = setup(fake);
+    const hour = 60 * 60_000;
+    const ago = (ms: number) => new Date(Date.now() - ms).toISOString();
+    const labels = (kind: string, extra: Record<string, string> = {}) => ({
+      'deuz.operation-id': `op-${kind}`,
+      'deuz.scope': 'tenant-a',
+      'deuz.kind': kind,
+      ...extra,
+    });
+    // In use: a staging helper mid-copy, a sandbox container being staged, a
+    // long run still inside its timeout, an exit the run is about to remove.
+    seedContainer(fake, 'a'.repeat(64), { labels: labels('staging') });
+    seedContainer(fake, 'b'.repeat(64), { labels: labels('sandbox') });
+    seedContainer(fake, 'c'.repeat(64), {
+      labels: labels('sandbox', { 'deuz.run-timeout-ms': String(24 * hour) }),
+      state: 'running',
+      created: ago(2 * hour),
+      startedAt: ago(2 * hour),
+    });
+    seedContainer(fake, 'd'.repeat(64), {
+      labels: labels('sandbox', { 'deuz.run-timeout-ms': '30000' }),
+      state: 'exited',
+      created: ago(2 * hour),
+      startedAt: ago(2 * hour),
+      finishedAt: ago(1_000),
+    });
+    // Left behind: an old helper, an old exited run, a run long past its timeout.
+    seedContainer(fake, 'e'.repeat(64), { labels: labels('staging'), created: ago(2 * hour) });
+    seedContainer(fake, 'f'.repeat(64), {
+      labels: labels('sandbox', { 'deuz.run-timeout-ms': '30000' }),
+      state: 'exited',
+      created: ago(2 * hour),
+      startedAt: ago(2 * hour),
+      finishedAt: ago(2 * hour),
+    });
+    seedContainer(fake, '9'.repeat(64), {
+      labels: labels('sandbox', { 'deuz.run-timeout-ms': '30000' }),
+      state: 'running',
+      created: ago(2 * hour),
+      startedAt: ago(2 * hour),
+    });
+    const report = await runner.reconcile({ removeOrphans: true });
+    const leftovers = ['e'.repeat(64), 'f'.repeat(64), '9'.repeat(64)];
+    expect(report.orphans.map((o) => o.containerId).sort()).toEqual(leftovers.sort());
+    expect([...report.removed].sort()).toEqual(leftovers.sort());
+    expect(
+      fake
+        .containers()
+        .map((c) => c.id[0])
+        .sort(),
+    ).toEqual(['a', 'b', 'c', 'd']);
+  });
+
+  it('a start that lands between the container snapshot and the record listing is not lost (R4-3)', async () => {
+    const fake = await fakeDocker(bundle);
+    const inner = createInMemoryProcessOperationStore();
+    const other = setup(fake, { store: inner });
+    let fired = false;
+    const store: ProcessOperationStore = {
+      ...inner,
+      create: (r) => inner.create(r),
+      get: (s, id) => inner.get(s, id),
+      update: (s, id, c, o) => inner.update(s, id, c, o),
+      prune: (o) => inner.prune(o),
+      async list(query) {
+        if (!fired) {
+          fired = true;
+          // Another host starts an operation after `docker ps` ran.
+          await other.runner.start(request({ operationId: 'fresh' }));
+        }
+        return inner.list(query);
+      },
+    };
+    const { runner } = setup(fake, { store });
+    const report = await runner.reconcile();
+    const record = await inner.get('tenant-a', 'fresh');
+    expect(report.lost).toEqual([]);
+    expect(report.matched.map((s) => [s.operationId, s.state])).toEqual([['fresh', 'running']]);
+    expect(record!.state).toBe('running');
+    expect(fake.container(record!.containerId!)?.state).toBe('running');
+    expect((await other.runner.poll('tenant-a', 'fresh')).state).toBe('running');
+    // A record whose container really is gone is still lost.
+    fake.update((state) => {
+      delete state.containers[record!.containerId!];
+    });
+    expect((await runner.reconcile()).lost.map((s) => s.operationId)).toEqual(['fresh']);
+  });
+
+  it("removes only the reconciled scope's dangling volumes (R4-5)", async () => {
+    const fake = await fakeDocker(bundle);
+    const labels = (scope: string) => ({
+      'deuz.operation-id': 'x',
+      'deuz.scope': scope,
+      'deuz.kind': 'process',
+    });
+    fake.update((state) => {
+      state.volumes['deuz-other-ws'] = { labels: labels('tenant-b'), files: {} };
+      state.volumes['deuz-mine-ws'] = { labels: labels('tenant-a'), files: {} };
+    });
+    const { runner } = setup(fake);
+    const report = await runner.reconcile({ scope: 'tenant-a', removeOrphans: true });
+    expect(report.removed).toEqual(['deuz-mine-ws']);
+    expect(Object.keys(fake.state().volumes)).toEqual(['deuz-other-ws']);
+    // Without a scope, every scope's dangling volumes go.
+    expect((await runner.reconcile({ removeOrphans: true })).removed).toEqual(['deuz-other-ws']);
+    expect(fake.state().volumes).toEqual({});
   });
 
   it('finishes what a crash left: an exit, a cancel, a container created but not recorded', async () => {

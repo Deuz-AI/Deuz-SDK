@@ -36,6 +36,16 @@ export const DEUZ_LABEL = {
   sdkVersion: 'deuz.sdk-version',
   /** `process` (a runner operation), `sandbox` (one sandbox run), `staging` (a read-only staging helper). */
   kind: 'deuz.kind',
+  /**
+   * A sandbox run's timeout in ms: how long after its start the run kills
+   * it, so `reconcile` can tell a live run from one its host left behind.
+   */
+  runTimeoutMs: 'deuz.run-timeout-ms',
+  /**
+   * A runner operation's request digest: a create a crash cut short is
+   * adopted only by the record whose request made it.
+   */
+  requestDigest: 'deuz.request-digest',
 } as const;
 
 export type ContainerKind = 'process' | 'sandbox' | 'staging';
@@ -76,7 +86,12 @@ export interface ResolvedDockerOptions {
   deps: ResolvedDependencies;
   /** The host passed its own clock: timers go through it (else they never hold the process open). */
   customClock: boolean;
+  /** How long one log read may take; internal, for tests (default `LOGS_TIMEOUT_MS`). */
+  logsTimeoutMs?: number;
 }
+
+/** How long one `docker logs` read may take before it is given up. */
+export const LOGS_TIMEOUT_MS = 120_000;
 
 function positiveInteger(value: unknown, name: string): number {
   if (!Number.isSafeInteger(value) || (value as number) <= 0)
@@ -202,12 +217,18 @@ export interface ContainerSpec {
   env?: Readonly<Record<string, string>>;
   /** The working directory of the command; default the workspace. */
   cwd?: string;
+  /** A sandbox run's timeout, written to the `deuz.run-timeout-ms` label. */
+  runTimeoutMs?: number;
+  /** A runner operation's request digest, written to the `deuz.request-digest` label. */
+  requestDigest?: string;
 }
 
 /** What inspection reports of one container. */
 export interface ContainerInfo {
   id: string;
   name: string;
+  /** Epoch ms of `docker create`, by the daemon's clock. */
+  createdAt?: number;
   imageId: string;
   labels: Record<string, string>;
   status: string;
@@ -234,6 +255,7 @@ function epoch(value: unknown): number | undefined {
 function parseInfo(line: string): ContainerInfo {
   const raw = JSON.parse(line) as {
     Id: string;
+    Created?: string;
     Name?: string;
     Image?: string;
     Config?: { Labels?: Record<string, string> | null } & Record<string, unknown>;
@@ -252,9 +274,11 @@ function parseInfo(line: string): ContainerInfo {
   const state = raw.State ?? {};
   const startedAt = epoch(state.StartedAt);
   const finishedAt = epoch(state.FinishedAt);
+  const createdAt = epoch(raw.Created);
   return {
     id: raw.Id,
     name: (raw.Name ?? '').replace(/^\//, ''),
+    ...(createdAt !== undefined ? { createdAt } : {}),
     imageId: raw.Image ?? '',
     labels: raw.Config?.Labels ?? {},
     status: state.Status ?? 'unknown',
@@ -349,9 +373,14 @@ export interface DockerEngine {
   inspectMany(ids: readonly string[]): Promise<ContainerInfo[]>;
   /** The labelled containers (`deuz.operation-id`), optionally of one scope. */
   listLabelled(scope?: string): Promise<string[]>;
-  /** The labelled volumes no container uses. */
-  listDanglingVolumes(): Promise<string[]>;
-  /** The bounded stdout/stderr tails of `docker logs`. */
+  /** The labelled volumes no container uses, optionally of one scope. */
+  listDanglingVolumes(scope?: string): Promise<string[]>;
+  /**
+   * The bounded stdout/stderr tails of `docker logs`, read from its last
+   * `maxOutputBytes` lines. A read that streams past `LOGS_TIMEOUT_MS` is
+   * `docker_failed` (the log is too large); one that got nothing at all is
+   * `docker_unavailable`.
+   */
   logs(containerId: string): Promise<ProcessOutput>;
   /** The one detached start command (`docker start <id>`). */
   start(containerId: string): Promise<void>;
@@ -373,9 +402,15 @@ export function createDockerEngine(options: ResolvedDockerOptions): DockerEngine
   const { cli } = options;
   let image: Promise<string> | undefined;
 
-  const labelArgs = (kind: ContainerKind, operationId: string, scope: string): string[] => {
+  const labelArgs = (
+    kind: ContainerKind,
+    operationId: string,
+    scope: string,
+    extra: Record<string, string> = {},
+  ): string[] => {
     const labels: Record<string, string> = {
       ...options.labels,
+      ...extra,
       [DEUZ_LABEL.operationId]: operationId,
       [DEUZ_LABEL.scope]: scope,
       [DEUZ_LABEL.sdkVersion]: DOCKER_LABEL_SDK_VERSION,
@@ -470,7 +505,14 @@ export function createDockerEngine(options: ResolvedDockerOptions): DockerEngine
             : []),
           ...(spec.interactive ? ['--interactive'] : []),
           ...(envFile !== undefined ? ['--env-file', envFile] : []),
-          ...labelArgs(spec.kind, spec.operationId, spec.scope),
+          ...labelArgs(spec.kind, spec.operationId, spec.scope, {
+            ...(spec.runTimeoutMs !== undefined
+              ? { [DEUZ_LABEL.runTimeoutMs]: String(spec.runTimeoutMs) }
+              : {}),
+            ...(spec.requestDigest !== undefined
+              ? { [DEUZ_LABEL.requestDigest]: spec.requestDigest }
+              : {}),
+          }),
           // The argv runs as given: an image ENTRYPOINT would prefix it.
           '--entrypoint=',
           imageId,
@@ -607,13 +649,14 @@ export function createDockerEngine(options: ResolvedDockerOptions): DockerEngine
         .filter(Boolean);
     },
 
-    async listDanglingVolumes() {
+    async listDanglingVolumes(scope) {
       const result = await docker(cli, [
         'volume',
         'ls',
         '--quiet',
         '--filter',
         `label=${DEUZ_LABEL.operationId}`,
+        ...(scope !== undefined ? ['--filter', `label=${DEUZ_LABEL.scope}=${scope}`] : []),
         '--filter',
         'dangling=true',
       ]);
@@ -626,15 +669,61 @@ export function createDockerEngine(options: ResolvedDockerOptions): DockerEngine
     async logs(containerId) {
       const stdout = new ByteTail(options.maxOutputBytes);
       const stderr = new ByteTail(options.maxOutputBytes);
-      await docker(cli, ['logs', containerId], {
-        timeoutMs: 120_000,
-        onStdout: (chunk) => stdout.push(chunk),
-        onStderr: (chunk) => stderr.push(chunk),
-      });
+      // Every line holds at least one byte, so a stream's last maxOutputBytes
+      // lines hold its whole kept tail; `--tail` spares streaming a huge log.
+      const window = options.maxOutputBytes;
+      let lines = 0;
+      let received = 0;
+      const count = (chunk: Uint8Array): void => {
+        received += chunk.byteLength;
+        for (const byte of chunk) if (byte === 0x0a) lines++;
+      };
+      const timeoutMs = options.logsTimeoutMs ?? LOGS_TIMEOUT_MS;
+      const stop = new AbortController();
+      let timedOut = false;
+      const timer = setTimeout(() => {
+        timedOut = true;
+        stop.abort();
+      }, timeoutMs);
+      let result;
+      try {
+        result = await docker(cli, ['logs', '--tail', String(window), containerId], {
+          timeoutMs: 0,
+          signal: stop.signal,
+          onStdout: (chunk) => {
+            count(chunk);
+            stdout.push(chunk);
+          },
+          onStderr: (chunk) => {
+            count(chunk);
+            stderr.push(chunk);
+          },
+        });
+      } finally {
+        clearTimeout(timer);
+      }
+      if (timedOut && result.stopped) {
+        // Bytes kept coming: the daemon answers, the log is just too large to
+        // read in time. That is no reason to hold up an exit, a cancel or a
+        // dispose, unlike a daemon that sent nothing at all.
+        if (received === 0)
+          throw new DockerSandboxError(
+            'docker_unavailable',
+            `docker logs did not answer within ${timeoutMs} ms`,
+            { command: 'logs' },
+          );
+        throw new DockerSandboxError(
+          'docker_failed',
+          `docker logs did not finish within ${timeoutMs} ms: the log is too large to read.`,
+          { command: 'logs' },
+        );
+      }
+      // A full window: earlier lines, of either stream, may be missing.
+      const full = lines >= window;
       return {
         stdout: stdout.text(),
         stderr: stderr.text(),
-        truncated: { stdout: stdout.truncated, stderr: stderr.truncated },
+        truncated: { stdout: stdout.truncated || full, stderr: stderr.truncated || full },
       };
     },
 

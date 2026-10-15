@@ -25,6 +25,7 @@ import {
   rmSync,
   statSync,
   writeFileSync,
+  writeSync,
 } from 'node:fs';
 import { join } from 'node:path';
 
@@ -61,6 +62,8 @@ export interface FakeContainer {
   mounts: FakeMount[];
   state: 'created' | 'running' | 'exited';
   exitCode: number;
+  /** When `docker create` made it (inspect's `Created`). */
+  created?: string;
   startedAt?: string;
   finishedAt?: string;
   error?: string;
@@ -76,7 +79,8 @@ export interface FakeContainer {
 export interface FakeFault {
   /** The subcommand it hits: 'start', 'stop', 'image', 'cp', ... or '*'. */
   command: string;
-  mode: 'unreachable' | 'fail-before' | 'fail-after' | 'hang' | 'noop';
+  /** `trickle` writes a line to stdout every 20 ms for ever: a log too long to read in time. */
+  mode: 'unreachable' | 'fail-before' | 'fail-after' | 'hang' | 'noop' | 'trickle';
   /** How many invocations it hits. Default 1. */
   times?: number;
   stderr?: string;
@@ -147,7 +151,18 @@ function withLock<T>(fn: (state: FakeState) => T): T {
     // Atomic: a command killed mid-write never leaves half a state behind.
     const temp = `${statePath}.${process.pid}`;
     writeFileSync(temp, JSON.stringify(state));
-    renameSync(temp, statePath);
+    for (let attempt = 0; ; attempt++) {
+      try {
+        renameSync(temp, statePath);
+        break;
+      } catch (error) {
+        // Windows refuses to replace a file a test is reading at that moment.
+        const code = (error as NodeJS.ErrnoException).code;
+        if (attempt >= 200 || (code !== 'EPERM' && code !== 'EBUSY' && code !== 'EACCES'))
+          throw error;
+        sleepSync(5);
+      }
+    }
     return result;
   } finally {
     rmSync(lockPath, { recursive: true, force: true });
@@ -491,6 +506,7 @@ function inspectJson(container: FakeContainer): string {
     );
   return JSON.stringify({
     Id: container.id,
+    Created: container.created ?? '0001-01-01T00:00:00Z',
     Name: `/${container.name}`,
     Image: container.image,
     Config: {
@@ -669,6 +685,7 @@ function create(state: FakeState, rest: string[]): string {
     mounts,
     state: 'created',
     exitCode: 0,
+    created: new Date().toISOString(),
     startCount: 0,
     stdout: '',
     stderr: '',
@@ -778,6 +795,11 @@ function main(): void {
         fail(before.stderr ?? 'Error response from daemon: fake failure', before.code ?? 1);
       case 'hang':
         for (;;) sleepSync(1_000);
+      case 'trickle':
+        for (;;) {
+          writeSync(1, 'trickle trickle trickle\n');
+          sleepSync(20);
+        }
       case 'noop':
         process.exit(0);
     }
@@ -890,8 +912,16 @@ function main(): void {
     }
     case 'logs': {
       const container = needContainer(readState(), rest[rest.length - 1]!);
-      out(container.stdout);
-      err(container.stderr);
+      // `--tail N`: the real daemon counts the merged log; per stream is close enough here.
+      const at = rest.indexOf('--tail');
+      const keep = at === -1 ? undefined : Number(rest[at + 1]);
+      const tail = (text: string) => {
+        if (keep === undefined) return text;
+        const lines = text.match(/[^\n]*\n|[^\n]+$/g) ?? [];
+        return lines.slice(Math.max(0, lines.length - keep)).join('');
+      };
+      out(tail(container.stdout));
+      err(tail(container.stderr));
       return;
     }
     case 'stop':

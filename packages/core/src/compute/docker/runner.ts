@@ -14,11 +14,13 @@
  * - a container that vanished makes the operation `lost`, never recreated.
  *
  * Cancel is recorded first, then stop with a 2 s grace, kill if needed and a
- * state check; while the daemon is unreachable the operation stays
- * `cancel-requested` and the next poll, cancel or reconcile drives it on.
- * `durableTimeout` is false: a deadline is enforced by this runner's timer
- * while it lives, and a deadline that passed while the host was down cancels
- * at the first poll, start or reconcile after it.
+ * state check (a container that never started is removed instead, so a start
+ * another host already dispatched has nothing to run); while the daemon is
+ * unreachable the operation stays `cancel-requested` and the next poll,
+ * cancel or reconcile drives it on. `durableTimeout` is false: a deadline is
+ * enforced by this runner's timer while it lives, and a deadline that passed
+ * while the host was down cancels at the first poll, start or reconcile
+ * after it; an operation not yet started is then never started.
  */
 import {
   digestJson,
@@ -62,8 +64,40 @@ const CANCEL_GRACE_SECONDS = 2;
  * issuing that start.
  */
 export const START_SETTLE_MS = 30_000;
+/**
+ * How long a sandbox container or staging helper is left alone by
+ * `reconcile` (2.4): after its create while it never ran, after its exit, and
+ * past its run timeout while it runs. Those containers belong to a sandbox
+ * run or a staging copy, here or on another host, that removes them itself;
+ * the window is longer than every CLI timeout of a run's create and staging
+ * steps put together, so only a container whose host is gone outlives it.
+ */
+export const TRANSIENT_CONTAINER_SETTLE_MS = 30 * 60_000;
+
+/**
+ * When a sandbox container or staging helper stops being in use (epoch ms,
+ * daemon clock): a running one only past its labelled run timeout (never
+ * without the label), any other once it has been created or exited for the
+ * settle window.
+ */
+function transientLeaseEnd(info: ContainerInfo): number {
+  if (info.running) {
+    const label = info.labels[DEUZ_LABEL.runTimeoutMs];
+    const runMs = label === undefined ? Number.NaN : Number(label);
+    const since = info.startedAt ?? info.createdAt;
+    if (since === undefined || !Number.isFinite(runMs) || runMs < 0)
+      return Number.POSITIVE_INFINITY;
+    return since + runMs + TRANSIENT_CONTAINER_SETTLE_MS;
+  }
+  const since = info.finishedAt ?? info.createdAt;
+  return since === undefined ? Number.POSITIVE_INFINITY : since + TRANSIENT_CONTAINER_SETTLE_MS;
+}
+
 /** How long a start with stdin is watched for the container to come up. */
 const STDIN_START_WAIT_MS = 30_000;
+
+/** The states before the start command: a passed deadline cancels them unstarted. */
+const PRE_START_STATES: ReadonlySet<ProcessState> = new Set(['recorded', 'created', 'staged']);
 
 /** The states a container may still exist for, and `reconcile` checks. */
 const ACTIVE_STATES: readonly ProcessState[] = [
@@ -202,6 +236,12 @@ export function createDockerRunnerFromOptions(
     deadlineTimers.set(key, cancelTimer);
   };
 
+  /** A pre-start record whose deadline has passed: cancelled, never started. */
+  const expiredBeforeStart = (record: ProcessOperationRecord): boolean =>
+    PRE_START_STATES.has(record.state) &&
+    record.deadlineAt !== undefined &&
+    deps.clock.now() >= record.deadlineAt;
+
   async function load(scope: string, operationId: string): Promise<ProcessOperationRecord> {
     const record = await store.get(scope, operationId);
     if (!record)
@@ -238,9 +278,35 @@ export function createDockerRunnerFromOptions(
       operationId: record.operationId,
       scope: record.scope,
       command: record.request.command,
+      requestDigest: record.requestDigest,
       interactive: request?.stdin !== undefined,
       ...(request?.env !== undefined ? { env: request.env } : {}),
     };
+  }
+
+  /**
+   * Whether a container found under a record's name is a create of that very
+   * record a crash cut short: it never ran and carries the record's request
+   * digest. Anything else an earlier operation under the same id left behind
+   * (its record pruned before the container was disposed).
+   */
+  const adoptable = (record: ProcessOperationRecord, info: ContainerInfo): boolean =>
+    info.startedAt === undefined && info.labels[DEUZ_LABEL.requestDigest] === record.requestDigest;
+
+  /** Fails a fresh record whose name an earlier operation's container holds; never adopted, never removed. */
+  async function refuseLeftover(
+    record: ProcessOperationRecord,
+    name: string,
+  ): Promise<{ ok: boolean; record: ProcessOperationRecord }> {
+    return commit(record, {
+      state: 'failed',
+      endedAt: deps.clock.now(),
+      error: {
+        name: 'DockerSandboxError',
+        message: `The container ${name} was left by an earlier operation under this id; dispose this operation to remove it, then prune the record before reusing the id.`,
+        code: 'container_conflict',
+      },
+    });
   }
 
   /** Records an exit (or a cancel's end) with the output tail, and reports it. */
@@ -321,7 +387,7 @@ export function createDockerRunnerFromOptions(
       case 'cancel-requested':
         return driveCancel(record);
       default:
-        return record;
+        return expiredBeforeStart(record) ? cancelRecord(record) : record;
     }
   }
 
@@ -347,7 +413,9 @@ export function createDockerRunnerFromOptions(
         const found = await engine.inspect(
           await operationContainerName(record.scope, record.operationId),
         );
-        containerId = found?.id;
+        // Only a create of this record a crash cut short is its container; an
+        // earlier operation's leftover under the name is not this cancel's.
+        containerId = found && adoptable(record, found) ? found.id : undefined;
       }
       const gone = async () =>
         (await commit(record, { state: 'cancelled', endedAt: deps.clock.now(), error: undefined }))
@@ -379,6 +447,11 @@ export function createDockerRunnerFromOptions(
           return result.record;
         }
       }
+      if (info.startedAt === undefined)
+        // Never started: removed before the cancel is final, so a start another
+        // host has already dispatched finds nothing to run (that host notices
+        // the cancel only after its start). Its volume goes with dispose.
+        await engine.remove(info.id);
       const withId =
         containerId !== record.containerId && containerId !== undefined
           ? (await commit(record, { containerId })).record
@@ -480,6 +553,8 @@ export function createDockerRunnerFromOptions(
     let created = false;
     const name = await operationContainerName(record.scope, record.operationId);
     for (let step = 0; step < 20; step++) {
+      // A deadline that passed before the start: cancelled, never started.
+      if (expiredBeforeStart(record)) return cancelRecord(record);
       switch (record.state) {
         case 'recorded': {
           // A create that crashed before it was recorded left the container
@@ -494,6 +569,12 @@ export function createDockerRunnerFromOptions(
               'docker_failed',
               `The container name ${name} belongs to another operation.`,
             );
+          if (info && !adoptable(record, info)) {
+            const result = await refuseLeftover(record, name);
+            record = result.record;
+            if (result.ok) return record;
+            continue;
+          }
           let containerId = info?.id;
           if (containerId === undefined) {
             files ??= await collectStageFiles(options, request.files);
@@ -793,6 +874,14 @@ export function createDockerRunnerFromOptions(
         for (const info of infos) {
           const operationId = info.labels[DEUZ_LABEL.operationId];
           const scope = info.labels[DEUZ_LABEL.scope];
+          const kind = info.labels[DEUZ_LABEL.kind];
+          // A sandbox run's container or a staging helper has no record: it is
+          // an orphan only once no run can still be using it.
+          if (
+            (kind === 'sandbox' || kind === 'staging') &&
+            deps.clock.now() < transientLeaseEnd(info)
+          )
+            continue;
           let record =
             info.labels[DEUZ_LABEL.kind] === 'process' && operationId && scope
               ? await store.get(scope, operationId)
@@ -823,7 +912,17 @@ export function createDockerRunnerFromOptions(
           });
           for (const record of page.records) {
             if (record.containerId === undefined) continue;
-            if (seen.has(recordKey(record.scope, record.operationId))) continue;
+            const key = recordKey(record.scope, record.operationId);
+            if (seen.has(key)) continue;
+            // The container snapshot came first: a container another host (or
+            // this one) made since then is not lost. Only a daemon that has no
+            // such container makes the record lost.
+            const info = await engine.inspect(record.containerId);
+            if (info) {
+              seen.add(key);
+              report.matched.push(sessionOf(await reconcileRecord(record, info)));
+              continue;
+            }
             const result = await commit(record, { state: 'lost' });
             if (result.ok) report.lost.push(sessionOf(result.record));
           }
@@ -834,7 +933,8 @@ export function createDockerRunnerFromOptions(
             await engine.remove(orphan.containerId);
             report.removed.push(orphan.containerId);
           }
-          for (const volume of await engine.listDanglingVolumes()) {
+          // Only this reconcile's scope: another tenant's volumes are not ours to judge.
+          for (const volume of await engine.listDanglingVolumes(query.scope)) {
             await engine.removeVolume(volume);
             report.removed.push(volume);
           }
@@ -859,9 +959,12 @@ export function createDockerRunnerFromOptions(
     record: ProcessOperationRecord,
     info: ContainerInfo,
   ): Promise<ProcessOperationRecord> {
+    if (expiredBeforeStart(record)) return cancelRecord(record);
     switch (record.state) {
       case 'recorded':
-        // Created, but the host stopped before recording it.
+        // Created, but the host stopped before recording it; or left by an
+        // earlier operation under this id, which is never adopted.
+        if (!adoptable(record, info)) return (await refuseLeftover(record, info.name)).record;
         return (await commit(record, { state: 'created', containerId: info.id })).record;
       case 'start-dispatched':
       case 'needs-reconcile': {

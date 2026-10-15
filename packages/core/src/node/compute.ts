@@ -115,7 +115,8 @@ function isWithin(path: NodePath, root: string, target: string): boolean {
  * Resolves a `runShell` cwd against the sandbox root (H3, 2.4): a relative
  * path is taken from the root, an absolute one must lie inside it, and the
  * real path (symlinks and junctions followed) must stay inside the real root.
- * Returns the directory to spawn in, or the refusal to report.
+ * Returns the directory to spawn in (the lexical path, once both checks
+ * pass), or the refusal to report.
  */
 async function resolveShellCwd(
   root: string,
@@ -139,7 +140,10 @@ async function resolveShellCwd(
     return { refusal: `Working directory '${requested}' does not exist in the sandbox root.` };
   }
   if (!isWithin(path, realBase, realTarget)) return { refusal: outside };
-  return { cwd: realTarget };
+  // The real path only decides containment. The spawn gets the lexical path:
+  // the real path of a mapped network drive is a UNC path, which cmd.exe
+  // refuses as a working directory (it runs in C:\Windows instead).
+  return { cwd: target };
 }
 
 /** language id → how to invoke an interpreter with an inline program. */
@@ -367,6 +371,8 @@ async function execProcess(
     let settled = false;
     /** From 'exit', for a killed run that settles before 'close' comes. */
     let exitCode: number | null = null;
+    /** 'exit' came: Node has let go of the child's pid, which the OS may reuse. */
+    let exited = false;
     let graceTimer: ReturnType<typeof setTimeout> | undefined;
 
     const collect = (chunks: Uint8Array[], countRef: 'out' | 'err') => (chunk: Uint8Array) => {
@@ -398,7 +404,13 @@ async function execProcess(
     const kill = (): void => {
       if (settled || timedOut) return;
       timedOut = true;
-      killProcessTree(spawn, input.host, child);
+      // After 'exit' (a program the child started still holds the pipes) the
+      // child's pid is free: on Windows `taskkill /PID <pid> /T` could hit an
+      // unrelated process and its tree, and cannot walk a dead process's tree
+      // anyway, so only the grace and the pipe close remain. A POSIX process
+      // group id stays reserved while any member lives, and those members are
+      // what holds the pipes: the group signal still goes out.
+      if (!(exited && input.host.platform === 'win32')) killProcessTree(spawn, input.host, child);
       graceTimer = setTimeout(() => finish(exitCode), KILL_GRACE_MS);
     };
     const timer = setTimeout(kill, input.timeoutMs);
@@ -419,7 +431,9 @@ async function execProcess(
       resolve({
         stdout: concat(outChunks),
         stderr: error ? `${concat(errChunks)}${error.message}` : concat(errChunks),
-        exitCode: code,
+        // A killed run has no exit code of its own, as before 2.4 (Node's
+        // emulated SIGKILL gave null); taskkill /F would report 1.
+        exitCode: timedOut ? null : code,
         ...(timedOut ? { timedOut: true } : {}),
         durationMs: Date.now() - start,
         ...(cut.stdout || cut.stderr ? { truncated: { ...cut } } : {}),
@@ -429,6 +443,7 @@ async function execProcess(
     child.on('error', (err) => finish(null, err));
     child.on('exit', (code) => {
       exitCode = code;
+      exited = true;
     });
     child.on('close', (code) => finish(code));
 
