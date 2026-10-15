@@ -94,11 +94,11 @@ import {
   type DurableStreamStateStore,
 } from '../../src/ui';
 import {
-  FAKE_IMAGE,
-  buildFakeDocker,
-  fakeDocker,
-  type FakeDockerBundle,
-} from '../fixtures/fake-docker';
+  FAKE_ENGINE_IMAGE,
+  buildFakeEngine,
+  fakeEngine,
+  type FakeEngineBundle,
+} from './fake-engine';
 import { dockerAvailable, dockerCommand, postgresUrl, redisUrl } from '../fixtures/services';
 
 // ---------------------------------------------------------------------------
@@ -256,16 +256,16 @@ export interface DockerHarness {
 }
 
 /** The fake CLI's bundle is built once per test file. */
-let bundle: Promise<FakeDockerBundle> | undefined;
+let bundle: Promise<FakeEngineBundle> | undefined;
 
 /** The Docker of this run: real when DEUZ_TEST_DOCKER=1 (failing if it does not answer), else the fake CLI. */
 export async function dockerHarness(): Promise<DockerHarness> {
   if (dockerAvailable()) return realDocker();
-  bundle ??= buildFakeDocker();
-  const fake = await fakeDocker(await bundle);
+  bundle ??= buildFakeEngine();
+  const fake = await fakeEngine(await bundle);
   return {
     kind: 'fake',
-    options: () => ({ image: FAKE_IMAGE, ...fake.cli }),
+    options: () => ({ image: FAKE_ENGINE_IMAGE, ...fake.cli }),
     // The fake runs a tiny op script: `write <path> <content>` then `echo`.
     command: (content) => ['sh', '-c', `write report.txt ${content} ; echo built`],
     facts(scope, operationId) {
@@ -694,6 +694,36 @@ export function reportJobResult(messages: readonly Message[]): ReportJobResult |
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
+/**
+ * The client's connection to a host process: when the process dies, the
+ * connection resets (a transport error), as when a killed process takes its
+ * sockets with it. Nothing the dying process still writes reaches the client,
+ * not even the error frame a live producer that fails closed would send.
+ */
+function connection(life: Life, response: Response): Response {
+  const source = response.body;
+  if (!source) return response;
+  const reader = source.getReader();
+  const body = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        const { value, done } = await reader.read();
+        if (!life.alive) {
+          controller.error(new TypeError(`connection reset: host process ${life.name} died`));
+          void reader.cancel().catch(() => undefined);
+          return;
+        }
+        if (done) controller.close();
+        else controller.enqueue(value);
+      } catch (error) {
+        controller.error(error);
+      }
+    },
+    cancel: (reason) => reader.cancel(reason),
+  });
+  return new Response(body, { status: response.status, headers: response.headers });
+}
+
 /** Opens a host process on the flow's data. */
 export function openProcess(env: FlowEnv, name: string): HostProcess {
   const life: Life = { name, alive: true };
@@ -1047,24 +1077,26 @@ export function openProcess(env: FlowEnv, name: string): HostProcess {
         capabilities: { request: new Headers(headers) },
       });
       void track(stream.result);
-      return response;
+      return connection(life, response);
     },
     resume(ctx) {
       void track(continueRun(RUN_ID));
-      return resumeDeuzStreamResponse(streams, RUN_ID, {
-        lastEventId: ctx.lastEventId ?? null,
-        pollIntervalMs: 20,
-        idleTimeoutMs: 120_000,
-        ...(ctx.capabilities ? { capabilities: { request: ctx.capabilities } } : {}),
-      });
+      return connection(
+        life,
+        resumeDeuzStreamResponse(streams, RUN_ID, {
+          lastEventId: ctx.lastEventId ?? null,
+          pollIntervalMs: 20,
+          idleTimeoutMs: 120_000,
+          ...(ctx.capabilities ? { capabilities: { request: ctx.capabilities } } : {}),
+        }),
+      );
     },
   };
 
+  // `alive` stays a getter (Object.assign would copy its value once).
+  Object.defineProperty(proc, 'alive', { get: () => life.alive, enumerable: true });
   Object.assign(proc, {
     name,
-    get alive() {
-      return life.alive;
-    },
     env,
     deps,
     goals,
