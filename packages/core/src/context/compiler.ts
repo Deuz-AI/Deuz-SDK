@@ -12,7 +12,7 @@ import type { Message } from '../types/message';
 import type { CallWarning } from '../types/methods';
 import { compileContext } from './compile';
 import { DEFAULT_CONTEXT_BUDGET, DEFAULT_CONTEXT_REFRESH } from './defaults';
-import { isContextMessage, messageText, placedPasses } from './render';
+import { blockKey, isContextMessage, messageText, placedBlocks, placedPasses } from './render';
 import { sha256DigestSync } from './sha256';
 import type {
   ContextBlobRef,
@@ -380,6 +380,7 @@ export function createContextCompiler(options: CreateContextCompilerOptions): Co
         ...(entry.revision !== undefined ? { revision: entry.revision } : {}),
         digest: entry.digest,
         pass: pkg.manifest.pass,
+        step: pkg.manifest.step,
       };
     });
     const digests = [...input.messages, ...(append?.messages ?? [])].map(messageDigest);
@@ -424,13 +425,24 @@ export function createContextCompiler(options: CreateContextCompilerOptions): Co
     };
   }
 
-  /** The placed entries whose blocks the messages still carry, and those a compaction removed. */
+  /**
+   * The placed entries whose blocks the messages still carry, and those a
+   * compaction removed. A block is its pass and step; an entry checkpointed
+   * without its step is kept while any block of its pass is present.
+   */
   function stillPlaced(entries: readonly ContextPlacedEntry[], messages: readonly Message[]) {
-    const present = placedPasses(messages);
+    const passes = placedPasses(messages);
+    const blocks = placedBlocks(messages);
     const kept: ContextPlacedEntry[] = [];
     const dropped: ContextPlacedEntry[] = [];
-    for (const entry of entries)
-      (entry.pass === undefined || present.has(entry.pass) ? kept : dropped).push(entry);
+    for (const entry of entries) {
+      const present =
+        entry.pass === undefined ||
+        (entry.step === undefined
+          ? passes.has(entry.pass)
+          : blocks.has(blockKey(entry.pass, entry.step)));
+      (present ? kept : dropped).push(entry);
+    }
     return { kept, dropped };
   }
 

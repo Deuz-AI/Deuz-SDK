@@ -310,6 +310,13 @@ export interface ContextPlacedEntry {
    * (a compaction removed it), so the entry can be placed again.
    */
   pass?: number;
+  /**
+   * The model step of the `'append'` block that carries it (2.4): with
+   * `pass`, it names that one block (`<deuz_context pass="P" step="S">`),
+   * since a block placing entries again after a compaction keeps the
+   * current pass. Without it, any block of the pass counts.
+   */
+  step?: number;
 }
 
 // ===================================================================

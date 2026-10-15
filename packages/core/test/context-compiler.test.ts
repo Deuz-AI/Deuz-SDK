@@ -19,6 +19,7 @@ import {
 import { sha256DigestSync } from '../src/context/sha256';
 import type {
   ContextCandidate,
+  ContextPackage,
   ContextSource,
   ContextSourceKind,
   ContextSourceRequest,
@@ -365,7 +366,14 @@ describe('createContextCompiler state, overflow and compaction', () => {
     expect(blob.records).toEqual([{ recordId: 'm1', revision: 2 }]);
     expect(compiler.state().lastPackage).toEqual({ digest: blob.digest, bytes: blob.bytes });
     expect(compiler.state().placed).toEqual([
-      { source: 'memory', recordId: 'm1', revision: 2, digest: sha256DigestSync('fact'), pass: 1 },
+      {
+        source: 'memory',
+        recordId: 'm1',
+        revision: 2,
+        digest: sha256DigestSync('fact'),
+        pass: 1,
+        step: 1,
+      },
     ]);
   });
 
@@ -513,6 +521,77 @@ describe('createContextCompiler state, overflow and compaction', () => {
     expect(appended).toContain('NEW seat preference');
     expect(appended).not.toContain('OLD seat preference');
     expect(older.requests).toBe(2);
+  });
+
+  it('tells a block from a later re-placement block of the same pass', async () => {
+    // R2-3: alpha (pass 1), beta (pass 2), alpha again in a pass-2 block at
+    // step 3; a second compaction removes the original pass-2 block.
+    let pass = 1;
+    const memory = fake('memory', 'memory', async () =>
+      pass === 1
+        ? [candidate('a', 'alpha fact', 0.9)]
+        : [candidate('a', 'alpha fact', 0.9), candidate('b', 'beta fact', 0.8)],
+    );
+    const compiler = createContextCompiler({ sources: [memory.source] });
+    const user: Message = { role: 'user', content: 'plan it' };
+    const appendOf = (pkg: ContextPackage) =>
+      pkg.blocks.filter((block) => block.placement === 'append').flatMap((b) => b.messages);
+    const block1 = appendOf(await compiler.beforeModelCall(step(1, [system, user])));
+    pass = 2;
+    compiler.requestRefresh();
+    const block2 = appendOf(
+      await compiler.beforeModelCall(
+        step(2, [system, user, ...block1, { role: 'assistant', content: 'ok1' }]),
+      ),
+    );
+    expect(JSON.stringify(block2)).toContain('beta fact');
+    expect(JSON.stringify(block2)).not.toContain('alpha fact');
+    // Compaction 1 removes the pass-1 block: alpha comes back.
+    const block3 = appendOf(
+      await compiler.beforeModelCall(
+        step(3, [
+          system,
+          { role: 'user', content: 'Summary 1' },
+          user,
+          ...block2,
+          { role: 'assistant', content: 'ok2' },
+        ]),
+      ),
+    );
+    expect(JSON.stringify(block3)).toContain('alpha fact');
+    expect(compiler.state().placed).toEqual([
+      expect.objectContaining({ recordId: 'b', pass: 2, step: 2 }),
+      expect.objectContaining({ recordId: 'a', pass: 2, step: 3 }),
+    ]);
+    // Compaction 2 removes the original pass-2 block and keeps the step-3 one.
+    const p4 = await compiler.beforeModelCall(
+      step(4, [
+        system,
+        { role: 'user', content: 'Summary 2' },
+        user,
+        ...block3,
+        { role: 'assistant', content: 'ok3' },
+      ]),
+    );
+    expect(JSON.stringify(appendOf(p4))).toContain('beta fact');
+    expect(JSON.stringify(appendOf(p4))).not.toContain('alpha fact');
+    expect(memory.requests).toHaveLength(2);
+  });
+
+  it('keeps reading the pass alone for an entry checkpointed without its step', async () => {
+    const memory = fake('memory', 'memory', [candidate('m1', 'Prefers aisle seats', 0.9)]);
+    const user: Message = { role: 'user', content: 'book it' };
+    const original = createContextCompiler({ sources: [memory.source] });
+    const first = await original.beforeModelCall(step(1, [system, user]));
+    const saved = original.state();
+    // A state written before entries carried their block's step.
+    for (const entry of saved.placed) delete entry.step;
+    const restored = createContextCompiler({ sources: [memory.source], state: saved });
+    const pkg = await restored.beforeModelCall(
+      step(2, [system, user, ...first.blocks[0]!.messages, { role: 'assistant', content: 'ok' }]),
+    );
+    expect(pkg.blocks).toEqual([]);
+    expect(restored.state().placed).toEqual([expect.objectContaining({ recordId: 'm1', pass: 1 })]);
   });
 
   it('places again what a compaction removed, and notes the prefix change', async () => {
