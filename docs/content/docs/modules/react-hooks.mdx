@@ -495,7 +495,9 @@ renders under, the cursor, a turn still streaming, pending approvals with the
 verdicts already given, parked client calls with the results already given, a
 native run's gate, and the announced capabilities. It reads the latest state,
 not the last render. For a user bubble the id comes from `generateId`; for an
-assistant turn it is the stream's start `messageId`, the id a route stores.
+assistant turn it is the stream's start `messageId`, the id a route stores. A
+tool or system message gets a generated id on its first export and keeps it,
+so every export names it the same. Fields with nothing to carry are left out.
 `initialSnapshot` restores all of it at mount.
 
 A chat stored server-side restores from its `ChatRecord` directly:
@@ -536,9 +538,12 @@ message-ids`. A function resume endpoint receives the same string as
 `ctx.capabilities`, to forward as the header or as `capabilities.request` to
 `resumeDeuzStreamResponse`. A 2.4 route that takes part answers in the response
 header and in a first `capabilities` frame, which the hook consumes: it never
-reaches the turn, `onData` or the transcript. `capabilities` on the result holds
-the announced set, sorted; it is absent until a response takes part (a 2.3
-route never does) or a restored snapshot recorded one. The hook uses a feature
+reaches the turn, `onData` or the transcript; a resume read that sends only
+that frame is still a silent no-op. `capabilities` on the result holds the
+announced set, sorted; it is absent until a response takes part (a 2.3 route
+never does) or a restored snapshot recorded one. Each announcing response
+replaces the set, a response that announces nothing leaves it, and a string the
+hook does not know is kept as it is. The hook uses a feature
 only while it is announced:
 
 | Capability | What the hook does |
