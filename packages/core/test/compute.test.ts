@@ -58,6 +58,36 @@ describe('codeActTool (edge wrapper over the seam)', () => {
     expect(out.stdout).toContain('truncated');
   });
 
+  it('passes the sandbox truncated flags to the model, and omits them when nothing was cut (2.4)', async () => {
+    const returning = (result: CodeExecutionResult): ComputeSandbox => ({
+      runCode: async () => result,
+      runShell: async () => result,
+    });
+    const cut = returning({
+      stdout: 'x',
+      stderr: '',
+      exitCode: 0,
+      truncated: { stdout: true, stderr: false },
+    });
+    const code = await codeActTool(cut).runCode!.execute!({ language: 'sh', code: 'x' }, ctx);
+    const shell = await shellTool(cut).runShell!.execute!({ command: 'x' }, ctx);
+    expect(code).toEqual({
+      stdout: 'x',
+      stderr: '',
+      exitCode: 0,
+      truncated: { stdout: true, stderr: false },
+    });
+    expect(shell).toEqual(code);
+    // Absent, the model-facing result is byte-for-byte the 2.3 one.
+    const whole = returning({ stdout: 'x', stderr: '', exitCode: 0 });
+    const plain = await codeActTool(whole).runCode!.execute!({ language: 'sh', code: 'x' }, ctx);
+    expect(plain).toEqual({ stdout: 'x', stderr: '', exitCode: 0 });
+    expect(plain).not.toHaveProperty('truncated');
+    expect(await shellTool(whole).runShell!.execute!({ command: 'x' }, ctx)).not.toHaveProperty(
+      'truncated',
+    );
+  });
+
   it('offers the language enum when restricted', () => {
     const sandbox: ComputeSandbox = {
       async runCode() {
