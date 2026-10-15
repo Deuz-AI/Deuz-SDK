@@ -246,7 +246,8 @@ export function createGoalDriver(options: GoalDriverOptions): {
     if (goal.deadline !== undefined && goal.deadline <= now) return true;
     const wait = answerable(goal);
     if (wait?.reason === 'wakeup' && wait.at <= now) return true;
-    if (wait?.reason === 'dependency') return true;
+    if (wait?.reason === 'dependency' && (await dependencyEvents(goal, now)).length > 0)
+      return true;
     const due = await store.inbox.list({
       scope: goal.scope,
       goalId: goal.goalId,
@@ -492,14 +493,18 @@ export function createGoalDriver(options: GoalDriverOptions): {
       : 'continue';
   }
 
-  /** Queues an event for each dependency of the goal's wait that already finished. */
-  async function reconcileDependencies(view: View, now: number): Promise<void> {
-    const events = await goalDependencyEvents(view.goal, {
+  /** One event per dependency of the goal's wait that already finished. */
+  function dependencyEvents(goal: GoalRecord, now: number) {
+    return goalDependencyEvents(goal, {
       now,
       goals: store,
       ...(options.runFinished ? { runFinished: options.runFinished } : {}),
     });
-    for (const event of events)
+  }
+
+  /** Queues an event for each dependency of the goal's wait that already finished. */
+  async function reconcileDependencies(view: View, now: number): Promise<void> {
+    for (const event of await dependencyEvents(view.goal, now))
       await store.inbox.enqueue({
         scope: event.scope,
         goalId: event.goalId,
@@ -723,7 +728,15 @@ export function createGoalDriver(options: GoalDriverOptions): {
   ): Promise<Step> {
     const { goal, runtime } = view;
     const held = await claim(drive, intent);
-    if (!held) return 'stop';
+    if (!held) {
+      // Held under a higher token than this drive's lease: never launched twice.
+      deps.logger.warn('goal supervisor: intent claim refused', {
+        scope: goal.scope,
+        goalId: goal.goalId,
+        intentId: intent.intentId,
+      });
+      return 'stop';
+    }
     const now = clock.now();
     if (drive.lost) return 'stop';
     const running: GoalRuntimeState = { ...bump(runtime, now), phase: 'running' };

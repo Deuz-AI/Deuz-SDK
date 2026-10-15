@@ -153,6 +153,7 @@ describe('submit, get and list', () => {
     expect(await supervisor.get(SCOPE, 'missing')).toBeUndefined();
     const page = await supervisor.list({ scope: SCOPE });
     expect(page.goals.map((goal) => goal.goalId)).toEqual(['g-1']);
+    await expect(supervisor.list({ scope: undefined as never })).rejects.toThrow(TypeError);
   });
 });
 

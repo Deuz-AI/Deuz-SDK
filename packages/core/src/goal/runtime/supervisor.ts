@@ -485,7 +485,12 @@ export function createGoalSupervisor(options: GoalSupervisorOptions): GoalSuperv
       return runtime ? { goal, runtime } : undefined;
     },
 
-    list: (query) => store.list(query),
+    async list(query) {
+      // Always one scope: a listing never crosses tenants.
+      if (typeof query?.scope !== 'string' || query.scope === '')
+        throw new TypeError('A supervised goal listing needs a scope');
+      return store.list(query);
+    },
 
     async dispatch(input, dispatchOptions = {}) {
       const event = checkGoalEvent(input);

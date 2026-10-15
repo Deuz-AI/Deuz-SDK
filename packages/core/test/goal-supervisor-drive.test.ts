@@ -734,14 +734,18 @@ describe('inbox, dependencies and time', () => {
 
   it('reconciles a dependency wait with dependencies that already finished', async () => {
     const w = world();
-    const { supervisor, launcher } = supervisorIn(w);
+    const { supervisor, launcher, seen } = supervisorIn(w);
     await supervisor.submit({ goalId: 'dep', scope: SCOPE, objective: 'x', start: false });
-    await supervisor.command(SCOPE, 'dep', { type: 'fail', reason: 'done elsewhere' });
+    await supervisor.command(SCOPE, 'dep', { type: 'wait', wait: { reason: 'user' } });
     await supervisor.submit({ goalId: 'g-1', scope: SCOPE, objective: 'y', start: false });
     await supervisor.command(SCOPE, 'g-1', {
       type: 'wait',
       wait: { reason: 'dependency', on: [{ kind: 'goal', id: 'dep' }] },
     });
+    // Nothing finished yet: the waiting goal is not even claimed.
+    await supervisor.tick();
+    expect(seen.filter((event) => event.type === 'claimed')).toEqual([]);
+    await supervisor.command(SCOPE, 'dep', { type: 'fail', reason: 'done elsewhere' });
     expect(await supervisor.tick()).toMatchObject({ applied: 1, dispatched: 1 });
     expect((await supervisor.get(SCOPE, 'g-1'))?.goal.status).toBe('active');
     expect(launcher.calls[0]?.request.goalId).toBe('g-1');
