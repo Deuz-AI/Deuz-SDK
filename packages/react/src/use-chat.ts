@@ -81,7 +81,7 @@ import type {
 import type { DeuzUIPart } from '@deuz-sdk/core/ui';
 import { connectDeuzStream, readDeuzStream } from '@deuz-sdk/core/ui';
 import { assertChatSnapshot, pairViews, restoreUI } from './chat-snapshot';
-import type { ChatSnapshotV1 } from './chat-snapshot';
+import type { ChatSnapshotGateV1, ChatSnapshotV1 } from './chat-snapshot';
 
 /**
  * Fold one wire part via the core reducer. Current core versions preserve the
@@ -877,26 +877,41 @@ export function useChat(options: UseChatOptions): UseChatResult {
   const messageIds = idsRef.current;
   const [status, setStatus] = useState<'idle' | 'streaming' | 'error'>('idle');
   const [error, setError] = useState<Error | undefined>(undefined);
-  const [pendingApprovals, setPendingApprovals] = useState<ToolApprovalRequest[]>([]);
-  const [pendingToolCalls, setPendingToolCalls] = useState<UIToolCall[]>([]);
+  // A restored snapshot's gates (2.4): the chat is still paused on them.
+  const restoredApprovals = restored?.pendingApprovals ?? [];
+  const restoredCalls = restored?.pendingToolCalls ?? [];
+  const restoredGate = restored?.gate;
+  const [pendingApprovals, setPendingApprovals] =
+    useState<ToolApprovalRequest[]>(restoredApprovals);
+  const [pendingToolCalls, setPendingToolCalls] = useState<UIToolCall[]>(restoredCalls);
 
   /** Authoritative snapshot: replaced (never mutated) by `commit`, published to React by `publish`. */
   const snapshotRef = useRef<ChatSnapshot>(snapshot);
   /** The in-flight turn — kept across a drop so `reconnect()` can continue it. */
   const turnRef = useRef<AssistantTurnState | undefined>(restoredTurn);
   /** The turn PARKED on client tool results, so `addToolResult` folds into the same one. */
-  const parkedTurnRef = useRef<AssistantTurnState | undefined>(undefined);
-  const clientToolsRef = useRef<UIToolCall[]>([]);
+  const parkedTurnRef = useRef<AssistantTurnState | undefined>(
+    restoredCalls.length > 0 ? restoredGate?.turn : undefined,
+  );
+  const clientToolsRef = useRef<UIToolCall[]>(restoredCalls);
   const toolResultsRef = useRef<Array<{ toolCallId: string; result: unknown; isError?: boolean }>>(
-    [],
+    restoredCalls.length > 0
+      ? (restoredGate?.toolResults ?? []).map((answer) => ({
+          toolCallId: answer.toolCallId,
+          result: answer.output,
+          ...(answer.isError ? { isError: true } : {}),
+        }))
+      : [],
   );
   /**
    * The gate the chat is PAUSED on: the open approvals of the last settled turn
    * (deduplicated, see `openApprovals`). Emptied the moment its verdicts are
    * sent, so a verdict that arrives later answers nothing (2.3, F06).
    */
-  const approvalsRef = useRef<ToolApprovalRequest[]>([]);
-  const verdictsRef = useRef<ToolApprovalResponse[]>([]);
+  const approvalsRef = useRef<ToolApprovalRequest[]>(restoredApprovals);
+  const verdictsRef = useRef<ToolApprovalResponse[]>(
+    restoredApprovals.length > 0 ? (restoredGate?.approvalResponses ?? []) : [],
+  );
   /**
    * A native run paused on approvals (2.3): the turn and the client calls it
    * also waits for. They run once the verdicts are in, and the verdicts ride
@@ -904,9 +919,26 @@ export function useChat(options: UseChatOptions): UseChatResult {
    */
   const nativeGateRef = useRef<
     { runId: string; turn: AssistantTurnState; clientCalls: UIToolCall[] } | undefined
-  >(undefined);
+  >(
+    restoredApprovals.length > 0 && restoredGate?.runId !== undefined && restoredGate.turn
+      ? {
+          runId: restoredGate.runId,
+          turn: restoredGate.turn,
+          clientCalls: restoredGate.clientCalls ?? [],
+        }
+      : undefined,
+  );
   /** The native run (and its verdicts) the parked client calls resume (2.3). */
-  const parkedNativeRef = useRef<NativeResume | undefined>(undefined);
+  const parkedNativeRef = useRef<NativeResume | undefined>(
+    restoredCalls.length > 0 && restoredGate?.runId !== undefined
+      ? {
+          runId: restoredGate.runId,
+          ...(restoredGate.approvalResponses?.length
+            ? { approvalResponses: restoredGate.approvalResponses }
+            : {}),
+        }
+      : undefined,
+  );
   /**
    * Bumped by `clearGates` (2.3). An `onToolCall` batch that started under an
    * older value belongs to a gate that was dropped meanwhile (a new message, a
@@ -1856,12 +1888,51 @@ export function useChat(options: UseChatOptions): UseChatResult {
     const canonical = snapshotRef.current.history.canonical;
     const cursor = lastEventIdRef.current;
     const turn = turnRef.current;
+    const approvals = approvalsRef.current;
+    const parked = clientToolsRef.current;
+    // The state behind the gate the chat is paused on, as `useChat` resumes it.
+    let gate: ChatSnapshotGateV1 | undefined;
+    if (approvals.length > 0) {
+      const native = nativeGateRef.current;
+      gate = {
+        ...(verdictsRef.current.length > 0 ? { approvalResponses: verdictsRef.current } : {}),
+        ...(native
+          ? { turn: native.turn, runId: native.runId, clientCalls: native.clientCalls }
+          : {}),
+      };
+    } else if (parked.length > 0) {
+      const native = parkedNativeRef.current;
+      const answers = toolResultsRef.current;
+      gate = {
+        ...(parkedTurnRef.current ? { turn: parkedTurnRef.current } : {}),
+        ...(answers.length > 0
+          ? {
+              toolResults: answers.map((answer) => ({
+                toolCallId: answer.toolCallId,
+                output: answer.result,
+                ...(answer.isError ? { isError: true } : {}),
+              })),
+            }
+          : {}),
+        ...(native
+          ? {
+              runId: native.runId,
+              ...(native.approvalResponses?.length
+                ? { approvalResponses: native.approvalResponses }
+                : {}),
+            }
+          : {}),
+      };
+    }
     return {
       version: 1,
       messages: [...canonical],
       messageIds: idsFor(canonical),
       ...(cursor !== undefined ? { cursor } : {}),
       ...(turn ? { turn } : {}),
+      ...(approvals.length > 0 ? { pendingApprovals: [...approvals] } : {}),
+      ...(parked.length > 0 ? { pendingToolCalls: [...parked] } : {}),
+      ...(gate && Object.keys(gate).length > 0 ? { gate } : {}),
     };
   }, [idsFor]);
 

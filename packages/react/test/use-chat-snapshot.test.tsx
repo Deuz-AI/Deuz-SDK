@@ -8,6 +8,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { act, renderHook, waitFor } from '@testing-library/react';
 import type { Message } from '@deuz-sdk/core';
+import type { DeuzUIPart } from '@deuz-sdk/core/ui';
 import { useChat } from '../src/use-chat';
 import type { ChatSnapshotV1 } from '../src/index';
 import { journal, parts, postResponse, recordingFetch, stallingResponse } from './wire';
@@ -385,5 +386,211 @@ describe('useChat({ initialSnapshot }) — the turn in progress and the cursor',
     expect(wire.cursors).toEqual(['4']);
     expect(result.current.messages.map((m) => m.content)).toEqual(['hi', 'Hello, Paris.']);
     expect(result.current.history.canonical).toHaveLength(2);
+  });
+});
+
+/** A verdict as the request body carries it. */
+type Verdict = { approvalId: string; approved: boolean; token?: string };
+
+/** Restores `snapshot` (through JSON) against a recording POST route. */
+function restore(snapshot: ChatSnapshotV1) {
+  const wire = recordingFetch(() => postResponse([parts.text('Done.'), parts.finish()]));
+  const hook = renderHook(() =>
+    useChat({
+      api: '/api/chat',
+      fetch: wire.fetch,
+      initialSnapshot: JSON.parse(JSON.stringify(snapshot)) as ChatSnapshotV1,
+    }),
+  );
+  return { ...hook, bodies: wire.bodies };
+}
+
+describe('useChat({ initialSnapshot }) — gates', () => {
+  it('keeps an approval gate across a remount; the verdict resumes with the restored history', async () => {
+    const live = renderHook(() =>
+      useChat({
+        api: '/api/chat',
+        fetch: recordingFetch(() =>
+          postResponse([
+            parts.start('m-1'),
+            parts.toolCall('d1', 'del', { path: '/a' }),
+            parts.approval('ap1', 'd1', 'del', { path: '/a' }, 'tok-1'),
+            parts.finish(),
+          ]),
+        ).fetch,
+      }),
+    );
+    await act(async () => {
+      await live.result.current.sendMessage('clean up');
+    });
+    await waitFor(() => expect(live.result.current.pendingApprovals).toHaveLength(1));
+    const snapshot = live.result.current.exportSnapshot();
+    expect(snapshot.pendingApprovals).toEqual(live.result.current.pendingApprovals);
+    expect(snapshot.turn).toBeUndefined();
+
+    const restored = restore(snapshot);
+    expect(restored.result.current.pendingApprovals).toEqual(snapshot.pendingApprovals);
+    expect(restored.result.current.messages.map((m) => m.id)).toEqual(snapshot.messageIds);
+    await act(async () => {
+      await restored.result.current.addToolApprovalResponse({ approvalId: 'ap1', approved: true });
+    });
+    await waitFor(() => expect(restored.result.current.status).toBe('idle'));
+    expect(restored.bodies).toHaveLength(1);
+    expect(restored.bodies[0]!.messages).toEqual(snapshot.messages);
+    expect(restored.bodies[0]!.approvalResponses).toEqual([
+      { approvalId: 'ap1', approved: true, token: 'tok-1' },
+    ]);
+    expect(restored.result.current.pendingApprovals).toEqual([]);
+  });
+
+  it('keeps the verdicts a gate already has', async () => {
+    const live = renderHook(() =>
+      useChat({
+        api: '/api/chat',
+        fetch: recordingFetch(() =>
+          postResponse([
+            parts.toolCall('d1', 'del', { path: '/a' }),
+            parts.approval('ap1', 'd1', 'del', { path: '/a' }),
+            parts.toolCall('d2', 'del', { path: '/b' }),
+            parts.approval('ap2', 'd2', 'del', { path: '/b' }),
+            parts.finish(),
+          ]),
+        ).fetch,
+      }),
+    );
+    await act(async () => {
+      await live.result.current.sendMessage('clean up');
+    });
+    await waitFor(() => expect(live.result.current.pendingApprovals).toHaveLength(2));
+    await act(async () => {
+      await live.result.current.addToolApprovalResponse({ approvalId: 'ap1', approved: false });
+    });
+    const snapshot = live.result.current.exportSnapshot();
+    expect(snapshot.gate?.approvalResponses).toEqual([{ approvalId: 'ap1', approved: false }]);
+
+    const restored = restore(snapshot);
+    await act(async () => {
+      await restored.result.current.addToolApprovalResponse({ approvalId: 'ap2', approved: true });
+    });
+    await waitFor(() => expect(restored.result.current.status).toBe('idle'));
+    expect(restored.bodies[0]!.approvalResponses as Verdict[]).toEqual([
+      { approvalId: 'ap1', approved: false },
+      { approvalId: 'ap2', approved: true },
+    ]);
+  });
+
+  it('keeps parked client calls and the results already given; the last one resumes the chat', async () => {
+    const live = renderHook(() =>
+      useChat({
+        api: '/api/chat',
+        fetch: recordingFetch(() =>
+          postResponse([
+            parts.start('m-1'),
+            parts.toolCall('c1', 'pick', { what: 'file' }),
+            parts.toolCall('c2', 'pick', { what: 'dir' }),
+            parts.finish(),
+          ]),
+        ).fetch,
+      }),
+    );
+    await act(async () => {
+      await live.result.current.sendMessage('choose');
+    });
+    await waitFor(() => expect(live.result.current.pendingToolCalls).toHaveLength(2));
+    await act(async () => {
+      await live.result.current.addToolResult({ toolCallId: 'c1', output: 'a.txt' });
+    });
+    const snapshot = live.result.current.exportSnapshot();
+    expect(snapshot.pendingToolCalls?.map((call) => call.toolCallId)).toEqual(['c1', 'c2']);
+    expect(snapshot.gate?.toolResults).toEqual([{ toolCallId: 'c1', output: 'a.txt' }]);
+    expect(snapshot.gate?.turn?.message.id).toBe('m-1');
+
+    const restored = restore(snapshot);
+    expect(restored.result.current.pendingToolCalls).toEqual(snapshot.pendingToolCalls);
+    await act(async () => {
+      await restored.result.current.addToolResult({ toolCallId: 'c2', output: '/tmp' });
+    });
+    await waitFor(() => expect(restored.result.current.status).toBe('idle'));
+    // The answers fold into the restored bubble, which keeps its id.
+    const bubble = restored.result.current.messages.find((m) => m.id === 'm-1');
+    expect(bubble?.toolCalls?.map((call) => [call.toolCallId, call.state, call.output])).toEqual([
+      ['c1', 'result', 'a.txt'],
+      ['c2', 'result', '/tmp'],
+    ]);
+    expect(restored.bodies).toHaveLength(1);
+    expect(restored.bodies[0]!.messages.at(-1)).toEqual({
+      role: 'tool',
+      content: [
+        { type: 'tool_result', toolUseId: 'c1', result: 'a.txt' },
+        { type: 'tool_result', toolUseId: 'c2', result: '/tmp' },
+      ],
+    });
+    expect(restored.result.current.pendingToolCalls).toEqual([]);
+  });
+
+  it('keeps a native run gate: the run id, its verdicts and its client calls ride the resume', async () => {
+    const approval = {
+      approvalId: 'ap1',
+      toolCallId: 'd1',
+      toolName: 'del',
+      input: { path: '/a' },
+    };
+    const agentFrame = (payload: Record<string, unknown>) =>
+      ({ type: 'data-agent', id: String(payload.kind), payload }) as unknown as DeuzUIPart;
+    const live = renderHook(() =>
+      useChat({
+        api: '/api/agent',
+        fetch: recordingFetch(() =>
+          postResponse([
+            parts.start('m-1'),
+            agentFrame({ kind: 'run', seq: 1, runId: 'run-1', status: 'running' }),
+            parts.toolCall('d1', 'del', { path: '/a' }),
+            parts.approval('ap1', 'd1', 'del', { path: '/a' }),
+            parts.toolCall('c1', 'pick', { what: 'file' }),
+            parts.finish(),
+            agentFrame({
+              kind: 'result',
+              seq: 6,
+              runId: 'run-1',
+              status: 'suspended',
+              pendingApprovals: [approval],
+              pendingClientCalls: [{ toolCallId: 'c1', toolName: 'pick', input: { what: 'file' } }],
+            }),
+          ]),
+        ).fetch,
+      }),
+    );
+    await act(async () => {
+      await live.result.current.sendMessage('go');
+    });
+    await waitFor(() => expect(live.result.current.pendingApprovals).toHaveLength(1));
+    const gated = live.result.current.exportSnapshot();
+    expect(gated.gate).toMatchObject({ runId: 'run-1', clientCalls: [{ toolCallId: 'c1' }] });
+
+    // First remount: the verdict lands; the run's client call parks (no onToolCall).
+    const first = restore(gated);
+    await act(async () => {
+      await first.result.current.addToolApprovalResponse({ approvalId: 'ap1', approved: true });
+    });
+    await waitFor(() => expect(first.result.current.pendingToolCalls).toHaveLength(1));
+    expect(first.bodies).toHaveLength(0);
+    const parked = first.result.current.exportSnapshot();
+    expect(parked.gate).toMatchObject({
+      runId: 'run-1',
+      approvalResponses: [{ approvalId: 'ap1', approved: true }],
+    });
+
+    // Second remount: the result resumes the run, with the verdict, in one request.
+    const second = restore(parked);
+    await act(async () => {
+      await second.result.current.addToolResult({ toolCallId: 'c1', output: 'a.txt' });
+    });
+    await waitFor(() => expect(second.result.current.status).toBe('idle'));
+    expect(second.bodies).toHaveLength(1);
+    expect(second.bodies[0]).toMatchObject({
+      runId: 'run-1',
+      approvalResponses: [{ approvalId: 'ap1', approved: true }],
+      clientToolResults: [{ toolCallId: 'c1', output: 'a.txt' }],
+    });
   });
 });
