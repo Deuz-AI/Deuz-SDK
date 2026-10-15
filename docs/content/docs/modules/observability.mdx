@@ -104,6 +104,61 @@ The field exists only when a run was actually observed; nothing about the run it
 - **Durable correlation.** A durable run keeps one `runId` across suspend/resume legs; each leg gets a fresh `executionId`, and `checkpoint.loaded` precedes `run.started { resumed: true }`.
 - **Sub-agents** share the parent's `runId` and are identified by `agentPath`; their usage is folded into the parent exactly once.
 
+## 2.4 spans
+
+The 2.4 subsystems report through the same seam, with no new dependency. Each
+reported operation is an `operation.started` / `operation.completed` (or
+`operation.failed`) pair whose `operation` is the span name and whose
+`subsystem` is `context`, `memory`, `goal`, `schedule`, `process` or `stream`.
+Attributes ride on the events' `attributes` field, split between the two
+events (what is known at the start, then what the work found);
+`createOtelObserver` turns each pair into one OTel span of that name with all
+of them. A moment, such as a cancel request or a fencing refusal, is a
+zero-length span.
+
+```ts
+import { createGoal } from '@deuz-sdk/core/goal';
+import { createDurableScheduler, createInMemoryGoalRuntimeStore } from '@deuz-sdk/core/goal/runtime';
+import { createMemoryObserver } from '@deuz-sdk/core/observe';
+
+const observer = createMemoryObserver();
+const store = createInMemoryGoalRuntimeStore();
+await store.save(createGoal({ goalId: 'digest', scope: 'acme', objective: 'Send the digest.' }, { now: 0 }));
+const scheduler = createDurableScheduler({
+  store,
+  deps: { clock: { now: () => Date.parse('2026-10-15T08:00:00Z'), setTimeout: () => () => {} }, observer },
+});
+await scheduler.put({ scheduleId: 'daily', scope: 'acme', goalId: 'digest', spec: { cron: '0 9 * * *' } });
+await scheduler.tick({ now: Date.parse('2026-10-15T09:00:05Z') });
+
+for (const event of observer.events())
+  if (event.type === 'operation.completed') console.log(event.subsystem, event.operation, event.attributes);
+// schedule deuz.schedule.delivery { 'deuz.schedule.id': 'daily', 'deuz.schedule.occurrence_id': 'daily@1792054800000', ... }
+```
+
+| Span | Attributes |
+| --- | --- |
+| `deuz.context.compile` | `deuz.context.selected`, `.excluded`, `.tokens`, `.estimator`, `.refresh_reason`, `.fallback`, `.cache_prefix_changed`, `.manifest_digest`, and per source `deuz.context.source.<id>.selected`, `.excluded`, `.tokens` |
+| `deuz.memory.op` | `deuz.memory.operation` (`remember`, `extract`, `revise`, `retract`, `forget`, `reembed`, `import`; `prune-history` and `prune-operations` from the SQL stores), `.record_count`, `.conflict_retries`, `.embedding_generation` |
+| `deuz.goal.claim`, `.dispatch`, `.retry`, `.cancel_requested`, `.cancel_applied`, `.drain`, `.generation` | `deuz.goal.id`, `.revision`, `.spec_generation`, `.run_id`, `.attempt` |
+| `deuz.schedule.delivery` | `deuz.schedule.id`, `.occurrence_id`, `.disposition`, `.catch_up`, `.reason` (skipped only), `deuz.goal.id` |
+| `deuz.process.start`, `.poll`, `.cancel`, `.exit`, `.reconcile` | `deuz.process.operation_id`, `.state`, `.replayed`, `.exit_code`, `.truncated`, `.matched`, `.orphans`, `.lost`, `.removed`, `.reconcile_result` |
+| `deuz.stream.batch`, `deuz.stream.fenced` | `deuz.stream.batch_frames`, `.batch_bytes`, `.commit_ms`; `.fencing_token` on a fenced producer |
+
+Attributes carry only counts, ids, digests, token values and small enums:
+never memory text, transcripts, tool output or payloads. In a native run, the
+`deuz.context.compile` span (the overflow recompile included) is a child of the
+step span and shares the run's `runId` and `executionId`. Chat writes and
+transcript searches report no span, and a skill proposal's model call appears
+as an ordinary `generate-text` run.
+
+Each module page lists its own spans:
+[context](/docs/modules/context#telemetry),
+[versioned memory](/docs/modules/versioned-memory#accounting-and-spans),
+[goal runtime](/docs/modules/goal-runtime#telemetry),
+[Docker runner](/docs/modules/docker#telemetry) and
+[durable streams](/docs/modules/chat-durability#telemetry).
+
 ## Tracer bridge
 
 An injected `Dependencies.tracer` now receives the full documented span hierarchy, driven by the same events:

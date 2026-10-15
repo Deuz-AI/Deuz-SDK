@@ -4,6 +4,7 @@
   "defaultOpen": true,
   "pages": [
     "observability",
+    "retention",
     "autonomy",
     "docker",
     "evals",
