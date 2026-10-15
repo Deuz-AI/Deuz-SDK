@@ -29,6 +29,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import pg from 'pg';
+import { createClient } from 'redis';
 import { resumeStreamAgent } from '../../src/agent-run';
 import {
   createDockerProcessRunner,
@@ -567,14 +568,15 @@ export async function disposeFlowEnv(env: FlowEnv): Promise<void> {
   for (const proc of [...env.open]) await proc.close();
   env.docker.removeAll(env.scope);
   if (env.redis) {
-    const store = createRedisDurableStreamStateStore({
-      url: env.redis.url,
-      prefix: env.redis.prefix,
-    });
+    // Every key the flow's stream store wrote lives under its prefix.
+    const client = createClient({ url: env.redis.url });
+    await client.connect();
     try {
-      await store.delete(RUN_ID);
+      for (const pattern of [`{${env.redis.prefix}:*`, `${env.redis.prefix}:*`])
+        for await (const keys of client.scanIterator({ MATCH: pattern, COUNT: 500 }))
+          if (keys.length) await client.unlink(keys);
     } finally {
-      await store.close();
+      await client.quit();
     }
   }
   if (env.pg) {
