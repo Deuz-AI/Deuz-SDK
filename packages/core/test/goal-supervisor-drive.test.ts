@@ -191,6 +191,27 @@ describe('leg outcomes', () => {
     });
   });
 
+  it('parks a goal whose verifier throws or answers a malformed command', async () => {
+    for (const verify of [
+      () => {
+        throw new Error('verifier down');
+      },
+      () => ({ type: 'evaluate', results: 'nope' }) as unknown as GoalCommand,
+    ]) {
+      const w = world();
+      const { supervisor, launcher } = supervisorIn(w, { verify });
+      await supervisor.submit({ goalId: 'g-1', scope: SCOPE, objective: 'x' });
+      await supervisor.tick();
+      await supervisor.tick();
+      expect(launcher.calls).toHaveLength(1);
+      expect((await supervisor.get(SCOPE, 'g-1'))?.goal).toMatchObject({
+        status: 'waiting',
+        waiting: { reason: 'user', note: 'verify-failed' },
+      });
+      expect((await w.store.intents.get(SCOPE, 'g-1#1'))?.status).toBe('completed');
+    }
+  });
+
   it('starts another automatic run while the goal stays active, within maxRuns', async () => {
     const w = world();
     const { supervisor, launcher, seen } = supervisorIn(w, { policy: { maxRuns: 2 } });

@@ -814,15 +814,34 @@ export function createGoalDriver(options: GoalDriverOptions): {
     return transition.changed ? transition.record : goal;
   }
 
-  /** Applies the host's verification of a completed run, one checked write per changed command. */
+  /**
+   * Applies the host's verification of a completed run, one checked write
+   * per changed command: the goal after it, `'conflict'` (decide again on
+   * fresh state), or `'failed'` when the hook threw or answered a command the
+   * goal refuses as malformed.
+   */
   async function verified(
     drive: Drive,
     goal: GoalRecord,
     runId: string,
     result: AgentResult<unknown>,
-  ): Promise<GoalRecord | undefined> {
+  ): Promise<GoalRecord | 'conflict' | 'failed'> {
     if (!options.verify) return goal;
-    const answer = await options.verify({ goal, runId, result });
+    const failed = (error: unknown): 'failed' => {
+      deps.logger.warn('goal supervisor: run verification failed', {
+        scope: goal.scope,
+        goalId: goal.goalId,
+        runId,
+        error,
+      });
+      return 'failed';
+    };
+    let answer: GoalCommand | readonly GoalCommand[] | undefined;
+    try {
+      answer = await options.verify({ goal, runId, result });
+    } catch (error) {
+      return failed(error);
+    }
     const commands: readonly GoalCommand[] =
       answer === undefined
         ? []
@@ -831,13 +850,18 @@ export function createGoalDriver(options: GoalDriverOptions): {
           : [answer as GoalCommand];
     let current = goal;
     for (const command of commands) {
-      if (drive.lost) return undefined;
-      const transition = transitionGoal(current, command, { now: clock.now() });
+      if (drive.lost) return 'conflict';
+      let transition: ReturnType<typeof transitionGoal>;
+      try {
+        transition = transitionGoal(current, command, { now: clock.now() });
+      } catch (error) {
+        return failed(error);
+      }
       if (!transition.changed) continue;
       const runtime = await store.runtime.get(current.scope, current.goalId);
-      if (!runtime) return undefined;
+      if (!runtime) return 'conflict';
       const written = await store.runtime.save(bump(runtime, clock.now()), transition.record);
-      if (written.status === 'conflict') return undefined;
+      if (written.status === 'conflict') return 'conflict';
       reportGeneration(deps, hub, current, transition.record);
       current = transition.record;
     }
@@ -866,7 +890,7 @@ export function createGoalDriver(options: GoalDriverOptions): {
       runId,
       'ok' in outcome ? outcome.ok.result.accounting : undefined,
     );
-    let verifiedOnce = false;
+    let verification: 'pending' | 'done' | 'failed' = 'pending';
     for (let conflicts = 0; conflicts < MAX_CONFLICTS && !drive.lost; conflicts++) {
       const goal0 = await store.load(goalId, { scope });
       const runtime0 = await store.runtime.get(scope, goalId);
@@ -987,12 +1011,24 @@ export function createGoalDriver(options: GoalDriverOptions): {
       }
       if (res.status === 'completed') {
         const goal = goal0;
-        if (!verifiedOnce) {
+        if (verification === 'pending') {
           // Its writes are checked one by one: decide again on what they wrote.
           const after = await verified(drive, goal0, runId, res);
-          if (after === undefined) continue;
-          verifiedOnce = true;
-          if (after !== goal0) continue;
+          if (after === 'conflict') continue;
+          verification = after === 'failed' ? 'failed' : 'done';
+          if (after !== 'failed' && after !== goal0) continue;
+        }
+        if (verification === 'failed') {
+          // A verifier that cannot answer never completes a goal, nor starts another run.
+          const parked = await waitForHost(goal0, 'verify-failed', now);
+          const written = await complete(
+            'completed',
+            outcomeOf(),
+            { ...withoutRun(base), phase: 'idle' },
+            parked,
+          );
+          if (written.status === 'conflict') continue;
+          return;
         }
         const completion = transitionGoal(goal, { type: 'complete' }, { now });
         const finalGoal = completion.changed ? completion.record : goal;
