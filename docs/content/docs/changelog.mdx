@@ -6,6 +6,76 @@ icon: History
 
 All notable changes to `@deuz-sdk/core`. The package follows semver: minor versions are additive, the locked 1.0 type surface only changes in a major.
 
+## 2.4.0
+
+Released 2026-10-16.
+
+**What an agent remembers, what it sees on each call, and work that outlives
+one process.** Versioned memory, a context compiler with working memory,
+transcript search, V3 native runs, a goal supervisor with a durable scheduler
+and webhooks, a local Docker runner, conditional chats, durable streams and
+React chat snapshots; nine new subpaths. Every 2.4 feature is off until you
+configure it, and with none configured, provider requests are byte-identical
+to 2.3.0's. Upgrade notes, behaviour changes and known limits are on
+[What is new in 2.4](/docs/reference/whats-new-2-4). Nothing in this release
+was run against a model provider: model calls are tested against scripted
+models, and the new stores and the Docker runner against real SQLite,
+PostgreSQL, Redis and Docker where the test environment provides them.
+
+- **Versioned memory** (`/memory/versioned`, `/sqlite`, `/postgres`) — records
+  with a stable id, revisions, sources and an asserted or inferred origin,
+  operations with receipts and idempotent replay, revise, retract, forget and a
+  resumable re-embed. → [Versioned memory](/docs/modules/versioned-memory)
+- **Context compiler and working memory** (`/context`) — memory, RAG, past
+  chats and the skill catalog in one token budget, placed append-only, with a
+  manifest of what each step saw, and structured working memory.
+  → [Context compiler](/docs/modules/context)
+- **Transcript search** — scope-checked lexical search over conditional chat
+  stores. → [Transcript search](/docs/modules/transcript-search)
+- **V3 native runs** (`checkpointVersion: 3`) — checkpoints that carry the
+  context packages, the working memory and durable memory intents, with V3 run
+  stores in memory, SQLite and PostgreSQL.
+  → [Native agents](/docs/modules/native-agents#v3-runs-checkpointversion-3)
+- **Goal runtime** (`/goal/runtime`, `/sqlite`, `/postgres`) — a goal
+  supervisor over the native executor, a durable time-zone aware scheduler, a
+  webhook handler that queues into a goal's inbox, and acceptance on evidence
+  with `verifyGoalAcceptance` and `digestWorkspace`.
+  → [Goal runtime](/docs/modules/goal-runtime)
+- **Docker runner** (`/compute/docker`, preview, Node-only) — a sandbox for the
+  compute tools and a process runner that reconnects after a host restart.
+  → [Docker runner](/docs/modules/docker)
+- **Chat and stream continuity** — compare-and-set chat stores with
+  tombstones, durable persist-before-publish streams (preview, Redis included),
+  the capability handshake, and `ChatSnapshotV1` in `@deuz-sdk/react`.
+  → [Chat and stream durability](/docs/modules/chat-durability)
+- **Accounting and retention** — `embed`, RAG, memory and verifier calls on the
+  budget ledger, unaccounted calls refused under `unknownPrice: 'reject'`, and
+  an explicit cleanup call for every new store.
+  → [Budgets](/docs/modules/budgets) · [Retention and forget](/docs/modules/retention)
+- **Skill proposals** (`/skills/learning`, experimental) — a sourced `SKILL.md`
+  draft from one verified run. → [Skills](/docs/modules/skills)
+- **Examples** — three new examples: versioned memory and context in a V3 run
+  (21), a goal supervisor on one SQLite file (22), both keyless, and the
+  Docker runner (23), which needs a local Docker engine.
+
+Fixed: a legacy `StreamStateStore` that cannot report its last seq, or fails an
+append, no longer journals over stored frames or loses frames silently; the
+response warns with `stream-store-error`. `createNodeSandbox` confines
+`runShell`'s `cwd` to the sandbox root, says when output was truncated, and
+kills the whole process tree on a timeout or abort. An interrupted native
+memory extraction completes only when every planned mutation is confirmed.
+`memory_update` drops a stale vector, a legacy vector query no longer ranks
+records of another embedding model or size, and `uiFromMessages` keeps stored
+message ids. `createOtelObserver` keeps a run's span when built-in memory runs
+inside it, and the SQLite ops store reports the error that failed a
+transaction.
+
+`CallWarning['type']`, `BudgetLedgerErrorCode`, `GoalErrorCode`,
+`ObservedSubsystem` and `DeuzUIPart` are widened. `@deuz-sdk/core/react` is
+deprecated and will be removed in 3.0. The new tables have their own version
+tables, so a 2.3 process still opens the same databases; it refuses V3 run
+records.
+
 ## 2.3.0
 
 Released 2026-10-13.

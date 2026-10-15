@@ -40,44 +40,44 @@ const siteDescriptions: Record<Locale, string> = {
 
 const bannerCopy: Record<Locale, { text: string; link: string }> = {
   en: {
-    text: 'Deuz SDK 2.3 is out — an MCP server, A2A, realtime voice, batch requests and Redis backends.',
-    link: 'What is new in 2.3',
+    text: 'Deuz SDK 2.4 is out — versioned memory and a context compiler, a goal supervisor and durable scheduler, a local Docker runner and durable chat streams.',
+    link: 'What is new in 2.4',
   },
   de: {
-    text: 'Deuz SDK 2.3 ist da — MCP-Server, A2A, Echtzeit-Sprache, Batch-Anfragen und Redis-Backends.',
-    link: 'Neu in 2.3',
+    text: 'Deuz SDK 2.4 ist da — versioniertes Gedächtnis und ein Kontext-Compiler, ein Goal-Supervisor und dauerhafter Scheduler, ein lokaler Docker-Runner und dauerhafte Chat-Streams.',
+    link: 'Neu in 2.4',
   },
   tr: {
-    text: 'Deuz SDK 2.3 çıktı — MCP sunucusu, A2A, gerçek zamanlı ses, toplu istekler ve Redis backend’leri.',
-    link: '2.3’te neler yeni',
+    text: 'Deuz SDK 2.4 çıktı — sürümlü bellek ve bağlam derleyicisi, hedef denetleyicisi ve kalıcı zamanlayıcı, yerel Docker çalıştırıcısı ve kalıcı sohbet akışları.',
+    link: '2.4’te neler yeni',
   },
   fr: {
-    text: 'Deuz SDK 2.3 est sorti — serveur MCP, A2A, voix en temps réel, requêtes par lots et backends Redis.',
-    link: 'Nouveautés de la 2.3',
+    text: 'Deuz SDK 2.4 est sorti — mémoire versionnée et compilateur de contexte, superviseur d’objectifs et planificateur durable, exécuteur Docker local et flux de chat durables.',
+    link: 'Nouveautés de la 2.4',
   },
   it: {
-    text: 'Deuz SDK 2.3 è uscito — server MCP, A2A, voce in tempo reale, richieste batch e backend Redis.',
-    link: 'Novità della 2.3',
+    text: 'Deuz SDK 2.4 è uscito — memoria versionata e compilatore di contesto, supervisore degli obiettivi e scheduler durevole, runner Docker locale e stream di chat durevoli.',
+    link: 'Novità della 2.4',
   },
   es: {
-    text: 'Deuz SDK 2.3 ya está aquí — servidor MCP, A2A, voz en tiempo real, solicitudes por lotes y backends de Redis.',
-    link: 'Novedades de 2.3',
+    text: 'Deuz SDK 2.4 ya está aquí — memoria versionada y compilador de contexto, supervisor de objetivos y planificador duradero, ejecutor Docker local y streams de chat duraderos.',
+    link: 'Novedades de 2.4',
   },
   ru: {
-    text: 'Вышел Deuz SDK 2.3 — MCP-сервер, A2A, голос в реальном времени, пакетные запросы и бэкенды Redis.',
-    link: 'Что нового в 2.3',
+    text: 'Вышел Deuz SDK 2.4 — версионируемая память и компилятор контекста, супервизор целей и надёжный планировщик, локальный Docker-раннер и надёжные потоки чата.',
+    link: 'Что нового в 2.4',
   },
   ja: {
-    text: 'Deuz SDK 2.3 リリース — MCP サーバー、A2A、リアルタイム音声、バッチリクエスト、Redis バックエンド。',
-    link: '2.3 の新機能',
+    text: 'Deuz SDK 2.4 リリース — バージョン管理されたメモリとコンテキストコンパイラ、ゴールスーパーバイザーと永続スケジューラ、ローカル Docker ランナー、永続チャットストリーム。',
+    link: '2.4 の新機能',
   },
   ko: {
-    text: 'Deuz SDK 2.3 출시 — MCP 서버, A2A, 실시간 음성, 배치 요청, Redis 백엔드.',
-    link: '2.3의 새로운 점',
+    text: 'Deuz SDK 2.4 출시 — 버전 관리 메모리와 컨텍스트 컴파일러, 목표 감독자와 영속 스케줄러, 로컬 Docker 러너, 영속 채팅 스트림.',
+    link: '2.4의 새로운 점',
   },
   zh: {
-    text: 'Deuz SDK 2.3 已发布 — MCP 服务器、A2A、实时语音、批量请求与 Redis 后端。',
-    link: '2.3 新特性',
+    text: 'Deuz SDK 2.4 已发布 — 版本化记忆与上下文编译器、目标监督器与持久调度器、本地 Docker 运行器以及持久聊天流。',
+    link: '2.4 新特性',
   },
 };
 
@@ -112,10 +112,10 @@ export default async function Layout({ params, children }: LayoutProps<'/[lang]'
     >
       <body className="flex min-h-screen flex-col">
         <RootProvider i18n={i18nProvider(translations, lang)}>
-          <Banner id="deuz-sdk-2-3">
+          <Banner id="deuz-sdk-2-4">
             {banner.text}{' '}
             <Link
-              href={localePath(locale, '/docs/reference/whats-new-2-3')}
+              href={localePath(locale, '/docs/reference/whats-new-2-4')}
               className="font-medium underline underline-offset-4"
             >
               {banner.link}

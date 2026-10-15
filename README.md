@@ -8,7 +8,7 @@
 [![runtime dependencies](https://img.shields.io/badge/runtime_dependencies-0-18181b?style=flat-square)](./packages/core/package.json)
 [![MIT](https://img.shields.io/badge/license-MIT-18181b?style=flat-square)](./LICENSE)
 
-[Documentation](https://deuz-sdk.tech/docs) · [Examples](./examples) · [What's new in 2.3](./docs/content/docs/reference/whats-new-2-3.mdx)
+[Documentation](https://deuz-sdk.tech/docs) · [Examples](./examples) · [What's new in 2.4](./docs/content/docs/reference/whats-new-2-4.mdx)
 
 </div>
 
@@ -37,22 +37,32 @@ if (result.status === 'completed') console.log(result.output);
 
 Use Node.js 22+, or an edge runtime with Web APIs. Node integrations have separate imports.
 
-The repository has twenty [examples](./examples): 01–06 call Anthropic with your key, and 07–20 run without a key or network.
+The repository has twenty-three [examples](./examples): 01–06 call Anthropic with your key, 07–22 run without a key or network, and 23 runs against a local Docker engine without a key.
 
 ## What ships
 
 - **Models** — multiple providers, streaming, structured output, tool calls, realtime voice, and batch requests.
 - **Agents** — typed results, verification, approvals, resumable runs, and memory, chat and model fail-over.
 - **Swarms** — task dependencies, runtime spawning, shared blackboards, rounds, and SQLite, Postgres or Redis persistence.
-- **Operations** — leases, drain, cross-process cancel and recovery, persistent budgets, schedules, goal records, and a headless preview.
+- **Operations** — leases, drain, cross-process cancel and recovery, persistent budgets, schedules, goal records with a goal supervisor, a local Docker runner (preview), and a headless preview.
 - **Evolve** — evolutionary program search with a mandatory budget and zero-call resume.
-- **Context** — memory, retrieval, compaction, and MCP tools.
+- **Context** — versioned memory, a context compiler with working memory, retrieval, compaction, transcript search, and MCP tools.
 - **Interop** — an MCP server, and A2A to call other agents and serve your own.
 - **Control** — shared execution policies, budget accounting, traces, eval suites, and optional React bindings.
 
 Core has zero required runtime dependencies; integrations use optional peers. Without a lease provider, drive each swarm or native agent run from one process; uncertain external effects require reconciliation before retry.
 
 [Agents](./docs/content/docs/modules/native-agents.mdx) · [Swarms](./docs/content/docs/modules/swarm.mdx) · [React](./docs/content/docs/modules/react-hooks.mdx) · [Changelog](./packages/core/CHANGELOG.md)
+
+### New in 2.4
+
+- **Memory and context** — versioned memory with revisions, sources and receipts, a context compiler that places memory, RAG, past chats and the skill catalog into one token budget, structured working memory, and transcript search.
+- **Durable work** — V3 native runs that checkpoint context, working memory and memory writes; a goal supervisor with a durable time-zone scheduler, a webhook inbox and acceptance on evidence; and a local Docker sandbox and process runner (preview).
+- **Chat continuity** — compare-and-set chat stores, durable persist-before-publish streams (preview), a capability handshake, and React chat snapshots.
+- **Accounting** — embeddings, RAG, memory and verifier calls reach the budget ledger.
+- **Retention and forget** — explicit cleanup calls for every 2.4 store, and a forget that redacts the context packages of V3 runs.
+
+Every 2.4 feature is off until you configure it. Nothing in 2.4 was run against a model provider: model calls are tested against scripted models, and the new stores and the Docker runner against real SQLite, PostgreSQL, Redis and Docker where the test environment provides them. Read [What's new in 2.4](./docs/content/docs/reference/whats-new-2-4.mdx) for the upgrade notes and known limits before you deploy.
 
 ### New in 2.3
 
