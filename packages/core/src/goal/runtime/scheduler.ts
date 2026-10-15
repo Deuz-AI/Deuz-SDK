@@ -76,8 +76,10 @@ export interface DurableSchedulerTickResult {
 
 /**
  * The durable scheduler (2.4). Its `put` creates or changes a schedule (a
- * change is a new revision with an explicit UTC transition boundary), `pause`
- * stops new scans, `cancel` also ends deliveries not yet applied.
+ * change is a new revision with an explicit UTC transition boundary; putting
+ * the stored goal, spec and event again, as a host that ensures its schedules
+ * at boot does, changes nothing and keeps catch-up intact), `pause` stops new
+ * scans, `cancel` also ends deliveries not yet applied.
  */
 export interface DurableScheduler {
   put(
@@ -195,6 +197,34 @@ function checkSchedule(input: DurableScheduleInput): DurableScheduleInput {
         }
       : {}),
   };
+}
+
+/** A spec with every default spelled out, as `checkSchedule` stores it. */
+function specKey(spec: ScheduleSpec): string {
+  let timezone = spec.timezone ?? 'UTC';
+  try {
+    timezone = assertTimeZone(timezone);
+  } catch {
+    // A stored zone this runtime does not know compares as written.
+  }
+  return JSON.stringify([
+    spec.cron,
+    timezone,
+    spec.dstGap ?? 'shift',
+    spec.dstOverlap ?? 'first',
+    spec.catchUp ?? 'latest',
+  ]);
+}
+
+/** Whether a checked input says what `stored` already says (goal, spec and event). */
+function sameSchedule(checked: DurableScheduleInput, stored: DurableSchedule): boolean {
+  const eventKey = (event: DurableScheduleInput['event']) =>
+    JSON.stringify([event?.correlationId ?? null, event?.expiresAfterMs ?? null]);
+  return (
+    checked.goalId === stored.goalId &&
+    specKey(checked.spec) === specKey(stored.spec) &&
+    eventKey(checked.event) === eventKey(stored.event)
+  );
 }
 
 function checkLimit(
@@ -678,6 +708,9 @@ export function createDurableScheduler(options: DurableSchedulerOptions): Durabl
       const expected = change?.expectedRevision ?? stored?.revision ?? 0;
       if (expected !== (stored?.revision ?? 0))
         throw conflict(scope, scheduleId, expected, stored?.revision);
+      // The same schedule again (a host ensuring it at every boot) is no change: a new
+      // boundary would drop the occurrences missed meanwhile and end an open window.
+      if (stored && sameSchedule(schedule, stored)) return stored;
       const result = await store.schedules.put(schedule, {
         expectedRevision: expected,
         effectiveFrom: deps.clock.now(),
