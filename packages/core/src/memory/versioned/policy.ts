@@ -1,14 +1,16 @@
 /**
  * The untrusted-source policy of automatic extraction (2.4, spec §2.1): which
  * messages extraction may read, and the source each one becomes. By default
- * only user messages, host input (system messages) and the results of tools
- * the host marked trusted; external content (unmarked tools: MCP, browser,
- * web) only with `allowExternal`, stored with source kind `'external'`;
- * assistant turns only with `allowAssistant`. The kind comes from the message
- * and the host's policy, never from the model. The SDK's own turns in a run
- * or chat transcript (a memory recall block, a compaction summary, a tool-set
- * change notice) are never read under any policy: they are neither host nor
- * user input, and a recall block or summary can carry external content. Edge-safe.
+ * only user messages, host input (system messages) and the results of the
+ * tools the host names in `trustedTools` (trust is declared by tool name
+ * there; a tool has no trust flag of its own); external content (every other
+ * tool: MCP, browser, web) only with `allowExternal`, stored with source kind
+ * `'external'`; assistant turns only with `allowAssistant`. The kind comes
+ * from the message and the host's policy, never from the model. The SDK's
+ * own turns in a run or chat transcript (a memory recall block, a compaction
+ * summary, a tool-set change notice) are never read under any policy: they
+ * are neither host nor user input, and a recall block or summary can carry
+ * external content. Edge-safe.
  */
 import type { MemoryScope } from '../../memory';
 import type { Message, Part, ToolResultPart } from '../../types/message';

@@ -2167,3 +2167,5 @@ export type {
   DeuzCapabilitiesPart,
   DeuzCapability,
 } from './internal/capabilities';
+/** The chat a client restores (2.4), type only: the same type as on `@deuz-sdk/core/chat`. */
+export type { ChatSnapshotGateV1, ChatSnapshotV1 } from './types/chat-snapshot';

@@ -398,7 +398,10 @@ export function createScheduleStoreDouble(
         }
       return count;
     },
-    async pruneOccurrences({ before, scope }) {
+    async pruneOccurrences(options) {
+      // `olderThan` is the spec's name for `before`.
+      const before = options.before ?? options.olderThan!;
+      const scope = options.scope;
       const kept = occurrences.filter(
         (record) =>
           !(record.recordedAt < before && (scope === undefined || record.scope === scope)),

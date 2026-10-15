@@ -34,6 +34,7 @@ interface Job {
   needs?: string | string[];
   env?: Record<string, string | number>;
   services?: Record<string, { image: string }>;
+  strategy?: { 'fail-fast'?: boolean; matrix?: Record<string, unknown> };
   steps?: Step[];
 }
 interface Workflow {
@@ -57,6 +58,17 @@ const coreScripts = (
 const runs = (job: Job | undefined) => (job?.steps ?? []).map((step) => step.run ?? '');
 const nodeVersion = (job: Job | undefined) =>
   job?.steps?.find((step) => step.uses?.startsWith('actions/setup-node'))?.with?.['node-version'];
+/**
+ * Every Node version a job runs on: its setup-node version, or, when that is
+ * `${{ matrix.node }}`, each value of the job's `matrix.node`.
+ */
+const nodeVersions = (job: Job | undefined): string[] => {
+  const version = nodeVersion(job);
+  if (version === undefined) return [];
+  if (!/^\$\{\{\s*matrix\.node\s*\}\}$/.test(String(version))) return [String(version)];
+  const node = job?.strategy?.matrix?.node;
+  return Array.isArray(node) ? node.map(String) : [];
+};
 const env = (job: Job | undefined, name: string) =>
   job?.env?.[name] === undefined ? undefined : String(job.env[name]);
 const needs = (job: Job | undefined) => [job?.needs ?? []].flat();
@@ -94,18 +106,23 @@ describe('ci.yml', () => {
     expect(ci.on).toHaveProperty('workflow_call');
   });
 
-  it('the integration job fails on a missing Postgres or Redis instead of skipping', () => {
+  it('the integration job fails on a missing Postgres or Redis instead of skipping, on Node 22 and 24', () => {
     const job = ci.jobs.integration;
+    // Spec §5.3: the real servers run under both supported Node lines, each leg on its own.
+    expect(nodeVersions(job)).toEqual(['22', '24']);
+    expect(job?.strategy?.['fail-fast']).toBe(false);
     expectBackends(job, ['postgres', 'redis']);
     // `1` would also require Docker, which this job does not opt into.
     expect(env(job, 'DEUZ_TEST_REQUIRE_SERVICES')).toBe('postgres,redis');
     expect(runs(job)).toContain('npm run test -w @deuz-sdk/core');
   });
 
-  it('a docker job runs the core suite on Linux, Node 22, with Docker and every backend required', () => {
+  it('a docker job runs the core suite on Linux, Node 22 and 24, with Docker and every backend required', () => {
     const job = ci.jobs.docker;
     expect(job?.['runs-on']).toBe('ubuntu-latest');
-    expect(String(nodeVersion(job))).toBe('22');
+    // Spec §5.3 "Linux Node 22 ve 24": real SQLite, Postgres, Redis and Docker on both.
+    expect(nodeVersions(job)).toEqual(['22', '24']);
+    expect(job?.strategy?.['fail-fast']).toBe(false);
     expect(env(job, 'DEUZ_TEST_DOCKER')).toBe('1');
     expect(env(job, 'DEUZ_TEST_REQUIRE_SERVICES')).toBe('1');
     // Required services are required: with no server here, every Postgres or Redis test

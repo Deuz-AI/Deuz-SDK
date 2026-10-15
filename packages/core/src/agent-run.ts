@@ -1665,6 +1665,8 @@ function makeAgentStream<T>(
           emit: (event) => eventsV3?.push(event),
           warn: (warning) => runWarnings.add(warning),
           deps: resolveDependencies(options.deps),
+          // Its sources' billable calls (a RAG query embedding) reach the run's ledger.
+          ...(common.execution ? { execution: common.execution } : {}),
         });
         // Redacted retrieval blocks left the history (spec §4.4).
         if (leg.redacted) common.messages = envelope.messages;

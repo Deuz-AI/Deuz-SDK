@@ -8,8 +8,10 @@ import { canonicalJson, digestJson, sha256Digest, type Sha256Digest } from '../i
 import { createTokenEstimator } from '../internal/estimate-tokens';
 import { pinCompilerScope } from '../internal/memory-scope-claims';
 import { resolveDependencies } from '../internal/resolve-deps';
-import { telemetryParentOf } from '../internal/native-context';
+import { runExecutionOf, telemetryParentOf } from '../internal/native-context';
 import { DEUZ_ATTR, DEUZ_SPAN, observeSpan, type TelemetryAttributes } from '../internal/telemetry';
+import type { CallAccounting } from '../types/accounting';
+import type { NativeExecutionContext } from '../types/execution';
 import type { Message } from '../types/message';
 import type { CallWarning } from '../types/methods';
 import { compileContext } from './compile';
@@ -198,7 +200,10 @@ interface StepMemory {
  *   gets `scope`, `candidatesPerSource` and a token hint of its share, and
  *   reads what it holds now: the compiler sends no `recordedAsOf`, since its
  *   clock is not a memory store's. A restarted step does not ask again: the
- *   V3 run sends the step's stored package.
+ *   V3 run sends the step's stored package. In a V3 run each query also
+ *   carries `accounting` (the run's execution context, a request id of its
+ *   own) and `onWarning`, so a source's billable call (a RAG query
+ *   embedding) is charged to the run's ledger.
  * - Automatic refreshes (an active-task change) wait `minSteps` model steps
  *   after the last retrieval; host requests (`requestRefresh()`,
  *   `input.refresh`) do not. A due refresh past `maxPasses` is consumed with
@@ -293,6 +298,21 @@ export function createContextCompiler(options: CreateContextCompilerOptions): Co
     return ask(sources, query, input, inputTokens, usedTokens);
   }
 
+  /**
+   * One query's accounting on the run's execution context. Its request id
+   * is drawn the first time a source reads it, so a query that charges
+   * nothing costs no `generateId()` draw, and stays the same after that.
+   */
+  function queryAccounting(execution: NativeExecutionContext, sourceId: string): CallAccounting {
+    let requestId: string | undefined;
+    return {
+      execution,
+      get requestId() {
+        return (requestId ??= `${execution.scopeId}/context/${sourceId}/${deps.generateId()}`);
+      },
+    };
+  }
+
   /** Asks `list` for `query`: a required source's failure is thrown, an optional one's recorded. */
   async function ask(
     list: readonly ContextSource[],
@@ -302,6 +322,9 @@ export function createContextCompiler(options: CreateContextCompilerOptions): Co
     usedTokens: number,
   ): Promise<ContextSourceResult[]> {
     const hints = budgetHints(inputTokens, usedTokens);
+    // A V3 run's execution: each query may charge one billable call to its
+    // ledger, under a request id of its own (spec §3.1).
+    const execution = runExecutionOf(input);
     // No `recordedAsOf`: a current read needs none, and the compiler's clock
     // (a V3 run's) is not the clock a memory store stamps its revisions with.
     const settled = await Promise.allSettled(
@@ -312,6 +335,12 @@ export function createContextCompiler(options: CreateContextCompilerOptions): Co
           limit,
           budgetTokens: hints.get(source.id) ?? 0,
           ...(input.signal ? { signal: input.signal } : {}),
+          ...(execution
+            ? {
+                accounting: queryAccounting(execution, source.id),
+                ...(options.onWarning ? { onWarning: options.onWarning } : {}),
+              }
+            : {}),
         });
         if (!Array.isArray(answer))
           throw new TypeError(

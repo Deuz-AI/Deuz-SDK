@@ -1655,3 +1655,9 @@ export {
 } from './chat-conditional';
 export type { InMemoryConditionalChatStoreOptions } from './chat-conditional';
 export { RevisionConflictError } from './errors';
+
+// ===================================================================
+// Chat snapshot (2.4) — type only; `@deuz-sdk/react` keeps an identical copy
+// ===================================================================
+
+export type { ChatSnapshotGateV1, ChatSnapshotV1 } from './types/chat-snapshot';

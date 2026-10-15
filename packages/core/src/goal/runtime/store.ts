@@ -17,6 +17,7 @@ import {
   checkIntentInput,
   checkIntentRecordOptions,
   checkMark,
+  checkOccurrencePruneOptions,
   checkPruneOptions,
   checkWatermarkAdvance,
   FINISHED_INTENT_STATUSES,
@@ -430,7 +431,7 @@ export function createInMemoryGoalRuntimeStore(options?: {
       return deleteWhere(entries, (entry) => settledBefore(entry, cut));
     },
     async pruneOccurrences(pruneOptions) {
-      const cut = checkPruneOptions(pruneOptions);
+      const cut = checkOccurrencePruneOptions(pruneOptions);
       return deleteWhere(
         occurrences,
         (record) =>
