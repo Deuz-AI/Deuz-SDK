@@ -130,11 +130,18 @@ describe('/chat and /ui 2.4 additions', () => {
 });
 
 describe('/goal/runtime skeleton', () => {
-  it('publishes the supervisor (a stub until L4b), scheduler, webhook, store and acceptance', async () => {
-    expectStub('createGoalSupervisor', () => goalRuntime.createGoalSupervisor(any));
-    expectStub('createNativeRunLauncher', () => goalRuntime.createNativeRunLauncher(any));
-    // Implemented by L5, L4a and L4c.
+  it('publishes the supervisor, scheduler, webhook, store and acceptance', async () => {
+    // Implemented by L4b: a native launcher needs a V3 store.
+    expect(() => goalRuntime.createNativeRunLauncher(any)).toThrow(TypeError);
+    expect(
+      typeof goalRuntime.createNativeRunLauncher({
+        store: createInMemoryAgentRunStoreV3(),
+        options: () => any,
+      }).launch,
+    ).toBe('function');
+    // Implemented by L4b, L5, L4a and L4c.
     for (const name of [
+      'createGoalSupervisor',
       'createDurableScheduler',
       'createWebhookHandler',
       'toNodeHandler',

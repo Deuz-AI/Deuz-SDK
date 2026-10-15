@@ -18,7 +18,7 @@ import type { Dependencies } from '../../types/deps';
 import type { LeaseProvider } from '../../types/lease';
 import type { ToolApprovalResponse } from '../../types/tool';
 import type { WorkingMemorySnapshot } from '../../context/working-memory/types';
-import { notImplemented } from '../../internal/not-implemented';
+
 import { resolveDependencies } from '../../internal/resolve-deps';
 import { DEUZ_SPAN, recordSpan } from '../../internal/telemetry';
 import { GoalError } from '../errors';
@@ -42,6 +42,7 @@ import type {
   GoalRuntimeStore,
 } from './store-types';
 import { createGoalDriver } from './supervisor-drive';
+import { createNativeRunLauncher as createNative } from './supervisor-native';
 import {
   createEventHub,
   goalAttributes,
@@ -653,11 +654,15 @@ export function createGoalSupervisor(options: GoalSupervisorOptions): GoalSuperv
 }
 
 /**
- * The native `RunLauncher` (2.4): runs, resumes and reconciles V3 runs with
- * the existing executor, loaded with a lazy `import()` so `/goal/runtime`
- * never bundles it statically. Cancel and drain go through the native run's
- * lease.
+ * The native `RunLauncher` (2.4): runs and resumes V3 runs with the existing
+ * executor, loaded with a lazy `import()` so `/goal/runtime` never bundles
+ * it statically. A run its V3 store does not hold is started, a stored one
+ * resumed (`retryFailed` only for a `'retry'` of a transient failure); the
+ * inherited working memory goes to a new run only. Cancel and drain go
+ * through the native run's lease (false without `lease`, or while no
+ * executor holds the run); `accounting` reads the ledger of the run's last
+ * checkpoint and `maintenance` its memory extraction.
  */
-export function createNativeRunLauncher(_options: NativeRunLauncherOptions): RunLauncher {
-  return notImplemented('createNativeRunLauncher');
+export function createNativeRunLauncher(options: NativeRunLauncherOptions): RunLauncher {
+  return createNative(options);
 }
