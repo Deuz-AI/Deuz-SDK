@@ -33,6 +33,8 @@ export interface LoopContextStep {
   model: LanguageModel;
   /** The tools on this step's wire, as the provider receives them. */
   wire?: WireToolRequest;
+  /** The structured-output JSON Schema the request carries (a native final answer call). */
+  outputSchema?: unknown;
   /** The step's span, so the hook's own spans nest under it. */
   telemetry?: TelemetryParent;
   signal?: AbortSignal;

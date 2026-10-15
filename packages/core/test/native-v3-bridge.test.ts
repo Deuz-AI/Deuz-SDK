@@ -10,7 +10,13 @@ import { streamAgent } from '../src/agent-run';
 import { inspectRun } from '../src/node/headless';
 import type { AgentRunStore } from '../src/types/agent-run';
 import { readDeuzStream, toDeuzAgentStreamResponse, type DeuzUIPart } from '../src/ui';
-import { candidate, fakeSource, recordingStoreV3, scriptedModel } from './fixtures/native-v3';
+import {
+  candidate,
+  fakeSource,
+  recordingStoreV3,
+  scriptedModel,
+  type ScriptedCall,
+} from './fixtures/native-v3';
 
 const parameters = { type: 'object' as const, properties: {} };
 
@@ -32,12 +38,12 @@ function shape(parts: DeuzUIPart[]): unknown[] {
 
 describe('a V3 run on the native UI wire', () => {
   it('frames like a 2.3 run, with nothing of its context on the wire', async () => {
-    const script = [
+    const script: ScriptedCall[] = [
       { toolCalls: [{ toolName: 'work', id: 'w1', args: {} }] },
       { text: 'all done' },
-    ] as const;
-    const legacy = scriptedModel([...script]);
-    const v3 = scriptedModel([...script]);
+    ];
+    const legacy = scriptedModel(script);
+    const v3 = scriptedModel(script);
     const tools = { work: { parameters, execute: () => 'worked' } };
     const before = await partsOf(
       toDeuzAgentStreamResponse(streamAgent({ model: legacy.model, prompt: 'go', tools }), {

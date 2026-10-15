@@ -476,7 +476,11 @@ export function createContextHook(input: ContextHookInput): LoopContextHook {
           maxOutputTokens: caps.maxOutput,
         },
         overheadTokens: estimateRequestOverhead(
-          { tools, provider: step.model.provider },
+          {
+            tools,
+            provider: step.model.provider,
+            ...(step.outputSchema !== undefined ? { outputSchema: step.outputSchema } : {}),
+          },
           estimator,
         ),
         ...(workingMemory ? { workingMemory } : {}),

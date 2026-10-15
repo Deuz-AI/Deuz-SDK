@@ -174,3 +174,37 @@ describe('context placement in the native loop', () => {
     expect(input!.step).toBe(0);
   });
 });
+
+describe('context placement in the final answer call', () => {
+  it('compiles the final structured-output call too, counting the output schema', async () => {
+    const rag = fakeSource('docs', 'rag', [candidate('doc-1', 'The deploy target is eu-west.')]);
+    const spy = spyCompiler(createContextCompiler({ sources: [rag.source] }));
+    const store = recordingStoreV3();
+    const { options, requests } = v3Run(store, [{ text: '{"region":"eu-west"}' }], {
+      tools: undefined,
+      context: spy.compiler,
+      workingMemory: { create: { scope: 'tenant', goal: 'Ship the service', now: 1 } },
+      output: {
+        mode: 'json',
+        schema: {
+          type: 'object',
+          properties: { region: { type: 'string' } },
+          required: ['region'],
+        },
+        validate: (value: unknown) => value as { region: string },
+      } as unknown as AgentRunOptionsV3['output'],
+    });
+    const result = await runAgent(options);
+    expect(result).toMatchObject({ status: 'completed', output: { region: 'eu-west' } });
+    const [final] = requests();
+    expect(final!.messages.filter((m) => isContext(m))).toHaveLength(1);
+    expect(isMemoryTail(final!.messages.at(-1)!)).toBe(true);
+    // The output schema is part of the request the budget counts.
+    expect(spy.inputs[0]!.overheadTokens).toBeGreaterThan(0);
+    const stored = (await store.load('run-ctx'))!;
+    expect(stored.context?.steps).toHaveLength(1);
+    // The retrieval block joined the history before the answer; the tail did not.
+    const history = stored.messages.map((m) => (isContext(m) ? 'context' : m.role));
+    expect(history).toEqual(['system', 'user', 'context', 'assistant']);
+  });
+});

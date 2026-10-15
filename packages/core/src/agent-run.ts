@@ -13,7 +13,7 @@ import type {
   AgentToolReceipt,
   AgentValidation,
 } from './types/agent-run';
-import type { LoopContextHook } from './inference/loop-context';
+import { placeContext, type LoopContextHook } from './inference/loop-context';
 import type {
   AgentEventV3,
   AgentRunEnvelopeV3,
@@ -2282,13 +2282,22 @@ function makeAgentStream<T>(
               )
             : undefined;
           const toolRequest = await finalizeToolRequest();
+          // A V3 run's final answer call (2.4) carries its compiled context as a
+          // loop step does: recorded before the call, the output schema counted.
+          const placement = await contextHook?.beforeModelCall({
+            stepIndex: envelope.modelSteps - 1,
+            messages: envelope.messages,
+            model: callModel,
+            ...(toolRequest ? { wire: toolRequest } : {}),
+            ...(outputSchema ? { outputSchema } : {}),
+          });
           const spentBefore = common.execution!.ledger.totals(common.execution!.scopeId).spent.usd;
           const attemptRequests = ledgerRequests();
           const inner = runStream(
             {
               ...common,
               model: callModel,
-              messages: envelope.messages,
+              messages: placeContext(envelope.messages, placement),
               prompt: undefined,
               instructions: undefined,
               tools: undefined,
@@ -2437,6 +2446,13 @@ function makeAgentStream<T>(
           }
           envelope.candidateText = buffer;
           currentText = buffer;
+          // The answer stands (2.4): its retrieval block joins the history
+          // before it, once; the working memory tail never does.
+          if (placement) {
+            contextHook?.afterModelCall?.(await inner.usage);
+            if (placement.append.length > 0)
+              envelope.messages = [...envelope.messages, ...placement.append];
+          }
           // The whole answer turn is kept: reasoning included, so the transcript
           // stays append-only. A forced `json_output` call (tool strategy) is
           // recorded as its JSON text, as before: a stored call would need an
