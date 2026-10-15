@@ -364,3 +364,102 @@ function deepFreeze<T>(value: T): T {
   }
   return value;
 }
+
+describe('proposeSkillFromRun: what the model may not do', () => {
+  const steps = (sources: unknown) => [{ text: 'Do the thing.', sources }];
+
+  it.each<[string, string]>([
+    ['cites an id the record does not have', draftJson({ steps: steps(['S2', 'S99']) })],
+    ['leaves a step without sources', draftJson({ steps: steps([]) })],
+    ['leaves the sources out', draftJson({ steps: [{ text: 'Do the thing.' }] })],
+    ['proposes no step', draftJson({ steps: [] })],
+    ['writes an empty step', draftJson({ steps: [{ text: '  ', sources: ['S1'] }] })],
+    ['suggests a tool the run never called', draftJson({ allowedTools: ['deploy', 'shell'] })],
+    ['suggests a tool whose only call failed', draftJson({ allowedTools: ['page_oncall'] })],
+    ['names the skill after claude', draftJson({ name: 'claude-deploys' })],
+    ['names the skill after anthropic', draftJson({ name: 'anthropic-helper' })],
+    ['uses an uppercase name', draftJson({ name: 'Staging-Deploy' })],
+    ['uses a name over 64 characters', draftJson({ name: 'a'.repeat(65) })],
+    ['writes a description over 1024 characters', draftJson({ description: 'd'.repeat(1025) })],
+    ['writes an empty description', draftJson({ description: ' ' })],
+    ['puts angle brackets in the description', draftJson({ description: 'Use <script>.' })],
+    ['answers with prose', 'Here is a skill: deploy carefully.'],
+    ['answers with malformed JSON', '{"name": "x", "steps": ['],
+  ])('refuses a draft that %s', async (_, text) => {
+    const { model, calls } = recordingModel([{ text }]);
+    const error = await refusal(proposeSkillFromRun({ run: verifiedRun(), model, budget: BUDGET }));
+    expect(error.code).toBe('invalid_proposal');
+    expect(calls()).toBe(1);
+  });
+
+  it('refuses a draft cut off at maxOutputTokens', async () => {
+    const { model } = recordingModel([{ text: draftJson(), finishReason: 'length' }]);
+    const error = await refusal(proposeSkillFromRun({ run: verifiedRun(), model, budget: BUDGET }));
+    expect(error.code).toBe('invalid_proposal');
+    expect(error.message).toContain('cut off');
+  });
+
+  it('refuses a refused draft', async () => {
+    const { model } = recordingModel([{ text: draftJson(), finishReason: 'content_filter' }]);
+    const error = await refusal(proposeSkillFromRun({ run: verifiedRun(), model, budget: BUDGET }));
+    expect(error.code).toBe('invalid_proposal');
+  });
+
+  it('accepts a fenced answer and a draft without tools', async () => {
+    const { model } = recordingModel([
+      { text: '```json\n' + draftJson({ allowedTools: undefined }) + '\n```' },
+    ]);
+    const proposal = await proposeSkillFromRun({ run: verifiedRun(), model, budget: BUDGET });
+    expect(proposal).not.toHaveProperty('allowedTools');
+    expect(proposal.manifest.allowedTools).toBeUndefined();
+    expect(proposal.skillMd).not.toContain('allowed-tools');
+  });
+
+  it('keeps a description with quotes and colons exactly as drafted', async () => {
+    const description = `Ships "billing": checks the team's version, then deploys.`;
+    const { model } = recordingModel([{ text: draftJson({ description }) }]);
+    const proposal = await proposeSkillFromRun({ run: verifiedRun(), model, budget: BUDGET });
+    expect(parseSkill(proposal.skillMd).manifest.description).toBe(description);
+  });
+});
+
+describe('proposeSkillFromRun: source references', () => {
+  it('gives every step the run, message, tool call, model step and digest it cites', async () => {
+    const run = verifiedRun();
+    const { model } = recordingModel([{ text: draftJson() }]);
+    const projection = await projectRun(run);
+    const digest = (id: string) => projection.items.find((item) => item.id === id)!.digest;
+    const proposal = await proposeSkillFromRun({ run, model, budget: BUDGET });
+    expect(proposal.steps[0]!.sources).toEqual([
+      { runId: 'run-billing', modelStep: 1, messageId: 'run-billing:2', digest: digest('S2') },
+      {
+        runId: 'run-billing',
+        modelStep: 1,
+        messageId: 'run-billing:2',
+        toolCallId: 'call_1',
+        digest: digest('S3'),
+      },
+    ]);
+    expect(proposal.steps[2]!.sources.map((ref) => ref.toolCallId)).toEqual([
+      'call_3',
+      'call_3',
+      undefined,
+    ]);
+    for (const step of proposal.steps) {
+      expect(step.sources.length).toBeGreaterThan(0);
+      for (const ref of step.sources) {
+        expect(ref.runId).toBe(run.runId);
+        expect(isSha256Digest(ref.digest)).toBe(true);
+      }
+    }
+  });
+
+  it('lists the cited items under Sources in the SKILL.md', async () => {
+    const { model } = recordingModel([{ text: draftJson() }]);
+    const proposal = await proposeSkillFromRun({ run: verifiedRun(), model, budget: BUDGET });
+    const body = proposal.manifest.body;
+    expect(body).toContain('Proposed from run `run-billing` (revision 7)');
+    expect(body).toContain('- S3: tool call `call_1` (get_version), message `run-billing:2`');
+    expect(body).not.toContain('- S1:');
+  });
+});
