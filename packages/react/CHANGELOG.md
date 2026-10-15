@@ -1,5 +1,24 @@
 # @deuz-sdk/react
 
+## 2.4.0
+
+### Minor Changes
+
+- d75c8bb: `useChat` resume and snapshot fixes:
+  - A turn whose `finish` frame had already arrived now settles when the resume endpoint is caught up (it answers `[DONE]` at once). This covers a read that dropped between `finish` and `[DONE]`, whether it continued on its own over `durable-stream` or through `reconnect()`, and a snapshot taken in that window and restored with `resume.auto`. The answer joins `history.canonical`, and an approval or client-call leg opens its gate. Before, the answer stayed on screen but was missing from the next request, and the chat stalled on the gate. A turn without its `finish` stays unsettled, as before.
+  - With `message-ids`, a replay that starts over keeps a leg that continued the run on the same stream (an approval or client-result continuation, sent without a `start` of its own) when the history does not hold it, and settles it as a message of its own. Before, such a leg was skipped together with the message before it, and the history kept that message's `tool_use` unanswered. Data parts and a native run's result frame that arrive after a skipped message's `finish` are still skipped.
+  - A restored gate whose stored message id repeats (a route without a `messageId` names every response `'deuz-msg'`) folds tool results into its own bubble. Before, `addToolResult` and a native gate's client results rewrote the earlier bubble that kept the id.
+
+- a165c14: **Chat snapshots: `ChatSnapshotV1`, `useChat({ initialSnapshot })` and `exportSnapshot()`.** `exportSnapshot()` captures a chat as plain data you can persist with `JSON.stringify`: the canonical history (`messages`) with one id per message (`messageIds`, aligned like `ChatRecord.messageIds`), the resume cursor, the assistant turn that was still streaming, the approvals the chat is paused on (with the verdicts already given) and the client tool calls it is parked on (with the results already given; a native run's id included). `useChat({ initialSnapshot })` restores all of it, read once at mount: a verdict or a tool result after a page reload resumes the chat exactly as it would have before, and `reconnect()` or `resume.auto` continues the restored turn from the snapshot's cursor, every frame once. `setHistory` still drops pending gates. A stored chat restores as `{ version: 1, messages: record.messages, messageIds: record.messageIds }`. `initialMessages` works as before; `initialSnapshot` takes precedence when both are set, and a snapshot whose `version` is not 1 throws a `TypeError`.
+
+  **Message ids reach the UI (H7).** Restoring renders every message under its stored id, through `uiFromMessages(messages, generateId, { messageIds })`, and the hook applies the ids itself too, so they survive next to a 2.3 core. A missing, empty or repeated id gets a fresh one from `generateId`. Messages are told apart by id, never by text: two messages with the same text stay two messages.
+
+  **Capability handshake (client side).** `useChat` now sends an `x-deuz-capabilities: chat-snapshot-v1, durable-stream, message-ids` request header on every POST and resume read (a function `resume.endpoint` receives the value as `ctx.capabilities`). A 2.4 route that passes `capabilities: { request, announce }` answers in the same response header and in a first stream frame; the hook reads either, exposes the result as `capabilities` and records it in the snapshot. It uses a feature only once the server announced it: with `message-ids`, a resume read that re-delivers a message the history already holds (a replay that starts over) skips it instead of rendering, appending and running it twice; with `chat-snapshot-v1`, request bodies also carry `messageIds` aligned with `messages`, so the server can store the ids the UI renders; with `durable-stream`, a POST read that drops before it ends continues from `resume.endpoint` instead of ending in `status: 'error'`. A 2.3 route announces nothing, and the hook behaves exactly as in 2.3, with the same request bodies.
+
+  **Behaviour change: one more request header.** Cross-origin chat APIs that answer preflights with an explicit `Access-Control-Allow-Headers` list must add `x-deuz-capabilities` to it, or pass `capabilityHandshake: false`, which sends no header and ignores announcements (exactly the 2.3 requests and behaviour). To read the response header cross-origin, expose it with `Access-Control-Expose-Headers`; otherwise the hook reads the announcement from the stream's first frame.
+
+  **Deprecated: `@deuz-sdk/core/react`.** The frozen `useChat` and `useObject` hooks of the core package are deprecated in favour of `@deuz-sdk/react` and will be removed in 3.0. Their behaviour is unchanged; a development build logs one console warning per page, a production build stays silent.
+
 ## 2.3.0
 
 ### Minor Changes

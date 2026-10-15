@@ -8,7 +8,7 @@
     "dev": "node --experimental-strip-types index.ts"
   },
   "dependencies": {
-    "@deuz-sdk/core": "^2.3.0",
+    "@deuz-sdk/core": "^2.4.0",
     "@modelcontextprotocol/client": "^2.3.1",
     "@modelcontextprotocol/server": "^2.3.1"
   },

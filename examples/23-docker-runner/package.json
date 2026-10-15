@@ -9,7 +9,7 @@
     "start": "node --experimental-strip-types index.ts"
   },
   "dependencies": {
-    "@deuz-sdk/core": "^2.3.0"
+    "@deuz-sdk/core": "^2.4.0"
   },
   "devDependencies": {
     "@types/node": "^22.10.0"

@@ -1,4 +1,4 @@
-<!-- verified: 2026-10-15 against @deuz-sdk/core@2.3.0 · api-contract sha256:e126e881213b
+<!-- verified: 2026-10-16 against @deuz-sdk/core@2.4.0 · api-contract sha256:e126e881213b
      sources: docs/content/docs/modules/{observability,pricing,middleware,budgets}.mdx,
      packages/core/src/{budget-ledger,budget-store}.ts, packages/core/src/types/{execution,budget-store}.ts,
      packages/core/src/internal/{native-request,usage-cost,unpriced,unpriced-error}.ts, packages/core/src/node/ops-redis.ts,

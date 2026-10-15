@@ -1,4 +1,4 @@
-<!-- verified: 2026-10-15 against @deuz-sdk/core@2.3.0 · api-contract sha256:e126e881213b
+<!-- verified: 2026-10-16 against @deuz-sdk/core@2.4.0 · api-contract sha256:e126e881213b
      sources: packages/core/src/types/{chat-conditional,stream-durable}.ts, packages/core/src/{chat-conditional,stream-durable,ui,chat,chat-request,durable}.ts,
      packages/core/src/internal/capabilities.ts, packages/core/src/node/{chat-conditional-sqlite,chat-conditional-postgres,
      stream-state-sqlite,stream-state-postgres,stream-state-redis}.ts, packages/react/src/{use-chat,chat-snapshot,index}.ts,
