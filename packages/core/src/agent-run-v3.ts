@@ -54,6 +54,19 @@ function assertContext(context: unknown): void {
     const blob = step.blob;
     if (!isObject(blob) || !isSha256Digest(blob.digest) || !isCount(blob.bytes))
       throw invalid(`context step ${String(step.step)} needs a blob with a sha256 digest`);
+    const first = step.firstAttempt;
+    if (
+      first !== undefined &&
+      (!isObject(first) ||
+        !isObject(first.manifest) ||
+        typeof first.input !== 'string' ||
+        !isObject(first.blob) ||
+        !isSha256Digest(first.blob.digest) ||
+        !isCount(first.blob.bytes))
+    )
+      throw invalid(
+        `the first attempt of context step ${String(step.step)} needs a manifest, its input and a blob with a sha256 digest`,
+      );
   }
   if (context.compiler !== undefined) {
     const compiler = context.compiler;
@@ -199,16 +212,18 @@ export function assertPruneOptions(options: unknown): number {
 }
 
 /**
- * Every context package blob the run points to: its steps' packages, their
- * manifests' blobs and the compiler's last package. Retention keeps a blob
+ * Every context package blob the run points to: its steps' packages (a
+ * step's first attempt included), their manifests' blobs and the compiler's
+ * last package. Retention keeps a blob
  * while one kept run points to it.
  */
 export function agentRunV3BlobDigests(envelope: AgentRunEnvelopeV3): Sha256Digest[] {
   const digests = new Set<Sha256Digest>();
-  for (const step of envelope.context?.steps ?? []) {
-    digests.add(step.blob.digest);
-    if (step.manifest.blob) digests.add(step.manifest.blob.digest);
-  }
+  for (const step of envelope.context?.steps ?? [])
+    for (const recorded of step.firstAttempt ? [step, step.firstAttempt] : [step]) {
+      digests.add(recorded.blob.digest);
+      if (recorded.manifest.blob) digests.add(recorded.manifest.blob.digest);
+    }
   const last = envelope.context?.compiler?.lastPackage;
   if (last) digests.add(last.digest);
   return [...digests];

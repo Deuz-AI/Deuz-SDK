@@ -168,7 +168,10 @@ export function markRedactedSteps(
   redacted: ReadonlySet<Sha256Digest>,
 ): AgentRunEnvelopeV3 {
   if (redacted.size === 0) return envelope;
-  for (const step of envelope.context?.steps ?? [])
+  for (const step of envelope.context?.steps ?? []) {
     if (redacted.has(step.blob.digest)) step.manifest.redacted = true;
+    if (step.firstAttempt && redacted.has(step.firstAttempt.blob.digest))
+      step.firstAttempt.manifest.redacted = true;
+  }
   return envelope;
 }

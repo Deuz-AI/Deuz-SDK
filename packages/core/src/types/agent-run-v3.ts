@@ -98,6 +98,15 @@ export interface AgentRunContextStepV3 {
    * restart, and then uses this package again instead of compiling anew.
    */
   input?: string;
+  /**
+   * The step's first package and the messages it was compiled for, kept when
+   * an overflow retry replaced the package (2.4). The loop's compaction
+   * during the step is never checkpointed, so a step reopened after a crash
+   * during its retry starts again from these messages: it sends this package
+   * again, and its retry the recorded one when the compaction gives the same
+   * messages again (`input`).
+   */
+  firstAttempt?: { manifest: ContextManifest; blob: ContextBlobRef; input: string };
 }
 
 /** A V3 run's context state: the compiler's state and every step's package reference. */

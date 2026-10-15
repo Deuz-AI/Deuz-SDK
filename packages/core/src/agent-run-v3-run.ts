@@ -499,7 +499,11 @@ export interface ContextHookInput {
  * a package a `forget` redacted is compiled again (`redacted` in its
  * manifest), the one documented exception. An overflow retry compiles the
  * step again for just under the failed request's estimate (a package that
- * placed nothing, with no compaction, leaves the provider's overflow).
+ * placed nothing, with no compaction, leaves the provider's overflow); its
+ * package replaces the step's, which stays as the step's `firstAttempt`. A
+ * crash during the retry reopens the step from its first attempt's messages
+ * (the compaction was never checkpointed): it sends that package again, and
+ * its retry the recorded one when the compaction gives the same messages.
  */
 export function createContextHook(input: ContextHookInput): LoopContextHook {
   const { compiler, store, runId } = input;
@@ -550,19 +554,41 @@ export function createContextHook(input: ContextHookInput): LoopContextHook {
     );
   };
 
-  /** Writes the package once by digest and the manifest with the run, then saves. */
-  const record = async (step: number, digest: string, pkg: ContextPackage): Promise<void> => {
+  /**
+   * Writes the package once by digest and the manifest with the run, then
+   * saves. An overflow retry's package (`retry`) replaces the step's, which
+   * stays as its `firstAttempt` (the first one only): the compaction during
+   * the step is never checkpointed, so a reopened step starts from there.
+   */
+  const record = async (
+    step: number,
+    digest: string,
+    pkg: ContextPackage,
+    retry = false,
+  ): Promise<void> => {
     const envelope = input.envelope();
     const steps = envelope.context?.steps ?? [];
     const blob = await contextPackageBlob(pkg);
     const ref = { digest: blob.digest, bytes: blob.bytes };
-    if (!steps.some((entry) => entry.blob.digest === blob.digest))
+    if (
+      !steps.some(
+        (entry) =>
+          entry.blob.digest === blob.digest || entry.firstAttempt?.blob.digest === blob.digest,
+      )
+    )
       await store.putBlob({ digest: blob.digest, content: blob.content, records: blob.records });
+    const previous = retry ? steps.find((other) => other.step === step) : undefined;
+    const firstAttempt =
+      previous?.firstAttempt ??
+      (previous?.input !== undefined && previous.input !== digest
+        ? { manifest: previous.manifest, blob: previous.blob, input: previous.input }
+        : undefined);
     const entry: AgentRunContextStepV3 = {
       step,
       manifest: { ...pkg.manifest, blob: ref },
       blob: ref,
       input: digest,
+      ...(firstAttempt ? { firstAttempt } : {}),
     };
     envelope.context = {
       compiler: compiler.compiler.state(),
@@ -598,18 +624,30 @@ export function createContextHook(input: ContextHookInput): LoopContextHook {
       // Redacted blocks left the history on resume: the next compile retrieves anew.
       let redacted = pendingRedaction;
       pendingRedaction = false;
-      if (!redacted && last && last.input === digest) {
-        // A reopened step: the same context, unless a forget redacted it.
-        const read = await readContextPackage(store, last);
+      // A reopened step: its messages are the ones its package was compiled
+      // for, or those of its first attempt when a crash came during its
+      // overflow retry (the compaction in between was never checkpointed).
+      const first = last?.firstAttempt;
+      const reopened =
+        redacted || !last
+          ? undefined
+          : last.input === digest
+            ? last
+            : first?.input === digest
+              ? { ...first, step: last.step }
+              : undefined;
+      if (reopened) {
+        // The same context, unless a forget redacted it.
+        const read = await readContextPackage(store, reopened);
         if (read.status === 'found')
           return begin(
             step,
-            last.step,
+            reopened.step,
             digest,
             read.package,
-            stepInput(step, last.step).overheadTokens,
+            stepInput(step, reopened.step).overheadTokens,
           );
-        number = last.step;
+        number = reopened.step;
         redacted = read.status === 'redacted';
       }
       const request = stepInput(step, number, redacted ? { redacted: true } : {});
@@ -627,6 +665,25 @@ export function createContextHook(input: ContextHookInput): LoopContextHook {
       // The package placed nothing and the history did not shrink: the
       // provider's overflow stands, as in 2.3.
       if (failed.selectedTokens === 0 && !step.compacted) return undefined;
+      const digest = inputDigest(step.messages);
+      // A step reopened from its first attempt overflowed again and the
+      // compaction gave the messages its recorded retry was compiled for: the
+      // retry sends that package again (a compiler restored after a restart
+      // could not place its optional entries again).
+      const recorded = input
+        .envelope()
+        .context?.steps.find((entry) => entry.step === current!.step);
+      if (recorded?.firstAttempt && recorded.input === digest && current.input !== digest) {
+        const read = await readContextPackage(store, recorded);
+        if (read.status === 'found')
+          return begin(
+            step,
+            recorded.step,
+            digest,
+            read.package,
+            stepInput(step, recorded.step).overheadTokens,
+          );
+      }
       // The request that overflowed (as estimated) did not fit: the retry is
       // compiled for less than that, so optional context shrinks to what the
       // added-context share of the gap allows and mandatory content must fit.
@@ -643,8 +700,7 @@ export function createContextHook(input: ContextHookInput): LoopContextHook {
       // Nothing shrank: the retry would be refused again.
       if (!step.compacted && pkg.manifest.budget.selectedTokens >= failed.selectedTokens)
         return undefined;
-      const digest = inputDigest(step.messages);
-      await record(current.step, digest, pkg);
+      await record(current.step, digest, pkg, true);
       return begin(step, current.step, digest, pkg, request.overheadTokens);
     },
 
@@ -676,15 +732,18 @@ export async function dropRedactedContext(
 ): Promise<boolean> {
   const markers: string[] = [];
   const seen = new Map<string, boolean>();
-  for (const step of envelope.context?.steps ?? []) {
-    if (!step.manifest.placement.append) continue;
-    let redacted = seen.get(step.blob.digest);
+  // A step's first attempt too: a step reopened from it after a crash sent it.
+  const packages = (envelope.context?.steps ?? []).flatMap((step) =>
+    step.firstAttempt ? [step, step.firstAttempt] : [step],
+  );
+  for (const { manifest, blob } of packages) {
+    if (!manifest.placement.append) continue;
+    let redacted = seen.get(blob.digest);
     if (redacted === undefined) {
-      redacted = (await store.getBlob(step.blob.digest)).status === 'redacted';
-      seen.set(step.blob.digest, redacted);
+      redacted = (await store.getBlob(blob.digest)).status === 'redacted';
+      seen.set(blob.digest, redacted);
     }
-    if (redacted)
-      markers.push(`<deuz_context pass="${step.manifest.pass}" step="${step.manifest.step}">`);
+    if (redacted) markers.push(`<deuz_context pass="${manifest.pass}" step="${manifest.step}">`);
   }
   if (markers.length === 0) return false;
   let dropped = false;
