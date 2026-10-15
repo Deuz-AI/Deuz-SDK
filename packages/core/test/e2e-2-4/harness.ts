@@ -251,6 +251,8 @@ export interface DockerHarness {
   options(): { image: string; dockerPath?: string; dockerArgs?: string[] };
   /** The argv that writes `report.txt` with `content` and prints `built`. */
   command(content: string): string[];
+  /** The argv of a job that runs until it is stopped. */
+  longCommand(): string[];
   facts(scope: string, operationId: string): ContainerFacts;
   /** Removes every container of `scope`. */
   removeAll(scope: string): void;
@@ -270,6 +272,8 @@ export async function dockerHarness(): Promise<DockerHarness> {
     options: () => ({ image: FAKE_ENGINE_IMAGE, ...fake.cli }),
     // The fake runs a tiny op script: `write <path> <content>` then `echo`.
     command: (content) => ['sh', '-c', `write report.txt ${content} ; echo built`],
+    // `sleep` leaves the fake container running until it is stopped.
+    longCommand: () => ['sh', '-c', 'sleep'],
     facts(scope, operationId) {
       const mine = fake
         .containers()
@@ -324,6 +328,7 @@ function realDocker(): DockerHarness {
     kind: 'real',
     options: () => ({ image: PINNED_IMAGE, dockerPath: dockerCommand() }),
     command: (content) => ['sh', '-c', `printf '%s' ${content} > report.txt && echo built`],
+    longCommand: () => ['sh', '-c', 'sleep 120'],
     facts(scope, operationId) {
       const ids = labelled(scope, operationId);
       if (ids.length !== 1) return { containers: ids.length, starts: ids.length };
@@ -417,16 +422,27 @@ function decide(request: WireRequest): MockResponse {
   return { text: /"ok":true/.test(results.get('job-1')!) ? FINAL_OK : FINAL_FAILED };
 }
 
-/** A mock model answering through `answer(request)`; every request is logged. */
+/**
+ * A mock model answering through `answer(request)`; every request it answers
+ * is logged. While `faults` holds HTTP statuses, each request takes the next
+ * one instead (a provider outage), unlogged.
+ */
 function policyModel(
   log: WireRequest[],
   answer: (request: WireRequest) => MockResponse,
+  faults: number[] = [],
 ): LanguageModel {
   const turn: MockResponse[] = [{ text: '' }];
   const model = createMockModel({ responses: turn });
   const config = readConfig(model)!;
   const base = config.fetch!;
   config.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const fault = faults.shift();
+    if (fault !== undefined)
+      return new Response(
+        JSON.stringify({ error: { message: 'injected outage', type: 'server_error' } }),
+        { status: fault, headers: { 'content-type': 'application/json' } },
+      );
     const request = JSON.parse(String(init?.body)) as WireRequest;
     log.push(request);
     turn[0] = answer(request);
@@ -516,6 +532,10 @@ export interface FlowEnv {
   outbox: OutboxPost[];
   /** Every request the run's model received, across processes. */
   requests: WireRequest[];
+  /** HTTP statuses the run's model answers its next requests with (a provider outage). */
+  modelFaults: number[];
+  /** The Docker step runs a job that only ends when it is stopped. */
+  slowJob: boolean;
   logs: FlowLog[];
   /** Process names in order. */
   processes: string[];
@@ -543,6 +563,8 @@ export async function createFlowEnv(backend: Backend, docker: DockerHarness): Pr
     docker,
     outbox: [],
     requests: [],
+    modelFaults: [],
+    slowJob: false,
     logs: [],
     processes: [],
     open: new Set(),
@@ -828,7 +850,7 @@ export function openProcess(env: FlowEnv, name: string): HostProcess {
     scope: env.scope,
     deps,
   });
-  const model = policyModel(env.requests, decide);
+  const model = policyModel(env.requests, decide, env.modelFaults);
 
   function tools(runId: string): AgentToolSet {
     return {
@@ -871,7 +893,9 @@ export function openProcess(env: FlowEnv, name: string): HostProcess {
           let session = await runner.start({
             operationId,
             scope: env.scope,
-            command: env.docker.command(`nightly-report-${date}`),
+            command: env.slowJob
+              ? env.docker.longCommand()
+              : env.docker.command(`nightly-report-${date}`),
           });
           // Polled at least once: the state the tool reports is the daemon's now.
           for (let i = 0; i < 600; i++) {
@@ -931,6 +955,9 @@ export function openProcess(env: FlowEnv, name: string): HostProcess {
         },
       },
       capabilities: { contextWindow: 100_000, maxOutput: 4_000 },
+      // A provider error fails the call at once (an injected outage is one
+      // failed call, never retried inside it): the run records it as transient.
+      maxRetries: 0,
       verify: ({ messages }) => verifyRun(messages),
       deps,
     };

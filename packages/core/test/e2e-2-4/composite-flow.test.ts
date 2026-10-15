@@ -389,6 +389,8 @@ async function assertMainFlow(env: FlowEnv, facts: MainFlowFacts, wire: WireClie
   expect((await storedFrames(proc)).length).toBe(stored.length);
 
   // --- the documented spans, with no content in their attributes --------------
+  // The ones this flow does not pass through (retry, generation, drain, a
+  // process cancel, the cancel pair) are asserted by composite-containment.
   const found = spans(env);
   for (const name of [
     'deuz.schedule.delivery',
