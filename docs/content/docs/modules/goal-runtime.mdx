@@ -107,7 +107,9 @@ defaults.
 `submit(input)` takes the fields of `createGoal` plus `policy` and `start`. It
 creates the goal with `specGeneration: 1` unless you give one (supervised goals
 use [spec generations](#spec-generations)), its runtime state, and a start
-intent `<goalId>#1` for the run `<goalId>:run:1`. `start: false` skips only
+intent `<goalId>#1` for the run `<goalId>:run:1`. In general an intent id is
+`<goalId>#<runtime revision it was recorded at>` and an automatic run is
+`<goalId>:run:<n>`; retries and resumes reuse the run id. `start: false` skips only
 that first intent: an active goal still gets an automatic run at the next
 tick, so give it a wait to keep it idle. A goal id that exists in any scope
 throws `GoalError('revision_conflict')`.
@@ -307,10 +309,18 @@ the launcher `lease` (the native run's own lease, apart from the goal lease) for
 them to reach a working run; without it, or while no executor holds the run,
 they answer `false` and the supervisor keeps the cancel for the next claim.
 `accounting` reads the ledger of the run's last checkpoint; `maintenance` reads
-its memory extraction status.
+its memory extraction status (`'completed'` maps to `'complete'`, `'partial'`
+and `'failed'` to `'failed'`).
 
 A `RunLauncher` of your own implements `launch`, `resume`, `cancel`, `drain` and
 optionally `accounting` and `maintenance`, and must be idempotent per `runId`.
+The supervisor calls `launch` only for a `'start'` intent not yet launched, and
+`resume` otherwise. A `RunLaunchRequest` carries `scope`, `goalId`, `intentId`,
+`runId` (the same on every attempt), `attempt`, `kind` (`'start'`, `'resume'`
+or `'retry'`), `goal`, and when they apply `workingMemory`,
+`approvalResponses`, `clientToolResults` and `signal`. A `RunLaunchResult`
+answers `{ runId, result, retryable?, workingMemory?, maintenance? }`.
+`cancel` and `drain` answer `false` when no executor holds the run.
 
 ## Goal runtime stores
 
@@ -333,8 +343,12 @@ the same file or database.
 
 Scopes are checked everywhere. `load(goalId, { scope })` reads a goal of
 another scope as `undefined`, so its existence is not disclosed, and a goal
-never changes scope. Runtime state, inbox entries, schedules, intents and
-watermarks must name a goal stored in their own scope.
+never changes scope: saving it under another scope throws
+`GoalError('scope_mismatch')`. Runtime state, inbox entries, schedules, intents
+and watermarks must name a goal stored in their own scope; `inbox.enqueue` and
+`schedules.put` throw `GoalError('scope_mismatch')` instead of answering a
+conflict. A runtime save that would withdraw or rewrite a recorded cancel
+request throws a `TypeError`.
 `createInMemoryGoalStore` of `@deuz-sdk/core/goal` gained the same
 `load(goalId, { scope })` option.
 
@@ -346,8 +360,8 @@ reason }`, and a conflict writes nothing. The reasons are `goal-revision`,
 | Part | What it keeps |
 | --- | --- |
 | `runtime` | The supervisor's state per goal; `save(state, goal?)` writes both at their next revisions |
-| `inbox` | Deliveries keyed by `goalInboxKey(scope, namespace, deliveryId)`; `enqueue`, `apply`, `get`, `list` (oldest first; `dueBy` leaves out entries whose `notBefore` is later) |
-| `schedules` | Durable schedules keyed by scope and schedule id, and their occurrence records |
+| `inbox` | Deliveries keyed by `goalInboxKey(scope, namespace, deliveryId)`; `enqueue`, `apply`, `get`, `list({ scope, goalId?, dispositions?, dueBy?, limit?, cursor? })` (oldest first; `scope` is required; `dispositions` default `['pending']`; `limit` 1 to 1000, default 100; `dueBy` leaves out entries whose `notBefore` is later) |
+| `schedules` | Durable schedules keyed by scope and schedule id, and their occurrence records: `occurrences({ scope, scheduleId?, limit?, cursor? })` lists them oldest first |
 | `intents` | Run intents: `record`, `claim`, `launched`, `complete`, `list` |
 | `watermarks` | How much of each run's ledger is charged to its goal |
 
@@ -441,8 +455,9 @@ console.log(await supervisor.tick()); // { applied: 1, dispatched: 1, cancelled:
 `DEFAULT_DURABLE_SCHEDULER` holds these defaults. `put(schedule, {
 expectedRevision? })` creates or changes a schedule; the stored `spec` spells
 out every default (`timezone: 'UTC'`, `dstGap: 'shift'`, `dstOverlap: 'first'`,
-`catchUp: 'latest'`). `schedule.event` adds `correlationId` and
-`expiresAfterMs` to every delivered event. A malformed cron, zone, policy,
+`catchUp: 'latest'`). `schedule.event` gives every delivered event its
+`correlationId` and an `expiresAt` of the occurrence time plus
+`expiresAfterMs`; an event past it settles as `'expired'`. A malformed cron, zone, policy,
 catch-up mode or id throws a `TypeError` before anything is written; a target
 goal missing from the scope throws `GoalError('scope_mismatch')`; a stale
 `expectedRevision` throws `GoalError('revision_conflict')`. Omitting
@@ -451,9 +466,14 @@ goal missing from the scope throws `GoalError('scope_mismatch')`; a stale
 `tick({ now?, signal? })` returns the `occurrences` it handled (delivered and
 skipped, in order), the number of `duplicates`, the `backlog` (schedules whose
 due work continues next tick) and the `errors` of schedules whose step failed.
-A failed schedule is logged and tried again next tick while the others still
-advance; `tick` rejects only when listing the schedules fails. `start()` ticks
-at once and then every `pollMs`, and `stop()` waits for the tick in flight.
+Each `errors` entry is `{ scope, scheduleId, error }`. A failed schedule is
+logged (`'durable schedule step failed'`) and tried again next tick while the
+others still advance; `tick` rejects only when listing the schedules fails.
+`start({ signal? })` ticks at once and then every `pollMs` and returns
+`{ stop() }`, which waits for the tick in flight; starting a running scheduler
+throws, and a failed tick is logged (`'durable scheduler tick failed'`) while
+the loop goes on. `get(scope, scheduleId)` and `list(query?)` read the stored
+schedules.
 
 ### Deliveries
 
@@ -492,7 +512,7 @@ The same rules are available on their own from
 An occurrence found within `graceMs` is on time and delivered under any mode.
 When the first due occurrence is older than that, for example after downtime,
 a catch-up window up to now opens and is stored as `scanTo`, so it survives a
-restart.
+restart (`'all'` needs no window: it goes on from the durable cursor).
 
 | `catchUp` | Delivers |
 | --- | --- |
@@ -501,10 +521,13 @@ restart.
 | `'none'` | Only occurrences within `graceMs` of the window's end; older ones are skipped (`'catch-up-none'`) |
 
 Each tick scans at most `maxScanMinutes` of UTC time per schedule and makes at
-most `maxDeliveriesPerTick` deliveries in total. Schedules take turns with a
-fair share of what is left, and the next tick starts after the schedule served
-last, so one large backlog never starves the others. A schedule with nothing
-due writes nothing on a tick.
+most `maxDeliveriesPerTick` deliveries in total; one store write records at
+most `maxDeliveriesPerTick` occurrences, skipped ones included, so a long
+catch-up window takes several writes. Schedules take turns with a fair share
+of what is left, and the next tick starts after the schedule served last, so
+one large backlog never starves the others. A schedule with nothing due writes
+nothing on a tick, except that its cursor moves up once it lags
+`maxScanMinutes / 2` (at least one minute), so a later scan starts close by.
 
 ### Changing, pausing and cancelling
 
@@ -629,8 +652,9 @@ entry's payload until you prune it. Dedupe ids do not expire by default.
 
 `toNodeHandler(handler, { origin? })` serves the handler from `node:http` or
 Express without importing `node:http`. It builds the URL from `origin`, else
-from `http://` and the `Host` header, and streams the body to the handler, so an
-oversized body stops being read. A handler that throws answers `500`
+from `http://` and the `Host` header (an `origin` that is not an absolute URL
+throws a `TypeError`); repeated headers are appended. It streams the body to
+the handler, so an oversized body stops being read. A handler that throws answers `500`
 (`'handler-error'`). With Express, mount it before any body-parsing middleware:
 a body that was already consumed arrives empty.
 
@@ -652,11 +676,18 @@ yourself:
 - `settleGoalEvent(goal, entry, { now })` returns `{ disposition: 'pending',
   retryAt }` for an event early for its `notBefore`, or `'applied'`,
   `'duplicate'`, `'unmatched'`, `'stale'`, `'expired'` or `'terminal'` with the
-  goal to save. An event is applied as it was queued: an event older than a
+  goal to save. Every answer carries the goal's `transition`; a settled one
+  also carries `application`, a ready `store.inbox.apply` input (add the
+  runtime state and run intent it implies), and a `'pending'` one leaves the
+  entry as it is. An event is applied as it was queued: an event older than a
   wait that began after it is `'stale'`, never re-dated.
 - `goalDependencyEvents(goal, { now, goals?, runFinished? })` returns one event
   per dependency of a dependency wait that already finished, keyed by
-  dependency and wait, so a repeated reconcile is a duplicate.
+  dependency and wait, so a repeated reconcile is a duplicate. A goal
+  dependency has finished when it is terminal in the same scope (read through
+  `goals`); a run dependency when `runFinished` says so, and without
+  `runFinished` run dependencies are left alone. A dependency that ended before
+  the wait began still counts.
 
 ## Acceptance on evidence
 
