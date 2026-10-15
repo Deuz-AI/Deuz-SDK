@@ -662,3 +662,156 @@ describe('durable mode: telemetry and configuration', () => {
     ).toThrow(/DurableStreamStateStore/);
   });
 });
+
+describe('durable mode: the lease across legs', () => {
+  /** One leg over `store`: a text part, then the end of the source. */
+  const leg = (
+    store: DurableStreamStateStore,
+    provider: LeaseProvider,
+    text: string,
+    extra: Partial<DurableStreamOptions> = {},
+  ) => {
+    const manual = manualResult();
+    manual.push(textPart(text));
+    manual.end();
+    return toDeuzStreamResponse(manual.result, {
+      streamId: 's',
+      messageId: 'm',
+      durable: { store, lease: { provider }, batch: { maxDelayMs: 0 }, ...extra },
+    });
+  };
+  const texts = async (store: DurableStreamStateStore) =>
+    (await readAll(store, 's'))
+      .map((record) => record.part)
+      .filter((part) => part.type === 'text-delta')
+      .map((part) => (part as { text: string }).text);
+
+  it('goes on after a lease prune reset the token below the stream fence', async () => {
+    const store = createInMemoryDurableStreamStateStore();
+    const provider = createInMemoryLeaseProvider();
+    expect(await leg(store, provider, 'one').text()).toContain('[DONE]');
+    expect(await leg(store, provider, 'two').text()).toContain('[DONE]');
+    // The documented daily retention: the released key goes, its token starts again at 1.
+    expect(await provider.prune!(Date.now() - 86_400_000)).toBe(1);
+    expect(await leg(store, provider, 'three').text()).toContain('[DONE]');
+    expect(await leg(store, provider, 'four').text()).toContain('[DONE]');
+    expect(await texts(store)).toEqual(['one', 'two', 'three', 'four']);
+    expect((await readAll(store, 's')).map((record) => record.seq)).toEqual(
+      // start, then a text and a sentinel per leg: one gapless log.
+      Array.from({ length: 9 }, (_, n) => n),
+    );
+  });
+
+  it('fences a stale producer off when a new one took over its pruned lease', async () => {
+    const time = immediateClock(1_000_000);
+    const provider = createInMemoryLeaseProvider({ clock: time.clock });
+    const store = createInMemoryDurableStreamStateStore();
+    // Two legs ended: the stream's fence is token 2.
+    for (const text of ['one', 'two']) {
+      const body = bodyReader(leg(store, provider, text, { deps: { clock: time.clock } }));
+      await driver(time)(20);
+      expect(await body.rest()).toContain('[DONE]');
+    }
+    // Producer A (token 3) runs, then is cut off from the lease provider.
+    let cutOff = false;
+    const aProvider: LeaseProvider = {
+      ...provider,
+      acquire: (request) => provider.acquire(request),
+      renew: async (lease, ttlMs, options) => {
+        if (cutOff) throw new Error('lease provider unreachable');
+        return provider.renew(lease, ttlMs, options);
+      },
+      release: (lease) => provider.release(lease),
+      signal: (key, signal) => provider.signal(key, signal),
+    };
+    const sourceA = manualResult();
+    const a = bodyReader(
+      toDeuzStreamResponse(sourceA.result, {
+        streamId: 's',
+        messageId: 'm',
+        durable: {
+          store,
+          lease: { provider: aProvider, owner: 'a', ttlMs: 300 },
+          deps: { clock: time.clock },
+        },
+      }),
+    );
+    sourceA.push(textPart('a1'));
+    await driver(time)(20);
+    await a.until('"a1"');
+    cutOff = true;
+    // A's lease expires and the host's retention prunes it: the key starts again at token 1.
+    await time.advance(1_000);
+    expect(await provider.prune!(time.clock.now())).toBe(1);
+    // Producer B takes the key at token 1, below the stream's fence (3), and goes on above it.
+    const sourceB = manualResult();
+    const b = bodyReader(
+      toDeuzStreamResponse(sourceB.result, {
+        streamId: 's',
+        messageId: 'm',
+        durable: {
+          store,
+          lease: { provider, owner: 'b', ttlMs: 300 },
+          deps: { clock: time.clock },
+        },
+      }),
+    );
+    sourceB.push(textPart('b1'));
+    await driver(time)(20);
+    await b.until('"b1"');
+    // A's next commit is refused: nothing it did not commit reaches its client.
+    sourceA.push(textPart('stale-a2'));
+    await time.advance(20);
+    const rawA = await a.rest();
+    expect(rawA).not.toContain('stale-a2');
+    expect(rawA).toContain('a newer producer took over this stream');
+    sourceB.end();
+    await time.advance(20);
+    expect(await b.rest()).toContain('[DONE]');
+    expect(await texts(store)).toEqual(['one', 'two', 'a1', 'b1']);
+  });
+
+  it('still refuses a producer whose lease changed hands before it opened the stream', async () => {
+    const time = immediateClock(1_000_000);
+    const provider = createInMemoryLeaseProvider({ clock: time.clock });
+    const inner = createInMemoryDurableStreamStateStore();
+    let letOpen: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => (letOpen = resolve));
+    let opening = false;
+    const store: DurableStreamStateStore = {
+      ...inner,
+      async open(streamId, token) {
+        opening = true;
+        await gate;
+        return inner.open(streamId, token);
+      },
+    };
+    const manual = manualResult();
+    const text = toDeuzStreamResponse(manual.result, {
+      streamId: 's',
+      messageId: 'm',
+      durable: {
+        store,
+        lease: { provider, owner: 'a', ttlMs: 300 },
+        deps: { clock: time.clock },
+      },
+    }).text();
+    await driver(time, () => opening)(0);
+    // A pauses past its lease; B takes the key (token 2) and opens the stream.
+    await time.advance(1_000);
+    expect(await provider.acquire({ key: 'stream:s', owner: 'b', ttlMs: 30_000 })).toMatchObject({
+      token: 2,
+    });
+    expect(await inner.open('s', 2)).toEqual({ status: 'opened', lastSeq: -1 });
+    letOpen!();
+    expect(await text).toBe(
+      `data: ${JSON.stringify({ type: 'error', message: 'Durable stream: a newer producer took over this stream.' })}\n\n`,
+    );
+    // The stream keeps B's fence.
+    expect(await inner.open('s', 2)).toEqual({ status: 'opened', lastSeq: -1 });
+    expect(await inner.commit({ streamId: 's', token: 2, records: [] })).toEqual({
+      status: 'committed',
+      lastSeq: -1,
+    });
+  });
+});
