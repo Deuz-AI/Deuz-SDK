@@ -10,6 +10,7 @@
  * rewrites them here.
  */
 import { sha256Digest } from '../internal/digest';
+import { pinSourceScope } from '../internal/memory-scope-claims';
 import { scopeKey, scopeWithin } from '../internal/native-scope';
 import { resolveDependencies } from '../internal/resolve-deps';
 import type { MemoryScope, MemoryStore, Embedder } from '../memory';
@@ -119,9 +120,10 @@ function source(
  * compiler's clock; else `clock`). Legacy records carry no revision or origin.
  */
 export function createMemoryContextSource(options: MemoryContextSourceOptions): ContextSource {
+  // A V3 run claims each source's pinned scope, so a nested run may only narrow it.
   if ('session' in options) {
     const { session } = options;
-    return source('memory', options, async (request) => {
+    const recalled = source('memory', options, async (request) => {
       if (request.scope && !scopeWithin(session.scope, request.scope))
         throw new TypeError(
           `The memory session's scope ${scopeKey(session.scope)} is wider than the context scope ${scopeKey(request.scope)}; a scope may only be narrowed.`,
@@ -150,10 +152,11 @@ export function createMemoryContextSource(options: MemoryContextSourceOptions): 
         ),
       );
     });
+    return pinSourceScope(recalled, session.scope);
   }
   const { store, embedder } = options;
   const clock = options.clock ?? resolveDependencies().clock;
-  return source('memory', options, async (request) => {
+  const searched = source('memory', options, async (request) => {
     const scope = narrowScope(options.scope, request.scope);
     let embedding: number[] | undefined;
     if (embedder && request.text) {
@@ -184,6 +187,7 @@ export function createMemoryContextSource(options: MemoryContextSourceOptions): 
       ),
     );
   });
+  return pinSourceScope(searched, options.scope);
 }
 
 /**
@@ -257,7 +261,7 @@ async function transcriptCandidate(
 export function createTranscriptContextSource(
   options: TranscriptContextSourceOptions,
 ): ContextSource {
-  return source('transcript', options, async (request) => {
+  const transcript = source('transcript', options, async (request) => {
     const scope = narrowScope(options.scope, request.scope);
     const around = options.around ?? 0;
     const hits = request.text.trim()
@@ -292,6 +296,7 @@ export function createTranscriptContextSource(
       .filter((candidate): candidate is ContextCandidate => candidate !== undefined)
       .slice(0, request.limit);
   });
+  return pinSourceScope(transcript, options.scope);
 }
 
 /**

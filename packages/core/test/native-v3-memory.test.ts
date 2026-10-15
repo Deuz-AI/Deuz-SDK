@@ -12,6 +12,8 @@
 import { describe, expect, it, vi } from 'vitest';
 import { reconcileAgentRun, resumeAgent, runAgent, streamAgent } from '../src/agent-run';
 import { createInMemoryAgentRunStoreV3 } from '../src/agent-run-v3-store';
+import { createMemoryContextSource } from '../src/context';
+import { createExecutionContext } from '../src/execution-policy';
 import { createInMemoryMemoryStore, type MemorySeams, type MemoryStore } from '../src/memory';
 import { createInMemoryVersionedMemoryStore, createMemorySession } from '../src/memory/versioned';
 import type {
@@ -20,6 +22,7 @@ import type {
   AgentRunOptionsV3,
   AgentRunStoreV3,
 } from '../src/types/agent-run-v3';
+import type { NativeExecutionContext } from '../src/types/execution';
 import { interceptedStore } from './fixtures/versioned-memory-session';
 import { recordingStoreV3, scriptedModel, type ScriptedCall } from './fixtures/native-v3';
 
@@ -250,5 +253,167 @@ describe('legacy memory extraction in a V3 run', () => {
     expect(outcome.memory).toBe('failed');
     expect(outcome.warnings?.[0]?.type).toBe('memory-extraction-partial');
     expect((await store.load('run-partial'))!.memory?.extraction?.status).toBe('partial');
+  });
+});
+
+describe('a nested V3 run may only narrow its parent run memory scope (S1-2)', () => {
+  function seams(): MemorySeams {
+    let n = 0;
+    return {
+      store: createInMemoryMemoryStore(),
+      llm: async () => '{"facts":[]}',
+      clock: { now: () => 5_000, setTimeout: () => () => {} },
+      generateId: () => `mem-${n++}`,
+      hashFn: async (text) => `h:${text}`,
+    };
+  }
+  const planner = { userId: 'ada', agentId: 'planner' };
+
+  /**
+   * Runs a parent native run (`parent` options) whose `helper` tool starts a
+   * nested run on the tool's execution context with `child` options; returns
+   * how the nested run ended (`failed: <message>` or its status).
+   */
+  async function nested(
+    parent: Record<string, unknown>,
+    child: (call: { execution?: NativeExecutionContext }) => Record<string, unknown>,
+  ): Promise<string> {
+    const outer = scriptedModel([
+      { toolCalls: [{ toolName: 'helper', id: 'h1', args: {} }] },
+      { text: 'ok' },
+    ]);
+    let told = '';
+    const result = await runAgent({
+      model: outer.model,
+      prompt: 'ask the helper',
+      execution: createExecutionContext({ scopeId: 'planner' }),
+      ...parent,
+      tools: {
+        helper: {
+          description: 'helper',
+          parameters: { type: 'object', properties: {} },
+          execute: async (_args: unknown, call: { execution?: NativeExecutionContext }) => {
+            const r = await runAgent(child(call) as unknown as AgentRunOptionsV3);
+            told = r.status === 'failed' ? `failed: ${r.error.message}` : r.status;
+            return told;
+          },
+        },
+      },
+    } as unknown as AgentRunOptionsV3);
+    expect(result.status).toBe('completed');
+    return told;
+  }
+
+  const childRemembers = () =>
+    scriptedModel([
+      { toolCalls: [{ toolName: 'memory_remember', id: 'm1', args: { text: 'user-wide fact' } }] },
+      { text: 'child done' },
+    ]).model;
+
+  it('refuses a versioned session wider than a legacy parent scope', async () => {
+    const wide = createMemorySession({
+      store: createInMemoryVersionedMemoryStore(),
+      scope: { userId: 'ada' },
+    });
+    const told = await nested(
+      {
+        memory: { seams: seams(), scope: planner, extract: false, recall: false },
+        session: {
+          store: createInMemoryAgentRunStoreV3(),
+          runId: 'planner',
+          scope: 'eval',
+        },
+        checkpointVersion: 3,
+      },
+      (call) => ({
+        model: childRemembers(),
+        prompt: 'remember something',
+        execution: call.execution!,
+        checkpointVersion: 3,
+        session: { store: createInMemoryAgentRunStoreV3(), runId: 'helper', scope: 'eval' },
+        versionedMemory: { session: wide, tools: true },
+      }),
+    );
+    expect(told).toMatch(/widens/);
+    expect(await wide.recall({ text: 'user-wide' })).toHaveLength(0);
+  });
+
+  it("limits a legacy child by a V3 parent's versioned session scope", async () => {
+    const parentSession = createMemorySession({
+      store: createInMemoryVersionedMemoryStore(),
+      scope: planner,
+    });
+    const told = await nested(
+      {
+        checkpointVersion: 3,
+        session: { store: createInMemoryAgentRunStoreV3(), runId: 'planner', scope: 'eval' },
+        versionedMemory: { session: parentSession },
+      },
+      (call) => ({
+        model: scriptedModel([{ text: 'child done' }]).model,
+        prompt: 'remember something',
+        execution: call.execution!,
+        memory: { seams: seams(), scope: { userId: 'ada' }, extract: false, recall: false },
+      }),
+    );
+    expect(told).toMatch(/widens/);
+  });
+
+  it("refuses a compiler memory source or a context scope wider than the parent's", async () => {
+    const parent = {
+      memory: { seams: seams(), scope: planner, extract: false, recall: false },
+      checkpointVersion: 3 as const,
+      session: { store: createInMemoryAgentRunStoreV3(), runId: 'planner', scope: 'eval' },
+    };
+    const wide = createMemorySession({
+      store: createInMemoryVersionedMemoryStore(),
+      scope: { userId: 'ada' },
+    });
+    const bySource = await nested(parent, (call) => ({
+      model: scriptedModel([{ text: 'child done' }]).model,
+      prompt: 'look it up',
+      execution: call.execution!,
+      checkpointVersion: 3,
+      session: { store: createInMemoryAgentRunStoreV3(), runId: 'helper-1', scope: 'eval' },
+      context: { sources: [createMemoryContextSource({ session: wide })] },
+    }));
+    expect(bySource).toMatch(/widens/);
+    const byScope = await nested(
+      { ...parent, session: { ...parent.session, store: createInMemoryAgentRunStoreV3() } },
+      (call) => ({
+        model: scriptedModel([{ text: 'child done' }]).model,
+        prompt: 'look it up',
+        execution: call.execution!,
+        checkpointVersion: 3,
+        session: { store: createInMemoryAgentRunStoreV3(), runId: 'helper-2', scope: 'eval' },
+        context: { sources: [], scope: { userId: 'ada' } },
+      }),
+    );
+    expect(byScope).toMatch(/widens/);
+  });
+
+  it('lets a child narrow every scope, and releases its claim when it ends', async () => {
+    const narrow = createMemorySession({
+      store: createInMemoryVersionedMemoryStore(),
+      scope: { ...planner, chatId: 'c1' },
+    });
+    const told = await nested(
+      {
+        memory: { seams: seams(), scope: planner, extract: false, recall: false },
+        checkpointVersion: 3,
+        session: { store: createInMemoryAgentRunStoreV3(), runId: 'planner', scope: 'eval' },
+      },
+      (call) => ({
+        model: childRemembers(),
+        prompt: 'remember something',
+        execution: call.execution!,
+        checkpointVersion: 3,
+        session: { store: createInMemoryAgentRunStoreV3(), runId: 'helper', scope: 'eval' },
+        versionedMemory: { session: narrow, tools: true },
+        context: { sources: [createMemoryContextSource({ session: narrow })], scope: planner },
+      }),
+    );
+    expect(told).toBe('completed');
+    expect(await narrow.recall({ text: 'user-wide' })).toHaveLength(1);
   });
 });
