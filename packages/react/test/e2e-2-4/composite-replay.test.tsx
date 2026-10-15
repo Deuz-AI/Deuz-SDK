@@ -19,7 +19,8 @@
  *   `reconnect()`s to the third host, which completes the run.
  *
  * Every frame the hook read is checked once, in order, against the journal;
- * the message ids survive the reload; the goal ends verified.
+ * the message ids survive the reload; the goal ends verified. Three rounds on
+ * clean stores, never retried.
  */
 import { act, renderHook, waitFor, type RenderHookResult } from '@testing-library/react';
 import { afterAll, describe, expect, it, vi } from 'vitest';
@@ -254,81 +255,82 @@ function reviewerPage() {
 }
 
 describe('the composite flow with a React client', () => {
-  it('approves from a snapshot, survives three host crashes and replays every frame once', async () => {
-    const docker = await dockerHarness();
-    const env = await createFlowEnv('sqlite', docker);
-    try {
-      const page = reviewerPage();
-      const facts = await runMainFlow(env, page.client);
-      const proc = facts.last;
-      expect(facts.crashes).toMatchObject({
-        p1: 'memory-commit',
-        p2: 'docker-start-outcome',
-        p3: 'docker-artifact',
-      });
+  for (const round of [1, 2, 3])
+    it(`round ${round}: approves from a snapshot, survives three host crashes and replays every frame once`, async () => {
+      const docker = await dockerHarness();
+      const env = await createFlowEnv('sqlite', docker);
+      try {
+        const page = reviewerPage();
+        const facts = await runMainFlow(env, page.client);
+        const proc = facts.last;
+        expect(facts.crashes).toMatchObject({
+          p1: 'memory-commit',
+          p2: 'docker-start-outcome',
+          p3: 'docker-artifact',
+        });
 
-      // The snapshot taken at the reload: the unsettled turn and its cursor.
-      const snapshot = page.snapshot();
-      expect(snapshot.messageIds).toEqual(['goal-prompt']);
-      expect(snapshot.turn?.message.id).toBe(`${RUN_ID}:turn`);
-      expect(snapshot.cursor).toBeDefined();
-      expect(snapshot.pendingApprovals ?? []).toEqual([]);
+        // The snapshot taken at the reload: the unsettled turn and its cursor.
+        const snapshot = page.snapshot();
+        expect(snapshot.messageIds).toEqual(['goal-prompt']);
+        expect(snapshot.turn?.message.id).toBe(`${RUN_ID}:turn`);
+        expect(snapshot.cursor).toBeDefined();
+        expect(snapshot.pendingApprovals ?? []).toEqual([]);
 
-      // The page after the reload: one assistant turn under the id the
-      // stream's start gave it, the run completed, nothing doubled.
-      const { result } = page.hook();
-      expect(result.current.status).toBe('idle');
-      expect(result.current.agent).toMatchObject({
-        status: 'completed',
-        runId: RUN_ID,
-        output: FINAL_OK,
-      });
-      expect(result.current.messages.map((m) => [m.id, m.role])).toEqual([
-        ['goal-prompt', 'user'],
-        [`${RUN_ID}:turn`, 'assistant'],
-      ]);
-      const assistant = result.current.messages[1]!;
-      expect(assistant.content).toBe(FINAL_OK);
-      const calls = assistant.toolCalls ?? [];
-      expect(calls.filter((call) => call.toolCallId === 'job-1')).toEqual([
-        expect.objectContaining({
-          toolName: 'run_report_job',
-          state: 'result',
-          output: expect.objectContaining({ ok: true, operationId: DOCKER_OPERATION }),
-        }),
-      ]);
-      expect(new Set(calls.map((call) => call.toolCallId)).size).toBe(calls.length);
-      expect(JSON.stringify(result.current.messages)).not.toContain(SECRET_MARK);
+        // The page after the reload: one assistant turn under the id the
+        // stream's start gave it, the run completed, nothing doubled.
+        const { result } = page.hook();
+        expect(result.current.status).toBe('idle');
+        expect(result.current.agent).toMatchObject({
+          status: 'completed',
+          runId: RUN_ID,
+          output: FINAL_OK,
+        });
+        expect(result.current.messages.map((m) => [m.id, m.role])).toEqual([
+          ['goal-prompt', 'user'],
+          [`${RUN_ID}:turn`, 'assistant'],
+        ]);
+        const assistant = result.current.messages[1]!;
+        expect(assistant.content).toBe(FINAL_OK);
+        const calls = assistant.toolCalls ?? [];
+        expect(calls.filter((call) => call.toolCallId === 'job-1')).toEqual([
+          expect.objectContaining({
+            toolName: 'run_report_job',
+            state: 'result',
+            output: expect.objectContaining({ ok: true, operationId: DOCKER_OPERATION }),
+          }),
+        ]);
+        expect(new Set(calls.map((call) => call.toolCallId)).size).toBe(calls.length);
+        expect(JSON.stringify(result.current.messages)).not.toContain(SECRET_MARK);
 
-      // Every frame the hook read, across the POST, the automatic continuation
-      // and the reload's reconnect, arrived once and in order: exactly the
-      // journal's committed frames.
-      expect(page.connections.map((c) => c.kind)).toEqual(['post', 'resume', 'resume']);
-      const read = page.connections.flatMap((c) => frameIds(c.text));
-      const stored = await storedFrames(proc);
-      expect(read).toEqual(
-        stored.filter((record) => record.part.type !== 'done').map((record) => record.seq),
-      );
-      // Each continuation asked from the last frame its hook had read: the
-      // first page after the POST and after the second crash (that request
-      // was held, then abandoned at the reload), the reloaded page from its
-      // snapshot's cursor.
-      const lastRead = (c: { text: string }) => String(frameIds(c.text).at(-1));
-      const [post, continuation] = page.connections;
-      expect(snapshot.cursor).toBe(lastRead(continuation!));
-      expect(page.cursors).toEqual([lastRead(post!), lastRead(continuation!), snapshot.cursor]);
+        // Every frame the hook read, across the POST, the automatic continuation
+        // and the reload's reconnect, arrived once and in order: exactly the
+        // journal's committed frames.
+        expect(page.connections.map((c) => c.kind)).toEqual(['post', 'resume', 'resume']);
+        const read = page.connections.flatMap((c) => frameIds(c.text));
+        const stored = await storedFrames(proc);
+        expect(read).toEqual(
+          stored.filter((record) => record.part.type !== 'done').map((record) => record.seq),
+        );
+        // Each continuation asked from the last frame its hook had read: the
+        // first page after the POST and after the second crash (that request
+        // was held, then abandoned at the reload), the reloaded page from its
+        // snapshot's cursor.
+        const lastRead = (c: { text: string }) => String(frameIds(c.text).at(-1));
+        const [post, continuation] = page.connections;
+        expect(snapshot.cursor).toBe(lastRead(continuation!));
+        expect(page.cursors).toEqual([lastRead(post!), lastRead(continuation!), snapshot.cursor]);
 
-      // The host side ended where the core test checks it in detail.
-      const goal = (await proc.supervisor.get(env.scope, GOAL_ID))!.goal;
-      expect(goal).toMatchObject({ status: 'completed' });
-      expect(env.outbox).toHaveLength(1);
-      expect(docker.facts(env.scope, DOCKER_OPERATION)).toMatchObject({
-        containers: 1,
-        starts: 1,
-      });
-    } finally {
-      await disposeFlowEnv(env);
-      await docker.dispose();
-    }
-  });
+        // The host side ended where the core test checks it in detail.
+        const goal = (await proc.supervisor.get(env.scope, GOAL_ID))!.goal;
+        expect(goal).toMatchObject({ status: 'completed' });
+        expect(env.outbox).toHaveLength(1);
+        expect(docker.facts(env.scope, DOCKER_OPERATION)).toMatchObject({
+          containers: 1,
+          starts: 1,
+        });
+      } finally {
+        await disposeFlowEnv(env);
+        await docker.dispose();
+      }
+    });
 });

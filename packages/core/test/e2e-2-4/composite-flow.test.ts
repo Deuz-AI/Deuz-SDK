@@ -34,6 +34,7 @@ import {
   DOCKER_OPERATION,
   FINAL_OK,
   GOAL_ID,
+  OBJECTIVE,
   OCCURRENCE_AT,
   OTHER_FACT,
   OTHER_MARK,
@@ -53,6 +54,7 @@ import {
   requestText,
   runMainFlow,
   storedFrames,
+  wireText as wireTextOf,
   type FlowClient,
   type FlowEnv,
   type MainFlowFacts,
@@ -221,6 +223,21 @@ async function assertMainFlow(env: FlowEnv, facts: MainFlowFacts, wire: WireClie
   // One model call per step: none repeated a step whose answer was saved, and
   // the supervisor's final leg found a terminal run (no call at all).
   expect(env.requests).toHaveLength(4);
+  // Working memory: the host's goal, in the V3 state and as each request's tail.
+  expect(envelope.workingMemory).toMatchObject({
+    goal: { text: OBJECTIVE, writer: 'host' },
+    goalRef: { goalId: GOAL_ID, specGeneration: 1 },
+  });
+  for (const request of env.requests)
+    expect(wireTextOf(request.messages.at(-1)!)).toMatch(/^<deuz_working_memory /);
+  // The run's ledger is charged to the goal once, above the watermark, over
+  // the two legs the supervisor settled (the routes' legs included).
+  expect(envelope.result?.accounting?.spent.tokens).toBe(envelope.usage.totalTokens);
+  expect(supervised.goal.spent.tokens).toBe(envelope.usage.totalTokens);
+  expect(await proc.goals.watermarks.get(scope, GOAL_ID, RUN_ID)).toMatchObject({
+    tokens: envelope.usage.totalTokens,
+    revision: 2,
+  });
 
   // --- forget, then resume: the redacted package is recompiled ---------------
   expect(facts.forget).toMatchObject({ redaction: 'complete', operationId: 'forget-secret' });
