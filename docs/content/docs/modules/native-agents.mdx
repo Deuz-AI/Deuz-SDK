@@ -989,7 +989,7 @@ fields:
 | --- | --- |
 | `context` | The compiler's state and, per model step, the manifest, the package's blob reference and a digest of the messages it was compiled for |
 | `workingMemory` | The `WorkingMemorySnapshot`, with the task list itself and the active task, so the active task survives a restart |
-| `memoryIntents` | One entry per versioned-memory write: its `operationId`, `status` (`intended`, `planned`, `committed`, `acknowledged`) and, for a versioned extraction, the cited message ids, the request digest, the applied mutation count and the receipt (a tool write records its model step and tool call id) |
+| `memoryIntents` | One entry per versioned-memory write: its `operationId`, `status` (`intended`, `planned`, `committed`, `acknowledged`) and, for a versioned extraction, the cited message ids, the request digest, the applied mutation count, the receipt and `error` when the run's own extraction pass failed (a tool write records its model step and tool call id) |
 | `memory` | The 2.3 memory state; its extraction status adds `'partial'` |
 
 `streamAgent` and `resumeStreamAgent` return an `AgentStreamV3`. It is still an
@@ -1051,8 +1051,12 @@ after a crash.
   the cited message ids and no plan), and the session prepares and commits the
   plan with its receipt in one call. The acknowledgment copies `requestDigest`
   (the request's digest) and `planned` (the mutation count) from the receipt,
-  with `receipt: { scopeRevision, committedAt }`. The extraction reads the input's last user turn and the
-  run's own turns, under the session's extraction policy.
+  with `receipt: { scopeRevision, committedAt }`. The extraction reads the
+  input's last user turn and the run's own turns, under the session's
+  extraction policy. When `session.extract` throws after the run's outcome,
+  the run saves why on the intent (`error`: `name`, `message` and `code` when
+  there is one) and keeps its status, so `reconcileAgentRun` can still settle
+  it; the acknowledgment clears `error`.
 
 ```ts
 import {

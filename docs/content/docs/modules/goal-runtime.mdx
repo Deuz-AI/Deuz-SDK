@@ -332,17 +332,22 @@ launcher used on its own has no lease. Without one, or while no executor holds
 the run, they answer `false` and the supervisor keeps the cancel for the next
 claim.
 
-A run with the 2.3 `memory` option returns its leg once its outcome is
-committed, with maintenance `'pending'` while the extraction finishes. A run
-that only has `versionedMemory.extract` still makes the leg wait for its
-extraction. A leg that another executor of the run refused (`lease_held`,
+Both the 2.3 `memory` extraction and the 2.4 `versionedMemory.extract`
+extraction are followed as maintenance: the leg returns once the run's outcome
+is committed, with maintenance `'pending'` while the extraction finishes. A
+model tool's memory write is never maintenance. A leg that another executor of the run refused (`lease_held`,
 `lease_lost`, or an executor in the same process) is reported as
 `heldElsewhere`: the supervisor keeps the intent and the active run, goes back
 to `dispatching` without spending a retry, and a later claim resumes the same
 run.
-`accounting` reads the ledger of the run's last checkpoint; `maintenance` reads
-its memory extraction status (`'completed'` maps to `'complete'`, `'partial'`
-and `'failed'` to `'failed'`).
+
+`accounting` reads the ledger of the run's last checkpoint. `maintenance` reads
+the run's extractions: a 2.3 extraction's status (`'completed'` maps to
+`'complete'`, `'partial'` and `'failed'` to `'failed'`), and a versioned
+extraction's intent, `'complete'` once it is acknowledged and `'failed'` when
+the run's own pass failed (`AgentRunMemoryIntentV3.error` is set, and the
+intent stays for `reconcileAgentRun`, which clears it). The run's maintenance
+is `'pending'` while any extraction is, else `'failed'` when any failed.
 
 A `RunLauncher` of your own implements `launch`, `resume`, `cancel`, `drain` and
 optionally `accounting` and `maintenance`, and must be idempotent per `runId`.

@@ -692,7 +692,10 @@ try {
 `agentRunLeaseKey({ scope, runId })` (`agent:["<scope>","<runId>"]`), before it
 reads the run, renews it at once and then every `ttlMs / 3` (default 30 000) on
 `deps.clock`, also while it reads the run, and releases it when the run returns,
-whatever the outcome. `owner` defaults to a generated ID per run.
+whatever the outcome. Giving the lease back is best effort: a `LeaseProvider`
+that throws or rejects at that point (a closed client, a host shutting down)
+no longer keeps the run's result from settling. `owner` defaults to a
+generated ID per run.
 
 - While another executor holds the key, the run fails at once with an error
   named `AgentRunLeaseError`, code `'lease_held'`. Nothing is read, written or

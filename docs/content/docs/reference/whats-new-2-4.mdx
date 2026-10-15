@@ -862,7 +862,7 @@ Exhaustive `switch` statements over these types need a new case:
 | ----------------------- | ------------------------------------------------------------------------------------------------------------ |
 | `CallWarning['type']`   | `'embedding-mismatch'`, `'unaccounted-usage'`, `'context-source-failed'`, `'stream-store-error'`, `'memory-extraction-partial'` |
 | `BudgetLedgerErrorCode` | `'unaccounted_call'`                                                                                         |
-| `GoalErrorCode`         | `'lease_lost'`, `'stale'`, `'policy_limit'`, `'delivery_conflict'`                                           |
+| `GoalErrorCode`         | `'delivery_conflict'`; `'lease_lost'`, `'stale'` and `'policy_limit'` are reserved and never thrown in 2.4   |
 | `ObservedSubsystem`     | `'context'`, `'goal'`, `'schedule'`, `'process'`, `'stream'`                                                 |
 | `DeuzUIPart`            | `{ type: 'capabilities' }`, consumed by `useChat` and ignored by `applyUIPart`                              |
 

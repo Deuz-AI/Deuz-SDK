@@ -339,7 +339,7 @@ Leases do not make external effects exactly-once. A task interrupted by a takeov
 
 ### Native runs across processes (2.3)
 
-`runAgent`, `streamAgent`, `resumeAgent` and `resumeStreamAgent` take `lease: { provider, owner?, ttlMs? }` (requires `session`). The executor holds the run's key, `agentRunLeaseKey({ scope, runId })` from `@deuz-sdk/core/ops`, from before it reads the run until it returns, renewing it at once after the claim and then every `ttlMs / 3`.
+`runAgent`, `streamAgent`, `resumeAgent` and `resumeStreamAgent` take `lease: { provider, owner?, ttlMs? }` (requires `session`). The executor holds the run's key, `agentRunLeaseKey({ scope, runId })` from `@deuz-sdk/core/ops`, from before it reads the run until it returns, renewing it at once after the claim and then every `ttlMs / 3`. Giving the lease back is best effort (2.4): a provider that throws or rejects then no longer keeps the run's result from settling.
 
 ```ts
 import { createInMemoryAgentRunStore, runAgent } from '@deuz-sdk/core/agent';
