@@ -14,7 +14,11 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('@deuz-sdk/core/agent', () => import('../src/agent'));
 vi.mock('@deuz-sdk/core/context', () => import('../src/context/index'));
+vi.mock('@deuz-sdk/core/goal/runtime', () => import('../src/goal/runtime/index'));
+vi.mock('@deuz-sdk/core/goal/runtime/sqlite', () => import('../src/node/goal-runtime-sqlite'));
 vi.mock('@deuz-sdk/core/memory/versioned', () => import('../src/memory/versioned/index'));
+vi.mock('@deuz-sdk/core/ops/sqlite', () => import('../src/node/ops-sqlite'));
+vi.mock('@deuz-sdk/core/schedule', () => import('../src/schedule'));
 vi.mock('@deuz-sdk/core/testing', () => import('../src/testing'));
 
 /** The temporary directories an example made (22 and 23 keep their SQLite files in one). */
@@ -65,7 +69,7 @@ function section(lines: string[], step: number): string {
 }
 
 /** The last run kept its files in one temporary directory and removed it when it finished. */
-export function expectTempDirRemoved(): void {
+function expectTempDirRemoved(): void {
   expect(tempDirs).toHaveLength(1);
   expect(existsSync(tempDirs[0]!), tempDirs[0]).toBe(false);
 }
@@ -132,5 +136,62 @@ describe('examples/21-versioned-memory-context', () => {
     expect(resumed).toContain('memory intents: acknowledged');
     expect(resumed).toMatch(/Ada's records now: (?=.*mem-1 r1)(?=.*mem-2 r2)(?=.*mem-4 r1)/);
     expect(resumed).not.toContain('mem-3 r');
+  }, 30_000);
+});
+
+describe('examples/22-goal-supervisor', () => {
+  it('runs schedule -> inbox -> supervisor -> V3 run across a restart and an approval, then verifies', async () => {
+    const lines = await run('22-goal-supervisor');
+    const thursday = section(lines, 1);
+    const caughtUp = section(lines, 2);
+    const approved = section(lines, 3);
+    const cancelled = section(lines, 4);
+
+    // The goal waits for its schedule; 09:00 Berlin is 07:00Z before the clocks go back, 08:00Z after.
+    expect(thursday).toContain('goal deps-clean: active, spec generation 1');
+    expect(thursday).toContain('goal waiting for schedule weekly-audit');
+    expect(thursday).toContain(
+      'schedule weekly-audit r1: Mondays 09:00 Europe/Berlin, next 2026-10-19 07:00Z and 2026-10-26 08:00Z',
+    );
+    expect(thursday).toContain('ticks: 0 occurrences due, 0 runs dispatched');
+
+    // After the restart: one catch-up delivery, applied with its start intent, one run that suspends.
+    expect(caughtUp).toContain('host B opens deuz.sqlite');
+    expect(caughtUp.match(/occurrence weekly-audit at .*: delivered/g)).toHaveLength(1);
+    expect(caughtUp).toContain('occurrence weekly-audit at 2026-10-19 07:00Z: delivered');
+    expect(caughtUp).toContain('a second tick: 0 occurrences');
+    expect(caughtUp).toContain('[supervisor] claimed deps-clean under its goal lease');
+    expect(caughtUp).toContain(
+      '[supervisor] inbox entry schedule:weekly-audit weekly-audit@2026-10-19 07:00Z: applied',
+    );
+    expect(caughtUp).toMatch(
+      /\[supervisor\] start intent for run deps-clean:run:1\n.*\[tool\] audit_dependencies: 2 vulnerable[^\n]*\n.*\[supervisor\] run deps-clean:run:1 suspended/,
+    );
+    expect(caughtUp).toContain('supervisor tick: 1 inbox entry applied, 1 run dispatched');
+    expect(caughtUp).toContain('goal waiting (user: approval), run deps-clean:run:1 kept');
+    expect(caughtUp).toContain(
+      'waiting for approval: upgrade_packages({"packages":["lodash@4.17.21","minimist@1.2.8"]})',
+    );
+    expect(caughtUp).not.toContain('[tool] upgrade_packages');
+
+    // The approval resumes the same run once; the verifier passes the clean report; the goal completes.
+    expect(approved).toContain('[supervisor] resume intent for run deps-clean:run:1');
+    expect(approved).not.toContain('start intent');
+    expect(approved.match(/\[tool\] upgrade_packages\(/g)).toHaveLength(1);
+    expect(approved).toContain('[tool] audit_dependencies: 0 vulnerable (reports/audit-2.json)');
+    expect(approved).toContain('[supervisor] run deps-clean:run:1 completed');
+    expect(approved).toContain('[verify] no-vulnerable-deps: passed on reports/audit-2.json');
+    // Four mock calls of 10 + 5 tokens, charged once.
+    expect(approved).toContain('goal completed (accepted), spent 60 of 20000 tokens');
+    expect(approved).toContain(
+      'evidence verifier: dependency-audit@1, reports/audit-2.json, generation 1, run deps-clean:run:1',
+    );
+    expect(approved).toContain('run deps-clean:run:1: version 3, terminal, completed');
+
+    // The cancelled schedule delivers nothing more.
+    expect(cancelled).toContain('schedule weekly-audit: cancelled, revision 2');
+    expect(cancelled).toContain('tick at 2026-10-26 08:00Z: 0 occurrences');
+    expect(cancelled).toContain('occurrence records: 2026-10-19 07:00Z delivered');
+    expectTempDirRemoved();
   }, 30_000);
 });
