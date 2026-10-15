@@ -161,11 +161,14 @@ console.log((await runs.getBlob(blob.digest)).status); // redacted
   revisions matches them all. The store also remembers the forget, so a
   package written later with the same record is stored redacted.
 - `redactForgotten(event)` also rewrites the runs that point to a redacted
-  package. Every stored copy of its retrieval block (the
-  `<deuz_context pass="P" step="S">` message) in the run's history, in every
-  checkpoint and in the stored result's messages, a terminal run's
-  `result.messages` included, becomes a stand-in that keeps the marker and
-  holds no record. Message count, roles and order stay the same. The rewrite
+  package. Every stored copy of its retrieval block (the exact
+  `<deuz_context pass="P" step="S">` message the compiler appended) that holds
+  a forgotten record, in the run's history, in every checkpoint and in the
+  stored result's messages, a terminal run's `result.messages` included,
+  becomes a stand-in that keeps the marker and holds no record. A user's
+  message that only opens with such a marker stays, and so does an overflow
+  retry's block, which carries its first attempt's marker but dropped the
+  forgotten record. Message count, roles and order stay the same. The rewrite
   is in place: the run keeps its revision and its last-save time, so its
   retention window does not move, and a repeated forget changes nothing. A
   later save of such a run is stored the same way.
@@ -179,10 +182,12 @@ console.log((await runs.getBlob(blob.digest)).status); // redacted
 A redacted package changes one rule of V3 recovery. A step reopened after a
 restart normally reuses its stored package, so the model sees the same context
 again. When that package was redacted, the step is compiled again instead
-(refresh `'redacted'`, `manifest.redacted: true`); on resume, the retrieval
-blocks of redacted packages (stand-ins included) are removed from the run's
-history and checkpoints, and the manifest records `cachePrefixChanged: true`. This is the
-only case in which a resumed step does not reuse its context.
+(refresh `'redacted'`, `manifest.redacted: true`); on resume, the stand-ins
+and any retrieval block that held a forgotten record are removed from the
+run's history and checkpoints (a block under the same marker whose package is
+still found, an overflow retry's, stays), and the manifest records
+`cachePrefixChanged: true`. This is the only case in which a resumed step does
+not reuse its context.
 
 The forget records the run store keeps hold record ids and revisions, never
 text. The SQLite and PostgreSQL V3 stores keep them in `deuz_runs_v3_forgotten`.
@@ -206,6 +211,10 @@ stored copies of their retrieval blocks. It does not touch:
   keeps the block and can still send it until the leg ends or the run is
   resumed;
 - run stores not subscribed through `onForget`;
+- a retrieval block a run received in its input messages, such as a previous
+  run's `result.messages` passed to `runAgent({ messages })`: it is not
+  redacted in that run's record, so continue from the chat projection or the
+  transcript, which carry no retrieval blocks;
 - observability backends: 2.4 spans carry ids, counts and digests, never
   content, but your own logs may;
 - files, exports and model provider logs outside the SDK.
@@ -226,5 +235,5 @@ observer. The other prune calls report no span. See
   windows longer than any retry or redelivery you expect.
 - Redaction covers the context packages of V3 runs, and the runs' stored
   copies of their retrieval blocks, in a store that subscribes to the forget.
-  Packages in a store that was not subscribed, or copies you made, are not
-  redacted.
+  Packages in a store that was not subscribed, copies you made, and blocks a
+  run received in its input messages are not redacted.

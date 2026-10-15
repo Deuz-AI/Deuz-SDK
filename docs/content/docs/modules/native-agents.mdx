@@ -989,7 +989,7 @@ fields:
 | --- | --- |
 | `context` | The compiler's state and, per model step, the manifest, the package's blob reference and a digest of the messages it was compiled for |
 | `workingMemory` | The `WorkingMemorySnapshot`, with the task list itself and the active task, so the active task survives a restart |
-| `memoryIntents` | One entry per versioned-memory write: its `operationId`, `status` (`intended`, `planned`, `committed`, `acknowledged`) and, for a versioned extraction, the cited message ids, the request digest, the applied mutation count and the receipt (a tool write records its model step and tool call id) |
+| `memoryIntents` | One entry per versioned-memory write: its `operationId`, `status` (`intended`, `planned`, `committed`, `acknowledged`) and, for a versioned extraction, the cited message ids, the request digest, the applied mutation count, the receipt and `error` when the run's own extraction pass failed (a tool write records its model step and tool call id) |
 | `memory` | The 2.3 memory state; its extraction status adds `'partial'` |
 
 `streamAgent` and `resumeStreamAgent` return an `AgentStreamV3`. It is still an
@@ -1018,9 +1018,10 @@ are on the [context compiler](/docs/modules/context#in-a-native-run) page.
 A step reopened after a restart with the same messages (its answer was never
 saved) reuses its stored package without asking the sources. A package a
 `forget` redacted is compiled again with refresh `'redacted'` and
-`redacted: true`, and on resume the retrieval blocks of redacted packages are
-removed from the run's history and checkpoints, which the manifest records as
-`cachePrefixChanged: true`.
+`redacted: true`, and on resume the stand-ins and any retrieval block that
+held a forgotten record are removed from the run's history and checkpoints
+(an overflow retry's block under the same marker, whose package is still
+found, stays), which the manifest records as `cachePrefixChanged: true`.
 
 `workingMemory: { snapshot?, create?, tools? }` keeps the snapshot in the
 record; a resume keeps the stored one. Working memory without a compiler still
@@ -1050,8 +1051,12 @@ after a crash.
   the cited message ids and no plan), and the session prepares and commits the
   plan with its receipt in one call. The acknowledgment copies `requestDigest`
   (the request's digest) and `planned` (the mutation count) from the receipt,
-  with `receipt: { scopeRevision, committedAt }`. The extraction reads the input's last user turn and the
-  run's own turns, under the session's extraction policy.
+  with `receipt: { scopeRevision, committedAt }`. The extraction reads the
+  input's last user turn and the run's own turns, under the session's
+  extraction policy. When `session.extract` throws after the run's outcome,
+  the run saves why on the intent (`error`: `name`, `message` and `code` when
+  there is one) and keeps its status, so `reconcileAgentRun` can still settle
+  it; the acknowledgment clears `error`.
 
 ```ts
 import {
@@ -1125,17 +1130,24 @@ and the manifests that point to it load with `redacted: true`. The forget record
 the store keeps hold record ids and revisions, never text.
 
 The same call rewrites, in place, every stored copy of a redacted package's
-retrieval block in the runs that point to it: history, checkpoints and the
-stored result's messages, a terminal run's `result.messages` included. Each
-copy becomes a stand-in that keeps the `<deuz_context pass="P" step="S">`
-marker and holds no record; the run keeps its revision and last-save time. A
-later save of such a run is stored the same way, and a resume still drops the
-block and compiles the step again. A forget does not reach text the model
-wrote from a block (assistant turns, `result.text`, a compaction summary),
-memory tool results (`memory_recall` output in tool messages, the run
-transcript, a chat store), the in-memory history of a leg running at forget
-time until it ends or is resumed, or run stores not subscribed through
-`onForget`. See [Retention and forget](/docs/modules/retention).
+retrieval block that holds a forgotten record, in the runs that point to it:
+history, checkpoints and the stored result's messages, a terminal run's
+`result.messages` included. Each copy becomes a stand-in that keeps the
+`<deuz_context pass="P" step="S">` marker and holds no record; the run keeps
+its revision and last-save time. Only the exact blocks the compiler appended
+are replaced: a user's message that only opens with such a marker stays, and
+so does an overflow retry's block, which shares its first attempt's marker but
+dropped the forgotten record. A later save of such a run is stored the same
+way, and a resume still drops the stand-ins and any block that held a
+forgotten record and compiles the step again. A forget does not reach a
+retrieval block a run received in its input messages (a previous run's
+`result.messages` passed to `runAgent({ messages })`): continue from the chat
+projection or the transcript, which carry no retrieval blocks. Nor does it
+reach text the model wrote from a block (assistant turns, `result.text`, a
+compaction summary), memory tool results (`memory_recall` output in tool
+messages, the run transcript, a chat store), the in-memory history of a leg
+running at forget time until it ends or is resumed, or run stores not
+subscribed through `onForget`. See [Retention and forget](/docs/modules/retention).
 
 ## Mandatory policy and shared budgets
 
