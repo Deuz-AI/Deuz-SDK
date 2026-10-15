@@ -15,10 +15,11 @@ import { scopeKey, scopeWithin } from '../internal/native-scope';
 import { resolveDependencies } from '../internal/resolve-deps';
 import type { MemoryScope, MemoryStore, Embedder } from '../memory';
 import type { MemorySourceKind, MemorySourceRef, MemorySession } from '../memory/versioned/types';
-import type { ScoredChunk } from '../rag';
+import type { EmbeddingAccountingOptions, ScoredChunk } from '../rag';
 import type { SkillRegistry } from '../skills';
 import type { TranscriptIndex, TranscriptMessage } from '../types/chat-conditional';
 import type { Clock } from '../types/deps';
+import type { NativeExecutionContext } from '../types/execution';
 import type { Role } from '../types/message';
 import { messageText } from './render';
 import type { ContextCandidate, ContextSource, ContextSourceKind } from './types';
@@ -50,7 +51,20 @@ export type MemoryContextSourceOptions = ContextSourceOptions &
 
 /** RAG candidates from the host's retrieval (dense, BM25 or hybrid). */
 export interface RagContextSourceOptions extends ContextSourceOptions {
-  retrieve(query: string, topK: number, signal?: AbortSignal): Promise<readonly ScoredChunk[]>;
+  /**
+   * Retrieves `topK` chunks for `query`. `charge` (2.4) comes only with a
+   * request that carries `accounting` (a V3 run's compile): spread it into
+   * the options of `retrieve` or `hybridRetrieve` (`{ topK, ...charge }`) so
+   * the query embedding is charged to the run's ledger, settled when the
+   * embedder is accounted (`defineAccountedEmbedder`), else held as
+   * unaccounted. A retrieve that ignores it charges nothing.
+   */
+  retrieve(
+    query: string,
+    topK: number,
+    signal?: AbortSignal,
+    charge?: EmbeddingAccountingOptions,
+  ): Promise<readonly ScoredChunk[]>;
 }
 
 /** Past messages from a transcript index, under its scope check. */
@@ -202,12 +216,35 @@ export function createMemoryContextSource(options: MemoryContextSourceOptions): 
 /**
  * RAG as a context source (2.4): the first link between `/rag` and the loop.
  * Wire it to `retrieve` or `hybridRetrieve`, e.g.
- * `retrieve: (query, topK) => hybridRetrieve(query, deps, { topK })`. A
- * chunk's record id is its `meta.id` when that is a string, else its index.
+ * `retrieve: (query, topK, signal, charge) => hybridRetrieve(query, deps, { topK, ...charge })`.
+ * A chunk's record id is its `meta.id` when that is a string, else its index.
+ *
+ * A request with `accounting` (a V3 run's compile) hands `retrieve` a
+ * fourth argument, `charge`: the accounting and the request's `onWarning`,
+ * which reports an embedder without usage (`unaccounted-usage`) once per
+ * execution context however many passes run. Without it `retrieve` is called
+ * with three arguments, as before.
  */
 export function createRagContextSource(options: RagContextSourceOptions): ContextSource {
+  const warned = new WeakSet<NativeExecutionContext>();
   return source('rag', options, async (request) => {
-    const chunks = await options.retrieve(request.text, request.limit, request.signal);
+    const { accounting, onWarning } = request;
+    const chunks = await (accounting
+      ? options.retrieve(request.text, request.limit, request.signal, {
+          accounting,
+          ...(onWarning
+            ? {
+                onWarning: (warning) => {
+                  if (warning.type === 'unaccounted-usage') {
+                    if (warned.has(accounting.execution)) return;
+                    warned.add(accounting.execution);
+                  }
+                  onWarning(warning);
+                },
+              }
+            : {}),
+        })
+      : options.retrieve(request.text, request.limit, request.signal));
     return Promise.all(
       chunks.slice(0, request.limit).map(
         async (chunk): Promise<ContextCandidate> => ({

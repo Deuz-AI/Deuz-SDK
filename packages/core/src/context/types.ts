@@ -28,6 +28,7 @@
 import type { Sha256Digest } from '../internal/digest';
 import type { TokenEstimator } from '../internal/estimate-tokens';
 import type { MemoryScope } from '../memory';
+import type { CallAccounting } from '../types/accounting';
 import type { Dependencies } from '../types/deps';
 import type { Message } from '../types/message';
 import type { CallWarning } from '../types/methods';
@@ -104,6 +105,22 @@ export interface ContextSourceRequest {
    */
   recordedAsOf?: number;
   signal?: AbortSignal;
+  /**
+   * Ledger accounting for the one billable call the query makes, e.g. a RAG
+   * source's query embedding (2.4, spec §3.1). A V3 run's compiler sets it:
+   * the run's execution context and a `requestId` unique to this query, so
+   * the call is reserved on the run's ledger before it is made and settled
+   * (or held as unaccounted) after it. A host querying a source itself may
+   * set it too. A source making more than one billable call gives each a
+   * `requestId` of its own. Absent, nothing is charged, as before.
+   */
+  accounting?: CallAccounting;
+  /**
+   * Receives the call warnings of the query, e.g. an embedder's
+   * `unaccounted-usage`. Set by the compiler with `accounting`: its
+   * `onWarning` (in a V3 run, the run's warnings).
+   */
+  onWarning?: (warning: CallWarning) => void;
 }
 
 /**

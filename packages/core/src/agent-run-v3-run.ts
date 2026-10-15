@@ -35,7 +35,7 @@ import type {
 } from './inference/loop-context';
 import { createTokenEstimator, type TokenEstimator } from './internal/estimate-tokens';
 import { claimMemoryScopes, compilerScope, sourceScope } from './internal/memory-scope-claims';
-import { withTelemetryParent } from './internal/native-context';
+import { withRunExecution, withTelemetryParent } from './internal/native-context';
 import { bindsThinkingToPrefix } from './internal/stable-prefix';
 import type { MemoryCallOptions } from './memory';
 import { createVersionedMemoryTools } from './memory/versioned/tools';
@@ -505,6 +505,11 @@ export interface ContextHookInput {
   logger: Logger;
   /** The history lost redacted retrieval blocks on resume: the next compile is a `redacted` refresh. */
   redacted?: boolean;
+  /**
+   * The run's execution context: each source query the compiler makes is
+   * handed `accounting` on it, so its billable call reaches the run's ledger.
+   */
+  execution?: NativeExecutionContext;
 }
 
 /**
@@ -548,7 +553,7 @@ export function createContextHook(input: ContextHookInput): LoopContextHook {
     }));
     const workingMemory = input.envelope().workingMemory;
     const kind = compiler.estimatorKind ?? { kind: 'heuristic' as const, calibrated: false };
-    return withTelemetryParent(
+    const built: ContextStepInput = withTelemetryParent(
       {
         runId,
         step: number,
@@ -574,6 +579,7 @@ export function createContextHook(input: ContextHookInput): LoopContextHook {
       },
       step.telemetry,
     );
+    return withRunExecution(built, input.execution);
   };
 
   /**
@@ -815,6 +821,8 @@ export interface V3LegInput {
   /** The run's warnings (a compiler's `context-source-failed`). */
   warn: (warning: CallWarning) => void;
   deps: ResolvedDependencies;
+  /** The run's execution context, which the sources' billable calls are charged to. */
+  execution?: NativeExecutionContext;
 }
 
 /**
@@ -848,6 +856,7 @@ export async function prepareV3Leg(
       ...(options.capabilities ? { capabilities: options.capabilities } : {}),
       logger: deps.logger,
       ...(redacted ? { redacted } : {}),
+      ...(input.execution ? { execution: input.execution } : {}),
     }),
   };
 }
