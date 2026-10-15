@@ -93,9 +93,14 @@ function assertMemoryIntents(intents: unknown): void {
       !isObject(intent) ||
       typeof intent.operationId !== 'string' ||
       !intent.operationId ||
-      !INTENT_STATUSES.includes(intent.status as AgentRunMemoryIntentV3['status'])
+      !INTENT_STATUSES.includes(intent.status as AgentRunMemoryIntentV3['status']) ||
+      (intent.messageIds !== undefined &&
+        (!Array.isArray(intent.messageIds) ||
+          !intent.messageIds.every((id) => typeof id === 'string')))
     )
-      throw invalid('every memory intent needs an operationId and a known status');
+      throw invalid(
+        'every memory intent needs an operationId, a known status and string message ids',
+      );
 }
 
 /**

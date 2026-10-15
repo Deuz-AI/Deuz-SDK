@@ -55,7 +55,8 @@ export interface AgentRunMemoryStateV3 extends Omit<AgentRunMemoryState, 'extrac
  * intent, the prepared plan, the atomic memory commit with its receipt, then
  * the run's acknowledgment. The memory session prepares the plan and commits
  * it in one call, so the run record never holds the plan itself: a versioned
- * extraction saves only its claim on the intent (`planned`) before that call,
+ * extraction saves only its claim on the intent (`planned`, with the message
+ * ids it cites) before that call,
  * and a model tool's write moves with its tool receipt (`intended`,
  * `committed`, `acknowledged`). There is no transaction across the two
  * databases: when the acknowledgment is lost after the commit, the receipt is
@@ -73,6 +74,14 @@ export interface AgentRunMemoryIntentV3 {
   requestDigest?: Sha256Digest;
   /** The mutations the commit applied (the receipt's entries), copied with the acknowledgment. */
   planned?: number;
+  /**
+   * The ids of the messages a versioned extraction reads, in order (2.4): the
+   * ids the chat projection gives them (`<runId>:<index>`, or a stored chat's
+   * own id for an input message it continues), so the memory sources it
+   * writes resolve through the transcript index. Saved with its claim
+   * (`planned`), so a replay cites the same ones.
+   */
+  messageIds?: string[];
   /** The memory receipt, once committed. */
   receipt?: { scopeRevision: number; committedAt: number };
   /** The tool call that asked for it, when a model tool did. */

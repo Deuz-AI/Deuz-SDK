@@ -320,13 +320,17 @@ export function versionedExtraction(
 
 /**
  * What a versioned extraction reads (spec §2.2): the input's last user turn
- * and the run's own turns, each with a stable id (`<runId>#<index>` in the
- * run's transcript); the SDK's turns and system messages are left out, and
- * the session's extraction policy decides which of the rest it may read.
+ * and the run's own turns; the SDK's turns and system messages are left out,
+ * and the session's extraction policy decides which of the rest it may read.
+ * Each message carries the id the chat projection gives its transcript
+ * position (spec §2.4: `resolveSource` resolves a memory source to it):
+ * `chatIds` (the run's chat state) where it has one, a stored chat's own id
+ * for an input message included, else `<runId>:<index>`.
  */
 export function extractionMessages(
   transcript: AgentRunTranscript,
   runId: string,
+  chatIds: readonly string[] = [],
 ): MemoryExtractionInput['messages'] {
   const internal = new Set(transcript.internal);
   const entries: MemoryExtractionInput['messages'][number][] = [];
@@ -334,7 +338,11 @@ export function extractionMessages(
   for (let index = 0; index < transcript.input; index++)
     if (transcript.messages[index]!.role === 'user') lastUser = index;
   const take = (index: number) =>
-    entries.push({ id: `${runId}#${index}`, message: transcript.messages[index]!, runId });
+    entries.push({
+      id: chatIds[index] ?? `${runId}:${index}`,
+      message: transcript.messages[index]!,
+      runId,
+    });
   if (lastUser >= 0) take(lastUser);
   for (let index = transcript.input; index < transcript.messages.length; index++)
     if (!internal.has(index) && transcript.messages[index]!.role !== 'system') take(index);
@@ -343,9 +351,10 @@ export function extractionMessages(
 
 /**
  * Runs a run's versioned extraction under its intent (spec §4.1): the run
- * first saves its claim on the intent (`planned`: the status only, no plan),
- * then the session prepares the plan and commits it atomically with its
- * receipt under the intent's operation id, in one call, and the
+ * first saves its claim on the intent (`planned`, with the ids of the
+ * messages it cites; no plan), then the session prepares the plan and
+ * commits it atomically with its receipt under the intent's operation id, in
+ * one call, and the
  * acknowledgment copies the receipt into the intent (`acknowledged`, with the
  * mutation count and the request digest). A session that already holds the
  * operation (its acknowledgment was lost) answers from its receipt and
@@ -362,6 +371,7 @@ export async function runVersionedExtraction(
 ): Promise<boolean> {
   if (intent.status === 'intended') {
     intent.status = 'planned';
+    intent.messageIds = input.messages.map((entry) => entry.id);
     if (!(await save())) return false;
     emit?.({ type: 'memory-intent', operationId: intent.operationId, status: 'planned' });
   }
@@ -810,6 +820,22 @@ export async function prepareV3Leg(
   };
 }
 
+/**
+ * The extraction an intent asks the session for: its options and the run's
+ * messages, cited by the ids its claim saved, else by the chat projection's.
+ */
+function extractionInput(
+  envelope: AgentRunEnvelopeV3,
+  transcript: AgentRunTranscript,
+  intent: AgentRunMemoryIntentV3,
+): MemoryExtractionInput {
+  const messages = extractionMessages(transcript, envelope.runId, envelope.chat?.messageIds);
+  const claimed = intent.messageIds;
+  if (claimed && claimed.length === messages.length)
+    messages.forEach((entry, index) => (entry.id = claimed[index]!));
+  return { ...intent.extraction, messages };
+}
+
 /** The extraction intent a V3 run has not acknowledged yet, if any. */
 function pendingExtraction(envelope: AgentRunEnvelopeV3): AgentRunMemoryIntentV3 | undefined {
   return envelope.memoryIntents?.find(
@@ -836,7 +862,7 @@ export async function settleVersionedExtraction(
     await runVersionedExtraction(
       session,
       intent,
-      { ...intent.extraction, messages: extractionMessages(envelope.transcript, envelope.runId) },
+      extractionInput(envelope, envelope.transcript, intent),
       save,
       emit,
     );
@@ -869,7 +895,7 @@ export async function reconcileVersionedIntents(
     await runVersionedExtraction(
       session,
       intent,
-      { ...intent.extraction, messages: extractionMessages(envelope.transcript, envelope.runId) },
+      extractionInput(envelope, envelope.transcript, intent),
       async () => {
         await save();
         return true;
