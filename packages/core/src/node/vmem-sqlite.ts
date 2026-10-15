@@ -765,6 +765,18 @@ export function createSqliteVersionedMemoryStore(
         validateGeneration(request);
         return write((s) =>
           sqliteTransaction(s.db, () => {
+            // One generation is prepared at a time: another model or size
+            // retires the pending one, and its vectors go with it.
+            run(
+              s,
+              "UPDATE deuz_vmem_generations SET status = 'retired' " +
+                "WHERE status = 'pending' AND NOT (model_id = ? AND dims = ?)",
+              [request.modelId, request.dims],
+            );
+            run(
+              s,
+              "DELETE FROM deuz_vmem_vectors WHERE generation IN (SELECT generation FROM deuz_vmem_generations WHERE status = 'retired')",
+            );
             const pending = one(
               s,
               "SELECT * FROM deuz_vmem_generations WHERE status = 'pending' AND model_id = ? AND dims = ? " +
@@ -793,8 +805,11 @@ export function createSqliteVersionedMemoryStore(
             'SELECT r.record, r.text_digest FROM deuz_vmem_records c ' +
               'JOIN deuz_vmem_revisions r ON r.id = c.id AND r.revision = c.revision ' +
               'LEFT JOIN deuz_vmem_vectors v ON v.generation = ? AND v.id = c.id AND v.revision = c.revision ' +
-              'WHERE v.id IS NULL AND c.id > ? ORDER BY c.id LIMIT ?',
-            [generation, pendingOptions.after ?? '', limit!],
+              'WHERE v.id IS NULL AND c.id > ? ' +
+              // An unknown or retired generation takes no vectors: nothing is pending there.
+              "AND EXISTS (SELECT 1 FROM deuz_vmem_generations g WHERE g.generation = ? AND g.status <> 'retired') " +
+              'ORDER BY c.id LIMIT ?',
+            [generation, pendingOptions.after ?? '', generation, limit!],
           ).map((row) => {
             const record = decodeRecord(text(row.record));
             return {
@@ -812,10 +827,8 @@ export function createSqliteVersionedMemoryStore(
         return write((s) =>
           sqliteTransaction(s.db, () => {
             const target = readGeneration(s, generation);
-            if (!target || target.status === 'retired')
-              throw new InvalidRequestError({
-                message: `Embedding generation ${generation} is not open for vectors.`,
-              });
+            // Retired (another model replaced it) or unknown: a racing filler loses quietly.
+            if (!target || target.status === 'retired') return 0;
             for (const item of vectors) assertGenerationVector(target, item.vector);
             let stored = 0;
             for (const item of vectors) {
@@ -842,10 +855,8 @@ export function createSqliteVersionedMemoryStore(
         return write((s) =>
           sqliteTransaction(s.db, () => {
             const target = readGeneration(s, generation);
-            if (!target)
-              throw new InvalidRequestError({
-                message: `Unknown embedding generation ${generation}.`,
-              });
+            // Unknown, or retired for good: it never becomes active (again).
+            if (!target || target.status === 'retired') return false;
             if (target.status === 'active') return true;
             const missing = one(
               s,

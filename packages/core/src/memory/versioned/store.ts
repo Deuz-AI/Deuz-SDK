@@ -634,7 +634,7 @@ export function createInMemoryVersionedMemoryStore(options?: {
           const pending = generations.find((generation) => generation.status === 'pending');
           if (pending && pending.modelId === request.modelId && pending.dims === request.dims)
             return copy(pending);
-          // One generation is prepared at a time: another model replaces it.
+          // One generation is prepared at a time: another model or size retires it.
           if (pending) {
             pending.status = 'retired';
             vectors.delete(pending.generation);
