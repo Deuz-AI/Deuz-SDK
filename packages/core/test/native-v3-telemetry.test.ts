@@ -60,3 +60,31 @@ describe('the context compile span of a V3 run', () => {
     expect(JSON.stringify(completed)).not.toContain('vault code');
   });
 });
+
+describe('the overflow recompile span', () => {
+  it('nests under the same step span as the compile it replaces', async () => {
+    const observer = createMemoryObserver();
+    const docs = Array.from({ length: 4 }, (_, index) =>
+      candidate(`doc-${index}`, `Fact ${index}: ${'mind the cutover. '.repeat(6)}`),
+    );
+    const { model } = scriptedModel(['overflow', { text: 'done' }]);
+    const result = await runAgent({
+      model,
+      prompt: 'Cut over',
+      checkpointVersion: 3,
+      session: { store: recordingStoreV3(), runId: 'run-tel-of', scope: 'tenant' },
+      context: { sources: [fakeSource('docs', 'rag', docs).source] },
+      capabilities: { contextWindow: 100_000, maxOutput: 4_000 },
+      deps: { observer },
+    });
+    expect(result.status).toBe('completed');
+    const events = observer.events();
+    const step = events.find((event) => event.type === 'step.started')!;
+    const compiles = events.filter(
+      (event): event is Extract<ObserveEvent, { type: 'operation.started' }> =>
+        event.type === 'operation.started' && event.operation === 'deuz.context.compile',
+    );
+    expect(compiles).toHaveLength(2);
+    for (const compile of compiles) expect(compile.parentSpanId).toBe(step.spanId);
+  });
+});

@@ -514,14 +514,20 @@ export function createContextHook(input: ContextHookInput): LoopContextHook {
     input.emit({ type: 'context', step, manifest: entry.manifest });
   };
 
-  const begin = (step: LoopContextStep, number: number, digest: string, pkg: ContextPackage) => {
+  const begin = (
+    step: LoopContextStep,
+    number: number,
+    digest: string,
+    pkg: ContextPackage,
+    overheadTokens: number,
+  ) => {
     const placement = placementOf(pkg);
     const request = [...step.messages, ...placement.append, ...placement.tail];
     current = {
       step: number,
       input: digest,
       pkg,
-      estimate: estimator.estimate(request) + stepInput(step, number).overheadTokens,
+      estimate: estimator.estimate(request) + overheadTokens,
     };
     return placement;
   };
@@ -537,15 +543,21 @@ export function createContextHook(input: ContextHookInput): LoopContextHook {
       if (!redacted && last && last.input === digest) {
         // A reopened step: the same context, unless a forget redacted it.
         const read = await readContextPackage(store, last);
-        if (read.status === 'found') return begin(step, last.step, digest, read.package);
+        if (read.status === 'found')
+          return begin(
+            step,
+            last.step,
+            digest,
+            read.package,
+            stepInput(step, last.step).overheadTokens,
+          );
         number = last.step;
         redacted = read.status === 'redacted';
       }
-      const pkg = await compiler.compiler.beforeModelCall(
-        stepInput(step, number, redacted ? { redacted: true } : {}),
-      );
+      const request = stepInput(step, number, redacted ? { redacted: true } : {});
+      const pkg = await compiler.compiler.beforeModelCall(request);
       await record(number, digest, pkg);
-      return begin(step, number, digest, pkg);
+      return begin(step, number, digest, pkg, request.overheadTokens);
     },
 
     async onOverflow(step) {
@@ -561,16 +573,15 @@ export function createContextHook(input: ContextHookInput): LoopContextHook {
         0,
         Math.min(failed.inputTokens, failed.usedTokens + failed.selectedTokens) - 1,
       );
-      const pkg = await compiler.compiler.onOverflow({
-        ...stepInput(step, current.step),
-        inputTokens: budget,
-      });
+      // Assigned onto the step input, so the span parent it carries stays.
+      const request = Object.assign(stepInput(step, current.step), { inputTokens: budget });
+      const pkg = await compiler.compiler.onOverflow(request);
       // Nothing shrank: the retry would be refused again.
       if (!step.compacted && pkg.manifest.budget.selectedTokens >= failed.selectedTokens)
         return undefined;
       const digest = inputDigest(step.messages);
       await record(current.step, digest, pkg);
-      return begin(step, current.step, digest, pkg);
+      return begin(step, current.step, digest, pkg, request.overheadTokens);
     },
 
     afterModelCall(usage: Usage) {
