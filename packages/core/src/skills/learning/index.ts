@@ -123,7 +123,68 @@ export class SkillLearningError extends DeuzError {
  * tool the run never used (`invalid_proposal`).
  */
 export async function proposeSkillFromRun(
-  _options: ProposeSkillFromRunOptions,
+  options: ProposeSkillFromRunOptions,
 ): Promise<SkillProposal> {
+  checkOptions(options);
+  assertEligible(options.run);
   return notImplemented('proposeSkillFromRun');
+}
+
+/** Default output tokens of the proposal call. */
+const DEFAULT_MAX_OUTPUT_TOKENS = 2048;
+/** Default characters of source projection. */
+const DEFAULT_MAX_SOURCE_CHARS = 32_000;
+
+function positiveInteger(value: number | undefined, fallback: number, name: string): number {
+  if (value === undefined) return fallback;
+  if (!Number.isSafeInteger(value) || value < 1)
+    throw new TypeError(`proposeSkillFromRun: ${name} must be a positive integer`);
+  return value;
+}
+
+/** Malformed options are a caller error (TypeError), never a refusal of the run. */
+function checkOptions(options: ProposeSkillFromRunOptions): void {
+  if (!options || typeof options !== 'object')
+    throw new TypeError('proposeSkillFromRun: options are required');
+  const run = options.run as Partial<AgentRunEnvelope> | undefined;
+  if (
+    !run ||
+    run.kind !== 'deuz-agent-run' ||
+    typeof run.runId !== 'string' ||
+    typeof run.scope !== 'string' ||
+    !Array.isArray(run.messages)
+  )
+    throw new TypeError('proposeSkillFromRun: run must be a native agent run envelope');
+  if (!options.model || typeof options.model !== 'object')
+    throw new TypeError('proposeSkillFromRun: model is required');
+  const budget = options.budget;
+  if (!budget || typeof budget !== 'object')
+    throw new TypeError('proposeSkillFromRun: budget is required (spec §2.6)');
+  if (budget.tokens === undefined && budget.usd === undefined)
+    throw new TypeError('proposeSkillFromRun: budget needs a tokens or usd bound');
+  for (const [name, value] of [
+    ['tokens', budget.tokens],
+    ['usd', budget.usd],
+  ] as const)
+    if (value !== undefined && (!Number.isFinite(value) || value < 0))
+      throw new TypeError(`proposeSkillFromRun: budget.${name} must be a finite number >= 0`);
+  positiveInteger(options.maxOutputTokens, DEFAULT_MAX_OUTPUT_TOKENS, 'maxOutputTokens');
+  positiveInteger(options.maxSourceChars, DEFAULT_MAX_SOURCE_CHARS, 'maxSourceChars');
+}
+
+/**
+ * The source condition (spec §2.6): terminal, completed, and verified by the
+ * run's own verifier (`verification === 'verified'`). It speaks about the
+ * source task, never about the skill drafted from it.
+ */
+function assertEligible(run: AgentRunEnvelope | AgentRunEnvelopeV3): void {
+  if (run.phase !== 'terminal')
+    throw new SkillLearningError('source_not_eligible', `run ${run.runId} is not terminal`);
+  if (run.result?.status !== 'completed')
+    throw new SkillLearningError('source_not_eligible', `run ${run.runId} did not complete`);
+  if (run.verification !== 'verified')
+    throw new SkillLearningError(
+      'source_not_eligible',
+      `run ${run.runId} is not verified (verification: ${run.verification ?? 'none'})`,
+    );
 }
