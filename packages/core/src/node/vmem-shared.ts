@@ -255,6 +255,12 @@ export function forgetRequestDigest(scope: MemoryScope, id: string): Promise<Sha
   return digestJson({ type: 'forget', scope, id });
 }
 
+/** What a SQL forget transaction found: the revisions it deleted, or that the scope's record was gone before. */
+export interface ForgetOutcome {
+  revisions: number[];
+  alreadyForgotten: boolean;
+}
+
 /** Throws `OperationConflictError` when `stored` is not the receipt of this same forget. */
 export function refuseForeignForget(
   stored: VersionedMemoryReceipt,

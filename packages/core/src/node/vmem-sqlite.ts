@@ -75,6 +75,7 @@ import {
   validateGeneration,
   type CommitPlan,
   type CommitSnapshot,
+  type ForgetOutcome,
   type RecordLookup,
   type ScoredRevision,
 } from './vmem-shared';
@@ -285,6 +286,12 @@ function readReceipt(s: State, operationId: string): VersionedMemoryReceipt | un
     operationId,
   ]);
   return row ? decodeReceipt(text(row.receipt), num(row.redacted) === 1) : undefined;
+}
+
+/** Whether record `id` was forgotten while scope `key` owned it. */
+function forgottenIn(s: State, id: string, key: string): boolean {
+  const row = one(s, 'SELECT scope_key FROM deuz_vmem_forgotten WHERE id = ?', [id]);
+  return row !== undefined && text(row.scope_key) === key;
 }
 
 function readScopeRevision(s: State, key: string): number {
@@ -660,17 +667,18 @@ export function createSqliteVersionedMemoryStore(
       if (typeof operationId !== 'string' || operationId === '')
         throw new InvalidRequestError({ message: 'forget needs an operationId.' });
       const requestDigest = await forgetRequestDigest(normalized, id);
-      const revisions = await write((s) =>
-        sqliteTransaction(s.db, (): number[] => {
+      const outcome = await write((s) =>
+        sqliteTransaction(s.db, (): ForgetOutcome => {
           // The forget is an operation: a repeated id replays, another's id conflicts.
           const stored = readReceipt(s, operationId);
           if (stored) {
             refuseForeignForget(stored, operationId, requestDigest);
-            return [];
+            return { revisions: [], alreadyForgotten: forgottenIn(s, id, key) };
           }
           syncFts(s, true);
           const record = one(s, 'SELECT scope_key FROM deuz_vmem_records WHERE id = ?', [id]);
           let rows: Record<string, unknown>[] = [];
+          const alreadyForgotten = !record && forgottenIn(s, id, key);
           if (record && text(record.scope_key) === key) {
             rows = all(
               s,
@@ -715,10 +723,16 @@ export function createSqliteVersionedMemoryStore(
             'INSERT INTO deuz_vmem_receipts (operation_id, request_digest, committed_at, redacted, receipt) VALUES (?, ?, ?, 0, ?)',
             [operationId, requestDigest, receipt.committedAt, encodeReceipt(receipt)],
           );
-          return rows.map((row) => num(row.revision));
+          return { revisions: rows.map((row) => num(row.revision)), alreadyForgotten };
         }),
       );
-      return { scope: normalized, recordId: id, revisions, operationId };
+      return {
+        scope: normalized,
+        recordId: id,
+        revisions: outcome.revisions,
+        operationId,
+        ...(outcome.alreadyForgotten ? { alreadyForgotten: true as const } : {}),
+      };
     },
 
     embeddings: {

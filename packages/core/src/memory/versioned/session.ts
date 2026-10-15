@@ -786,7 +786,10 @@ export function createMemorySession(options: CreateMemorySessionOptions): Memory
           const event = await store.forget(scope, id, operationId);
           annotate({ [DEUZ_ATTR.memoryRecordCount]: event.revisions.length > 0 ? 1 : 0 });
           let redaction: MemoryForgetResult['redaction'] = 'none';
-          if (event.revisions.length > 0 && listeners.length > 0) {
+          // A record this scope forgot before goes to the listeners again (revisions []
+          // meaning all of them): a retry finishes a redaction a crash or a failure cut short.
+          const forgotten = event.revisions.length > 0 || event.alreadyForgotten === true;
+          if (forgotten && listeners.length > 0) {
             redaction = 'complete';
             for (const listener of listeners) {
               try {
@@ -794,7 +797,7 @@ export function createMemorySession(options: CreateMemorySessionOptions): Memory
               } catch (error) {
                 redaction = 'failed';
                 deps.logger.warn(
-                  'A versioned memory onForget listener failed; the record stays forgotten. Run the redaction again from the forget event.',
+                  'A versioned memory onForget listener failed; the record stays forgotten. Forget it again to rerun the listeners, or run the redaction from the forget event.',
                   {
                     operationId,
                     recordId: id,

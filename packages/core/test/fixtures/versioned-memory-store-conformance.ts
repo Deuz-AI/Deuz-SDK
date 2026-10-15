@@ -899,6 +899,53 @@ export function assertVersionedMemoryStoreContract(
       );
 
       it(
+        'reports a record forgotten before in the scope, so a retry can finish its redaction',
+        { timeout },
+        async () => {
+          await withStore(async ({ store }) => {
+            await commit(store, await operation('op-1', [await create('r1', 'fact')]));
+            const first = await store.forget(SCOPE, 'r1', 'f-1');
+            expect(first).toEqual({
+              scope: SCOPE,
+              recordId: 'r1',
+              revisions: [1],
+              operationId: 'f-1',
+            });
+            // A replay of the same forget, and a new forget of the same record, both say so:
+            // revisions [] then stands for every revision the record had.
+            const already = { scope: SCOPE, recordId: 'r1', revisions: [], alreadyForgotten: true };
+            expect(await store.forget(SCOPE, 'r1', 'f-1')).toEqual({
+              ...already,
+              operationId: 'f-1',
+            });
+            expect(await store.forget(SCOPE, 'r1', 'f-2')).toEqual({
+              ...already,
+              operationId: 'f-2',
+            });
+            // Never for an id the scope does not own: unknown, or forgotten in another scope.
+            expect(await store.forget(OTHER, 'r1', 'f-3')).toEqual({
+              scope: OTHER,
+              recordId: 'r1',
+              revisions: [],
+              operationId: 'f-3',
+            });
+            expect(await store.forget(SCOPE, 'ghost', 'f-4')).toEqual({
+              scope: SCOPE,
+              recordId: 'ghost',
+              revisions: [],
+              operationId: 'f-4',
+            });
+            expect(await store.forget(SCOPE, 'ghost', 'f-4')).toEqual({
+              scope: SCOPE,
+              recordId: 'ghost',
+              revisions: [],
+              operationId: 'f-4',
+            });
+          });
+        },
+      );
+
+      it(
         'is an operation: a content-free receipt, a scope revision, an id never reused',
         { timeout },
         async () => {

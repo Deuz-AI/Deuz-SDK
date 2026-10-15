@@ -731,6 +731,7 @@ describe('forget', () => {
       recordId: 'r1',
       revisions: [],
       operationId: 'op-forget',
+      alreadyForgotten: true,
     });
     expect(await store.scopeRevision(USER)).toBe(2);
     await expect(store.forget(USER, 'r2', 'op-forget')).rejects.toBeInstanceOf(

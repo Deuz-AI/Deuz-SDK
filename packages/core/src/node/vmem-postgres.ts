@@ -71,6 +71,7 @@ import {
   validateGeneration,
   type CommitPlan,
   type CommitSnapshot,
+  type ForgetOutcome,
   type RecordLookup,
   type ScoredRevision,
 } from './vmem-shared';
@@ -659,7 +660,13 @@ export function createPostgresVersionedMemoryStore(
       if (typeof operationId !== 'string' || operationId === '')
         throw new InvalidRequestError({ message: 'forget needs an operationId.' });
       const requestDigest = await forgetRequestDigest(normalized, id);
-      const revisions = await tx(async (q): Promise<number[]> => {
+      const forgottenIn = async (q: PgClientLike): Promise<boolean> => {
+        const { rows } = await q.query(`SELECT scope_key FROM ${t('forgotten')} WHERE id = $1`, [
+          id,
+        ]);
+        return rows[0] !== undefined && str(rows[0].scope_key) === key;
+      };
+      const outcome = await tx(async (q): Promise<ForgetOutcome> => {
         await q.query(
           `INSERT INTO ${t('scopes')} (scope_key, revision) VALUES ($1, 0) ON CONFLICT (scope_key) DO NOTHING`,
           [key],
@@ -669,13 +676,14 @@ export function createPostgresVersionedMemoryStore(
         const stored = await readReceipt(q, operationId);
         if (stored) {
           refuseForeignForget(stored, operationId, requestDigest);
-          return [];
+          return { revisions: [], alreadyForgotten: await forgottenIn(q) };
         }
         const record = await q.query(
           `SELECT scope_key FROM ${t('records')} WHERE id = $1 FOR UPDATE`,
           [id],
         );
         let rows: Record<string, unknown>[] = [];
+        const alreadyForgotten = !record.rows[0] && (await forgottenIn(q));
         if (record.rows[0] && str(record.rows[0].scope_key) === key) {
           rows = (
             await q.query(
@@ -715,9 +723,15 @@ export function createPostgresVersionedMemoryStore(
           `INSERT INTO ${t('receipts')} (operation_id, request_digest, committed_at, redacted, receipt) VALUES ($1, $2, $3, FALSE, $4)`,
           [operationId, requestDigest, receipt.committedAt, encodeReceipt(receipt)],
         );
-        return rows.map((row) => num(row.revision));
+        return { revisions: rows.map((row) => num(row.revision)), alreadyForgotten };
       });
-      return { scope: normalized, recordId: id, revisions, operationId };
+      return {
+        scope: normalized,
+        recordId: id,
+        revisions: outcome.revisions,
+        operationId,
+        ...(outcome.alreadyForgotten ? { alreadyForgotten: true as const } : {}),
+      };
     },
 
     embeddings: {

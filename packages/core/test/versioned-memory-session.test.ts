@@ -462,7 +462,67 @@ describe('revise, retract, forget, history', () => {
       { scope: USER, recordId: id, revisions: [1, 2], operationId: 'forget-1' },
     ]);
     expect(await session.history(id)).toEqual([]);
-    expect((await session.forget(id, { operationId: 'forget-1' })).redaction).toBe('none');
+    // A repeated forget hands the listeners the record again (every revision), so a
+    // redaction that did not finish the first time does now; redaction is idempotent.
+    expect(await session.forget(id, { operationId: 'forget-1' })).toEqual({
+      scope: USER,
+      recordId: id,
+      revisions: [],
+      operationId: 'forget-1',
+      alreadyForgotten: true,
+      redaction: 'complete',
+    });
+    expect(events.at(-1)).toEqual({
+      scope: USER,
+      recordId: id,
+      revisions: [],
+      operationId: 'forget-1',
+      alreadyForgotten: true,
+    });
+  });
+
+  it('a retried forget after a crash between commit and onForget still runs the redaction', async () => {
+    const store = createInMemoryVersionedMemoryStore();
+    const events: MemoryForgetEvent[] = [];
+    const session = createMemorySession({
+      store,
+      scope: USER,
+      onForget: (event) => void events.push(event),
+    });
+    const { records } = await session.remember({ text: 'my secret is zebracornxyz' });
+    const id = records[0]!.id;
+    // The forget commits in the store, then the process dies before any listener runs.
+    await store.forget(USER, id, 'gdpr-1');
+    const retried = await session.forget(id, { operationId: 'gdpr-1' });
+    const fresh = await session.forget(id);
+    expect({ retried: retried.redaction, fresh: fresh.redaction }).toEqual({
+      retried: 'complete',
+      fresh: 'complete',
+    });
+    expect(
+      events.map((event) => [event.recordId, event.revisions, event.alreadyForgotten]),
+    ).toEqual([
+      [id, [], true],
+      [id, [], true],
+    ]);
+  });
+
+  it('never redacts for an id that is unknown or was forgotten in another scope', async () => {
+    const store = createInMemoryVersionedMemoryStore();
+    const events: MemoryForgetEvent[] = [];
+    const onForget = (event: MemoryForgetEvent) => void events.push(event);
+    const mine = createMemorySession({ store, scope: USER, onForget });
+    const theirs = createMemorySession({ store, scope: { userId: 'u2' }, onForget });
+    const { records } = await mine.remember({ text: 'secret' });
+    const id = records[0]!.id;
+    await store.forget(USER, id, 'gdpr-1');
+    const other = await theirs.forget(id);
+    const ghost = await mine.forget('never-existed');
+    expect([other, ghost].map((result) => [result.redaction, result.alreadyForgotten])).toEqual([
+      ['none', undefined],
+      ['none', undefined],
+    ]);
+    expect(events).toEqual([]);
   });
 
   it('a failing listener leaves redaction failed and never undoes the forget', async () => {
