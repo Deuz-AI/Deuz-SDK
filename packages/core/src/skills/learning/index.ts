@@ -25,12 +25,20 @@ import { projectRun } from './projection';
 /** A reference into the source run that a method step rests on. */
 export interface SkillSourceRef {
   runId: string;
-  /** The model step the content came from. */
+  /** The model step the content came from, when a tool receipt records it. */
   modelStep?: number;
-  /** The message (stable id) or tool call it came from. */
+  /**
+   * The message (stable id) or tool call it came from. The message id is
+   * `<runId>:<index>`: its index in the run's transcript, or in its history
+   * for a run without a transcript (the id a run message keeps in the run's
+   * chat projection).
+   */
   messageId?: string;
   toolCallId?: string;
-  /** `sha256:<hex>` of the projected content the step cites. */
+  /**
+   * `sha256:<hex>` of the projected content the step cites: the item's line
+   * as the model read it, after its `[Sn] ` label.
+   */
   digest: Sha256Digest;
 }
 
@@ -65,7 +73,8 @@ export interface SkillProposal {
   limitations: string[];
   /**
    * Suggested `allowed-tools`: always a subset of the tools the source run
-   * really used. The model can never add a tool permission.
+   * really used (called, and answered without an error). The model can never
+   * add a tool permission. Absent when none is suggested.
    */
   allowedTools?: string[];
   /** The source run: its id, scope, revision at the time, and the projection's digest. */
@@ -79,18 +88,21 @@ export interface ProposeSkillFromRunOptions {
   /** The source run: terminal, completed, with `verification: 'verified'`. */
   run: AgentRunEnvelope | AgentRunEnvelopeV3;
   model: LanguageModel;
-  /** Mandatory: the proposal's own budget, separate from the source run's. */
+  /**
+   * Mandatory: the proposal's own budget, separate from the source run's. It
+   * needs a `tokens` or `usd` bound.
+   */
   budget: BudgetLimits;
   /**
    * Host summaries of chosen tool results, by tool call id. Raw tool results
-   * never go to the model by default.
+   * never go to the model: a result without a summary reads `omitted`.
    */
   toolSummaries?: Readonly<Record<string, string>>;
   /** Output tokens at most. Default 2048. */
   maxOutputTokens?: number;
   /** Characters of source projection at most. Default 32 000; more is refused, never cut. */
   maxSourceChars?: number;
-  /** Extra instructions for the proposal. */
+  /** Extra instructions for the proposal, added to its system prompt. */
   instructions?: string;
   signal?: AbortSignal;
   deps?: Dependencies;
