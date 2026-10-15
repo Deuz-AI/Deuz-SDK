@@ -1001,7 +1001,10 @@ plus three more: `{ type: 'context', step, manifest }`, `{ type:
 The loop calls it after compaction and your `prepareStep`, with the step's real
 model and tools, and saves the package blob and manifest before the model call;
 retrieval enters the history after the call succeeded, and the working memory is
-the request's ephemeral tail. A final answer call (a structured-output run
+the request's ephemeral tail, except on a model that binds preserved thinking to
+the transcript prefix (Claude 5.x): there each step's copy joins the history after
+the call succeeds and the next request ends with the current copy (the manifest
+says `placement.tailKept`). A final answer call (a structured-output run
 without tools included) is compiled the same way. A resumed run restores the
 compiler's state from the record; a compiler you built yourself resumes only if
 its `state()` equals the stored state. A host estimator given as
@@ -1093,10 +1096,13 @@ operation that committed is replayed, never applied again) and returns the
 settled operation ids in `memoryIntents`. A resume replays a lost tool write the
 same way.
 
-The source references of an extraction name the run's transcript positions as
-message ids (`<runId>#<index>`). They are not the ids a chat projection gives
-its messages (`<runId>:<n>`), so [`resolveSource`](/docs/modules/transcript-search#resolving-memory-sources)
-does not resolve them to chat messages.
+The source references of an extraction cite each message by the id the chat
+projection gives it (`<runId>:<index>`, or a stored chat's own id for an input
+message the run continues), so
+[`resolveSource`](/docs/modules/transcript-search#resolving-memory-sources)
+resolves them to the chat messages. The extraction's claim (`planned`, which
+holds the cited `messageIds` and no plan) is saved before the session prepares
+and commits the plan in one call, so a replay cites the same ids.
 
 The legacy `memory` option works in a V3 run too. A legacy extraction that
 wrote only part of its plan is stored as `'partial'` with a

@@ -214,7 +214,10 @@ gives the same package, byte for byte.
   (`context_budget_exceeded`).
 - **Placement keeps the prompt cache.** Retrieval enters the conversation as
   one append-only user message that adds only what is new. The working memory
-  is a separate tail message that is never written to history. The system
+  is a separate tail message that is never written to history, except on models
+  that bind preserved thinking to the prefix (Claude 5.x), where each step's copy
+  is kept so the bytes before every replayed thinking block stay the same
+  (`placement.tailKept`). The system
   message and the tool schemas never change, so a refresh keeps the cached
   prefix and preserved thinking. Retrieved content is escaped and labelled with
   its source, origin and source kinds, so it reads as data.

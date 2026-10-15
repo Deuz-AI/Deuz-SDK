@@ -148,8 +148,8 @@ The stored message ids of a native run's chat projection (`ChatRecord.messageIds
 `uiFromMessages(messages, generateId, { messageIds })` renders a chat under the
 same ids, so a hit, a memory source and a UI message can name the same message.
 A [V3 run's versioned extraction](/docs/modules/native-agents#versioned-memory-intent-commit-acknowledgment)
-cites transcript positions (`<runId>#<index>`) instead, which `resolveSource`
-does not resolve to chat messages.
+cites the same ids, so `resolveSource` resolves its memory sources to the chat
+messages.
 
 ## As a context source
 
