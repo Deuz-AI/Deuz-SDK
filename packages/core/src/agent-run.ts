@@ -1250,8 +1250,23 @@ function makeAgentStream<T>(
           await saveInFlight(ctx.messages);
         },
       };
+      // A V3 run's own tools (2.4): the working memory tools, through the same
+      // receipts as the host's, so a patch is durable with its call's receipt.
+      const runTools = nativeV3
+        ? {
+            ...options.tools,
+            ...nativeV3.v3Tools(
+              v3Options as AgentRunOptionsV3<unknown>,
+              nativeV3.workingMemoryHandle(
+                () => envelope as unknown as AgentRunEnvelopeV3,
+                resolveDependencies(options.deps).clock,
+                (event) => eventsV3?.push(event),
+              ),
+            ),
+          }
+        : options.tools;
       common.tools = await prepareAgentTools(
-        options.tools,
+        runTools,
         options.toolsContext,
         onToolOutput,
         receipts,
@@ -1550,7 +1565,10 @@ function makeAgentStream<T>(
       if (nativeV3) {
         const record = envelope as unknown as AgentRunEnvelopeV3;
         if (!resume) {
-          const snapshot = nativeV3.initialWorkingMemory(v3Options as AgentRunOptionsV3<unknown>);
+          const snapshot = nativeV3.initialWorkingMemory(
+            v3Options as AgentRunOptionsV3<unknown>,
+            resolveDependencies(options.deps).clock.now(),
+          );
           if (snapshot) record.workingMemory = snapshot;
         }
         // A forget redacted packages while the run was down (spec §4.4): their

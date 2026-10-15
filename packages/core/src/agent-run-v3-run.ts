@@ -19,8 +19,12 @@ import type {
   ContextStepInput,
   CreateContextCompilerOptions,
 } from './context/types';
-import { createWorkingMemory } from './context/working-memory';
-import type { WorkingMemorySnapshot } from './context/working-memory/types';
+import {
+  applyWorkingMemoryPatch,
+  createWorkingMemory,
+  workingMemoryTools,
+} from './context/working-memory';
+import type { WorkingMemoryHandle, WorkingMemorySnapshot } from './context/working-memory/types';
 import { getCapabilities } from './core/registry';
 import type { ModelCapabilities } from './core/registry';
 import type {
@@ -39,11 +43,11 @@ import type {
   AgentRunSessionV3,
   AgentRunStoreV3,
 } from './types/agent-run-v3';
-import type { Logger } from './types/deps';
+import type { Clock, Logger } from './types/deps';
 import type { CallWarning } from './types/methods';
 import type { Message } from './types/message';
 import type { Usage } from './types/usage';
-import type { AgentEvent } from './types/agent-run';
+import type { AgentEvent, AgentToolSet } from './types/agent-run';
 
 /** The events only a V3 run emits (2.4), beside every 2.3 one. */
 export type AgentEventV3Only = Exclude<AgentEventV3, AgentEvent>;
@@ -111,15 +115,69 @@ export function assertV3Options(options: AgentRunOptionsV3<unknown>): void {
   }
 }
 
-/** The working memory a new V3 run starts with (spec §2.5), or none. */
+/**
+ * The working memory a new V3 run starts with (spec §2.5): the given
+ * snapshot, the one `create` describes, or (tools only) an empty one for the
+ * run's scope. None without `workingMemory`.
+ */
 export function initialWorkingMemory(
   options: AgentRunOptionsV3<unknown>,
+  now: number,
 ): WorkingMemorySnapshot | undefined {
   const working = options.workingMemory;
   if (!working) return undefined;
   if (working.snapshot) return structuredClone(working.snapshot);
   if (working.create) return createWorkingMemory(working.create);
-  return undefined;
+  return createWorkingMemory({ scope: options.session.scope, now });
+}
+
+/**
+ * The run's working memory (spec §2.5): the snapshot in the V3 record. A
+ * model tool's patch changes it in place; it becomes durable with the next
+ * save, which is the save of that call's receipt, so the patch and its
+ * receipt are in the same native checkpoint.
+ */
+export function workingMemoryHandle(
+  envelope: () => AgentRunEnvelopeV3,
+  clock: Clock,
+  emit: (event: AgentEventV3Only) => void,
+): WorkingMemoryHandle {
+  const current = (): WorkingMemorySnapshot => {
+    const snapshot = envelope().workingMemory;
+    if (!snapshot) throw new TypeError('This V3 run has no working memory.');
+    return snapshot;
+  };
+  return {
+    current,
+    apply(patch) {
+      const result = applyWorkingMemoryPatch(current(), patch, { now: clock.now() });
+      if (result.status === 'applied') {
+        envelope().workingMemory = result.snapshot;
+        emit({ type: 'working-memory', revision: result.snapshot.revision });
+      }
+      return result;
+    },
+  };
+}
+
+/**
+ * The tools a V3 run adds to the host's (spec §2.5): the working memory
+ * tools with `workingMemory.tools`. A host tool with one of their names is
+ * refused at configuration time.
+ */
+export function v3Tools(
+  options: AgentRunOptionsV3<unknown>,
+  memory: WorkingMemoryHandle,
+): AgentToolSet {
+  const tools: AgentToolSet = {};
+  if (options.workingMemory?.tools)
+    Object.assign(tools, workingMemoryTools({ memory, agentPath: options.agentPath ?? [] }));
+  for (const name of Object.keys(tools))
+    if (options.tools && Object.hasOwn(options.tools, name))
+      throw new TypeError(
+        `The tool name ${name} belongs to this V3 run's own tools; rename the host tool.`,
+      );
+  return tools;
 }
 
 /** What `createV3Compiler` built: the compiler, and the estimator the loop calibrates. */
