@@ -242,6 +242,18 @@ export function conditionalChatStoreContracts(
       await done();
     });
 
+    it('prunes on a finite fractional cutoff as on any other: strictly older tombstones', async () => {
+      const { store, clock, done } = await setup();
+      clock.set(1_000);
+      await store.deleteChat('old');
+      // 1000 is not before 999.5; it is before 1000.5.
+      expect(await store.pruneTombstones(999.5)).toBe(0);
+      expect(await store.readChat('old')).toMatchObject({ status: 'deleted' });
+      expect(await store.pruneTombstones(1_000.5)).toBe(1);
+      expect(await store.readChat('old')).toEqual({ status: 'missing' });
+      await done();
+    });
+
     it('moves its transcript index with every committed write and tombstone', async () => {
       const { store, transcript, done } = await setup();
       const scope = { userId: 'ada' };

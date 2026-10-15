@@ -137,6 +137,38 @@ assertVersionedMemoryStoreContract(
 );
 
 describe('createPostgresVersionedMemoryStore (PGlite)', { timeout: SLOW_TEST_TIMEOUT_MS }, () => {
+  it('drops the vectors of a pending generation that another model replaces', async () => {
+    const schema = await liteSchema();
+    const store = createPostgresVersionedMemoryStore({ pool: litePool, schema });
+    await store.commit(await createOp('op-1', 'r1', 'a fact', [1, 0, 0]));
+    const abandoned = await store.embeddings.begin({ modelId: 'model-b', dims: 2 });
+    const vectors = async (generation: number) =>
+      Number(
+        (
+          await litePool.query(
+            `SELECT COUNT(*) AS n FROM ${schema}.deuz_vmem_vectors WHERE generation = $1`,
+            [generation],
+          )
+        ).rows[0]!.n,
+      );
+    expect(
+      await store.embeddings.put(abandoned.generation, [
+        { id: 'r1', revision: 1, textDigest: await sha256Digest('a fact'), vector: [1, 0] },
+      ]),
+    ).toBe(1);
+    expect(await vectors(abandoned.generation)).toBe(1);
+    const next = await store.embeddings.begin({ modelId: 'model-c', dims: 2 });
+    expect(await vectors(abandoned.generation)).toBe(0);
+    const { rows } = await litePool.query(
+      `SELECT generation, status FROM ${schema}.deuz_vmem_generations WHERE status <> 'active' ORDER BY generation`,
+    );
+    expect(rows.map((row) => [Number(row.generation), row.status])).toEqual([
+      [abandoned.generation, 'retired'],
+      [next.generation, 'pending'],
+    ]);
+    await store.close();
+  });
+
   it('refuses a client that cannot lend a connection', () => {
     expect(() =>
       createPostgresVersionedMemoryStore({

@@ -1157,6 +1157,125 @@ export function assertVersionedMemoryStoreContract(
           });
         },
       );
+
+      it(
+        'prepares one generation at a time: another model or size retires the pending one',
+        { timeout },
+        async () => {
+          await withStore(async ({ store }) => {
+            await commit(
+              store,
+              await operation('op-1', [
+                await create('r1', 'first fact', { vector: [1, 0, 0] }),
+                await create('r2', 'second fact', { vector: [0, 1, 0] }),
+              ]),
+            );
+            const old = (await store.embeddings.active())!;
+            const vector = async (id: string, text: string, values: number[]) => ({
+              id,
+              revision: 1,
+              textDigest: await sha256Digest(text),
+              vector: values,
+            });
+
+            const abandoned = await store.embeddings.begin({ modelId: MODEL_B, dims: 2 });
+            expect(
+              await store.embeddings.put(abandoned.generation, [
+                await vector('r1', 'first fact', [1, 0]),
+              ]),
+            ).toBe(1);
+            // Another size of the same model replaces it.
+            const resized = await store.embeddings.begin({ modelId: MODEL_B, dims: 3 });
+            expect(resized).toMatchObject({ modelId: MODEL_B, dims: 3, status: 'pending' });
+            expect(resized.generation).not.toBe(abandoned.generation);
+
+            // The retired one lists nothing, takes nothing (a racing filler
+            // loses quietly) and never becomes active.
+            expect(await store.embeddings.pending(abandoned.generation, { limit: 10 })).toEqual([]);
+            expect(
+              await store.embeddings.put(abandoned.generation, [
+                await vector('r2', 'second fact', [0, 1]),
+              ]),
+            ).toBe(0);
+            expect(await store.embeddings.activate(abandoned.generation)).toBe(false);
+            expect((await store.embeddings.active())?.generation).toBe(old.generation);
+
+            // Asking for the first model again starts afresh: its old vectors are gone.
+            const again = await store.embeddings.begin({ modelId: MODEL_B, dims: 2 });
+            expect(again.generation).not.toBe(abandoned.generation);
+            expect(again.generation).not.toBe(resized.generation);
+            expect(await store.embeddings.pending(resized.generation, { limit: 10 })).toEqual([]);
+            expect(
+              (await store.embeddings.pending(again.generation, { limit: 10 })).map(
+                (item) => item.id,
+              ),
+            ).toEqual(['r1', 'r2']);
+            expect(
+              await store.embeddings.put(again.generation, [
+                await vector('r1', 'first fact', [1, 0]),
+                await vector('r2', 'second fact', [0, 1]),
+              ]),
+            ).toBe(2);
+            expect(await store.embeddings.activate(again.generation)).toBe(true);
+            expect(await store.embeddings.activate(abandoned.generation)).toBe(false);
+            expect(await store.embeddings.activate(resized.generation)).toBe(false);
+            expect(await store.embeddings.active()).toMatchObject({
+              generation: again.generation,
+              modelId: MODEL_B,
+              dims: 2,
+              status: 'active',
+            });
+          });
+        },
+      );
+
+      it(
+        'never stores into, lists or activates an unknown or retired generation',
+        { timeout },
+        async () => {
+          await withStore(async ({ store }) => {
+            const unknown = 9_999;
+            expect(await store.embeddings.pending(unknown, { limit: 10 })).toEqual([]);
+            expect(await store.embeddings.put(unknown, [])).toBe(0);
+            expect(await store.embeddings.activate(unknown)).toBe(false);
+
+            // An empty store: every generation is complete at once.
+            const first = await store.embeddings.begin({ modelId: MODEL_A, dims: 3 });
+            expect(await store.embeddings.activate(first.generation)).toBe(true);
+            expect(await store.embeddings.activate(first.generation)).toBe(true);
+            const second = await store.embeddings.begin({ modelId: MODEL_B, dims: 2 });
+            expect(await store.embeddings.activate(second.generation)).toBe(true);
+            // The generation it replaced is retired for good, never active again.
+            expect(await store.embeddings.activate(first.generation)).toBe(false);
+            expect((await store.embeddings.active())?.generation).toBe(second.generation);
+
+            await commit(
+              store,
+              await operation('op-1', [
+                await create('r1', 'first fact', { vector: [1, 0], modelId: MODEL_B }),
+              ]),
+            );
+            const r1 = {
+              id: 'r1',
+              revision: 1,
+              textDigest: await sha256Digest('first fact'),
+            };
+            expect(await store.embeddings.pending(first.generation, { limit: 10 })).toEqual([]);
+            expect(
+              await store.embeddings.put(first.generation, [{ ...r1, vector: [1, 0, 0] }]),
+            ).toBe(0);
+            expect(await store.embeddings.put(unknown, [{ ...r1, vector: [1, 0] }])).toBe(0);
+            expect(await store.embeddings.activate(first.generation)).toBe(false);
+            expect(await store.embeddings.active()).toMatchObject({
+              generation: second.generation,
+              modelId: MODEL_B,
+            });
+            expect((await store.get(SCOPE, 'r1'))?.embedding).toMatchObject({
+              generation: second.generation,
+            });
+          });
+        },
+      );
     });
 
     describe('retention', () => {

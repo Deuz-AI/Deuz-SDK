@@ -37,6 +37,7 @@ import {
   forgetTombstones,
   markRedactedSteps,
   redactedPayload,
+  type ContextBlobRecord,
 } from '../agent-run-v3-context';
 import { agentRunListPage, planAgentRunList, summarizeAgentRun } from '../internal/agent-run-list';
 import type { Sha256Digest } from '../internal/digest';
@@ -166,6 +167,27 @@ function redactedOf(s: State, runId: string): Set<Sha256Digest> {
   );
 }
 
+/**
+ * The tombstones that cover a record of the `redacted` blobs: what tells a
+ * retrieval block that holds a forgotten record from one of the same marker
+ * that does not (`redactRetrievalBlocks`).
+ */
+function tombstonesOf(s: State, redacted: ReadonlySet<Sha256Digest>): ContextBlobRecord[] {
+  if (redacted.size === 0) return [];
+  return all(
+    s,
+    `SELECT DISTINCT t.record_id, t.revision FROM deuz_runs_v3_forgotten t
+     JOIN deuz_runs_v3_blob_records r ON r.record_id = t.record_id
+     WHERE r.digest IN (${[...redacted].map(() => '?').join(', ')})
+       AND (r.revision = ${NO_REVISION} OR t.revision = ${NO_REVISION} OR t.revision = r.revision)`,
+    [...redacted],
+  ).map((row) =>
+    Number(row.revision) === NO_REVISION
+      ? { recordId: String(row.record_id) }
+      : { recordId: String(row.record_id), revision: Number(row.revision) },
+  );
+}
+
 /** The redacted blobs among `digests`. */
 function redactedAmong(s: State, digests: readonly Sha256Digest[]): Set<Sha256Digest> {
   if (digests.length === 0) return new Set();
@@ -228,7 +250,8 @@ export function createSqliteAgentRunStoreV3(
           ]);
           assertEnvelopeRevisionV3(row ? { revision: Number(row.revision) } : undefined, envelope);
           // A leg that ran through a forget still holds the block: stored redacted.
-          const payload = redactedPayload(encoded, redactedAmong(s, digests));
+          const redacted = redactedAmong(s, digests);
+          const payload = redactedPayload(encoded, redacted, tombstonesOf(s, redacted));
           run(
             s,
             `INSERT INTO deuz_runs_v3 (run_id, scope, revision, phase, status, payload, updated_at)
@@ -379,7 +402,8 @@ export function createSqliteAgentRunStoreV3(
             ]);
             if (!row) continue;
             const payload = String(row.payload);
-            const next = redactedPayload(payload, redactedOf(s, String(runId)));
+            const redactedBlobs = redactedOf(s, String(runId));
+            const next = redactedPayload(payload, redactedBlobs, tombstonesOf(s, redactedBlobs));
             if (next !== payload)
               run(s, 'UPDATE deuz_runs_v3 SET payload = ? WHERE run_id = ?', [next, String(runId)]);
           }

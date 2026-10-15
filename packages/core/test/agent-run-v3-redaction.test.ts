@@ -15,8 +15,17 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { PGlite } from '@electric-sql/pglite';
 import pg from 'pg';
 import { createInMemoryAgentRunStoreV3 } from '../src/agent-run-v3-store';
-import { redactedRetrievalBlock, retrievalBlockMarker } from '../src/agent-run-v3-context';
+import {
+  blockRecords,
+  holdsForgotten,
+  isBlockOf,
+  redactedRetrievalBlock,
+  retrievalBlockMarker,
+  retrievalBlockOpening,
+} from '../src/agent-run-v3-context';
 import { contextPackageBlob, type ContextPackageBlob } from '../src/agent-run-v3-package';
+import { dropRedactedContext } from '../src/agent-run-v3-run';
+import type { ContextPackage } from '../src/context/types';
 import {
   isContextMessage,
   messageText,
@@ -29,7 +38,11 @@ import type { PgPoolLike } from '../src/node/pg-tx';
 import { createPostgresAgentRunStoreV3 } from '../src/node/runs-v3-postgres';
 import { createSqliteAgentRunStoreV3 } from '../src/node/runs-v3-sqlite';
 import type { AgentResult } from '../src/types/agent-run';
-import type { AgentRunEnvelopeV3, AgentRunStoreV3 } from '../src/types/agent-run-v3';
+import type {
+  AgentRunContextStepV3,
+  AgentRunEnvelopeV3,
+  AgentRunStoreV3,
+} from '../src/types/agent-run-v3';
 import type { Message } from '../src/types/message';
 import type { AgentCheckpoint } from '../src/types/session';
 import { stepFor } from './fixtures/agent-run-store-v3-conformance';
@@ -125,6 +138,102 @@ function everyCopy(envelope: AgentRunEnvelopeV3): string[][] {
   ];
 }
 
+/** A terminal run whose history, one checkpoint and result all hold `messages`. */
+function storedRun(
+  runId: string,
+  messages: Message[],
+  steps: AgentRunContextStepV3[],
+): AgentRunEnvelopeV3 {
+  return envelopeV3(runId, 1, {
+    phase: 'terminal',
+    messages,
+    checkpoints: { [`${runId}#1`]: checkpoint(runId, 1, messages) },
+    context: { steps },
+    result: {
+      runId,
+      status: 'completed',
+      output: 'done',
+      text: 'done',
+      messages,
+      usage: envelopeV3(runId, 1).usage,
+      modelSteps: 1,
+    },
+  });
+}
+
+/** Every stored message list of a run, as messages. */
+function everyList(envelope: AgentRunEnvelopeV3): Message[][] {
+  return [
+    envelope.messages,
+    ...Object.values(envelope.checkpoints).map((entry) => entry.messages),
+    ...(envelope.result ? [envelope.result.messages] : []),
+  ];
+}
+
+/** `pkg` whose append block is `content`, as the compiler writes the block it appends. */
+function appending(pkg: ContextPackage, content: string): ContextPackage {
+  pkg.blocks[0] = { ...pkg.blocks[0]!, messages: [{ role: 'user', content }] };
+  return pkg;
+}
+
+/**
+ * Step 0 overflowed. Its first attempt placed mem-a@2 (forgotten below) and
+ * mem-b; the retry, compiled under the same pass after a compaction, dropped
+ * mem-a and placed mem-b only. Both blocks open with `pass="1" step="0"`.
+ */
+async function overflowedStep(): Promise<{
+  first: ContextPackageBlob;
+  retry: ContextPackageBlob;
+  firstBlock: Message;
+  retryBlock: Message;
+  step: AgentRunContextStepV3;
+}> {
+  const firstBlock = {
+    role: 'user' as const,
+    content: `${retrievalOpening(1, 0)}${renderRecord({ source: 'memory', kind: 'memory', recordId: 'mem-a', revision: 2 }, FORGOTTEN)}${renderRecord({ source: 'memory', kind: 'memory', recordId: 'mem-b', revision: 1 }, KEPT)}${RETRIEVAL_CLOSING}`,
+  };
+  const retryBlock = block(1, 0, 'mem-b', 1, KEPT);
+  const firstPkg = appending(contextPackage(0, 'first', 2), firstBlock.content);
+  const retryPkg = appending(contextPackage(0, 'retry', 2), retryBlock.content);
+  retryPkg.manifest.entries[0] = {
+    ...retryPkg.manifest.entries[0]!,
+    selected: false,
+    reason: 'over-budget',
+  };
+  retryPkg.blocks[0] = { ...retryPkg.blocks[0]!, entries: [1, 3] };
+  retryPkg.manifest.refresh = 'overflow-retry';
+  const first = await contextPackageBlob(firstPkg);
+  const retry = await contextPackageBlob(retryPkg);
+  expect(retry.records.some((record) => record.recordId === 'mem-a')).toBe(false);
+  const ref = (blob: ContextPackageBlob) => ({ digest: blob.digest, bytes: blob.bytes });
+  const step: AgentRunContextStepV3 = {
+    step: 0,
+    manifest: { ...retryPkg.manifest, blob: ref(retry) },
+    blob: ref(retry),
+    input: 'after-compaction',
+    firstAttempt: {
+      manifest: { ...firstPkg.manifest, blob: ref(first) },
+      blob: ref(first),
+      input: 'before-compaction',
+    },
+  };
+  return { first, retry, firstBlock, retryBlock, step };
+}
+
+/** A user's own message that opens with step 0's marker: a question about the tag. */
+const QUOTED = '<deuz_context pass="1" step="0"> is the tag I want to ask you about';
+const asked: Message = {
+  role: 'user',
+  content: [
+    { type: 'image', image: 'aGVsbG8=', mediaType: 'image/png' },
+    { type: 'text', text: QUOTED },
+  ],
+};
+/** One that even ends with the closing tag, but lacks the opening's preamble. */
+const typed: Message = { role: 'user', content: `${QUOTED}\n${RETRIEVAL_CLOSING}` };
+
+const FORGET_2 = { scope: { userId: 'u' }, recordId: 'mem-a', revisions: [2], operationId: 'f2' };
+
 describe('the stand-in of a redacted retrieval block', () => {
   it('reads as the block the renderer wrote: same marker and closing, no record', () => {
     const marker = retrievalBlockMarker(3, 7);
@@ -136,6 +245,64 @@ describe('the stand-in of a redacted retrieval block', () => {
     expect(isContextMessage(standIn)).toBe(true);
     expect([...placedBlocks([standIn])]).toEqual(['3:7']);
     expect(messageText(standIn)).toBe(standIn.content);
+  });
+
+  it('is found by its exact shape: the full opening through the closing, or the stand-in', () => {
+    const marker = retrievalBlockMarker(1, 0);
+    // The run stores repeat the renderer's opening rather than load it.
+    for (const [pass, step] of [
+      [1, 0],
+      [3, 7],
+      [12, 40],
+    ] as const)
+      expect(retrievalBlockOpening(retrievalBlockMarker(pass, step))).toBe(
+        retrievalOpening(pass, step),
+      );
+    // The opening the redaction looks for is the renderer's, preamble included.
+    expect(isBlockOf(block0, [marker])).toBe(marker);
+    expect(isBlockOf({ role: 'user', content: redactedRetrievalBlock(marker) }, [marker])).toBe(
+      marker,
+    );
+    expect(isBlockOf(block0, [retrievalBlockMarker(1, 1)])).toBeUndefined();
+    expect(isBlockOf({ ...block0, role: 'assistant' }, [marker])).toBeUndefined();
+    // A message that only opens with the marker is the user's, not a block.
+    expect(isBlockOf(asked, [marker])).toBeUndefined();
+    expect(isBlockOf(typed, [marker])).toBeUndefined();
+    expect(isBlockOf({ role: 'user', content: QUOTED }, [marker])).toBeUndefined();
+    expect(
+      isBlockOf({ role: 'user', content: [{ type: 'text', text: block0.content }] }, [marker]),
+    ).toBeUndefined();
+  });
+
+  it("reads the memory records a block holds from the renderer's labels", () => {
+    const content =
+      retrievalOpening(1, 0) +
+      renderRecord(
+        {
+          source: 'memory',
+          kind: 'memory',
+          recordId: 'a "quoted" <id> & co',
+          revision: 3,
+          provenance: { origin: 'asserted', sourceKinds: ['user'] },
+        },
+        'text with <record source="memory" kind="memory" id="fake" revision="9">',
+      ) +
+      renderRecord({ source: 'memory', kind: 'memory', recordId: 'no-revision' }, 'plain') +
+      renderRecord({ source: 'docs', kind: 'rag', recordId: 'mem-a', revision: 2 }, 'a document') +
+      RETRIEVAL_CLOSING;
+    // Escaped text never poses as a label; a document's record is not a memory record.
+    expect(blockRecords(content)).toEqual([
+      { recordId: 'a "quoted" <id> & co', revision: 3 },
+      { recordId: 'no-revision' },
+    ]);
+    // The forget rule: a record without a revision matches any revision of its id.
+    expect(holdsForgotten(content, [{ recordId: 'no-revision', revision: 8 }])).toBe(true);
+    expect(holdsForgotten(content, [{ recordId: 'a "quoted" <id> & co', revision: 3 }])).toBe(true);
+    expect(holdsForgotten(content, [{ recordId: 'a "quoted" <id> & co', revision: 4 }])).toBe(
+      false,
+    );
+    expect(holdsForgotten(content, [{ recordId: 'mem-a' }])).toBe(false);
+    expect(holdsForgotten(content, [{ recordId: 'fake' }])).toBe(false);
   });
 });
 
@@ -283,12 +450,119 @@ function redactionContract(name: string, make: () => Promise<Harness>, slow = fa
         expect(texts((await store.load('tail'))!.messages)).toContain(block0.content);
       }),
     );
+
+    it(
+      "keeps a user's own message that opens with a redacted step's marker",
+      withHarness(async ({ store }) => {
+        const held = await contextPackageBlob(contextPackage(0, 'held', 2));
+        await store.putBlob(held);
+        await store.save(storedRun('asked', [asked, typed, block0, answer], [stepFor(0, held)]));
+        await store.redactForgotten(FORGET);
+        const loaded = (await store.load('asked'))!;
+        expect(JSON.stringify(loaded)).not.toContain(FORGOTTEN);
+        for (const list of everyList(loaded)) {
+          // The image and the text stay: the message is the user's, not a block.
+          expect(list[0]).toEqual(asked);
+          expect(list[1]).toEqual(typed);
+          expect(list[2]!.content).toBe(redactedRetrievalBlock(retrievalBlockMarker(1, 0)));
+        }
+      }),
+    );
+
+    it(
+      "replaces a step's first attempt's block when only its package held the forgotten record",
+      withHarness(async ({ store }) => {
+        // A step reopened from its first attempt after a crash sent that
+        // attempt's block, which is what the history keeps.
+        const { first, retry, firstBlock, step } = await overflowedStep();
+        await store.putBlob(first);
+        await store.putBlob(retry);
+        await store.save(storedRun('reopened', [prompt, firstBlock, answer], [step]));
+
+        expect(await store.redactForgotten(FORGET_2)).toBe(1);
+        expect((await store.getBlob(first.digest)).status).toBe('redacted');
+        expect((await store.getBlob(retry.digest)).status).toBe('found');
+        const loaded = (await store.load('reopened'))!;
+        expect(JSON.stringify(loaded)).not.toContain(FORGOTTEN);
+        expect(loaded.context?.steps[0]?.firstAttempt?.manifest.redacted).toBe(true);
+        expect(loaded.context?.steps[0]?.manifest.redacted).toBeUndefined();
+        for (const list of everyList(loaded))
+          expect(list.map((message) => message.content)).toEqual([
+            prompt.content,
+            redactedRetrievalBlock(retrievalBlockMarker(1, 0)),
+            answer.content,
+          ]);
+      }),
+    );
+
+    it(
+      "keeps the overflow retry's block, which held no forgotten record, under the same marker",
+      withHarness(async ({ store }) => {
+        const { first, retry, retryBlock, step } = await overflowedStep();
+        await store.putBlob(first);
+        await store.putBlob(retry);
+        const messages = [prompt, retryBlock, answer];
+        await store.save(storedRun('retried', messages, [step]));
+
+        await store.redactForgotten(FORGET_2);
+        expect((await store.getBlob(first.digest)).status).toBe('redacted');
+        const loaded = (await store.load('retried'))!;
+        for (const list of everyList(loaded)) expect(list).toEqual(messages);
+        // A later save keeps it too.
+        await store.save({ ...loaded, revision: 2 });
+        for (const list of everyList((await store.load('retried'))!))
+          expect(list).toEqual(messages);
+      }),
+    );
   });
 }
 
 redactionContract('in-memory V3 run store', async () => {
   const { clock } = manualClock();
   return { store: createInMemoryAgentRunStoreV3({ deps: { clock } }) };
+});
+
+describe('a resumed run drops what the store redacts, and only that', () => {
+  const make = () => createInMemoryAgentRunStoreV3({ deps: { clock: manualClock().clock } });
+
+  it("keeps a user's own message that opens with a redacted step's marker", async () => {
+    const store = make();
+    const held = await contextPackageBlob(contextPackage(0, 'held', 2));
+    await store.putBlob(held);
+    await store.save(storedRun('asked', [asked, typed, block0, answer], [stepFor(0, held)]));
+    await store.redactForgotten(FORGET);
+    const loaded = (await store.load('asked'))!;
+    expect(await dropRedactedContext(loaded, store)).toBe(true);
+    expect(loaded.messages).toEqual([asked, typed, answer]);
+    // A live leg that still holds the block drops it the same way.
+    const live = storedRun('asked', [asked, typed, block0, answer], [stepFor(0, held)]);
+    expect(await dropRedactedContext(live, store)).toBe(true);
+    expect(live.messages).toEqual([asked, typed, answer]);
+  });
+
+  it("keeps the overflow retry's block and drops the first attempt's", async () => {
+    const store = make();
+    const { first, retry, firstBlock, retryBlock, step } = await overflowedStep();
+    await store.putBlob(first);
+    await store.putBlob(retry);
+    await store.save(storedRun('retried', [prompt, retryBlock, answer], [step]));
+    await store.save(storedRun('reopened', [prompt, firstBlock, answer], [step]));
+    await store.redactForgotten(FORGET_2);
+
+    const retried = (await store.load('retried'))!;
+    expect(await dropRedactedContext(retried, store)).toBe(false);
+    expect(retried.messages).toEqual([prompt, retryBlock, answer]);
+
+    // The stand-in the store left, and the block a live leg still holds.
+    for (const reopened of [
+      (await store.load('reopened'))!,
+      storedRun('reopened', [prompt, firstBlock, answer], [step]),
+    ]) {
+      expect(await dropRedactedContext(reopened, store)).toBe(true);
+      expect(reopened.messages).toEqual([prompt, answer]);
+      expect(Object.values(reopened.checkpoints)[0]!.messages).toEqual([prompt, answer]);
+    }
+  });
 });
 
 redactionContract(

@@ -11,6 +11,7 @@ import { digestJson, sha256Digest } from '../src/internal/digest';
 import { createMemoryObserver } from '../src/observe';
 import { createInMemoryVersionedMemoryStore, createMemorySession } from '../src/memory/versioned';
 import type { VersionedMemoryStore } from '../src/memory/versioned';
+import { createSqliteVersionedMemoryStore } from '../src/node/vmem-sqlite';
 import type { Embedder, MemoryScope } from '../src/memory';
 import type { ObserveEvent } from '../src/index';
 import { keywordEmbedder } from './fixtures/versioned-memory-session';
@@ -219,6 +220,42 @@ describe('reembed', () => {
     expect(next.maxInFlight).toBe(2);
     expect(next.batches.flat()).toHaveLength(12);
   });
+
+  for (const [name, make] of [
+    ['in-memory', () => createInMemoryVersionedMemoryStore()],
+    ['SQLite', () => createSqliteVersionedMemoryStore({ path: ':memory:' })],
+  ] as Array<[string, () => VersionedMemoryStore]>)
+    it(`loses quietly when another model replaces its pending generation (${name})`, async () => {
+      const store = make();
+      try {
+        const session = await fill(store, 6);
+        // Another job begins a generation of another model mid-way: one is
+        // prepared at a time, so this job's generation is retired under it.
+        let replaced: number | undefined;
+        const racing = trackingEmbedder('new-1', 2, {
+          onBatch: async (_texts, call) => {
+            if (call === 1)
+              replaced = (await store.embeddings.begin({ modelId: 'new-2', dims: 3 })).generation;
+          },
+        });
+        const result = await session.reembed({
+          embedder: racing.embedder,
+          modelId: 'new-1',
+          dims: 2,
+          batchSize: 4,
+        });
+        expect(result).toMatchObject({ embedded: 0, skipped: 4, activated: false });
+        // The retired generation listed nothing more after the first batch.
+        expect(racing.batches.map((batch) => batch.length)).toEqual([4]);
+        expect(await store.embeddings.activate(result.generation)).toBe(false);
+        expect((await store.embeddings.active())!.modelId).toBe('kw-1');
+        expect(
+          (await store.embeddings.pending(replaced!, { limit: 10 })).map((item) => item.text),
+        ).toHaveLength(6);
+      } finally {
+        await store.close?.();
+      }
+    });
 
   it('refuses vectors of another model or size than the generation it fills', async () => {
     const store = createInMemoryVersionedMemoryStore();

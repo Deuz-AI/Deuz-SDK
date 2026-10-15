@@ -386,20 +386,37 @@ export interface VersionedMemoryStore {
    * `alreadyForgotten` when the scope's record was forgotten before.
    */
   forget(scope: MemoryScope, id: string, operationId: string): Promise<MemoryForgetEvent>;
-  /** Embedding generations for `reembed`: prepared aside, switched atomically. */
+  /**
+   * Embedding generations for `reembed`: prepared aside, switched atomically.
+   * One generation is prepared at a time. A retired generation (the one an
+   * activation replaced, or a pending one another model or size replaced) is
+   * done for good: it lists nothing, takes no vector and never becomes active
+   * again. Every store behaves the same.
+   */
   embeddings: {
     /** The active generation; absent before any vector was stored. */
     active(): Promise<MemoryEmbeddingGeneration | undefined>;
-    /** Starts (or returns the pending) generation for a model and size. */
+    /**
+     * Returns the pending generation for this model and size, or starts one.
+     * A pending generation of another model or size is retired and its
+     * vectors deleted in the same transaction, so an abandoned job leaves no
+     * vectors behind and a job still filling it loses quietly (`put` stores
+     * nothing, `activate` returns false).
+     */
     begin(request: { modelId: string; dims: number }): Promise<MemoryEmbeddingGeneration>;
-    /** Current revisions without a vector in `generation`, by id after `after`. */
+    /**
+     * Current revisions without a vector in `generation`, by id after
+     * `after`; none for an unknown or retired generation.
+     */
     pending(
       generation: number,
       options: { limit: number; after?: string },
     ): Promise<MemoryReembedItem[]>;
     /**
-     * Stores vectors for a generation; one whose revision or text digest is no
-     * longer current is skipped. Returns how many were stored.
+     * Stores vectors for the pending or the active generation; one whose
+     * revision or text digest is no longer current is skipped. Returns how
+     * many were stored: 0, storing nothing, for an unknown or retired
+     * generation.
      */
     put(
       generation: number,
@@ -407,7 +424,9 @@ export interface VersionedMemoryStore {
     ): Promise<number>;
     /**
      * Makes `generation` active once every current revision has its vector
-     * there; returns false (and changes nothing) while some still lack one.
+     * there, retiring the active one and deleting its vectors; true when it
+     * is active already. Returns false (and changes nothing) while some
+     * revision still lacks one, and for an unknown or retired generation.
      */
     activate(generation: number): Promise<boolean>;
   };

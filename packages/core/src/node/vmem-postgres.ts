@@ -743,6 +743,17 @@ export function createPostgresVersionedMemoryStore(
         validateGeneration(request);
         return tx(async (q) => {
           await holdGenerations(q);
+          // One generation is prepared at a time: another model or size
+          // retires the pending one, and its vectors go with it.
+          await q.query(
+            `UPDATE ${t('generations')} SET status = 'retired' ` +
+              "WHERE status = 'pending' AND NOT (model_id = $1 AND dims = $2)",
+            [request.modelId, request.dims],
+          );
+          await q.query(
+            `DELETE FROM ${t('vectors')} WHERE generation IN ` +
+              `(SELECT generation FROM ${t('generations')} WHERE status = 'retired')`,
+          );
           const { rows } = await q.query(
             `SELECT * FROM ${t('generations')} WHERE status = 'pending' AND model_id = $1 AND dims = $2 ` +
               'ORDER BY generation DESC LIMIT 1',
@@ -765,7 +776,10 @@ export function createPostgresVersionedMemoryStore(
           `SELECT r.record, r.text_digest FROM ${t('records')} c ` +
             `JOIN ${t('revisions')} r ON r.id = c.id AND r.revision = c.revision ` +
             `LEFT JOIN ${t('vectors')} v ON v.generation = $1 AND v.id = c.id AND v.revision = c.revision ` +
-            'WHERE v.id IS NULL AND c.id COLLATE "C" > $2 ORDER BY c.id COLLATE "C" LIMIT $3',
+            'WHERE v.id IS NULL AND c.id COLLATE "C" > $2 ' +
+            // An unknown or retired generation takes no vectors: nothing is pending there.
+            `AND EXISTS (SELECT 1 FROM ${t('generations')} g WHERE g.generation = $1 AND g.status <> 'retired') ` +
+            'ORDER BY c.id COLLATE "C" LIMIT $3',
           [generation, pendingOptions.after ?? '', limit],
         );
         return rows.map((row) => {
@@ -782,11 +796,12 @@ export function createPostgresVersionedMemoryStore(
 
       async put(generation, vectors) {
         return tx(async (q) => {
+          // Shared with commits; begin and activate hold it exclusively, so a
+          // generation they retire takes no vector afterwards.
+          await shareGenerations(q);
           const target = await readGeneration(q, generation);
-          if (!target || target.status === 'retired')
-            throw new InvalidRequestError({
-              message: `Embedding generation ${generation} is not open for vectors.`,
-            });
+          // Retired (another model replaced it) or unknown: a racing filler loses quietly.
+          if (!target || target.status === 'retired') return 0;
           for (const item of vectors) assertGenerationVector(target, item.vector);
           let stored = 0;
           for (const item of vectors) {
@@ -811,10 +826,8 @@ export function createPostgresVersionedMemoryStore(
         return tx(async (q) => {
           await holdGenerations(q);
           const target = await readGeneration(q, generation);
-          if (!target)
-            throw new InvalidRequestError({
-              message: `Unknown embedding generation ${generation}.`,
-            });
+          // Unknown, or retired for good: it never becomes active (again).
+          if (!target || target.status === 'retired') return false;
           if (target.status === 'active') return true;
           const { rows } = await q.query(
             `SELECT COUNT(*) AS n FROM ${t('records')} c LEFT JOIN ${t('vectors')} v ` +

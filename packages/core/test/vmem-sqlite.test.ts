@@ -279,6 +279,37 @@ describe.skipIf(!hasFts5())(
   },
 );
 
+describe('createSqliteVersionedMemoryStore: embedding generations', () => {
+  it('drops the vectors of a pending generation that another model replaces', async () => {
+    const db = new DatabaseSync(':memory:');
+    const store = createSqliteVersionedMemoryStore({ database: db });
+    await store.commit(await createOp('op-1', 'r1', 'a fact', [1, 0, 0]));
+    const abandoned = await store.embeddings.begin({ modelId: 'model-b', dims: 2 });
+    const vectors = (generation: number) =>
+      db
+        .prepare('SELECT COUNT(*) AS n FROM deuz_vmem_vectors WHERE generation = ?')
+        .get(generation);
+    expect(
+      await store.embeddings.put(abandoned.generation, [
+        { id: 'r1', revision: 1, textDigest: await sha256Digest('a fact'), vector: [1, 0] },
+      ]),
+    ).toBe(1);
+    expect(vectors(abandoned.generation)).toEqual({ n: 1 });
+    const next = await store.embeddings.begin({ modelId: 'model-c', dims: 2 });
+    expect(vectors(abandoned.generation)).toEqual({ n: 0 });
+    expect(
+      db
+        .prepare("SELECT generation, status FROM deuz_vmem_generations WHERE status <> 'active'")
+        .all(),
+    ).toEqual([
+      { generation: abandoned.generation, status: 'retired' },
+      { generation: next.generation, status: 'pending' },
+    ]);
+    await store.close();
+    db.close();
+  });
+});
+
 describe('createSqliteVersionedMemoryStore: a commit that fails half way', () => {
   it('rolls back the revision, index, vector, scope revision and receipt together', async () => {
     const db = new DatabaseSync(':memory:');
