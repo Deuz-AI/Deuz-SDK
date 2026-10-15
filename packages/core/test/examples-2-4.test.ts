@@ -9,10 +9,13 @@
  * sources, so no build is needed. Each run is a fresh instance of the example
  * over one module graph of the sources.
  */
+import { spawnSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { dockerAvailable, dockerCommand } from './fixtures/services';
 
 vi.mock('@deuz-sdk/core/agent', () => import('../src/agent'));
+vi.mock('@deuz-sdk/core/compute/docker', () => import('../src/compute/docker/index'));
 vi.mock('@deuz-sdk/core/context', () => import('../src/context/index'));
 vi.mock('@deuz-sdk/core/goal/runtime', () => import('../src/goal/runtime/index'));
 vi.mock('@deuz-sdk/core/goal/runtime/sqlite', () => import('../src/node/goal-runtime-sqlite'));
@@ -20,6 +23,7 @@ vi.mock('@deuz-sdk/core/memory/versioned', () => import('../src/memory/versioned
 vi.mock('@deuz-sdk/core/ops/sqlite', () => import('../src/node/ops-sqlite'));
 vi.mock('@deuz-sdk/core/schedule', () => import('../src/schedule'));
 vi.mock('@deuz-sdk/core/testing', () => import('../src/testing'));
+vi.mock('@deuz-sdk/core/workspace', () => import('../src/workspace'));
 
 /** The temporary directories an example made (22 and 23 keep their SQLite files in one). */
 const tempDirs = vi.hoisted(() => [] as string[]);
@@ -194,4 +198,82 @@ describe('examples/22-goal-supervisor', () => {
     expect(cancelled).toContain('occurrence records: 2026-10-19 07:00Z delivered');
     expectTempDirRemoved();
   }, 30_000);
+});
+
+describe('examples/23-docker-runner', () => {
+  /** Runs example 23 with `DOCKER_PATH` set to `docker`, the CLI it reads from the environment. */
+  async function withDocker(docker: string): Promise<string[]> {
+    const before = process.env.DOCKER_PATH;
+    process.env.DOCKER_PATH = docker;
+    try {
+      return await run('23-docker-runner');
+    } finally {
+      if (before === undefined) delete process.env.DOCKER_PATH;
+      else process.env.DOCKER_PATH = before;
+    }
+  }
+
+  it('says why it skips and finishes normally when the Docker CLI cannot run', async () => {
+    const lines = await withDocker('deuz-no-such-docker-cli');
+    const skipped = section(lines, 1);
+    expect(skipped).toMatch(/skipped: Docker is not available \(.*deuz-no-such-docker-cli/);
+    expect(skipped).toContain('set DOCKER_PATH to its CLI');
+    // Nothing past the probe ran: no step 2, no temporary directory.
+    expect(lines.some((line) => /^\n?2\) /.test(line))).toBe(false);
+    expect(tempDirs).toHaveLength(0);
+  }, 30_000);
+
+  // Gated like docker-live.test.ts: needs DEUZ_TEST_DOCKER=1 and the pinned image pulled.
+  const docker = dockerAvailable();
+  it.runIf(docker)(
+    'isolates, stages, reconnects, cancels and cleans up on a real engine',
+    async () => {
+      const lines = await withDocker(dockerCommand());
+      const sandboxed = section(lines, 1);
+      const processed = section(lines, 2);
+      const restarted = section(lines, 3);
+      const cancelled = section(lines, 4);
+      const cleaned = section(lines, 5);
+
+      expect(sandboxed).not.toContain('skipped');
+      expect(sandboxed).toContain('uid 10001');
+      expect(sandboxed).toContain('orders 3');
+      expect(sandboxed).toContain('offline');
+      expect(sandboxed).toContain('exit 0; made.txt on the host: false');
+      expect(sandboxed).toContain('sleep 30 with a 1 s timeout: timedOut=true, exit null');
+      expect(sandboxed).toMatch(/cwd \.\.\/etc: exit null \(.*outside/);
+      expect(sandboxed).toContain(
+        'seq 1 1000 with a 64-byte tail: ends "1000", truncated={"stdout":true,"stderr":false}',
+      );
+
+      expect(processed).toMatch(
+        /start: (running|exited), container [0-9a-f]{12}, image d9e853e87e55/,
+      );
+      expect(processed).toContain('poll: exited, exit code 0');
+      expect(processed).toContain(String.raw`output: "done\n", truncated false`);
+      expect(processed).toMatch(/artifact out\/total\.txt: "68", 3 bytes, sha256:[0-9a-f]{12}…/);
+      expect(processed).toContain('artifact ../etc/passwd: artifact_rejected');
+
+      expect(restarted).toContain('start again: exited, same container true');
+      expect(restarted).toContain('the same id with another command: operation_conflict');
+
+      expect(cancelled).toContain('long-job: running');
+      expect(cancelled).toContain('cancel: cancelled, killed: true');
+
+      expect(cleaned).toContain('reconcile: 2 matched, 0 orphans, 0 lost');
+      expect(cleaned).toContain(String.raw`the stored output tail is still "done\n"`);
+      expect(cleaned).toContain('records: orders-total disposed, long-job disposed');
+      expect(cleaned).toContain('prune: 2 terminal records removed');
+      expectTempDirRemoved();
+      // No container of this run is left behind.
+      const left = spawnSync(
+        dockerCommand(),
+        ['ps', '-a', '-q', '--filter', `label=deuz.scope=example-23-${process.pid}`],
+        { encoding: 'utf8', shell: false, windowsHide: true, timeout: 60_000 },
+      );
+      expect(left.status).toBe(0);
+      expect(left.stdout.trim()).toBe('');
+    },
+    120_000,
+  );
 });
