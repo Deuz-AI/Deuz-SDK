@@ -1117,8 +1117,20 @@ is the versioned-memory `onForget` listener: it redacts every stored package
 that holds one of the forgotten revisions, also one written after the forget,
 and returns how many it redacted. `getBlob` then answers `{ status: 'redacted' }`
 and the manifests that point to it load with `redacted: true`. The forget records
-the store keeps hold record ids and revisions, never text. See
-[Retention and forget](/docs/modules/retention).
+the store keeps hold record ids and revisions, never text.
+
+The same call rewrites, in place, every stored copy of a redacted package's
+retrieval block in the runs that point to it: history, checkpoints and the
+stored result's messages, a terminal run's `result.messages` included. Each
+copy becomes a stand-in that keeps the `<deuz_context pass="P" step="S">`
+marker and holds no record; the run keeps its revision and last-save time. A
+later save of such a run is stored the same way, and a resume still drops the
+block and compiles the step again. A forget does not reach text the model
+wrote from a block (assistant turns, `result.text`, a compaction summary),
+memory tool results (`memory_recall` output in tool messages, the run
+transcript, a chat store), the in-memory history of a leg running at forget
+time until it ends or is resumed, or run stores not subscribed through
+`onForget`. See [Retention and forget](/docs/modules/retention).
 
 ## Mandatory policy and shared budgets
 
