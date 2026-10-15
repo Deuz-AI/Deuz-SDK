@@ -10,6 +10,9 @@ import {
   type ProposeSkillFromRunOptions,
 } from '../src/skills/learning';
 import { projectRun } from '../src/skills/learning/projection';
+import { parseSkill } from '../src/skills';
+import { createPriceProvider } from '../src/pricing';
+import { readConfig } from '../src/internal/config-symbol';
 import { isSha256Digest, sha256Digest } from '../src/internal/digest';
 import type { AgentRunEnvelope } from '../src/types/agent-run';
 import {
@@ -204,3 +207,160 @@ describe('the source projection', () => {
     expect(calls()).toBe(0);
   });
 });
+
+describe('proposeSkillFromRun: the draft', () => {
+  const clock = { now: () => 1_700_000_000_000, setTimeout: () => () => {} };
+
+  it('drafts a sourced, inert SKILL.md that passes parseSkill', async () => {
+    const { model, calls } = recordingModel([{ text: draftJson() }]);
+    const run = verifiedRun();
+    const projection = await projectRun(run);
+    const proposal = await proposeSkillFromRun({ run, model, budget: BUDGET, deps: { clock } });
+
+    expect(calls()).toBe(1);
+    expect(proposal).toMatchObject({
+      kind: 'deuz-skill-proposal',
+      version: 1,
+      status: 'proposed',
+      evaluation: 'not-evaluated',
+      allowedTools: ['get_version', 'deploy', 'health_check'],
+      source: { runId: 'run-billing', scope: 'tenant-a', revision: 7, digest: projection.digest },
+      createdAt: clock.now(),
+    });
+    const parsed = parseSkill(proposal.skillMd);
+    expect(parsed.issues).toEqual([]);
+    expect(proposal.manifest).toEqual(parsed.manifest);
+    expect(parsed.manifest).toMatchObject({
+      name: 'staging-deploy-check',
+      description:
+        'Deploys a service to staging and confirms its health check. Use when a service must be promoted to staging safely.',
+      allowedTools: ['get_version', 'deploy', 'health_check'],
+      metadata: {
+        'deuz-status': 'proposed',
+        'deuz-evaluation': 'not-evaluated',
+        'deuz-source-digest': projection.digest,
+      },
+    });
+    expect(parsed.manifest.body).toContain(
+      '1. Read the version currently deployed. (sources: S2, S3)',
+    );
+    expect(parsed.manifest.body).toContain('- Shown for one service only.');
+    expect(proposal.steps.map((step) => step.text)).toEqual([
+      'Read the version currently deployed.',
+      'Deploy the next version to staging.',
+      'Run the health check and report the version.',
+    ]);
+    expect(proposal.limitations).toEqual([
+      'Shown for one service only.',
+      'Proposed from one verified run (run-billing); the skill itself has not been evaluated.',
+    ]);
+  });
+
+  it('sends the projection in one request, never the raw transcript', async () => {
+    const { model, requests } = recordingModel([{ text: draftJson() }]);
+    await proposeSkillFromRun({ run: verifiedRun(), model, budget: BUDGET });
+    const [body, ...more] = requests();
+    expect(more).toEqual([]);
+    const wire = JSON.stringify(body);
+    expect(Object.values(SECRETS).filter((secret) => wire.includes(secret))).toEqual([]);
+    expect(wire).toContain('[S1] task: Deploy the billing service');
+    expect(body).not.toHaveProperty('tools');
+    expect(body!.max_tokens ?? body!.max_completion_tokens).toBe(2048);
+  });
+
+  it('honours maxOutputTokens and the host instructions', async () => {
+    const { model, requests } = recordingModel([{ text: draftJson() }]);
+    await proposeSkillFromRun({
+      run: verifiedRun(),
+      model,
+      budget: BUDGET,
+      maxOutputTokens: 512,
+      instructions: 'Name the skill after the service family.',
+    });
+    const [body] = requests();
+    expect(body!.max_tokens ?? body!.max_completion_tokens).toBe(512);
+    expect(JSON.stringify(body)).toContain('Name the skill after the service family.');
+  });
+
+  it('accounts its call apart from the source run, priced when the model has a price', async () => {
+    const { model } = recordingModel([
+      { text: draftJson(), usage: { inputTokens: 1000, outputTokens: 200 } },
+    ]);
+    const run = verifiedRun();
+    const before = structuredClone(run);
+    const priceProvider = createPriceProvider({ table: { 'mock-model': { input: 1, output: 2 } } });
+    const proposal = await proposeSkillFromRun({
+      run,
+      model,
+      budget: { tokens: 50_000, usd: 1 },
+      deps: { priceProvider },
+    });
+    expect(proposal.cost).toEqual({
+      modelId: 'mock-model',
+      usage: expect.objectContaining({ inputTokens: 1000, outputTokens: 200, totalTokens: 1200 }),
+      costUsd: 0.0014,
+    });
+    expect(run).toEqual(before);
+  });
+
+  it('leaves costUsd out for a model without a price', async () => {
+    const { model } = recordingModel([{ text: draftJson() }]);
+    const proposal = await proposeSkillFromRun({ run: verifiedRun(), model, budget: BUDGET });
+    expect(proposal.cost.modelId).toBe('mock-model');
+    expect(proposal.cost).not.toHaveProperty('costUsd');
+  });
+
+  it('refuses a call its budget cannot admit, before any request', async () => {
+    const { model, calls } = recordingModel([{ text: draftJson() }]);
+    await expect(
+      proposeSkillFromRun({ run: verifiedRun(), model, budget: { tokens: 100 } }),
+    ).rejects.toMatchObject({ code: 'budget_exceeded' });
+    expect(calls()).toBe(0);
+  });
+
+  it('makes exactly one attempt: a failing call is not retried', async () => {
+    const { model } = recordingModel([{ text: draftJson() }]);
+    let attempts = 0;
+    readConfig(model)!.fetch = (async () => {
+      attempts += 1;
+      return new Response('{"error":{"message":"overloaded"}}', { status: 529 });
+    }) as typeof fetch;
+    await expect(
+      proposeSkillFromRun({ run: verifiedRun(), model, budget: BUDGET }),
+    ).rejects.toBeInstanceOf(Error);
+    expect(attempts).toBe(1);
+  });
+
+  it('works on a frozen run and changes nothing: no file, no registry, no evaluation', async () => {
+    const { model } = recordingModel([{ text: draftJson() }]);
+    const run = deepFreeze(verifiedRun());
+    const proposal = await proposeSkillFromRun({ run, model, budget: BUDGET });
+    expect(proposal.status).toBe('proposed');
+    expect(JSON.parse(JSON.stringify(proposal))).toEqual(proposal);
+  });
+
+  it('may cost again on a repeated call: one draft per call, no exactly-once', async () => {
+    const { model, calls } = recordingModel([{ text: draftJson() }]);
+    await proposeSkillFromRun({ run: verifiedRun(), model, budget: BUDGET });
+    await proposeSkillFromRun({ run: verifiedRun(), model, budget: BUDGET });
+    expect(calls()).toBe(2);
+  });
+
+  it('stops on an aborted signal without a request', async () => {
+    const { model, calls } = recordingModel([{ text: draftJson() }]);
+    const controller = new AbortController();
+    controller.abort(new Error('host cancelled'));
+    await expect(
+      proposeSkillFromRun({ run: verifiedRun(), model, budget: BUDGET, signal: controller.signal }),
+    ).rejects.toThrow('host cancelled');
+    expect(calls()).toBe(0);
+  });
+});
+
+function deepFreeze<T>(value: T): T {
+  if (value && typeof value === 'object') {
+    for (const inner of Object.values(value)) deepFreeze(inner);
+    Object.freeze(value);
+  }
+  return value;
+}

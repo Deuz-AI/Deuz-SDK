@@ -17,7 +17,9 @@ import type { BudgetLimits } from '../../types/execution';
 import type { LanguageModel } from '../../types/model';
 import type { Usage } from '../../types/usage';
 import { DeuzError } from '../../errors';
-import { notImplemented } from '../../internal/not-implemented';
+import { resolveDependencies } from '../../internal/resolve-deps';
+import { callProposalModel } from './call';
+import { acceptDraft, InvalidDraftError, parseDraft, proposalMessages } from './draft';
 import { projectRun } from './projection';
 
 /** A reference into the source run that a method step rests on. */
@@ -141,7 +143,49 @@ export async function proposeSkillFromRun(
       'source_too_large',
       `the projection of run ${run.runId} has ${projection.text.length} characters; maxSourceChars is ${maxSourceChars}`,
     );
-  return notImplemented('proposeSkillFromRun');
+
+  const call = await callProposalModel({
+    model: options.model,
+    messages: proposalMessages(projection, options.instructions),
+    maxOutputTokens: options.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS,
+    budget: options.budget,
+    ...(options.signal ? { signal: options.signal } : {}),
+    ...(options.deps ? { deps: options.deps } : {}),
+  });
+  const revision = run.revision ?? 0;
+  let accepted: ReturnType<typeof acceptDraft>;
+  try {
+    if (call.finishReason === 'length')
+      throw new InvalidDraftError('the draft was cut off at maxOutputTokens');
+    if (call.finishReason === 'content_filter')
+      throw new InvalidDraftError('the model refused to draft');
+    accepted = acceptDraft(parseDraft(call.text), { runId: run.runId, revision, projection });
+  } catch (error) {
+    if (error instanceof InvalidDraftError)
+      throw new SkillLearningError(
+        'invalid_proposal',
+        `the proposal for run ${run.runId} was refused: ${error.message}`,
+      );
+    throw error;
+  }
+  return {
+    kind: 'deuz-skill-proposal',
+    version: 1,
+    status: 'proposed',
+    evaluation: 'not-evaluated',
+    skillMd: accepted.skillMd,
+    manifest: accepted.manifest,
+    steps: accepted.steps,
+    limitations: accepted.limitations,
+    ...(accepted.allowedTools ? { allowedTools: accepted.allowedTools } : {}),
+    source: { runId: run.runId, scope: run.scope, revision, digest: projection.digest },
+    cost: {
+      modelId: options.model.modelId,
+      usage: call.usage,
+      ...(call.costUsd !== undefined ? { costUsd: call.costUsd } : {}),
+    },
+    createdAt: resolveDependencies(options.deps).clock.now(),
+  };
 }
 
 /** Default output tokens of the proposal call. */
