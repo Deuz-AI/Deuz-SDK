@@ -80,6 +80,8 @@ import type {
 } from '@deuz-sdk/core/chat';
 import type { DeuzUIPart } from '@deuz-sdk/core/ui';
 import { connectDeuzStream, readDeuzStream } from '@deuz-sdk/core/ui';
+import { assertChatSnapshot, pairViews, restoreUI } from './chat-snapshot';
+import type { ChatSnapshotV1 } from './chat-snapshot';
 
 /**
  * Fold one wire part via the core reducer. Current core versions preserve the
@@ -524,6 +526,16 @@ export interface UseChatOptions {
    * `setHistory` (both views) or `setMessages` (re-derives canonical).
    */
   initialMessages?: Message[];
+  /**
+   * Restore a chat (2.4): a {@link ChatSnapshotV1} from `exportSnapshot()`,
+   * or one built from a stored `ChatRecord` (`{ version: 1, messages:
+   * record.messages, messageIds: record.messageIds }`). Every message renders
+   * under its stored id (a missing, empty or repeated one gets a fresh id),
+   * so two messages with the same text stay two messages. Takes precedence
+   * over `initialMessages`, and is read once, at mount, like it. Throws a
+   * TypeError for a snapshot whose `version` is not 1.
+   */
+  initialSnapshot?: ChatSnapshotV1;
   headers?: Record<string, string>;
   /** Extra fields merged into every request body. */
   body?: Record<string, unknown>;
@@ -750,6 +762,13 @@ export interface UseChatResult {
    * it and appends nothing the hook already holds.
    */
   reconnect: () => Promise<void>;
+  /**
+   * Capture the chat as a {@link ChatSnapshotV1} (2.4), to persist and restore
+   * with `initialSnapshot`: the canonical history with one id per message
+   * (the ids the UI renders, the stream's ids for assistant turns), and
+   * whatever is still open. Reads the latest state, not the last render.
+   */
+  exportSnapshot: () => ChatSnapshotV1;
 }
 
 /**
@@ -801,15 +820,51 @@ function saveCursor(resume: UseChatResumeOptions, id: string): void {
 
 export function useChat(options: UseChatOptions): UseChatResult {
   const genId = options.generateId ?? defaultGenerateId;
+  /** The snapshot this hook was mounted with (2.4), checked once. */
+  const [restored] = useState<ChatSnapshotV1 | undefined>(() => {
+    const initial = options.initialSnapshot;
+    if (initial === undefined) return undefined;
+    assertChatSnapshot(initial);
+    return initial;
+  });
   const [snapshot, setSnapshot] = useState<ChatSnapshot>(() => ({
-    history: {
-      ui: uiFromMessages(options.initialMessages ?? [], genId),
-      canonical: options.initialMessages ? [...options.initialMessages] : [],
-    },
+    history: restored
+      ? {
+          ui: restoreUI(restored.messages, restored.messageIds, genId),
+          canonical: [...restored.messages],
+        }
+      : {
+          ui: uiFromMessages(options.initialMessages ?? [], genId),
+          canonical: options.initialMessages ? [...options.initialMessages] : [],
+        },
     dataParts: [],
     citations: [],
     activity: [],
   }));
+  /**
+   * The id of each canonical message (2.4): the id its UI message renders
+   * under, so `exportSnapshot()` can align `messageIds` with `messages` the
+   * way `ChatRecord` does. Keyed by the message object, which the hook never
+   * mutates and which keeps its identity across every history array. Filled
+   * here from the mounted history (not inside the state initializer, which
+   * StrictMode may run twice with different generated ids), and as messages
+   * join the history: `sendMessage` (the user bubble's id), a settled turn
+   * (the stream's message id) and `setHistory` (paired with the new UI view).
+   */
+  const idsRef = useRef<WeakMap<Message, string> | null>(null);
+  if (idsRef.current === null) {
+    const ids = new WeakMap<Message, string>();
+    idsRef.current = ids;
+    // A message the UI has no bubble for (system, tool) keeps its stored id too.
+    restored?.messages.forEach((message, index) => {
+      const id = restored.messageIds?.[index];
+      if (typeof id === 'string' && id !== '') ids.set(message, id);
+    });
+    pairViews(snapshot.history.canonical, snapshot.history.ui, (message, view) =>
+      ids.set(message, view.id),
+    );
+  }
+  const messageIds = idsRef.current;
   const [status, setStatus] = useState<'idle' | 'streaming' | 'error'>('idle');
   const [error, setError] = useState<Error | undefined>(undefined);
   const [pendingApprovals, setPendingApprovals] = useState<ToolApprovalRequest[]>([]);
@@ -1208,8 +1263,11 @@ export function useChat(options: UseChatOptions): UseChatResult {
       );
       priorResultsRef.current = [];
       if (answers.length > 0) appendCanonical(clientToolResultMessage(answers));
-      // Append the canonical assistant turn (client-tools reconstruction).
-      appendCanonical(assistantMessageFromTurn(turn));
+      // Append the canonical assistant turn (client-tools reconstruction),
+      // under the id its bubble renders with (2.4: `exportSnapshot`).
+      const assistant = assistantMessageFromTurn(turn);
+      messageIds.set(assistant, turn.message.id);
+      appendCanonical(assistant);
       // The calls the server ran within this leg (2.3) keep their `tool_use` in
       // that message and their result on the card: it answers them right after
       // it, as `canonicalFromUI` does. Before 2.3 the next request carried them
@@ -1279,7 +1337,7 @@ export function useChat(options: UseChatOptions): UseChatResult {
       }
       return settleClientCalls(turn, clientPending, native ? { runId: native.runId } : undefined);
     },
-    [appendCanonical, settleClientCalls],
+    [appendCanonical, settleClientCalls, messageIds],
   );
 
   const run = useCallback(
@@ -1433,6 +1491,7 @@ export function useChat(options: UseChatOptions): UseChatResult {
       // prefix does not move when a caller upgrades.
       const message = userMessageFromInput(input);
       const bubble = uiFromMessages([message], genId)[0];
+      if (bubble) messageIds.set(message, bubble.id);
       const previous = snapshotRef.current;
       commit({
         ...previous,
@@ -1445,7 +1504,7 @@ export function useChat(options: UseChatOptions): UseChatResult {
       flush();
       await run();
     },
-    [run, commit, clearGates, flush, options.generateId],
+    [run, commit, clearGates, flush, options.generateId, messageIds],
   );
 
   const regenerate = useCallback(async (): Promise<void> => {
@@ -1482,6 +1541,11 @@ export function useChat(options: UseChatOptions): UseChatResult {
         ...previous,
         history: { ui: [...next.ui], canonical: [...next.canonical] },
       });
+      // A message new to the history takes the id of its UI counterpart (2.4);
+      // one the hook already knows keeps its id, identity being the safer pairing.
+      pairViews(next.canonical, next.ui, (message, view) => {
+        if (!messageIds.has(message)) messageIds.set(message, view.id);
+      });
       clearGates();
       // The in-memory resume cursor (2.3: POST reads move it too) addresses
       // the stream of the transcript just replaced, like the gates. After a
@@ -1495,7 +1559,7 @@ export function useChat(options: UseChatOptions): UseChatResult {
       behindCursorRef.current = [];
       flush();
     },
-    [commit, clearGates, flush],
+    [commit, clearGates, flush, messageIds],
   );
 
   const setMessages = useCallback(
@@ -1751,6 +1815,29 @@ export function useChat(options: UseChatOptions): UseChatResult {
     void runResume(true);
   }, [options.resume?.auto, runResume]);
 
+  /**
+   * `messageIds` aligned with `history` (2.4). A message with no id yet (a
+   * tool result, a message `setHistory` could not pair) gets a generated one
+   * here and keeps it, so every export names it the same.
+   */
+  const idsFor = useCallback(
+    (history: readonly Message[]): string[] =>
+      history.map((message) => {
+        let id = messageIds.get(message);
+        if (id === undefined) {
+          id = genId();
+          messageIds.set(message, id);
+        }
+        return id;
+      }),
+    [messageIds, options.generateId],
+  );
+
+  const exportSnapshot = useCallback((): ChatSnapshotV1 => {
+    const canonical = snapshotRef.current.history.canonical;
+    return { version: 1, messages: [...canonical], messageIds: idsFor(canonical) };
+  }, [idsFor]);
+
   return {
     messages: snapshot.history.ui,
     history: snapshot.history,
@@ -1783,5 +1870,6 @@ export function useChat(options: UseChatOptions): UseChatResult {
     clearError,
     addToolApprovalResponse,
     reconnect,
+    exportSnapshot,
   };
 }
