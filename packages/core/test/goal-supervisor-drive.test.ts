@@ -598,6 +598,82 @@ describe('drain and lease loss', () => {
   });
 });
 
+describe('lease provider restart', () => {
+  /**
+   * Supervisor A drives three legs and holds a fourth (its intent claimed
+   * under token 4), then its process dies; B starts on a fresh lease
+   * provider (tokens from 1 again) over the same goal store.
+   */
+  async function restarted(w: World) {
+    let legs = 0;
+    const before = fakeRunLauncher((request) => {
+      legs++;
+      return legs <= 3
+        ? { runId: request.runId, result: results.completed(request.runId) }
+        : 'hold';
+    });
+    const a = supervisorIn(w, { owner: 'sup-a', launcher: before });
+    await a.supervisor.submit({ goalId: 'g-1', scope: SCOPE, objective: 'x' });
+    for (let index = 0; index < 3; index++) await a.supervisor.tick();
+    void a.supervisor.tick();
+    const held = await before.whenHeld();
+    const intent = (await w.store.intents.get(SCOPE, held.request.intentId))!;
+    expect(intent).toMatchObject({ status: 'claimed', claim: { token: 4 } });
+    const after = fakeRunLauncher();
+    const b = createGoalSupervisor({
+      store: w.store,
+      launcher: after,
+      lease: { provider: createInMemoryLeaseProvider({ clock: w.time.clock }), owner: 'sup-b' },
+      deps: { clock: w.time.clock },
+    });
+    return { b, after, intent, runId: held.request.runId };
+  }
+
+  it('applies a recorded cancel on the first tick after a restart', async () => {
+    const w = world();
+    const { b, intent } = await restarted(w);
+    await b.command(SCOPE, 'g-1', { type: 'cancel' });
+    expect(await b.tick()).toMatchObject({ cancelled: 1 });
+    expect((await b.get(SCOPE, 'g-1'))?.goal.status).toBe('cancelled');
+    expect((await w.store.intents.get(SCOPE, intent.intentId))?.status).toBe('cancelled');
+  });
+
+  it('resumes the same run on the first tick after a restart, under a fresh intent', async () => {
+    const w = world();
+    const { b, after, intent, runId } = await restarted(w);
+    expect(await b.tick()).toMatchObject({ dispatched: 1 });
+    expect(after.calls.map((call) => call.request.runId)).toEqual([runId]);
+    expect(after.calls[0]!.request.intentId).not.toBe(intent.intentId);
+    expect(await w.store.intents.get(SCOPE, intent.intentId)).toMatchObject({
+      status: 'cancelled',
+      outcome: { reason: 'superseded' },
+    });
+    expect((await b.get(SCOPE, 'g-1'))?.runtime).toMatchObject({ runs: 4, phase: 'idle' });
+  });
+
+  it('never takes over a claim of a later holder while its own lease is gone', async () => {
+    const w = world();
+    const { intent } = await restarted(w);
+    // C's renewals answer that C no longer holds the goal: the higher claim
+    // may be a live holder's, so C leaves it alone.
+    const lost = createGoalSupervisor({
+      store: w.store,
+      launcher: fakeRunLauncher(),
+      lease: {
+        provider: {
+          ...createInMemoryLeaseProvider({ clock: w.time.clock }),
+          renew: async () => ({ held: false }),
+        },
+        owner: 'sup-c',
+      },
+      deps: { clock: w.time.clock },
+    });
+    await lost.command(SCOPE, 'g-1', { type: 'cancel' });
+    expect(await lost.tick()).toMatchObject({ cancelled: 0 });
+    expect((await w.store.intents.get(SCOPE, intent.intentId))?.status).toBe('claimed');
+  });
+});
+
 describe('accounting', () => {
   it('charges the run ledger above its watermark once, keeping reservations apart', async () => {
     const w = world();
