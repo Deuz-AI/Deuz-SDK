@@ -58,12 +58,15 @@ import {
   embeddingMeta,
   encodeReceipt,
   encodeRecord,
+  forgetReceipt,
+  forgetRequestDigest,
   fuseHits,
   normalizeScope,
   planCommit,
   pruneOperationsWarning,
   queryTokens,
   rankByCosine,
+  refuseForeignForget,
   replayOrRefuse,
   retentionSpan,
   scopeKey,
@@ -656,39 +659,62 @@ export function createSqliteVersionedMemoryStore(
       const key = scopeKey(normalized);
       if (typeof operationId !== 'string' || operationId === '')
         throw new InvalidRequestError({ message: 'forget needs an operationId.' });
+      const requestDigest = await forgetRequestDigest(normalized, id);
       const revisions = await write((s) =>
-        sqliteTransaction(s.db, () => {
+        sqliteTransaction(s.db, (): number[] => {
+          // The forget is an operation: a repeated id replays, another's id conflicts.
+          const stored = readReceipt(s, operationId);
+          if (stored) {
+            refuseForeignForget(stored, operationId, requestDigest);
+            return [];
+          }
           syncFts(s, true);
           const record = one(s, 'SELECT scope_key FROM deuz_vmem_records WHERE id = ?', [id]);
-          if (!record || text(record.scope_key) !== key) return [];
-          const rows = all(
-            s,
-            'SELECT seq, revision, text FROM deuz_vmem_revisions WHERE id = ? ORDER BY revision',
-            [id],
-          );
-          for (const row of rows) unindexRevision(s, num(row.seq), text(row.text));
-          run(s, 'DELETE FROM deuz_vmem_vectors WHERE id = ?', [id]);
-          run(s, 'DELETE FROM deuz_vmem_revisions WHERE id = ?', [id]);
-          run(s, 'DELETE FROM deuz_vmem_records WHERE id = ?', [id]);
+          let rows: Record<string, unknown>[] = [];
+          if (record && text(record.scope_key) === key) {
+            rows = all(
+              s,
+              'SELECT seq, revision, text FROM deuz_vmem_revisions WHERE id = ? ORDER BY revision',
+              [id],
+            );
+            for (const row of rows) unindexRevision(s, num(row.seq), text(row.text));
+            run(s, 'DELETE FROM deuz_vmem_vectors WHERE id = ?', [id]);
+            run(s, 'DELETE FROM deuz_vmem_revisions WHERE id = ?', [id]);
+            run(s, 'DELETE FROM deuz_vmem_records WHERE id = ?', [id]);
+            run(
+              s,
+              'INSERT OR REPLACE INTO deuz_vmem_forgotten (id, scope_key, operation_id, forgotten_at) VALUES (?, ?, ?, ?)',
+              [id, key, operationId, clock.now()],
+            );
+            run(
+              s,
+              'UPDATE deuz_vmem_receipts SET redacted = 1 WHERE operation_id IN ' +
+                '(SELECT operation_id FROM deuz_vmem_receipt_records WHERE record_id = ?)',
+              [id],
+            );
+            run(s, 'DELETE FROM deuz_vmem_receipt_records WHERE record_id = ?', [id]);
+            markWritten(s);
+          }
+          // Committed even when it deleted nothing: the scope moves and the id is taken.
+          const scopeRevision = readScopeRevision(s, key) + 1;
           run(
             s,
-            'INSERT OR REPLACE INTO deuz_vmem_forgotten (id, scope_key, operation_id, forgotten_at) VALUES (?, ?, ?, ?)',
-            [id, key, operationId, clock.now()],
+            'INSERT INTO deuz_vmem_scopes (scope_key, revision) VALUES (?, ?) ' +
+              'ON CONFLICT(scope_key) DO UPDATE SET revision = excluded.revision',
+            [key, scopeRevision],
+          );
+          const receipt = forgetReceipt(
+            normalized,
+            operationId,
+            requestDigest,
+            scopeRevision,
+            clock.now(),
           );
           run(
             s,
-            'UPDATE deuz_vmem_receipts SET redacted = 1 WHERE operation_id IN ' +
-              '(SELECT operation_id FROM deuz_vmem_receipt_records WHERE record_id = ?)',
-            [id],
+            'INSERT INTO deuz_vmem_receipts (operation_id, request_digest, committed_at, redacted, receipt) VALUES (?, ?, ?, 0, ?)',
+            [operationId, requestDigest, receipt.committedAt, encodeReceipt(receipt)],
           );
-          run(s, 'DELETE FROM deuz_vmem_receipt_records WHERE record_id = ?', [id]);
-          run(
-            s,
-            'INSERT INTO deuz_vmem_scopes (scope_key, revision) VALUES (?, 1) ' +
-              'ON CONFLICT(scope_key) DO UPDATE SET revision = revision + 1',
-            [key],
-          );
-          markWritten(s);
           return rows.map((row) => num(row.revision));
         }),
       );

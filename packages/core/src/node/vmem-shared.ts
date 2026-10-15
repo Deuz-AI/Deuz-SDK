@@ -243,6 +243,53 @@ export function replayOrRefuse(
 }
 
 // ===================================================================
+// Forget as an operation
+// ===================================================================
+
+/**
+ * The request digest of a forget, as the in-memory reference computes it: a
+ * repeated operation id replays on the same scope and record, and conflicts
+ * otherwise (with a commit's id too).
+ */
+export function forgetRequestDigest(scope: MemoryScope, id: string): Promise<Sha256Digest> {
+  return digestJson({ type: 'forget', scope, id });
+}
+
+/** Throws `OperationConflictError` when `stored` is not the receipt of this same forget. */
+export function refuseForeignForget(
+  stored: VersionedMemoryReceipt,
+  operationId: string,
+  requestDigest: Sha256Digest,
+): void {
+  if (stored.requestDigest !== requestDigest)
+    throw new OperationConflictError({
+      subsystem: 'memory',
+      operationId,
+      storedDigest: stored.requestDigest,
+      requestDigest,
+    });
+}
+
+/** The content-free receipt a committed forget leaves, whether or not it deleted anything. */
+export function forgetReceipt(
+  scope: MemoryScope,
+  operationId: string,
+  requestDigest: Sha256Digest,
+  scopeRevision: number,
+  committedAt: number,
+): VersionedMemoryReceipt {
+  return {
+    operationId,
+    scope,
+    actor: 'host',
+    requestDigest,
+    scopeRevision,
+    entries: [],
+    committedAt,
+  };
+}
+
+// ===================================================================
 // The commit planner
 // ===================================================================
 
