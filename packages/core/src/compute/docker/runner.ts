@@ -16,11 +16,11 @@
  * Cancel is recorded first, then stop with a 2 s grace, kill if needed and a
  * state check (a container that never started is removed instead, so a start
  * another host already dispatched has nothing to run); while the daemon is
- * unreachable the operation stays
- * `cancel-requested` and the next poll, cancel or reconcile drives it on.
- * `durableTimeout` is false: a deadline is enforced by this runner's timer
- * while it lives, and a deadline that passed while the host was down cancels
- * at the first poll, start or reconcile after it.
+ * unreachable the operation stays `cancel-requested` and the next poll,
+ * cancel or reconcile drives it on. `durableTimeout` is false: a deadline is
+ * enforced by this runner's timer while it lives, and a deadline that passed
+ * while the host was down cancels at the first poll, start or reconcile
+ * after it; an operation not yet started is then never started.
  */
 import {
   digestJson,
@@ -95,6 +95,9 @@ function transientLeaseEnd(info: ContainerInfo): number {
 
 /** How long a start with stdin is watched for the container to come up. */
 const STDIN_START_WAIT_MS = 30_000;
+
+/** The states before the start command: a passed deadline cancels them unstarted. */
+const PRE_START_STATES: ReadonlySet<ProcessState> = new Set(['recorded', 'created', 'staged']);
 
 /** The states a container may still exist for, and `reconcile` checks. */
 const ACTIVE_STATES: readonly ProcessState[] = [
@@ -232,6 +235,12 @@ export function createDockerRunnerFromOptions(
     );
     deadlineTimers.set(key, cancelTimer);
   };
+
+  /** A pre-start record whose deadline has passed: cancelled, never started. */
+  const expiredBeforeStart = (record: ProcessOperationRecord): boolean =>
+    PRE_START_STATES.has(record.state) &&
+    record.deadlineAt !== undefined &&
+    deps.clock.now() >= record.deadlineAt;
 
   async function load(scope: string, operationId: string): Promise<ProcessOperationRecord> {
     const record = await store.get(scope, operationId);
@@ -378,7 +387,7 @@ export function createDockerRunnerFromOptions(
       case 'cancel-requested':
         return driveCancel(record);
       default:
-        return record;
+        return expiredBeforeStart(record) ? cancelRecord(record) : record;
     }
   }
 
@@ -404,7 +413,9 @@ export function createDockerRunnerFromOptions(
         const found = await engine.inspect(
           await operationContainerName(record.scope, record.operationId),
         );
-        containerId = found?.id;
+        // Only a create of this record a crash cut short is its container; an
+        // earlier operation's leftover under the name is not this cancel's.
+        containerId = found && adoptable(record, found) ? found.id : undefined;
       }
       const gone = async () =>
         (await commit(record, { state: 'cancelled', endedAt: deps.clock.now(), error: undefined }))
@@ -542,6 +553,8 @@ export function createDockerRunnerFromOptions(
     let created = false;
     const name = await operationContainerName(record.scope, record.operationId);
     for (let step = 0; step < 20; step++) {
+      // A deadline that passed before the start: cancelled, never started.
+      if (expiredBeforeStart(record)) return cancelRecord(record);
       switch (record.state) {
         case 'recorded': {
           // A create that crashed before it was recorded left the container
@@ -946,6 +959,7 @@ export function createDockerRunnerFromOptions(
     record: ProcessOperationRecord,
     info: ContainerInfo,
   ): Promise<ProcessOperationRecord> {
+    if (expiredBeforeStart(record)) return cancelRecord(record);
     switch (record.state) {
       case 'recorded':
         // Created, but the host stopped before recording it; or left by an

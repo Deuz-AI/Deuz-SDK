@@ -74,6 +74,21 @@ function crashingStore(
   };
 }
 
+/** A store whose host crashes right after it records a new operation, before anything else. */
+function recordThenCrash(inner: ProcessOperationStore): ProcessOperationStore {
+  return {
+    ...inner,
+    async create(record) {
+      await inner.create(record);
+      throw new HostCrash('crash after recorded');
+    },
+    get: (scope, id) => inner.get(scope, id),
+    list: (query) => inner.list(query),
+    update: (scope, id, changes, options) => inner.update(scope, id, changes, options),
+    prune: (options) => inner.prune(options),
+  };
+}
+
 /** A store that notes its writes in `timeline`, after the docker calls that came before each. */
 function timelineStore(inner: ProcessOperationStore, fake: FakeDocker, timeline: string[]) {
   let seen = 0;
@@ -319,17 +334,7 @@ describe('createDockerProcessRunner: start', () => {
     expect((await runner.reconcile()).matched.map((s) => s.state)).toEqual(['failed']);
     expect(await store.prune({ terminalBefore: time.clock.now() + 1_000 })).toBe(1);
     // A host that crashed right after recording the new request: reconcile sees it first.
-    const crashOnCreate: ProcessOperationStore = {
-      ...store,
-      async create(record) {
-        await store.create(record);
-        throw new HostCrash('crash after recorded');
-      },
-      get: (scope, id) => store.get(scope, id),
-      list: (query) => store.list(query),
-      update: (scope, id, changes, options) => store.update(scope, id, changes, options),
-      prune: (options) => store.prune(options),
-    };
+    const crashOnCreate = recordThenCrash(store);
     const crashed = setup(fake, { store: crashOnCreate, clock: time.clock });
     await expect(crashed.runner.start(request({ command: ['echo', 'new'] }))).rejects.toThrow(
       HostCrash,
@@ -523,6 +528,78 @@ describe('createDockerProcessRunner: poll, output and exit', () => {
     const second = setup(fake, { store, clock: time.clock });
     expect((await second.runner.poll('tenant-a', 'op-1')).state).toBe('cancelled');
     expect(count(fake, 'stop')).toBe(1);
+  });
+
+  it('a start past its deadline never starts the container (R4-6)', async () => {
+    const fake = await fakeDocker(bundle);
+    const { runner } = setup(fake);
+    const session = await runner.start(
+      request({ command: ['echo', 'ran', ';', 'exit', '0'], deadlineAt: Date.now() - 60_000 }),
+    );
+    expect(session.state).toBe('cancelled');
+    expect(startCount(fake)).toBe(0);
+    expect(count(fake, 'start')).toBe(0);
+    expect(fake.containers()).toEqual([]);
+  });
+
+  it('a pre-start operation past its deadline is cancelled at the next poll or reconcile (R4-6)', async () => {
+    const fake = await fakeDocker(bundle);
+    const time = manualClock(100_000);
+    const durable = createInMemoryProcessOperationStore({ deps: { clock: time.clock } });
+    const hostDown = { now: time.clock.now, setTimeout: () => () => {} };
+    // Each host crashes just before its start-dispatched record: 'staged'.
+    for (const operationId of ['polled', 'reconciled']) {
+      const crashed = setup(fake, {
+        store: crashingStore(durable, { state: 'start-dispatched', when: 'before' }),
+        clock: hostDown,
+      });
+      await expect(
+        crashed.runner.start(request({ operationId, deadlineAt: 101_000 })),
+      ).rejects.toThrow(HostCrash);
+    }
+    // A host that recorded the request and stopped before creating anything.
+    const recordOnly = recordThenCrash(durable);
+    await expect(
+      setup(fake, { store: recordOnly, clock: hostDown }).runner.start(
+        request({ operationId: 'recorded', deadlineAt: 101_000 }),
+      ),
+    ).rejects.toThrow(HostCrash);
+    await time.advance(5_000);
+    const restarted = setup(fake, { store: durable, clock: time.clock });
+    expect((await restarted.runner.poll('tenant-a', 'polled')).state).toBe('cancelled');
+    expect((await restarted.runner.poll('tenant-a', 'recorded')).state).toBe('cancelled');
+    const report = await restarted.runner.reconcile();
+    expect(report.matched.map((s) => [s.operationId, s.state])).toEqual([
+      ['reconciled', 'cancelled'],
+    ]);
+    expect(startCount(fake)).toBe(0);
+    expect(fake.containers()).toEqual([]);
+  });
+
+  it('a cancel of a fresh record never touches an earlier operation left under its name (R4-6)', async () => {
+    const fake = await fakeDocker(bundle);
+    const { runner, store } = setup(fake);
+    await runner.start(request({ command: ['echo', 'old', ';', 'exit', '7'] }));
+    expect(await store.prune({ terminalBefore: Date.now() + 1_000 })).toBe(1);
+    const late = await runner.start(
+      request({ command: ['echo', 'new'], deadlineAt: Date.now() - 1_000 }),
+    );
+    expect(late).toMatchObject({ state: 'cancelled' });
+    expect(late.exitCode ?? null).toBeNull();
+    expect(late.containerId).toBeUndefined();
+    expect((await runner.readOutput('tenant-a', 'op-1')).stdout).toBe('');
+    expect(fake.containers().map((c) => c.state)).toEqual(['exited']);
+    // The same for a plain cancel of a record whose host stopped before create.
+    expect(await store.prune({ terminalBefore: Date.now() + 1_000 })).toBe(1);
+    const recordOnly = recordThenCrash(store);
+    await expect(
+      setup(fake, { store: recordOnly }).runner.start(request({ command: ['echo', 'other'] })),
+    ).rejects.toThrow(HostCrash);
+    const cancelled = await runner.cancel('tenant-a', 'op-1');
+    expect(cancelled).toMatchObject({ state: 'cancelled' });
+    expect(cancelled.exitCode ?? null).toBeNull();
+    expect(cancelled.containerId).toBeUndefined();
+    expect(fake.containers().map((c) => c.state)).toEqual(['exited']);
   });
 
   it('while the host is up, the deadline cancels by itself', async () => {
