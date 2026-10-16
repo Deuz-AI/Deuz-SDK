@@ -37,6 +37,7 @@ import { createTokenEstimator, type TokenEstimator } from './internal/estimate-t
 import { claimMemoryScopes, compilerScope, sourceScope } from './internal/memory-scope-claims';
 import { withRunExecution, withTelemetryParent } from './internal/native-context';
 import { bindsThinkingToPrefix } from './internal/stable-prefix';
+import { wireOutputCap } from './internal/output-cap';
 import type { MemoryCallOptions } from './memory';
 import { createVersionedMemoryTools } from './memory/versioned/tools';
 import type { MemoryExtractionInput, MemorySession } from './memory/versioned/types';
@@ -562,7 +563,9 @@ export function createContextHook(input: ContextHookInput): LoopContextHook {
           provider: step.model.provider,
           modelId: step.model.modelId,
           contextWindow: caps.contextWindow,
-          maxOutputTokens: caps.maxOutput,
+          maxOutputTokens:
+            wireOutputCap(step.model.surface, caps, step.outputOptions ?? {}, step.model.modelId) ??
+            caps.maxOutput,
         },
         overheadTokens: estimateRequestOverhead(
           {
