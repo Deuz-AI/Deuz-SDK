@@ -93,6 +93,13 @@ const res = await generateText({
 
 `providerOptions.google` is the escape hatch for unmodeled top-level body fields — `{ cachedContent: 'cachedContents/…' }` is the documented path for [explicit caching](#explicit-caching--files-api) (the old typed-cast passthrough still works).
 
+## Partial function arguments
+
+The native adapters currently accept complete function calls only. Requesting `streamFunctionCallArguments: true` through the active provider's `toolConfig` raises `UnsupportedCapabilityError` before HTTP. A response containing `partialArgs` or `willContinue` terminates the turn with a non-retryable error before its tools execute, rather than turning each partial frame into a separate empty call. Keep argument streaming disabled until assembly is supported. On Vertex, provider options use the `vertex-google` key. Ordinary text streaming and complete zero-argument function calls are unaffected.
+
+See the [official FunctionCall contract](https://googleapis.github.io/js-genai/release_docs/interfaces/types.FunctionCall.html) for this optional Vertex protocol. This guard does not implement incremental argument assembly.
+
+
 ## Embeddings
 
 `createGoogleEmbedding` returns an `EmbeddingModel` for [embed / embedMany](/docs/core/embeddings). Models include `gemini-embedding-2` (no `taskType` — task instructions ride the prompt) and `gemini-embedding-001`. (`text-embedding-004` was shut down by Google on 2026-01-14.)
