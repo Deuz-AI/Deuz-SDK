@@ -56,24 +56,19 @@ Core has zero required runtime dependencies; integrations use optional peers. Wi
 
 ### New in 2.4
 
-- **Memory and context** — versioned memory with revisions, sources and receipts, a context compiler that places memory, RAG, past chats and the skill catalog into one token budget, structured working memory, and transcript search.
-- **Durable work** — V3 native runs that checkpoint context, working memory and memory writes; a goal supervisor with a durable time-zone scheduler, a webhook inbox and acceptance on evidence; and a local Docker sandbox and process runner (preview).
-- **Chat continuity** — compare-and-set chat stores, durable persist-before-publish streams (preview), a capability handshake, and React chat snapshots.
-- **Accounting** — embeddings, RAG, memory and verifier calls reach the budget ledger.
-- **Retention and forget** — explicit cleanup calls for every 2.4 store, and a forget that redacts the context packages of V3 runs.
+2.3 agents worked well inside one conversation. 2.4 adds what an agent needs to keep working over days: memory it can trust, background work that survives a crash, and chats that do not break.
 
-Every 2.4 feature is off until you configure it. Nothing in 2.4 was run against a model provider: model calls are tested against scripted models, and the new stores and the Docker runner against real SQLite, PostgreSQL, Redis and Docker where the test environment provides them. Read [What's new in 2.4](./docs/content/docs/reference/whats-new-2-4.mdx) for the upgrade notes and known limits before you deploy.
+- **Remembers over time** — [versioned memory](./docs/content/docs/modules/versioned-memory.mdx) keeps every fact with its history and its source, and `forget` deletes a fact and redacts the stored context that held it.
+- **Picks the right context** — a [context compiler](./docs/content/docs/modules/context.mdx) fits memory, documents, past chats and skills into one token budget, next to a small working memory for the goal, constraints and decisions. [Transcript search](./docs/content/docs/modules/transcript-search.mdx) finds past messages.
+- **Works on its own** — a [goal supervisor](./docs/content/docs/modules/goal-runtime.mdx) runs goals on a schedule (time zones and daylight saving included) and from verified webhooks, and resumes after a crash without repeating an external effect or charging usage twice.
+- **Runs code in a box** — a local [Docker sandbox](./docs/content/docs/modules/docker.mdx) for agent-written code (preview).
+- **Keeps the chat alive** — answers continue after a dropped connection or a page reload, without duplicates, and a React chat can be saved and restored as a [snapshot](./docs/content/docs/modules/chat-durability.mdx).
+- **Proves it is done** — a goal completes only on evidence the host can check, such as the digest of the file a run produced.
+- **Learns from success** — a verified run can be turned into a draft skill for you to review.
 
-### New in 2.3
+Every 2.4 feature is off until you configure it; with them off, provider requests are byte-identical to 2.3's. A few 2.3 behaviours changed (bug fixes, and one new request header from `useChat`); the upgrade notes list each one. A 2.3 install can still open a database that 2.4 wrote, so you can roll back. Nothing in 2.4 was run against a model provider: model calls are tested against scripted models, and the new stores and the Docker runner against real SQLite, PostgreSQL, Redis and Docker. Read [What's new in 2.4](./docs/content/docs/reference/whats-new-2-4.mdx) for the upgrade notes and known limits before you deploy.
 
-- **Native runs** — memory, chat and model fail-over, and one path for every tool call: policy, approval, budget admission and an effect receipt.
-- **Interop** — the MCP 2026-07-28 client, an MCP server, and A2A in both directions.
-- **Models** — realtime voice on OpenAI Realtime and Gemini Live, provider batch requests, model profiles, a stable request prefix for Claude 5.x thinking, usage billed once, and models without a price under USD budgets.
-- **Redis** — backends for swarms, leases, native runs, schedule claims and budgets.
-- **UI** — `useChat` drives native agent runs, with their approvals and client tools.
-- **Goals and evals** — goal records, versioned eval suites, and a headless preview for scripts and CI.
-
-Nothing in 2.3 was run against a live provider or third-party service; it is tested offline. Read [What's new in 2.3](./docs/content/docs/reference/whats-new-2-3.mdx) for the upgrade notes and known limits before you deploy.
+2.3 added memory, chat and model fail-over to native runs, an MCP server and A2A, realtime voice, batch requests and Redis backends: [What's new in 2.3](./docs/content/docs/reference/whats-new-2-3.mdx).
 
 ### Add the coding-agent skill
 
