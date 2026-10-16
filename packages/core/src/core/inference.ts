@@ -393,11 +393,9 @@ export function runStream(
       // carry (1.9). Only ever for a value that was passed: an option nobody
       // supplied was not degraded, and a warning on every call would be noise.
       if (caps.samplingRestrictions && options.model.surface !== 'native') {
-        // Reasoning rows reject sampling params, so all three wires that read the
-        // flag strip them (anthropic.ts / openai-compatible.ts /
-        // openai-responses.ts). google-native.ts never strips — it sends
-        // temperature/topP unconditionally — so a row that claims the restriction
-        // on the native wire must NOT be reported as a drop.
+        // These three adapters strip settings from the capability flag.
+        // The native adapter applies and reports its own model-specific rules;
+        // do not report a native drop here unless that adapter actually made it.
         const why = `${modelId} restricts sampling parameters (a reasoning model rejects them)`;
         if (options.temperature !== undefined) {
           addWarning(
