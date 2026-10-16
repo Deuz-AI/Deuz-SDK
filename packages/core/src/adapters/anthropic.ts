@@ -26,6 +26,7 @@ import {
 } from '../core/request-rules';
 import { applyProviderOptions } from '../internal/provider-options';
 import { replaysTo } from '../internal/reasoning';
+import { hasGoogleTextSignature } from '../internal/text-signature';
 import {
   bindsThinkingToPrefix,
   toolSetChangeOf,
@@ -61,6 +62,8 @@ interface MediaContext {
 function partToBlock(part: Part, media: MediaContext): AnthropicBlock | null {
   switch (part.type) {
     case 'text':
+      // Empty Google signature carriers have no meaning on the Anthropic wire.
+      if (!part.text && hasGoogleTextSignature(part)) return null;
       return { type: 'text', text: part.text };
     case 'tool_use':
       return { type: 'tool_use', id: part.id, name: part.name, input: part.input };

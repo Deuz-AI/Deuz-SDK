@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { generateText, streamChat } from '../src/index';
 import { createGoogleNative } from '../src/google';
 import { createVertexGoogleNative } from '../src/vertex';
+import { createAnthropic } from '../src/anthropic';
 import { runAgent } from '../src/agent-run';
 import { createTurnContent } from '../src/inference/run-step';
 import {
@@ -155,4 +156,25 @@ describe.each(providers)('$name signed text replay', ({ create }) => {
       ).toEqual(wire(parts));
     },
   );
+});
+
+it('keeps an empty Google signature carrier out of a later Anthropic request', async () => {
+  const history: Message[] = [
+    { role: 'user', content: 'First turn' },
+    { role: 'assistant', content: [text('answer'), signed('')] },
+    { role: 'user', content: 'Continue with another provider' },
+  ];
+  const before = JSON.stringify(history);
+  const transport = mockFetchSequence([() => sseResponse([])]);
+  await generateText({
+    model: createAnthropic({ apiKey: 'test-key', fetch: transport.fetch })('claude-sonnet-5-5'),
+    messages: history,
+    maxRetries: 0,
+  });
+  const body = JSON.parse(String(transport.calls[0]!.init!.body));
+  expect(
+    body.messages.find((message: { role: string }) => message.role === 'assistant').content,
+  ).toEqual([{ type: 'text', text: 'answer' }]);
+  expect(JSON.stringify(body)).not.toContain('signature-A');
+  expect(JSON.stringify(history)).toBe(before);
 });
