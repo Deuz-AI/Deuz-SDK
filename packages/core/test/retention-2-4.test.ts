@@ -59,6 +59,9 @@ import {
 import { postgresUrl } from './fixtures/services';
 import { SLOW_HOOK_TIMEOUT_MS, SLOW_TEST_TIMEOUT_MS } from './fixtures/timeouts';
 
+// Every case here opens SQLite or Postgres stores: a loaded machine makes their I/O slow.
+vi.setConfig({ testTimeout: SLOW_TEST_TIMEOUT_MS, hookTimeout: SLOW_HOOK_TIMEOUT_MS });
+
 const SLOW = { timeout: SLOW_TEST_TIMEOUT_MS };
 const BAD_CUTOFFS: unknown[] = [Number.NaN, Number.POSITIVE_INFINITY, '5', null, undefined];
 
