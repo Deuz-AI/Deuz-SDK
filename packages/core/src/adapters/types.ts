@@ -73,6 +73,11 @@ export interface ParseContext {
   generateId: () => string;
   /** Actual provider id from the model descriptor (important for compat wires). */
   provider: string;
+  /** Private callback: a terminal native hop's resumable state, not stream metadata. */
+  onContinuationCheckpoint?: (checkpoint: {
+    continuationToken: string;
+    finishReason: 'CONTINUATION' | 'MAX_TOKENS';
+  }) => void;
 }
 
 export interface ErrorContext {
