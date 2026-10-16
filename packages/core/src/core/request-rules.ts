@@ -14,7 +14,7 @@ import type { ModelSurface } from '../types/model';
 import type { ToolChoice } from '../types/tool';
 import { InvalidRequestError } from '../errors';
 import {
-  isMaxOutputPlaceholder,
+  omitsDefaultOutputCap,
   type EffortLevel,
   type EffortNoneMapping,
   type ModelCapabilities,
@@ -280,7 +280,7 @@ export function optionalOutputCap(
   options: Pick<CommonCallOptions, 'maxOutputTokens'>,
 ): number | undefined {
   if (options.maxOutputTokens !== undefined) return options.maxOutputTokens;
-  return isMaxOutputPlaceholder(caps) ? undefined : caps.maxOutput;
+  return omitsDefaultOutputCap(caps) ? undefined : caps.maxOutput;
 }
 
 /**

@@ -57,9 +57,8 @@ export function createNativeRequest(
 ) {
   const execution = options.execution!;
   const caps = getCapabilities(options.model);
-  // F12 (2.3): a row with no documented output limit sends no cap on the OpenAI
-  // and Gemini wires (F08). Under a token or USD bound the call sends the row's
-  // placeholder instead, so the reservation below bounds what it can bill.
+  // A token or USD bound needs an explicit cap even when ordinary requests
+  // leave it to the provider. The reservation must cover the cap actually sent.
   const capped =
     wireOutputCap(options.model.surface, caps, options, modelId) === undefined &&
     bounded(execution);
@@ -90,8 +89,8 @@ export function createNativeRequest(
         type: 'clamped-setting',
         setting: 'maxOutputTokens',
         message:
-          `maxOutputTokens ${caps.maxOutput} was sent: ${modelId} documents no output limit ` +
-          'and the call has a budget; pass maxOutputTokens to raise it.',
+          `maxOutputTokens ${caps.maxOutput} was sent: ${modelId} leaves its default output cap unset ` +
+          'and the call has a budget; pass maxOutputTokens to select a cap.',
       }
     : undefined;
   return {
