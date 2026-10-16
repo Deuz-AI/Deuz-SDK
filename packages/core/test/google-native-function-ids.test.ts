@@ -58,23 +58,27 @@ const parameters = {
   required: ['key'],
 } as const;
 
-const providers = [
+// Model names select request rules, not live endpoints: every response is synthetic.
+// ID-less/unsigned cases below are compatibility fixtures, not claims about 3.8 output.
+// https://ai.google.dev/gemini-api/docs/generate-content/whats-new-gemini-3.8
+// https://ai.google.dev/gemini-api/docs/generate-content/thought-signatures
+const providers = ['gemini-2.5-flash', 'gemini-3.8-flash'].flatMap((modelId) => [
   {
-    name: 'Gemini API',
+    name: `Gemini API ${modelId}`,
     create: (fetch: typeof globalThis.fetch) =>
-      createGoogleNative({ apiKey: 'test-api-key', fetch })('gemini-2.5-flash'),
+      createGoogleNative({ apiKey: 'test-api-key', fetch })(modelId),
   },
   {
-    name: 'Vertex AI',
+    name: `Vertex AI ${modelId}`,
     create: (fetch: typeof globalThis.fetch) =>
       createVertexGoogleNative({
         project: 'test-project',
         location: 'global',
         accessToken: 'test-access-token',
         fetch,
-      })('gemini-2.5-flash'),
+      })(modelId),
   },
-];
+]);
 
 describe.each(providers)('$name native function-call IDs', ({ create }) => {
   it.each([undefined, 'signature-A'])(
@@ -131,6 +135,46 @@ describe.each(providers)('$name native function-call IDs', ({ create }) => {
         },
       })),
     );
+  });
+
+  it('keeps pre-tool text before a signed call received in a later stream chunk', async () => {
+    const signedCall = call('A', 'provider-A', 'signature-A');
+    const text = { text: 'Checking the record.' };
+    const { fetch, calls } = mockFetchSequence([
+      () =>
+        sseResponse([
+          sseEvents([
+            { data: { candidates: [{ content: { role: 'model', parts: [text] } }] } },
+            {
+              data: {
+                candidates: [
+                  { content: { role: 'model', parts: [signedCall] }, finishReason: 'STOP' },
+                ],
+                usageMetadata: { promptTokenCount: 4, candidatesTokenCount: 2, totalTokenCount: 6 },
+              },
+            },
+          ]),
+        ]),
+      reply([{ text: 'done' }]),
+    ]);
+    const execute = vi.fn((input: unknown) => input);
+    const result = await runAgent({
+      model: create(fetch),
+      prompt: 'Look up A',
+      deps: dependencies(),
+      tools: { lookup: { parameters, execute } },
+      maxSteps: 3,
+    });
+    expect(result.status).toBe('completed');
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(calls).toHaveLength(2);
+    const body = JSON.parse(String(calls[1]!.init!.body));
+    expect(
+      body.contents.find((content: { role: string }) => content.role === 'model').parts,
+    ).toEqual([text, signedCall]);
+    expect(wireParts(calls[1]!.init).filter((part) => part.functionResponse)).toEqual([
+      { functionResponse: { id: 'provider-A', name: 'lookup', response: { key: 'A' } } },
+    ]);
   });
 
   it('keeps recycled provider IDs separate across native agent steps', async () => {
