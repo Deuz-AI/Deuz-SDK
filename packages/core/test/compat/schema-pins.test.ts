@@ -329,9 +329,27 @@ const SQLITE_CASES: readonly SqliteCase[] = [
   },
 ];
 
+/**
+ * The recorded 2.3 layout of `sqlite/stores` includes its FTS5 index, which a
+ * Node whose SQLite lacks FTS5 (22.14, the release job's) never creates.
+ */
+function needsFts5(key: string): boolean {
+  if (key !== 'sqlite/stores') return false;
+  const db = new DatabaseSync(':memory:');
+  try {
+    db.exec('CREATE VIRTUAL TABLE probe USING fts5(text)');
+    return false;
+  } catch {
+    return true;
+  } finally {
+    db.close();
+  }
+}
+
 describe('SQLite schema versions stay at their 2.3.0 values', () => {
   for (const entry of SQLITE_CASES) {
-    it(`${entry.key}: a new database is stamped ${entry.pinned} and keeps the 2.3 layout`, async () => {
+    it(`${entry.key}: a new database is stamped ${entry.pinned} and keeps the 2.3 layout`, async (ctx) => {
+      if (needsFts5(entry.key)) ctx.skip();
       const db = new DatabaseSync(':memory:');
       const store = await entry.touch(db);
       try {
@@ -342,7 +360,8 @@ describe('SQLite schema versions stay at their 2.3.0 values', () => {
       }
     });
 
-    it(`${entry.key}: a database 2.3 created opens, works and keeps version ${entry.pinned}`, async () => {
+    it(`${entry.key}: a database 2.3 created opens, works and keeps version ${entry.pinned}`, async (ctx) => {
+      if (needsFts5(entry.key)) ctx.skip();
       const layout = recorded[entry.key];
       if (!layout) return; // Reported by the layout test above.
       const db = new DatabaseSync(':memory:');

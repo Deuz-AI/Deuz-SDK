@@ -159,7 +159,7 @@ describe('createSqliteVersionedMemoryStore: schema and connection', () => {
     await expect(owned.scopeRevision(SCOPE)).rejects.toThrow(/closed/);
   });
 
-  it(
+  it.skipIf(!hasFts5())(
     'rebuilds the FTS index after a process without FTS5 wrote to the file',
     { timeout: SLOW_TEST_TIMEOUT_MS },
     async () => {
@@ -330,7 +330,7 @@ describe('createSqliteVersionedMemoryStore: a commit that fails half way', () =>
       'deuz_vmem_revisions',
       'deuz_vmem_records',
       'deuz_vmem_vectors',
-      'deuz_vmem_fts',
+      ...(hasFts5() ? ['deuz_vmem_fts'] : []),
     ])
       expect(db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get()).toEqual({ n: 0 });
 
@@ -376,7 +376,7 @@ describe('createSqliteVersionedMemoryStore: a commit that fails half way', () =>
       await store.close();
       const db = new DatabaseSync(path);
       expect(db.prepare('SELECT COUNT(*) AS n FROM deuz_vmem_revisions').get()).toEqual({ n: 0 });
-      db.exec("INSERT INTO deuz_vmem_fts(deuz_vmem_fts) VALUES('integrity-check')");
+      if (hasFts5()) db.exec("INSERT INTO deuz_vmem_fts(deuz_vmem_fts) VALUES('integrity-check')");
       db.close();
     },
   );
