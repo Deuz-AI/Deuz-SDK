@@ -92,7 +92,7 @@ Outside a V3 run there is no `context` option: call `compileContext` or a compil
 | Source | Options | Candidates |
 | --- | --- | --- |
 | `createMemoryContextSource` | `{ session }` (versioned: revisions, origin labels; `recordedAsOf` only when a host sets it on a direct query) or `{ store, scope, embedder?, clock? }` (legacy `MemoryStore`; `clock` is the clock TTL expiry is read against) | Active, unexpired records; with this source the native loop's legacy recall must be off |
-| `createRagContextSource` | `{ retrieve(query, topK, signal) }`, e.g. `(q, k) => hybridRetrieve(q, deps, { topK: k })` | Record id is `meta.id` when it is a string, else the chunk index |
+| `createRagContextSource` | `{ retrieve(query, topK, signal, charge?) }`, e.g. `(q, topK, signal, charge) => hybridRetrieve(q, deps, { topK, ...charge })`; `charge` (accounting and `onWarning`) comes only with a request that carries `accounting`, as a V3 run's compile does, and charges the query embedding to the run's ledger (settled for `defineAccountedEmbedder`, else held as unaccounted with one warning per run) | Record id is `meta.id` when it is a string, else the chunk index |
 | `createTranscriptContextSource` | `{ index, scope, chatIds?, around? = 0, refs? }` | `role: text` lines from a `TranscriptIndex`; `refs()` (e.g. the messages recalled memories cite) resolved first, match `'source-ref'`. Off unless configured |
 | `createSkillsContextSource` | `{ registry, loaded? }` | Catalog lines `name (id): description` from `registry.match`; each `loaded()` skill as a mandatory `<id>/SKILL.md` body. A body is never injected because retrieval matched it |
 

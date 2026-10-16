@@ -69,7 +69,8 @@ Existing entries grow too:
   `createSqliteAgentRunStoreV3` and `createPostgresAgentRunStoreV3`.
 - **`@deuz-sdk/core/chat`**: `createInMemoryConditionalChatStore`,
   `createInMemoryTranscriptIndex`, `indexChat`, `updateConditionalChat` and
-  `isConditionalChatStore`. `@deuz-sdk/core/stores/sqlite` and
+  `isConditionalChatStore`, and the `ChatSnapshotV1` and `ChatSnapshotGateV1`
+  types (type-only, also on `@deuz-sdk/core/ui`). `@deuz-sdk/core/stores/sqlite` and
   `/stores/postgres` add `createSqliteConditionalChatStore` and
   `createPostgresConditionalChatStore`, each with its own transcript index.
 - **`@deuz-sdk/core/ui`**: `createInMemoryDurableStreamStateStore`, the
@@ -514,14 +515,18 @@ Several calls of 2.3 never reached a budget ledger. In 2.4:
   `createVerifier` takes `execution`: the call is reserved before its first
   request and settled with the provider's usage.
 - `retrieve`, `hybridRetrieve` and `indexChunks` take an optional `accounting`
-  for their embedding calls.
+  for their embedding calls. In a V3 run, the RAG context source hands its
+  `retrieve` a fourth `charge` argument; spread into `retrieve` or
+  `hybridRetrieve`, it charges the query embedding to the run's ledger, and so
+  to the goal supervisor's watermark (see
+  [Context compiler](/docs/modules/context#sources)).
 - Memory LLM and embedder callbacks, in `MemorySeams` (`seams.execution`) and in
   a versioned memory session (`execution`), are reserved before they run. A
   callback marked as accounted settles the usage it reports
   (`defineAccountedMemoryLLM`, or an embedder object with `accounted: true`
   whose `embed` returns the usage with the vectors). In `MemorySeams` the
-  accounted LLM goes in `seams.accountedLlm`; `seams.llm` keeps the 2.3 type. An unmarked one is held at
-  its estimate as unaccounted, never treated as free, and reports one
+  accounted LLM goes in `seams.accountedLlm`; `seams.llm` keeps the 2.3 type.
+  An unmarked one is held at its estimate as unaccounted, never treated as free, and reports one
   `unaccounted-usage` warning. A budget with `unknownPrice: 'reject'` refuses
   an unaccounted call with `BudgetLedgerError` code `'unaccounted_call'`.
 - Native runs charge their built-in `memory` calls to the run's execution

@@ -318,13 +318,26 @@ parent run's memory scope.
 | --- | --- | --- |
 | `createMemoryContextSource({ session })` | A [versioned memory](/docs/modules/versioned-memory) session (its scope must be within the request scope) | Record id and revision, origin and source kinds, at the request's `recordedAsOf` when a host sets one (the compiler reads current memory) |
 | `createMemoryContextSource({ store, scope, embedder?, clock? })` | A legacy `MemoryStore`, within the narrowed scope; expired and invalidated records left out. `clock` is the clock TTL expiry is read against (pass the memory seams' clock; default the host clock), unless the request sets `recordedAsOf` | Record id, `match` `'vector'` or `'lexical'` |
-| `createRagContextSource({ retrieve })` | Your `retrieve(query, topK, signal)`, for example over `retrieve` or `hybridRetrieve` from `/rag` | `meta.id` when it is a string, else the chunk index |
+| `createRagContextSource({ retrieve })` | Your `retrieve(query, topK, signal, charge?)`, for example over `retrieve` or `hybridRetrieve` from `/rag`; see the charge note below | `meta.id` when it is a string, else the chunk index |
 | `createTranscriptContextSource({ index, scope, chatIds?, around?, refs? })` | A [`TranscriptIndex`](/docs/modules/transcript-search); `refs` returns message references (such as those memory records cite) that are resolved under the same scope and ranked above search hits | Message id; text as `role: text` lines, with `around` neighbours (default 0) |
 | `createSkillsContextSource({ registry, loaded? })` | The skill catalog: `name (id): description` lines from `registry.match` (none for an empty query), and the bodies of skills the model loaded (`loaded()`) as mandatory `<id>/SKILL.md` candidates | Catalog lines; loaded bodies |
 
 A skill body is never placed because retrieval matched it. Only the catalog
 lines and the bodies the model already loaded with `load_skill` are budgeted;
 skills are never activated automatically.
+
+A request that carries `accounting` (a V3 run's compile sets it, with the
+run's execution context and a request id per query, plus the run's
+`onWarning`) hands the RAG source's `retrieve` a fourth argument, `charge`.
+Spread it into the options of `retrieve` or `hybridRetrieve`, for example
+`retrieve: (q, topK, signal, charge) => hybridRetrieve(q, deps, { topK, ...charge })`,
+and the query embedding is charged to the run's ledger, and so to the goal
+supervisor's watermark: settled with the reported usage when the embedder is
+accounted (`defineAccountedEmbedder`), otherwise held as unaccounted, with one
+`unaccounted-usage` warning per run. A `retrieve` that ignores `charge`
+charges nothing, and without `accounting` it is called with three arguments,
+as before. A host that queries a source itself may set
+`ContextSourceRequest.accounting` and `onWarning` the same way.
 
 A source of your own implements `ContextSource`: `id`, `kind` (`'memory'`,
 `'rag'`, `'transcript'` or `'skills'`, which picks its budget share),

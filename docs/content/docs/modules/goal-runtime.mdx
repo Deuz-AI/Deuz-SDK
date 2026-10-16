@@ -876,7 +876,7 @@ for example on a durable schedule of its own.
 | --- | --- |
 | `store.prunePayloads({ before, scope? })` | The payloads of entries settled before `before`, replaced by content-free tombstones (`payloadPruned: true`); ids stay, so dedupe holds. Pass `now - policy.retainPayloadMs` |
 | `store.pruneInbox({ before, scope? })` | Settled entries, ids included: a repeated delivery is queued again. Only for a dedupe window you choose |
-| `store.pruneOccurrences({ before, scope? })` | Occurrence records, by `recordedAt` |
+| `store.pruneOccurrences({ before, scope? })` | Occurrence records, by `recordedAt`. It also takes `{ olderThan, scope? }` with the same meaning; pass exactly one of `before` and `olderThan` (both, or neither, is a `TypeError`). The type is `GoalRuntimeOccurrencePruneOptions` |
 | `store.pruneIntents({ before, scope? })` | Completed, failed and cancelled intents, by `updatedAt` |
 
 Each returns how many it touched. Entries queued for an ended goal settle as

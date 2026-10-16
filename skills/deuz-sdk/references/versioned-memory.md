@@ -90,7 +90,7 @@ console.log(forgotten.revisions, forgotten.redaction); // [1, 2] 'complete'
 | Assistant text | only with `allowAssistant: true` | `assistant` |
 | Failed tool results; the SDK's own recall blocks, compaction summaries and tool-set notices | never | — |
 
-One LLM call per operation, even across conflict retries. `infer: false` stores the readable sources verbatim; nothing readable still writes a durable empty receipt. The model can set neither scope, origin nor source kind.
+Trust is declared by tool name in `extraction.trustedTools`; a tool has no trust flag of its own (no per-tool `memorySource: 'trusted'` mark), so the result of a tool that is not listed is `external` content, read only with `allowExternal`. One LLM call per operation, even across conflict retries. `infer: false` stores the readable sources verbatim; nothing readable still writes a durable empty receipt. The model can set neither scope, origin nor source kind.
 
 ## Stores, re-embedding, import and retention
 

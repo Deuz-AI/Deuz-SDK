@@ -50,7 +50,7 @@ console.log(deliveries); // [] until a schedule has a due occurrence
 | Versioned memory | `pruneHistory({ olderThan, scope? })` | Past revisions of records currently retracted or expired | Current revisions, receipts |
 | Versioned memory | `pruneOperations({ olderThan })` | Receipts (warns: those operation ids no longer dedupe) | — |
 | Goal runtime | `prunePayloads({ before, scope? })` | Settled inbox payloads → content-free tombstones (`payloadPruned`) | Entry ids, so dedupe holds |
-| Goal runtime | `pruneInbox`, `pruneOccurrences`, `pruneIntents` (`{ before, scope? }`) | Settled entries ids included; occurrence records; finished intents | Schedules and cursors; open intents |
+| Goal runtime | `pruneInbox`, `pruneOccurrences`, `pruneIntents` (`{ before, scope? }`; `pruneOccurrences` also takes `{ olderThan, scope? }`, exactly one of the two) | Settled entries ids included; occurrence records; finished intents | Schedules and cursors; open intents |
 | Durable streams | `prune({ terminalBefore })` | Finished streams (last record the `done` sentinel) | Active streams (a pruned one forgets its fence) |
 | Process operations | `prune({ terminalBefore })`; `dispose`; `reconcile({ removeOrphans: true })` | Terminal records; a container; orphan containers and dangling volumes | — |
 | V3 runs | `prune({ terminalBefore })` | Terminal runs and blobs only they used | Running and suspended runs; a blob put again since |

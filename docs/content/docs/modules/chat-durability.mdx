@@ -363,7 +363,8 @@ hook reads the announcement from the first stream frame.
 ## React chat snapshots
 
 `ChatSnapshotV1` (a type exported from `@deuz-sdk/react`, with
-`ChatSnapshotGateV1`) is a chat as `useChat` holds it, as plain data you can
+`ChatSnapshotGateV1`; the same two types are exported type-only from
+`@deuz-sdk/core/chat` and `@deuz-sdk/core/ui`) is a chat as `useChat` holds it, as plain data you can
 persist with `JSON.stringify`:
 
 | Field | Meaning |
@@ -379,8 +380,10 @@ persist with `JSON.stringify`:
 
 Only `version` and `messages` are required. Treat a snapshot as read-only. Its
 `gate` (`ChatSnapshotGateV1`) holds `turn`, `approvalResponses`, `toolResults`
-(`{ toolCallId, output, isError? }[]`), `runId` and `clientCalls`. The type lives in React, not in
-core, because the React package accepts any `@deuz-sdk/core` 2.x as its peer.
+(`{ toolCallId, output, isError? }[]`), `runId` and `clientCalls`. A server can
+store, validate or build a snapshot with the core types, without the React
+package. React keeps an identical copy of its own, because it accepts any
+`@deuz-sdk/core` 2.x as its peer, and its tests keep the two the same shape.
 
 ```tsx
 import { useChat } from '@deuz-sdk/react';

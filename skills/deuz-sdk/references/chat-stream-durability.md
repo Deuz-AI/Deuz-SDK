@@ -130,7 +130,7 @@ export function Chat({ streamId }: { streamId: string }): ReactElement {
 
 ## React chat snapshots
 
-`ChatSnapshotV1` (`@deuz-sdk/react`, plain data for `JSON.stringify`): `version: 1`, `messages`, `messageIds?`, `cursor?`, `turn?` (the streaming turn), `pendingApprovals?`, `pendingToolCalls?`, `gate?` (`ChatSnapshotGateV1`: verdicts and results already given, a native run's `runId` and client calls), `capabilities?`.
+`ChatSnapshotV1` (`@deuz-sdk/react`, and type-only from `@deuz-sdk/core/chat` and `@deuz-sdk/core/ui` with the same shape, so a server can store or build one without React; plain data for `JSON.stringify`): `version: 1`, `messages`, `messageIds?`, `cursor?`, `turn?` (the streaming turn), `pendingApprovals?`, `pendingToolCalls?`, `gate?` (`ChatSnapshotGateV1`: verdicts and results already given, a native run's `runId` and client calls), `capabilities?`.
 
 - `useChat({ initialSnapshot })` restores messages under their stored ids, the turn in progress as the last bubble, the cursor (it beats `resume.lastEventId`), pending approvals and parked client calls with what was already answered, and the recorded capabilities. `reconnect()` or `resume.auto` continues the restored turn from the cursor, every frame once; without `resume` the restored turn is sealed. A version other than 1, or a malformed array field, throws a `TypeError`.
 - A stored chat restores as `{ version: 1, messages: record.messages, messageIds: record.messageIds }` — this also works against a 2.3 core (the hook applies the ids itself).
