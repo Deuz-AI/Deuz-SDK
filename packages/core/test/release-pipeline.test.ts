@@ -115,6 +115,8 @@ describe('ci.yml', () => {
     expectBackends(job, ['postgres', 'redis']);
     // `1` would also require Docker, which this job does not opt into.
     expect(env(job, 'DEUZ_TEST_REQUIRE_SERVICES')).toBe('postgres,redis');
+    // One worker: parallel files against one Postgres service contend.
+    expect(env(job, 'VITEST_MAX_WORKERS')).toBe('1');
     expect(runs(job)).toContain('npm run test -w @deuz-sdk/core');
   });
 
@@ -129,6 +131,7 @@ describe('ci.yml', () => {
     // Required services are required: with no server here, every Postgres or Redis test
     // would fail this job rather than skip.
     expectBackends(job, ['postgres', 'redis']);
+    expect(env(job, 'VITEST_MAX_WORKERS')).toBe('1');
     expect(runs(job)).toContain('npm run test -w @deuz-sdk/core');
   });
 

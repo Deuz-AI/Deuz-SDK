@@ -157,6 +157,9 @@ jobs:
           --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 3s
           --health-retries 10
     env:
+      # One test worker: parallel files against the one Postgres service
+      # exhausted serialization retries and stalled concurrent-claim tests.
+      VITEST_MAX_WORKERS: '1'
       DEUZ_TEST_REDIS_URL: redis://localhost:6379
       DEUZ_TEST_POSTGRES_URL: postgres://postgres:deuz@localhost:5432/deuz
       DEUZ_TEST_REQUIRE_SERVICES: postgres,redis
@@ -202,6 +205,9 @@ jobs:
           --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 3s
           --health-retries 10
     env:
+      # One test worker: parallel files against the one Postgres service
+      # exhausted serialization retries and stalled concurrent-claim tests.
+      VITEST_MAX_WORKERS: '1'
       DEUZ_TEST_REDIS_URL: redis://localhost:6379
       DEUZ_TEST_POSTGRES_URL: postgres://postgres:deuz@localhost:5432/deuz
       DEUZ_TEST_DOCKER: '1'
