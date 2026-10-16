@@ -14,7 +14,7 @@ schedule you choose.
 | Versioned memory | `pruneOperations({ olderThan })` | Operation receipts | Nothing of them: those operation ids no longer deduplicate, and the store logs a warning |
 | Goal runtime | `prunePayloads({ before, scope? })` | Payloads of settled inbox entries | The entries and ids (`payloadPruned: true`), so dedupe holds |
 | Goal runtime | `pruneInbox({ before, scope? })` | Settled inbox entries, ids included | Nothing: a repeated delivery is queued again |
-| Goal runtime | `pruneOccurrences({ before, scope? })` | Schedule occurrence records | The schedules and their cursors |
+| Goal runtime | `pruneOccurrences({ before, scope? })`, or `{ olderThan, scope? }` (exactly one of the two) | Schedule occurrence records | The schedules and their cursors |
 | Goal runtime | `pruneIntents({ before, scope? })` | Completed, failed and cancelled run intents | Open intents |
 | Durable streams | `prune({ terminalBefore })` | Finished streams (last record is the `done` sentinel) | Active streams; a pruned stream forgets its fence |
 | Process operations | `prune({ terminalBefore })` | Records of terminal operations | Containers: those go with `dispose` |
