@@ -368,6 +368,7 @@ interface GeminiStreamEvent {
   candidates?: {
     content?: { role?: string; parts?: GeminiPart[] };
     finishReason?: string;
+    continuationToken?: string;
     groundingMetadata?: {
       groundingChunks?: { web?: { uri?: string; title?: string } }[];
     };
@@ -382,6 +383,7 @@ async function* parseStream(
 ): AsyncGenerator<StreamPart> {
   let lastUsage: GeminiUsageMetadata | undefined;
   let lastFinish: string | undefined;
+  let continuationToken: string | undefined;
   let sawFunctionCall = false;
   let blocked: string | undefined;
 
@@ -398,7 +400,15 @@ async function* parseStream(
 
     const candidate = event.candidates?.[0];
     if (!candidate) continue;
-    if (candidate.finishReason) lastFinish = candidate.finishReason;
+    if (candidate.finishReason) {
+      lastFinish = candidate.finishReason;
+      // Capture only a token associated with the terminal frame. An earlier
+      // checkpoint may precede already emitted content and needs output-cursor recovery.
+      continuationToken =
+        typeof candidate.continuationToken === 'string' && candidate.continuationToken.length > 0
+          ? candidate.continuationToken
+          : undefined;
+    }
 
     for (const part of candidate.content?.parts ?? []) {
       if (part.functionCall) {
@@ -446,6 +456,28 @@ async function* parseStream(
     typeof lastUsage?.promptTokenCount === 'number' &&
       typeof lastUsage.candidatesTokenCount === 'number',
   );
+  if (
+    !blocked &&
+    (lastFinish === 'CONTINUATION' || lastFinish === 'MAX_TOKENS') &&
+    continuationToken
+  ) {
+    ctx.onContinuationCheckpoint?.({
+      continuationToken,
+      finishReason: lastFinish,
+      usage: mapGeminiUsage(lastUsage),
+    });
+  }
+  if (!blocked && lastFinish === 'CONTINUATION') {
+    yield {
+      type: 'warning',
+      warning: {
+        type: 'unsupported-setting',
+        setting: 'automaticContinuation',
+        message:
+          'Native generation stopped at a continuation boundary. Automatic continuation is not implemented; this output is incomplete.',
+      },
+    };
+  }
   yield {
     type: 'finish',
     usage: mapGeminiUsage(lastUsage),

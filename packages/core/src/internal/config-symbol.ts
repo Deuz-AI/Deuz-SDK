@@ -3,6 +3,7 @@ import type { LanguageModel } from '../types/model';
 // RUNTIME import of this module (`readConfig`, for the capability merge), so a
 // value import here would close a real cycle. This one adds no runtime edge.
 import type { ModelCapabilities } from '../core/registry';
+import type { GoogleContinuationHandler } from '../types/google-continuation';
 
 /**
  * The descriptor returned by a provider factory (`anthropic('model')`) is the
@@ -27,6 +28,8 @@ export interface ProviderConfig {
   headers?: Record<string, string>;
   /** Present for Vertex AI transports — adapters build Vertex URLs/bodies. */
   vertex?: VertexConfig;
+  /** Private native completion hook; never placed on public stream parts. */
+  onContinuationCheckpoint?: GoogleContinuationHandler;
   /**
    * Extra query params appended to the wire URL (e.g. Azure OpenAI
    * `api-version`). Adapters merge these onto the final request URL.

@@ -5,6 +5,7 @@ import type { Usage, FinishReason } from '../types/usage';
 import type { UsageMeta } from '../types/deps';
 import type { ModelSurface } from '../types/model';
 import type { Adapter, BuildContext, ObjectRequest, WireToolRequest } from '../adapters/types';
+import type { GoogleContinuationCheckpoint } from '../types/google-continuation';
 import { APICallError, BreakerOpenError, NetworkError, TimeoutError } from '../errors';
 import { resolveDependencies } from '../internal/resolve-deps';
 import { resolveCall, resolveSignal } from '../internal/resolve-call';
@@ -19,6 +20,8 @@ import type { RunStartedEvent, ObservedError } from '../types/observe';
 import { readClientContext } from '../internal/client-context';
 import { createWarningSink, unsupportedSetting, type WarningSink } from '../internal/warnings';
 import { stopDetailsFrom } from '../internal/stop-details';
+import { readConfig } from '../internal/config-symbol';
+import { saveGoogleContinuation } from '../internal/google-continuation';
 import { createBroadcaster, createDeferred, lazyAsyncIterable } from '../internal/async-iter';
 import { normalizeMessages } from './normalize';
 import { getCapabilities } from './registry';
@@ -475,6 +478,12 @@ export function runStream(
         warnings,
       };
       const { url, init } = adapter.buildRequest(buildCtx);
+      const continuationHandler =
+        options.model.surface === 'native'
+          ? readConfig(options.model)?.onContinuationCheckpoint
+          : undefined;
+      // Snapshot serialized body bytes before custom transport code can mutate RequestInit.
+      const continuationRequest = continuationHandler ? String(init.body) : undefined;
       // Every warning site of a call runs before the first byte (capability
       // resolution, request building and, below, native admission), so this
       // flush and the one after each reservation put them on the stream ahead
@@ -592,6 +601,9 @@ export function runStream(
       }
 
       let firstContent = false;
+      let continuationCheckpoint:
+        | Pick<GoogleContinuationCheckpoint, 'continuationToken' | 'finishReason' | 'usage'>
+        | undefined;
       try {
         for await (const part of adapter.parseStream(res.body, {
           usageAvailable: (available) => {
@@ -600,6 +612,13 @@ export function runStream(
           caps,
           generateId: deps.generateId,
           provider: call.provider,
+          ...(continuationHandler
+            ? {
+                onContinuationCheckpoint: (checkpoint) => {
+                  continuationCheckpoint = checkpoint;
+                },
+              }
+            : {}),
         })) {
           // 2.2: the idle timer measures provider silence only, not the pump's own work.
           timeout.hold();
@@ -657,6 +676,23 @@ export function runStream(
             finalUsage = part.usage;
             finalFinish = part.finishReason;
             finalStopDetails = stopDetailsFrom(part.providerMetadata);
+            if (continuationHandler && continuationCheckpoint) {
+              const signal =
+                combineSignals([userSignal, internal.failSignal, timeout.signal]) ?? timeout.signal;
+              await saveGoogleContinuation(
+                continuationHandler,
+                {
+                  ...continuationCheckpoint,
+                  provider: call.provider,
+                  modelId,
+                  apiVersion: call.vertex ? 'v1' : 'v1beta',
+                  request: JSON.parse(continuationRequest!) as Record<string, unknown>,
+                  usage: { ...part.usage },
+                },
+                signal,
+              );
+              continuationCheckpoint = undefined;
+            }
             await settleReservation();
             // Live cost (1.7, D2): single-turn calls price the finish usage
             // inline; loop-driven calls (internal.tools set) leave it to the
