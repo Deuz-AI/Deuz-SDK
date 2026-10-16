@@ -21,7 +21,6 @@ import { readClientContext } from '../internal/client-context';
 import { createWarningSink, unsupportedSetting, type WarningSink } from '../internal/warnings';
 import { stopDetailsFrom } from '../internal/stop-details';
 import { readConfig } from '../internal/config-symbol';
-import { saveGoogleContinuation } from '../internal/google-continuation';
 import { createBroadcaster, createDeferred, lazyAsyncIterable } from '../internal/async-iter';
 import { normalizeMessages } from './normalize';
 import { getCapabilities } from './registry';
@@ -679,6 +678,7 @@ export function runStream(
             if (continuationHandler && continuationCheckpoint) {
               const signal =
                 combineSignals([userSignal, internal.failSignal, timeout.signal]) ?? timeout.signal;
+              const { saveGoogleContinuation } = await import('../internal/google-continuation');
               await saveGoogleContinuation(
                 continuationHandler,
                 {
