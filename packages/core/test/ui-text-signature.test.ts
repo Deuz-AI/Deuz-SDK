@@ -77,12 +77,16 @@ describe('a Gemini text signature over the UI wire', () => {
     const turn = fold(frames);
     expect(turn.message.content).toBe('Paris is the capital.');
     expect(turn.message.parts?.filter((p) => p.type === 'text')).toEqual([
-      { type: 'text', text: 'Paris is the capital.', state: 'done', providerMetadata: META },
+      { type: 'text', text: 'Paris is the capital.', state: 'done' },
+      { type: 'text', text: '', state: 'done', providerMetadata: META },
     ]);
     const answer = assistantMessageFromTurn(turn);
     expect(answer).toEqual({
       role: 'assistant',
-      content: [{ type: 'text', text: 'Paris is the capital.', providerMetadata: META }],
+      content: [
+        { type: 'text', text: 'Paris is the capital.' },
+        { type: 'text', text: '', providerMetadata: META },
+      ],
     });
 
     history.push(answer, { role: 'user', content: 'sure?' });
@@ -95,7 +99,8 @@ describe('a Gemini text signature over the UI wire', () => {
       contents: { role: string; parts: Record<string, unknown>[] }[];
     };
     expect(second.contents.find((c) => c.role === 'model')!.parts).toEqual([
-      { text: 'Paris is the capital.', thoughtSignature: 'TS_TEXT' },
+      { text: 'Paris is the capital.' },
+      { text: '', thoughtSignature: 'TS_TEXT' },
     ]);
   });
 
