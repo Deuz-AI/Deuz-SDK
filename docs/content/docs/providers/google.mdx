@@ -46,11 +46,12 @@ for await (const chunk of result.textStream) process.stdout.write(chunk);
 
 | Model family | Maps to | Values |
 | --- | --- | --- |
+| `gemini-4-argon` | `thinkingConfig.thinkingLevel` | low/medium/high pass through; xhigh/max map to high; none maps to low with a warning |
 | `gemini-3*` flash tier | `thinkingConfig.thinkingLevel` | low/medium/high pass through; xhigh/max → `'high'` |
 | `gemini-3*` pro tier | `thinkingConfig.thinkingLevel` | `'low'` or `'high'` only — medium collapses to `'low'` |
 | `gemini-2.5*` | `thinkingConfig.thinkingBudget` | low → `4096`, medium → `12288`, high → `24576`, xhigh/max → `32768` |
 
-`includeThoughts: true` is always set when reasoning is requested, so thought summaries stream back as `reasoning-delta` parts. `effort: 'none'` (or omitting it) sends no thinking config.
+`includeThoughts: true` is set when reasoning is requested, so thought summaries stream back as `reasoning-delta` parts. Omitting `effort` leaves the backend default unchanged. For `gemini-3.8-flash` and `gemini-4-argon`, `effort: 'none'` maps to `low` with a warning because thinking cannot be disabled; other models follow their capability row and wire rules.
 
 ```ts
 import { streamChat } from '@deuz-sdk/core';
@@ -73,6 +74,14 @@ for await (const part of result.fullStream) {
 Reasoning models emit a `thoughtSignature` on reasoning, tool-call and plain text parts. The adapter keeps a thought's signature on its `reasoning` part (with `source: 'google'`) and a tool call's or text part's in `providerMetadata.google.thoughtSignature`, and replays each on the next turn, so the agentic [tool loop](/docs/agents/tool-loop) round-trips multi-step thinking correctly. Keep the message history immutable — the signature lives on the prior turn's parts.
 
 Since 2.3 a signature on a plain text part is kept too, including one streamed in a final chunk whose text is empty: it rides back on that text part. Gemini does not enforce text signatures, but drops in reasoning quality without them (not live-verified). Only Gemini's own thoughts are replayed here: reasoning another provider produced (a Claude thinking block, an OpenAI encrypted item) never becomes a `thoughtSignature`.
+
+## Gemini 4 Argon request settings
+
+The native Gemini API and Vertex adapters recognize `gemini-4-argon` for request settings. They use `thinkingLevel` rather than the deprecated `thinkingBudget`, omit supplied `temperature` and `topP` with typed warnings, and reject explicit `cachedContent` before sending the model request. A cache reference is not silently removed, since its contents may be part of the prompt. Send the original context to use implicit caching instead. On Vertex, provider options are keyed by `vertex-google`, not `google`.
+
+These request-contract fixes do not by themselves add catalog/pricing entries or implement long decode. Caller output budgets and timeout limits are not raised automatically. A `CONTINUATION` finish still ends this request as `length`, without following its token. Partial function-argument assembly, exact signed-part replay and model catalog facts are separate changes. Interactions API background generation is a different transport and is not enabled by these request rules.
+
+The request rules were checked against [Google's Argon migration guide](https://ai.google.dev/gemini-api/docs/generate-content/latest-model) and [thinking guide](https://ai.google.dev/gemini-api/docs/generate-content/thinking), using synthetic HTTP responses. See [long decode](https://ai.google.dev/gemini-api/docs/generate-content/long-decode) for the separate continuation contract. No live-model validation is claimed.
 
 ## Google Search grounding
 
