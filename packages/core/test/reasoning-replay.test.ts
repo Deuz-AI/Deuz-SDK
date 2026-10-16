@@ -435,12 +435,13 @@ describe('Gemini thought signatures on plain text parts (not live-verified)', ()
     });
     expect(bodiesOf(seq.calls)[1]!.contents![1]!.parts).toEqual([
       { text: 'a thought', thought: true, thoughtSignature: 'TS_THOUGHT' },
-      { text: 'Checking.', thoughtSignature: 'TS_TEXT' },
+      { text: 'Checking', thoughtSignature: 'TS_TEXT' },
+      { text: '.' },
       { functionCall: { name: 'lookup', args: { q: 'x' } }, thoughtSignature: 'TS_FC' },
     ]);
   });
 
-  it('a signature in an empty final chunk lands on the answer text and rides back', async () => {
+  it('keeps a signature in its empty final part rather than moving it to answer text', async () => {
     const first = mockFetch(() =>
       sseResponse([geminiTurn([[{ text: 'Hello' }], [{ text: '', thoughtSignature: 'TS_END' }]])]),
     );
@@ -451,9 +452,10 @@ describe('Gemini thought signatures on plain text parts (not live-verified)', ()
     expect(answer.response.messages[0]).toEqual({
       role: 'assistant',
       content: [
+        { type: 'text', text: 'Hello' },
         {
           type: 'text',
-          text: 'Hello',
+          text: '',
           providerMetadata: { google: { thoughtSignature: 'TS_END' } },
         },
       ],
@@ -468,7 +470,8 @@ describe('Gemini thought signatures on plain text parts (not live-verified)', ()
       ],
     });
     expect(bodiesOf(next.calls)[0]!.contents![1]!.parts).toEqual([
-      { text: 'Hello', thoughtSignature: 'TS_END' },
+      { text: 'Hello' },
+      { text: '', thoughtSignature: 'TS_END' },
     ]);
   });
 
