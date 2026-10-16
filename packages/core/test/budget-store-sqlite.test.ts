@@ -7,6 +7,7 @@ import { createSqliteBudgetStore } from '../src/node/budget-sqlite';
 import type { SqliteDatabaseLike, SqliteStatementLike } from '../src/node/store-sqlite';
 import type { BudgetStore } from '../src/types/budget-store';
 import { budgetStoreContracts } from './fixtures/budget-store-conformance';
+import { SLOW_TEST_TIMEOUT_MS } from './fixtures/timeouts';
 
 function manualClock(start = 1_000_000) {
   let now = start;
@@ -139,13 +140,15 @@ describe('SQLite budget store', () => {
     }
   });
 
-  it('builds the running total of a 2.2 file from its history, and keeps it readable by 2.2', async () => {
-    const directory = await mkdtemp(join(tmpdir(), 'deuz-budget-'));
-    directories.push(directory);
-    const path = join(directory, 'budget.sqlite');
-    const legacy = await openDatabase(path);
-    // The 2.2 schema, as 2.2 creates it, with 70 tokens of lifetime history.
-    legacy.exec(`CREATE TABLE deuz_budget_schema (singleton INTEGER PRIMARY KEY CHECK(singleton = 1), version INTEGER NOT NULL);
+  it(
+    'builds the running total of a 2.2 file from its history, and keeps it readable by 2.2',
+    async () => {
+      const directory = await mkdtemp(join(tmpdir(), 'deuz-budget-'));
+      directories.push(directory);
+      const path = join(directory, 'budget.sqlite');
+      const legacy = await openDatabase(path);
+      // The 2.2 schema, as 2.2 creates it, with 70 tokens of lifetime history.
+      legacy.exec(`CREATE TABLE deuz_budget_schema (singleton INTEGER PRIMARY KEY CHECK(singleton = 1), version INTEGER NOT NULL);
       CREATE TABLE deuz_budget_scopes (key TEXT PRIMARY KEY, window_ms INTEGER, buckets INTEGER NOT NULL, bucket_ms INTEGER NOT NULL);
       CREATE TABLE deuz_budget_counters (key TEXT NOT NULL, bucket INTEGER NOT NULL, model_id TEXT NOT NULL,
         tokens INTEGER NOT NULL, usd REAL NOT NULL, PRIMARY KEY(key, bucket, model_id));
@@ -155,28 +158,32 @@ describe('SQLite budget store', () => {
       INSERT INTO deuz_budget_schema VALUES (1, 1);
       INSERT INTO deuz_budget_scopes VALUES ('org:1', NULL, 1, 3600000);
       INSERT INTO deuz_budget_counters VALUES ('org:1', 0, 'm', 40, 0.5), ('org:1', 1, 'm', 30, 0.25);`);
-    legacy.close();
-    const { clock } = manualClock();
-    const store = createSqliteBudgetStore({ path, clock });
-    try {
-      expect(
-        await store.reserve({
-          requestId: 'r',
-          modelId: 'm',
-          tokens: 31,
-          scopes: [{ key: 'org:1', limits: { tokens: 100 } }],
-        }),
-      ).toMatchObject({ admitted: false, committed: 70 });
-    } finally {
-      await store.close();
-    }
-    const after = await openDatabase(path);
-    try {
-      expect(after.prepare('SELECT version FROM deuz_budget_schema').get()).toEqual({ version: 1 });
-    } finally {
-      after.close();
-    }
-  }, 30_000); // a SQLite file opened, migrated and reopened: slow on a hosted Windows runner
+      legacy.close();
+      const { clock } = manualClock();
+      const store = createSqliteBudgetStore({ path, clock });
+      try {
+        expect(
+          await store.reserve({
+            requestId: 'r',
+            modelId: 'm',
+            tokens: 31,
+            scopes: [{ key: 'org:1', limits: { tokens: 100 } }],
+          }),
+        ).toMatchObject({ admitted: false, committed: 70 });
+      } finally {
+        await store.close();
+      }
+      const after = await openDatabase(path);
+      try {
+        expect(after.prepare('SELECT version FROM deuz_budget_schema').get()).toEqual({
+          version: 1,
+        });
+      } finally {
+        after.close();
+      }
+    },
+    SLOW_TEST_TIMEOUT_MS,
+  ); // a SQLite file opened, migrated and reopened: slow on a hosted Windows runner
 
   it('agrees with the memory store, and keeps its running totals, through any sequence', async () => {
     const { clock, advance, now } = manualClock();

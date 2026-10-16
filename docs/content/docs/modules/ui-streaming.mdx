@@ -1,6 +1,6 @@
 ---
 title: UI Streaming
-description: The Deuz UI wire — our versioned SSE protocol, now resumable (wire v2) with a two-method StreamStateStore seam, server-side data parts, and an auto-reconnecting client reader.
+description: The Deuz UI wire — our versioned SSE protocol, resumable (wire v2) with a two-method StreamStateStore seam, a durable persist-before-publish mode and a capability handshake (2.4), server-side data parts, and an auto-reconnecting client reader.
 ---
 
 `@deuz-sdk/core` ships its own UI streaming protocol. The server serializes a [`streamChat`](/docs/core/stream-chat) result to Server-Sent Events with `toDeuzStreamResponse`; the browser reads it back as typed parts with `readDeuzStream` (or the fault-tolerant `connectDeuzStream`). This is **our** wire — the canonical `fullStream` is reframed into stable, versioned UI parts, never a raw provider stream proxied through.
@@ -22,6 +22,8 @@ import {
   connectDeuzStream, // client: readDeuzStream + auto-reconnect + dedup
   negotiateDeuzStreamVersion, // pick v1/v2 from the request
   createInMemoryStreamStateStore, // reference StreamStateStore
+  createInMemoryDurableStreamStateStore, // durable mode store (2.4, preview)
+  DEUZ_CAPABILITY, // capability names for the handshake (2.4)
 } from '@deuz-sdk/core/ui';
 ```
 
@@ -61,13 +63,16 @@ function toDeuzStreamResponse(
 | `wireVersion` | `'v1' \| 'v2'` | `'v2'` | Pass `negotiateDeuzStreamVersion(request)` to honor v1 clients. |
 | `store` | `StreamStateStore` | — | Journal every emitted event under `streamId` (resumability). |
 | `streamId` | `string` | — | Stream identity in `store`. **Required when `store` is set** (throws otherwise). |
-| `onStoreError` | `(error: unknown) => void` | silently dropped | Store append failures land here — appends are best-effort. |
+| `onStoreError` | `(error: unknown) => void` | silently dropped | Store failures land here. With `store`, appends are best-effort and the client also gets a warning part (2.4); with `durable`, the response fails closed. |
+| `durable` | `DurableStreamOptions` | off | Persist before publish (2.4, preview): every frame is committed to a `DurableStreamStateStore` before it is sent. See [Durable mode](#durable-mode-and-the-capability-handshake-24). |
+| `capabilities` | `{ request, announce? }` | — | The capability handshake (2.4): answer a client that lists `x-deuz-capabilities`. Without the request header the response is byte-identical to 2.3's. |
 
 If neither `messageId` nor `generateId` is given, the id falls back to the literal `'deuz-msg'`. The response is fixed at `status: 200` with `content-type: text/event-stream; charset=utf-8`, `cache-control: no-cache`, and `x-deuz-stream: <version>`.
 
 ### Journaling semantics (when `store` is set)
 
-- **Store before wire.** Each part is appended to the store *before* it is enqueued on the response body, so a part in flight during a disconnect still lands in the log.
+- **Queued before wire, not awaited.** Each part's append is queued *before* the part is enqueued on the response body, so a part in flight during a disconnect still lands in the log. The wire does not wait for the store, so a frame can reach the client before the store has it. For a guarantee that a client never sees a frame the store lacks, use [durable mode](#durable-mode-and-the-capability-handshake-24).
+- **A store failure ends the journal of the leg (2.4).** The first failed append stops journaling that leg (the appends queued behind it are skipped), `onStoreError` hears it once, and a v2 client gets a `warning` part of type `'stream-store-error'`: "The stream store failed: this response is not journaled and cannot be resumed." Before 2.4 later appends went on, leaving a gap a replay skipped without a word. A store that cannot report its last seq no longer makes the response number its frames from 0 over the stored ones: that response is not journaled at all (no records, no `id:` lines) and sends the same warning.
 - **The client can vanish; the store keeps recording.** A refresh, tab close, or network drop kills the response body — the serializer flips a flag and keeps draining the model stream into the store. Resumability exists precisely for that moment.
 - **Leg-end sentinel.** When the source ends — complete, errored, *or* suspended on an approval — a terminal `done` record is appended (never serialized as a data line). Replay treats it as terminal only when nothing was appended after it, so a continued run stays reachable.
 - **Leg continuation.** If the store already holds records for `streamId` (a continued run — see [the unbreakable chatbot](/docs/agents/unbreakable-chatbot)), seq numbering continues after the last stored seq and the synthetic `start` part is *not* re-emitted.
@@ -228,6 +233,7 @@ function resumeDeuzStreamResponse(
 | `idleTimeoutMs` | `number` | `30_000` | Give up after this long with no new records and no sentinel. The response closes **without** `[DONE]`, so a reconnecting client treats it as another drop and may retry. |
 | `clock` | `Pick<Clock, 'setTimeout'>` | global `setTimeout` | Timer seam for deterministic tests. |
 | `headers` | `Record<string, string>` | — | Extra response headers. |
+| `capabilities` | `{ request, announce? }` | — | The capability handshake (2.4); `durable-stream` is announced automatically when the store is durable. |
 
 Cursor parsing is strict: only a plain non-negative integer counts — an empty or garbled `Last-Event-ID` means "no cursor", never seq 0. A `done` record is terminal only when nothing follows it: continued runs (durable resume, approval legs) append past their previous leg's sentinel, and replay sails through those boundaries. A caught-up client whose cursor already sits at a terminal sentinel gets an immediate `[DONE]` instead of an idle hang. A store failure surfaces as a redacted `error` part and the response closes without `[DONE]`.
 
@@ -244,6 +250,54 @@ export async function GET(req: Request, { params }: { params: Promise<{ id: stri
   });
 }
 ```
+
+## Durable mode and the capability handshake (2.4)
+
+Two opt-in options sit next to `store`. Both are off by default, and without
+them a response is byte-identical to 2.3's.
+
+**`durable`** (preview) persists before it publishes. It works on
+`toDeuzStreamResponse`, `toDeuzObjectStreamResponse`,
+`toDeuzAgentStreamResponse` and `createDeuzStream`, takes a
+`DurableStreamStateStore` (in-memory here; SQLite, PostgreSQL and Redis under
+`/stores/*`) and a `LeaseProvider`, and requires `streamId`:
+
+```ts
+return toDeuzStreamResponse(result, {
+  streamId: chatId,
+  durable: { store: streams, lease: { provider: leases } },
+});
+```
+
+Frames are committed in batches (at most 20 ms or 16 KiB, whichever comes
+first) and each batch is written to the wire only after it committed, so a
+client that reconnects through `resumeDeuzStreamResponse` gets every frame
+once, in order, and never one the store lacks. One producer writes a stream at
+a time, fenced by its lease token (key `stream:<streamId>`). Instead of
+degrading, a durable response fails closed: when another producer holds or took
+the stream, the log moved past it, the lease was lost or the store threw, it
+sends one `error` frame without an event id and without `[DONE]`. A refused
+response never reads a lazy source, so the run behind it never starts: a
+`streamChat` result behind `toDeuzStreamResponse` or `createDeuzStream`, or a
+refused `resumeDeuzChatResponse` continuation leg, makes no model call, runs
+no tool and saves no checkpoint. An agent stream is not lazy: it starts as soon
+as it is passed to `toDeuzAgentStreamResponse`, so for native runs the run's
+own lease, not the stream lease, keeps a second executor out. A refused agent
+response gives its subscription to the run's events back at once, so events
+no longer queue up for it, while the run itself goes on. A refused
+`createDeuzStream` drops what was queued and every later `writeData`, as after
+the stream ended.
+
+**`capabilities: { request, announce? }`** answers a client that lists what it
+understands in an `x-deuz-capabilities` request header (a 2.4 `useChat` does).
+The response then announces what it supports in the same response header and
+in a first `capabilities` frame: `durable-stream` automatically for a durable
+response, plus what you `announce` (`DEUZ_CAPABILITY.messageIds`,
+`DEUZ_CAPABILITY.chatSnapshot`). It takes the same option on
+`createDeuzStream`, `toDeuzAgentStreamResponse` and `resumeDeuzStreamResponse`.
+
+The stores, batching, fencing, retention and the client side are on
+[Chat and stream durability](/docs/modules/chat-durability#durable-streams-preview).
 
 ## Client: `readDeuzStream`
 
@@ -500,10 +554,11 @@ For a route and a React component, see [Native agents in a UI](/docs/modules/nat
 | `false-finish` **(v2, 1.9)** | `stepIndex`, `attempt`, `willRetry` | The `doneWhen` guard rejected a natural completion — render "not done yet, continuing". One part per rejection, always before the terminal `finish`; `willRetry: false` spent the `falseFinishGuard` budget, so the run stops anyway. Field names mirror the canonical `FalseFinishPart` exactly. Journaled and replayed like `verify`. |
 | `finish` | `finishReason: FinishReason`, `usage: Usage`, `stopDetails?: StopDetails` **(2.3)** | Last meaningful part — the whole turn finished. `stopDetails` is the provider's explanation of an early stop (a Claude refusal's `category` and `explanation`, or an OpenAI refusal's text as `explanation`), secret-redacted; absent when the provider explained nothing. |
 | `error` | `message: string` | A stream error occurred; `message` is redacted of secrets. |
+| `capabilities` **(v2, 2.4)** | `capabilities: string[]` | The first frame of a response that takes part in the capability handshake, before `start`. It has no event id, is never journaled, and `useChat` consumes it. |
 
 `Usage` and `FinishReason` are the canonical types from the core ([usage breakdown](/docs/core/stream-chat)). The `tool-input-delta` fragments accumulate into the `input` you receive on the matching `tool-call` — render the deltas for a live "typing the arguments" effect, then swap to the final `input`.
 
-Since 2.3 the wire's `reasoning-delta` carries the canonical part's `id`, `encrypted`, `redacted` and `source`, so a chat client rebuilds every reasoning block and sends it back unchanged (`useChat` does; see [Reasoning parts](/docs/core/messages#reasoning-parts)). Before 2.3 it carried only `text` and `signature`. The fields ride every wire version, and a client that does not know them ignores them like any unknown key. That is why an opaque block (an OpenAI encrypted item, a Claude `redacted_thinking` block) puts its payload in `data` and sends an empty `text`: a client that predates these fields, such as a 2.2 `@deuz-sdk/react`, the frozen `@deuz-sdk/core/react` hook or your own reader, appends `text` to the reasoning it shows, so it shows nothing for the block instead of the payload. `applyUIPart` reads the payload back from `data`. A reader of your own should skip a frame flagged `encrypted` or `redacted` when it renders reasoning, and keep `data` only to send the block back.
+Since 2.3 the wire's `reasoning-delta` carries the canonical part's `id`, `encrypted`, `redacted` and `source`, so a chat client rebuilds every reasoning block and sends it back unchanged (`useChat` does; see [Reasoning parts](/docs/core/messages#reasoning-parts)). Before 2.3 it carried only `text` and `signature`. The fields ride every wire version, and a client that does not know them ignores them like any unknown key. That is why an opaque block (an OpenAI encrypted item, a Claude `redacted_thinking` block) puts its payload in `data` and sends an empty `text`: a client that predates these fields, such as a 2.2 `@deuz-sdk/react`, the frozen `@deuz-sdk/core/react` hook (deprecated since 2.4 and removed in 3.0; a development build warns once) or your own reader, appends `text` to the reasoning it shows, so it shows nothing for the block instead of the payload. `applyUIPart` reads the payload back from `data`. A reader of your own should skip a frame flagged `encrypted` or `redacted` when it renders reasoning, and keep `data` only to send the block back.
 
 ### Refusals, outcomes and thinking display (2.3)
 

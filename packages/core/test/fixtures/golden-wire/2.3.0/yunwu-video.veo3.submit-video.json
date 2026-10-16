@@ -1,0 +1,18 @@
+{
+  "scenario": "yunwu-video.veo3.submit-video",
+  "recordedFrom": "2.3.0",
+  "requests": [
+    {
+      "method": "POST",
+      "url": "https://yunwu.ai/v1/videos",
+      "headers": {
+        "authorization": "Bearer <secret>",
+        "content-type": "application/json"
+      },
+      "json": {
+        "model": "veo3",
+        "prompt": "Waves at night."
+      }
+    }
+  ]
+}

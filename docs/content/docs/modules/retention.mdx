@@ -1,0 +1,239 @@
+---
+title: Retention and forget
+description: The explicit cleanup calls of every 2.4 store, what each keeps so that deduplication and audits still hold, and how a versioned memory forget redacts the compiled context packages of V3 runs (2.4).
+---
+
+The SDK never deletes data in the background. Every 2.4 store keeps what it
+wrote until you call its cleanup method, and each method says what it keeps so
+that deduplication, fencing and audits still hold afterwards. Run them on a
+schedule you choose.
+
+| Store | Call | Removes | Keeps |
+| --- | --- | --- | --- |
+| Versioned memory | `pruneHistory({ olderThan, scope? })` | Past revisions of records whose current revision is retracted or expired | The current revision and the receipts |
+| Versioned memory | `pruneOperations({ olderThan })` | Operation receipts | Nothing of them: those operation ids no longer deduplicate, and the store logs a warning |
+| Goal runtime | `prunePayloads({ before, scope? })` | Payloads of settled inbox entries | The entries and ids (`payloadPruned: true`), so dedupe holds |
+| Goal runtime | `pruneInbox({ before, scope? })` | Settled inbox entries, ids included | Nothing: a repeated delivery is queued again |
+| Goal runtime | `pruneOccurrences({ before, scope? })`, or `{ olderThan, scope? }` (exactly one of the two) | Schedule occurrence records | The schedules and their cursors |
+| Goal runtime | `pruneIntents({ before, scope? })` | Completed, failed and cancelled run intents | Open intents |
+| Durable streams | `prune({ terminalBefore })` | Finished streams (last record is the `done` sentinel) | Active streams; a pruned stream forgets its fence |
+| Process operations | `prune({ terminalBefore })` | Records of terminal operations | Containers: those go with `dispose` |
+| V3 runs | `prune({ terminalBefore })` | Terminal runs and the context package blobs only they used | Running and suspended runs |
+| Conditional chats | `pruneTombstones(before)` | Tombstones of deleted chats | Live chats; after this the id can be reused |
+
+Every call returns how many it removed. Times are epoch milliseconds on the
+store's own clock: the in-memory and SQLite stores use their injected clock,
+the PostgreSQL V3 run and durable stream stores the database clock, the Redis
+stream store the server time, and the PostgreSQL goal runtime and versioned
+memory stores their `clock` option.
+
+Every cutoff is exclusive: a record stamped exactly at it stays. A malformed
+cutoff is refused before anything is deleted: `ProcessOperationStore.prune`
+throws a `TypeError` for a bad `terminalBefore`, and `pruneTombstones` throws
+`InvalidRequestError` for a bad `before`.
+
+Every versioned memory store (in-memory, SQLite and PostgreSQL) logs the same
+warning when `pruneOperations` deletes receipts, with `{ count, olderThan }`.
+It goes through the store's logger (`deps.logger` in memory, `logger` on the
+SQL stores), which is silent by default.
+
+## Suggested windows
+
+Two windows are SDK defaults: `DEFAULT_GOAL_RUNTIME_POLICY.retainPayloadMs`
+(7 days) for inbox payloads, and `DEFAULT_DURABLE_STREAM_RETAIN_MS` (24 hours,
+exported from `@deuz-sdk/core/ui`) for finished durable streams. For the rest,
+pick what your audit and support needs require. As a starting point:
+
+| Data | Window | Why |
+| --- | --- | --- |
+| Inbox payloads | 7 days (`retainPayloadMs`) | Webhook bodies can hold personal data; the ids keep dedupe |
+| Finished durable streams | 24 hours (`DEFAULT_DURABLE_STREAM_RETAIN_MS`) | Long enough for a client to reconnect and replay a turn |
+| Terminal process records | days | Only needed to read output and artifacts after exit |
+| Terminal V3 runs | your audit window | They hold transcripts, checkpoints and context packages |
+| Memory history | your audit window | Past revisions of retracted or expired records |
+| Memory receipts | keep, or longer than any retry | Without them a redelivered operation is applied again |
+| Inbox entries and ids | keep, unless you want a dedupe window | Without them a repeated delivery is queued again |
+
+`prunePayloads` cuts per store or per scope, not per goal. When goals in one
+scope carry different `retainPayloadMs` values, pass the largest window: a
+payload may then outlive its own goal's window, never the reverse.
+
+## A retention pass
+
+```ts
+import { createInMemoryAgentRunStoreV3 } from '@deuz-sdk/core/agent';
+import { createInMemoryConditionalChatStore } from '@deuz-sdk/core/chat';
+import { createInMemoryProcessOperationStore } from '@deuz-sdk/core/compute/docker';
+import { DEFAULT_GOAL_RUNTIME_POLICY, createInMemoryGoalRuntimeStore } from '@deuz-sdk/core/goal/runtime';
+import { createInMemoryVersionedMemoryStore } from '@deuz-sdk/core/memory/versioned';
+import { createScheduler } from '@deuz-sdk/core/schedule';
+import { DEFAULT_DURABLE_STREAM_RETAIN_MS, createInMemoryDurableStreamStateStore } from '@deuz-sdk/core/ui';
+
+const DAY = 86_400_000;
+const memory = createInMemoryVersionedMemoryStore();
+const goals = createInMemoryGoalRuntimeStore();
+const streams = createInMemoryDurableStreamStateStore();
+const processes = createInMemoryProcessOperationStore();
+const runs = createInMemoryAgentRunStoreV3();
+const chats = createInMemoryConditionalChatStore();
+
+/** One retention pass. The windows are examples; only the two DEFAULT_* windows are SDK defaults. */
+async function prune(now: number) {
+  return {
+    memoryHistory: await memory.pruneHistory({ olderThan: now - 90 * DAY }),
+    inboxPayloads: await goals.prunePayloads({ before: now - DEFAULT_GOAL_RUNTIME_POLICY.retainPayloadMs }),
+    occurrences: await goals.pruneOccurrences({ before: now - 30 * DAY }),
+    intents: await goals.pruneIntents({ before: now - 30 * DAY }),
+    streams: await streams.prune({ terminalBefore: now - DEFAULT_DURABLE_STREAM_RETAIN_MS }),
+    processes: await processes.prune({ terminalBefore: now - 7 * DAY }),
+    runs: await runs.prune({ terminalBefore: now - 30 * DAY }),
+    tombstones: await chats.pruneTombstones(now - 365 * DAY),
+  };
+}
+
+// Once a night, from the host's cron trigger.
+const cleanup = createScheduler({
+  schedules: [{ id: 'retention', cron: '15 3 * * *', run: async (occurrence) => console.log(await prune(occurrence.at)) }],
+});
+await cleanup.tick(Date.parse('2026-10-15T03:15:20Z'));
+```
+
+The pass leaves out `pruneOperations` and `pruneInbox` on purpose: both remove
+the ids that make a redelivery a duplicate. A cron trigger with
+[`createScheduler`](/docs/modules/schedule) is enough for a cleanup job; run it
+in one process, or give the scheduler a durable claim. Process containers are
+removed with `dispose` and `reconcile({ removeOrphans: true })` on the
+[Docker runner](/docs/modules/docker#reconcile-and-cleanup), not by `prune`.
+
+## Forget and V3 context packages
+
+A [V3 run](/docs/modules/native-agents#v3-runs-checkpointversion-3) stores the
+context package it compiled for each step as a content-addressed blob, and the
+step's manifest points to the blob's digest. The same package is written once,
+however many steps or runs use it. When a
+[versioned memory](/docs/modules/versioned-memory#revise-retract-and-forget)
+record is forgotten, those blobs may still hold its text, so the run store
+subscribes to the forget:
+
+```ts
+import { createInMemoryAgentRunStoreV3 } from '@deuz-sdk/core/agent';
+import { contextPackageBlob, createContextCompiler, createMemoryContextSource } from '@deuz-sdk/core/context';
+import { createInMemoryVersionedMemoryStore, createMemorySession } from '@deuz-sdk/core/memory/versioned';
+
+const runs = createInMemoryAgentRunStoreV3();
+const memory = createMemorySession({
+  store: createInMemoryVersionedMemoryStore(),
+  scope: { userId: 'ada' },
+  // Every forget also redacts the stored context packages that hold the record.
+  onForget: async (event) => {
+    await runs.redactForgotten(event);
+  },
+});
+const { records } = await memory.remember({ text: 'Ada lives in Izmir.' });
+
+const compiler = createContextCompiler({
+  scope: { userId: 'ada' },
+  sources: [createMemoryContextSource({ session: memory })],
+});
+const pkg = await compiler.beforeModelCall({
+  runId: 'run-1',
+  step: 0,
+  messages: [{ role: 'user', content: 'Where does Ada live?' }],
+  model: { provider: 'anthropic', modelId: 'claude-opus-5-5', contextWindow: 200_000, maxOutputTokens: 8_000 },
+  overheadTokens: 0,
+});
+const blob = await contextPackageBlob(pkg);
+await runs.putBlob(blob); // what a V3 run does for each compiled step
+console.log((await runs.getBlob(blob.digest)).status); // found
+
+const forgotten = await memory.forget(records[0]!.id);
+console.log(forgotten.redaction); // complete
+console.log((await runs.getBlob(blob.digest)).status); // redacted
+```
+
+- `contextPackageBlob(pkg)` returns the blob: its `digest` (SHA-256 of the
+  canonical JSON of the package blocks), `content`, `bytes` and the memory
+  `records` (id and revision) it contains. A V3 run writes it with `putBlob`,
+  which is idempotent and rejects content that does not hash to the digest.
+- `redactForgotten(event)` redacts every blob that holds one of the forgotten
+  revisions and returns how many it newly redacted. A record placed without a
+  revision matches any forgotten revision of its id, and a forget with no
+  revisions matches them all. The store also remembers the forget, so a
+  package written later with the same record is stored redacted.
+- `redactForgotten(event)` also rewrites the runs that point to a redacted
+  package. Every stored copy of its retrieval block (the exact
+  `<deuz_context pass="P" step="S">` message the compiler appended) that holds
+  a forgotten record, in the run's history, in every checkpoint and in the
+  stored result's messages, a terminal run's `result.messages` included,
+  becomes a stand-in that keeps the marker and holds no record. A user's
+  message that only opens with such a marker stays, and so does an overflow
+  retry's block, which carries its first attempt's marker but dropped the
+  forgotten record. Message count, roles and order stay the same. The rewrite
+  is in place: the run keeps its revision and its last-save time, so its
+  retention window does not move, and a repeated forget changes nothing. A
+  later save of such a run is stored the same way.
+- `getBlob(digest)` then answers `{ status: 'redacted' }`, and the step
+  manifests that point to it load with `redacted: true`.
+- The forget's `redaction` is `'failed'` when a listener threw. The forget
+  itself is never undone; call `forget` again, which reruns every listener
+  with `alreadyForgotten: true`, or call `runs.redactForgotten(event)` with the
+  event the result carries.
+
+A redacted package changes one rule of V3 recovery. A step reopened after a
+restart normally reuses its stored package, so the model sees the same context
+again. When that package was redacted, the step is compiled again instead
+(refresh `'redacted'`, `manifest.redacted: true`); on resume, the stand-ins
+and any retrieval block that held a forgotten record are removed from the
+run's history and checkpoints (a block under the same marker whose package is
+still found, an overflow retry's, stays), and the manifest records
+`cachePrefixChanged: true`. This is the only case in which a resumed step does
+not reuse its context.
+
+The forget records the run store keeps hold record ids and revisions, never
+text. The SQLite and PostgreSQL V3 stores keep them in `deuz_runs_v3_forgotten`.
+
+## What a forget does not reach
+
+A versioned memory forget deletes the record's content, revisions and vectors
+and, with the listener above, the context packages that hold it and the
+stored copies of their retrieval blocks. It does not touch:
+
+- chat records and the [transcript index](/docs/modules/transcript-search):
+  delete or tombstone the chat;
+- the legacy `MemoryStore`: delete the record there;
+- goal inbox payloads, durable stream logs and process output tails that
+  quote the text: prune or delete them;
+- text the model wrote from a block: assistant turns, `result.text`, a
+  compaction summary;
+- memory tool results: `memory_recall` output in tool messages, in the run
+  transcript and in a chat store;
+- the in-memory history of a leg that is running when the forget lands: it
+  keeps the block and can still send it until the leg ends or the run is
+  resumed;
+- run stores not subscribed through `onForget`;
+- a retrieval block a run received in its input messages, such as a previous
+  run's `result.messages` passed to `runAgent({ messages })`: it is not
+  redacted in that run's record, so continue from the chat projection or the
+  transcript, which carry no retrieval blocks;
+- observability backends: 2.4 spans carry ids, counts and digests, never
+  content, but your own logs may;
+- files, exports and model provider logs outside the SDK.
+
+## Telemetry
+
+The SQL versioned memory stores report `pruneHistory` and `pruneOperations` as
+`deuz.memory.op` spans (`deuz.memory.operation` `'prune-history'` or
+`'prune-operations'`, with `deuz.memory.record_count`) when they have an
+observer. The other prune calls report no span. See
+[Observability](/docs/modules/observability#24-spans).
+
+## Limits
+
+- Cleanup is yours to schedule; a store that is never pruned grows without
+  bound.
+- `pruneOperations` and `pruneInbox` trade deduplication for space. Keep their
+  windows longer than any retry or redelivery you expect.
+- Redaction covers the context packages of V3 runs, and the runs' stored
+  copies of their retrieval blocks, in a store that subscribes to the forget.
+  Packages in a store that was not subscribed, copies you made, and blocks a
+  run received in its input messages are not redacted.

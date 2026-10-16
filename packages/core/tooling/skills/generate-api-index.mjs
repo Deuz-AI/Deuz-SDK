@@ -56,12 +56,15 @@ export const SUBPATH_DESCRIPTIONS = {
   '@deuz-sdk/core/testing':
     'Deterministic mock models, SSE fixtures, fetch mocks, eval runners and versioned eval suites for YOUR tests.',
   '@deuz-sdk/core/workspace':
-    'A file-tree seam agents use as externalized memory, plus the tools that drive it.',
+    'A file-tree seam agents use as externalized memory, plus the tools that drive it and digestWorkspace (2.4).',
   '@deuz-sdk/core/workspace/node': 'Real-filesystem workspace (Node only).',
-  '@deuz-sdk/core/compute': 'CodeAct: let the model act by writing code; sandbox seam and shell tool.',
+  '@deuz-sdk/core/compute':
+    'CodeAct: let the model act by writing code; sandbox seam and shell tool.',
   '@deuz-sdk/core/compute/node': 'Node child-process sandbox for the compute tools.',
+  '@deuz-sdk/core/compute/docker':
+    'Preview (Node only): local Docker sandbox for the compute tools and a reconnectable process runner with its operation store.',
   '@deuz-sdk/core/agent':
-    'Native run/stream/resume/reconcile, validated outputs, execution policies, shared and persistent budgets; also createAgent templates and handoff.',
+    'Native run/stream/resume/reconcile, validated outputs, execution policies, shared and persistent budgets, V3 runs (checkpointVersion 3, 2.4); also createAgent templates and handoff.',
   '@deuz-sdk/core/swarm':
     'Bounded agent/reducer DAGs, runtime spawning, blackboards, rounds, leases, drain and recovery, atomic snapshots and cursor events.',
   '@deuz-sdk/core/swarm/sqlite':
@@ -73,18 +76,23 @@ export const SUBPATH_DESCRIPTIONS = {
   '@deuz-sdk/core/ops':
     'Leases for cross-process runs: the LeaseProvider contract, an in-memory provider, native run lease keys and stale-run discovery.',
   '@deuz-sdk/core/ops/sqlite':
-    'Node-only SQLite leases, native agent run store, schedule claims and persistent budget store.',
+    'Node-only SQLite leases, native agent run store, V3 run store (2.4), schedule claims and persistent budget store.',
   '@deuz-sdk/core/ops/postgres':
-    'Node-only Postgres leases, native agent run store, schedule claims and persistent budget store.',
+    'Node-only Postgres leases, native agent run store, V3 run store (2.4), schedule claims and persistent budget store.',
   '@deuz-sdk/core/ops/redis':
     'Node-only Redis leases, native agent run store, schedule claims and persistent budget store.',
   '@deuz-sdk/core/evolve':
     'Evolutionary program search: evolve blocks, SEARCH/REPLACE patches, cascade, islands, zero-call resume.',
   '@deuz-sdk/core/evolve/sqlite': 'Node-only SQLite population store for evolve.',
   '@deuz-sdk/core/schedule':
-    'Five-field UTC cron, a tick-driven scheduler with dedupe, and verified webhooks.',
+    'Five-field UTC cron, a tick-driven scheduler with dedupe, verified webhooks, and IANA time-zone and DST helpers (2.4).',
   '@deuz-sdk/core/goal':
     'Goals, wakeups and events: versioned records, pure transitions, evidence-based acceptance, a GoalStore seam.',
+  '@deuz-sdk/core/goal/runtime':
+    'Durable goals: a supervisor over the native executor, the goal runtime store, a time-zone aware durable scheduler, webhook delivery and verifyGoalAcceptance.',
+  '@deuz-sdk/core/goal/runtime/sqlite':
+    'Node-only SQLite goal runtime store: the first durable GoalStore.',
+  '@deuz-sdk/core/goal/runtime/postgres': 'Node-only Postgres goal runtime store.',
   '@deuz-sdk/core/autonomy':
     'Ensemble strategies: best-of-N, self-consistency, parallel agents, task planning.',
   '@deuz-sdk/core/runtime':
@@ -116,12 +124,22 @@ export const SUBPATH_DESCRIPTIONS = {
     'Long-term memory: extract, reconcile, apply — behind one swappable store seam.',
   '@deuz-sdk/core/memory/markdown':
     'Obsidian-style markdown vault as the memory store (Node only).',
+  '@deuz-sdk/core/memory/versioned':
+    'Versioned memory with provenance: revisions, receipts, idempotent operations, forget, re-embed and the legacy import.',
+  '@deuz-sdk/core/memory/versioned/sqlite':
+    'Node-only SQLite versioned memory store: hybrid FTS5 + vector search.',
+  '@deuz-sdk/core/memory/versioned/postgres':
+    'Node-only Postgres versioned memory store: hybrid tsvector + vector search, pgvector optional.',
+  '@deuz-sdk/core/context':
+    'One token budget for memory, RAG, transcript and skills: compileContext, the context compiler, working memory and the token estimator.',
   '@deuz-sdk/core/rag':
     'Edge-safe RAG: sniff, parse, chunk, embed, dense + BM25 hybrid retrieval, citations.',
   '@deuz-sdk/core/rag/node': 'PDF / DOCX / XLSX / HTML parsers for the RAG registry (Node only).',
   '@deuz-sdk/core/skills':
     'Agent Skills: SKILL.md parsing, registry, matchers, catalog rendering, tool scoping.',
   '@deuz-sdk/core/skills/node': 'Load skills from directories on disk (Node only).',
+  '@deuz-sdk/core/skills/learning':
+    'Experimental: a sourced, inert skill proposal from a verified run (proposeSkillFromRun).',
   '@deuz-sdk/core/vertex':
     'Claude and Gemini through Vertex AI; edge-safe service-account JWT signing.',
   '@deuz-sdk/core/vertex/node': 'Vertex Application Default Credentials (Node only).',
@@ -133,11 +151,11 @@ export const SUBPATH_DESCRIPTIONS = {
     'Serve Deuz tools, native agent tools and whole agents as an MCP server over Streamable HTTP.',
   '@deuz-sdk/core/mcp/server/stdio': 'The same MCP server over stdio (Node only).',
   '@deuz-sdk/core/stores/sqlite':
-    'One factory for memory + chat + session + run stores on node:sqlite.',
+    'One factory for memory + chat + session + run stores on node:sqlite; conditional chat store with transcript index and durable stream store (2.4).',
   '@deuz-sdk/core/stores/redis':
-    'The same four store seams on Redis (runs since 2.3), over node-redis or a wrapped ioredis client.',
+    'The same four store seams on Redis (runs since 2.3), over node-redis or a wrapped ioredis client; durable stream store (2.4).',
   '@deuz-sdk/core/stores/postgres':
-    'The same four store seams on Postgres (pgvector when available).',
+    'The same four store seams on Postgres (pgvector when available); conditional chat store with transcript index and durable stream store (2.4).',
   '@deuz-sdk/core/durable': 'Checkpoints, resume-after-crash, and HMAC-signed tool approvals.',
   '@deuz-sdk/core/otel': 'OpenTelemetry bridge for traces and events.',
   '@deuz-sdk/core/observe':
@@ -145,13 +163,14 @@ export const SUBPATH_DESCRIPTIONS = {
   '@deuz-sdk/core/observe/node': 'JSONL persistence for observation events (Node only).',
   '@deuz-sdk/core/edge': 'A curated re-export subset guaranteed to contain nothing Node-only.',
   '@deuz-sdk/core/ui':
-    'The Deuz UI wire: SSE responses (native agent runs included), resumable streams, and the client-side reader.',
+    'The Deuz UI wire: SSE responses (native agent runs included), resumable streams, durable streams and the capability handshake (2.4), and the client-side reader.',
   '@deuz-sdk/core/react':
-    'Legacy in-core React hooks, frozen at 2.2: no 2.3 verdict matching or resumed-turn settlement, drops approval tokens, and drops client calls without onToolCall. Prefer the @deuz-sdk/react package.',
+    'Deprecated (2.4), removed in 3.0: legacy in-core React hooks, frozen at 2.2 (no 2.3 verdict matching or resumed-turn settlement, drops approval tokens, drops client calls without onToolCall). A development build warns once. Use @deuz-sdk/react.',
   '@deuz-sdk/core/chat':
-    'The pure chat state engine plus validateChatRequest — the gate in front of client history.',
+    'The pure chat state engine plus validateChatRequest — the gate in front of client history; conditional chat stores and the transcript index (2.4).',
   '@deuz-sdk/core/chat/node': 'File-backed chat store (Node only).',
-  '@deuz-sdk/react': 'React hooks and components: useChat, useObject, approval card, cost badge.',
+  '@deuz-sdk/react':
+    'React hooks and components: useChat, useObject, approval card, cost badge, chat snapshots (2.4).',
 };
 
 /** The curated re-export subset would list half the package again; the reverse lookup skips it. */
@@ -178,7 +197,8 @@ export function resolveStampDate({ date, env = process.env } = {}) {
   if (epoch === undefined || epoch === '') {
     throw new Error('no stamp date: pass --date YYYY-MM-DD or set SOURCE_DATE_EPOCH');
   }
-  if (!/^\d+$/.test(epoch)) throw new Error(`SOURCE_DATE_EPOCH must be whole seconds, got "${epoch}"`);
+  if (!/^\d+$/.test(epoch))
+    throw new Error(`SOURCE_DATE_EPOCH must be whole seconds, got "${epoch}"`);
   return new Date(Number(epoch) * 1000).toISOString().slice(0, 10);
 }
 

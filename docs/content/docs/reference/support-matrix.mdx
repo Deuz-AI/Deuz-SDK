@@ -1,6 +1,6 @@
 ---
 title: Support Matrix
-description: How far each model row and protocol that 2.3 added is verified — documented, fixture-tested, live-verified — kept apart.
+description: How far each model row and protocol that 2.3 added is verified — documented, fixture-tested, live-verified — kept apart, and what the 2.4 stores and runners were tested against.
 ---
 
 A model in the registry, or a protocol in a module, is not a promise that it works against the provider's live API. This page says, for every model row and every protocol 2.3 added, which of three levels of verification it has reached. The levels are kept apart on purpose: a documented rule that is tested offline is still not live-verified.
@@ -62,6 +62,21 @@ Deuz reads a stop explanation from Anthropic (`stop_details`, with a refusal's c
 - **Streams, OpenAI.** Chat Completions' `finish_reason` maps one to one, with the deprecated `function_call` as `tool_calls`. A Responses turn ends with `length` when `incomplete_details.reason` is `max_output_tokens` and with `content_filter` when it is `content_filter`; before 2.3 the latter ended with `'stop'`, or `'tool_calls'` when the turn streamed a call. `max_messages` and `steered`, which `openai` 7.32 does not document beyond the name, end it as a complete response does. A refusal on either wire ends the turn with `content_filter` unless the provider reported `length` or `content_filter` itself, also when the stream closed before its last event (Chat Completions without a `finish_reason`, Responses without `response.completed` or `response.incomplete`). Before 2.3 the refusal was dropped, so a refused turn ended with `'stop'` (or `'tool_calls'`) like an empty answer. The refusal never becomes answer text.
 - **Batch results.** The batch parsers share the streaming adapters' mapping, so a batch result ends as the same reply does when streamed: the same finish reason, for an OpenAI refusal the same `stopDetails` and `providerMetadata.openai.refusal`, and for Gemini the same `providerMetadata.google.finishReason`.
 - **Tool calls.** Whatever the provider, a turn that ends with `content_filter` or `length` dispatches none of its tool calls (2.3; `finish-gate` replays the Anthropic wire, `finish-gate-providers` the Gemini, Responses and Chat Completions wires). That covers a Gemini filter or limit after a call, an OpenAI turn its content filter stopped, and an OpenAI refusal. A turn that ends with any other reason is not held back: a Gemini stop without a usable answer after a call ends with `tool_calls`, and its call runs, as before 2.3.
+
+## 2.4
+
+2.4 adds no model row and no provider protocol, and nothing in it was run against a live provider: every model call its features make (memory LLM and embedder callbacks, native runs under the goal supervisor, verifiers, skill proposals) is tested against scripted models. What 2.4 adds is verified against the backends it runs on.
+
+| Surface | In every check run (offline) | Against a real backend |
+| --- | --- | --- |
+| SQLite stores: versioned memory, goal runtime, V3 runs, conditional chats with their transcript index, durable streams, process operations | Real `node:sqlite` databases | The same |
+| PostgreSQL stores: versioned memory, goal runtime, V3 runs, conditional chats with their transcript index, durable streams | PGlite | Postgres 16 in the CI integration job (`DEUZ_TEST_POSTGRES_URL`). The pgvector path of the versioned memory store only against an emulated `vector` type in PGlite |
+| Redis durable stream store | ioredis-mock, which runs the same Lua scripts | Redis 7 in the CI integration job (`DEUZ_TEST_REDIS_URL`) |
+| Docker sandbox and process runner (preview) | A scripted Docker CLI | A Docker Engine with Linux containers (`DEUZ_TEST_DOCKER=1`): GitHub's ubuntu runner in the CI Docker job, and Docker Desktop on Windows 11 locally |
+| Webhook handler | GitHub, Slack and HMAC signatures computed in the tests with `node:crypto` | Not against deliveries from GitHub or Slack |
+| Time zone schedules | The host's `Intl` time zone data, across DST gaps and overlaps | Not applicable |
+
+Golden fixtures recorded with 2.3.0 (179 scenarios across the provider factories) check in every run that, with the 2.4 features off, the provider requests (method, URL, headers and body bytes) are the ones 2.3.0 sent. See [What is new in 2.4](/docs/reference/whats-new-2-4#known-limits) for the release's known limits.
 
 ## Related
 

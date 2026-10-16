@@ -1,0 +1,35 @@
+{
+  "scenario": "anthropic.claude-opus-5-5.call-options",
+  "recordedFrom": "2.3.0",
+  "requests": [
+    {
+      "method": "POST",
+      "url": "https://api.anthropic.com/v1/messages",
+      "headers": {
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+        "x-api-key": "<secret>"
+      },
+      "json": {
+        "model": "claude-opus-5-5",
+        "max_tokens": 256,
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "Say hello."
+              }
+            ]
+          }
+        ],
+        "stream": true,
+        "stop_sequences": ["END"],
+        "output_config": {
+          "effort": "low"
+        }
+      }
+    }
+  ]
+}

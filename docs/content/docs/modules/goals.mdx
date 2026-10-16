@@ -18,9 +18,12 @@ move them forward with `transitionGoal`, giving it the time.
 | `GoalEvent` | A wakeup or outside event addressed to a goal, with a dedupe key |
 | `GoalStore` | Your persistence boundary; `createInMemoryGoalStore` is the reference |
 
-A running supervisor that drives goals on its own, a durable inbox and timezone
-aware wakeups are planned for 2.4. The 2.3 records are the contract they will
-build on.
+In 2.4 the [goal runtime](/docs/modules/goal-runtime) drives these records: a
+supervisor that runs goals with the native executor, durable SQLite and
+PostgreSQL goal stores, a time-zone aware durable scheduler, webhook delivery
+into a goal's inbox, and acceptance verified on evidence. The records on this
+page are the contract it builds on, and everything here still works without
+it.
 
 [`examples/16-goals-and-wakeups`](https://github.com/Deuz-AI/Deuz-SDK/tree/main/examples/16-goals-and-wakeups)
 runs the contract end to end without a key: a goal woken by a schedule
@@ -233,6 +236,13 @@ ID that says something else (`'evidence-conflict'`). When a revision changes a
 criterion's `description` or `required`, its verdict is dropped; evidence is
 kept. Passing `goal.criteria` back unchanged changes nothing.
 
+2.4 adds optional evidence fields (`criterionId`, `verifier`, `specGeneration`,
+`artifactDigest`, `workspaceDigest`), spec generations for goals that opt in
+with `specGeneration`, and `verifyGoalAcceptance`, which runs your verifiers
+and returns the `evaluate` command to apply. See
+[Acceptance on evidence](/docs/modules/goal-runtime#acceptance-on-evidence). A
+goal without `specGeneration` keeps the rules above exactly.
+
 ## Budget and deadline
 
 `charge` adds what a run spent. When the spend reaches `budget.usd` or
@@ -323,8 +333,9 @@ last 64 charges apart from them in `charged`. Further back, claim an event's
 key durably before you apply the event, as `handleSignal` does with its
 `dedupe`.
 
-Nothing in 2.3 fires a wakeup by itself. A periodic job of yours finds the due
-ones and ticks them. Several processes can run it at once: the store's revision
+Nothing in `@deuz-sdk/core/goal` fires a wakeup by itself. The
+[goal supervisor](/docs/modules/goal-runtime) (2.4) applies time on every tick;
+without it, a periodic job of yours finds the due ones and ticks them. Several processes can run it at once: the store's revision
 check lets one save win. A pass whose save conflicts, with another pass or with
 a charge that landed since the listing, leaves the goal to the next pass, which
 sees the fresh record. Resume a goal's run only once your save went through:
@@ -385,7 +396,10 @@ The records are yours to store. A `GoalStore` is the boundary the SDK expects:
 `createInMemoryGoalStore()` is the reference implementation, for tests and a
 single process; the SDK's test suite runs a conformance fixture against it, and
 a store of yours on SQL or a key-value store with compare-and-set should pass
-the same checks. Around a store, every writer runs the same loop: load,
+the same checks. In 2.4, `load(goalId, { scope })` reads a goal of another
+scope as `undefined`, and the
+[goal runtime stores](/docs/modules/goal-runtime#goal-runtime-stores) on SQLite
+and PostgreSQL are durable `GoalStore`s that pass the same fixture. Around a store, every writer runs the same loop: load,
 transition, save, and on a conflict load again. A transition is pure, so the
 retry is safe, and a duplicate event or charge is recognised on the fresh copy:
 
@@ -425,7 +439,7 @@ Records and events carry `kind` and `version`. `serializeGoal` and
 
 - A reader accepts every version up to its own, `GOAL_RECORD_VERSION`
   (`GOAL_EVENT_VERSION`), and refuses a newer one with `unsupported_version`.
-  2.3 writes and reads version 1.
+  2.3 and 2.4 write and read version 1; the 2.4 fields are optional additions.
 - Within a version, later 2.x releases only add optional fields. A reader keeps
   fields it does not know, through every transition, and fills in the ones a
   writer may leave out (no evidence, verdicts, spend or keys yet). It compares
@@ -477,7 +491,8 @@ console.log(result.status, goal.status); // completed waiting
 Leases, run discovery and cross-process cancellation of native runs are on the
 [operations](/docs/modules/operations#listing-leasing-and-cancelling-native-runs)
 page: a goal's cancel is yours to forward to its run, by signalling `'cancel'` to
-the run's lease key.
+the run's lease key. The [goal supervisor](/docs/modules/goal-runtime#commands-cancel-and-drain)
+(2.4) records the cancel and forwards it for the runs it drives.
 
 ## Design note: plugin manifests and hook provenance
 

@@ -1,0 +1,344 @@
+---
+title: Docker runner
+description: A local Docker sandbox for the compute tools and a process runner that reconnects after a host restart, with isolation defaults, a fixed start order, recorded cancels, checked artifacts and explicit cleanup (2.4, preview).
+---
+
+`@deuz-sdk/core/compute/docker` (2.4, preview) runs code in local Linux
+containers. It has two parts: a `ComputeSandbox` that fits `codeActTool` and
+`shellTool` the same way `createNodeSandbox` does, and a process runner for
+longer work that records every step in a `ProcessOperationStore`, so a host
+that restarts reconnects to its containers instead of starting them again. It
+is Node-only: it drives the Docker CLI as a child process with `shell: false`
+and never mounts the host workspace or the Docker socket.
+
+| Piece | What it is |
+| --- | --- |
+| `createDockerSandbox(options)` | A `ComputeSandbox`: each `runCode` and `runShell` in a fresh container that is removed afterwards |
+| `createDockerProcessRunner({ ...options, store })` | `start`, `poll`, `readOutput`, `readArtifact`, `cancel`, `dispose`, `reconcile` |
+| `createInMemoryProcessOperationStore({ deps? })` | Operation records for tests and one process |
+| `createSqliteProcessOperationStore({ path \| database, wal?, clock? })` | Operation records that survive a restart |
+| `DEFAULT_DOCKER_SANDBOX` | The isolation and size defaults |
+| `DockerSandboxError`, `OperationConflictError` | An infrastructure failure (with a `code`); an operation id reused for another request |
+
+Preview means the API may still change in 2.5; the stored record format is
+versioned. The first release targets Linux containers. It is tested in Linux
+CI with a real Docker engine and was verified on Windows 11 with Docker
+Desktop 29.8 (Linux containers, containerd image store). Only the Docker CLI is
+tested; `dockerPath` can name another binary, at your own risk.
+
+[`examples/23-docker-runner`](https://github.com/Deuz-AI/Deuz-SDK/tree/main/examples/23-docker-runner)
+runs both parts on a pinned alpine image without a key: sandbox runs under the
+defaults, a process with a staged file and a checked artifact, a host restart
+that reconnects instead of starting again, a cancel, and the cleanup calls.
+
+## The sandbox
+
+```ts
+import { createDockerSandbox } from '@deuz-sdk/core/compute/docker';
+import { createInMemoryWorkspace } from '@deuz-sdk/core/workspace';
+
+const workspace = createInMemoryWorkspace();
+await workspace.write('data/input.txt', 'three\nlines\nhere\n');
+
+// The image must be present locally: it is never pulled.
+const sandbox = createDockerSandbox({ image: 'alpine:3.20', workspace, scope: 'acme' });
+
+const counted = await sandbox.runShell!({ command: 'wc -l < input.txt', cwd: 'data' });
+console.log(counted.exitCode, counted.stdout.trim()); // 0 3
+
+const offline = await sandbox.runShell!({ command: 'wget -q -T 2 -O- http://example.com' });
+console.log(offline.exitCode !== 0); // true: no network by default
+
+const escaped = await sandbox.runShell!({ command: 'ls', cwd: '../etc' });
+console.log(escaped.exitCode, escaped.stderr); // null, and why it was refused
+```
+
+Pass the sandbox to `codeActTool(sandbox)` and `shellTool(sandbox)` from
+`@deuz-sdk/core/compute` as you would the Node sandbox; see
+[Compute / CodeAct](/docs/modules/autonomy#compute--codeact--action-as-executable-code).
+
+- Every run uses a fresh container, which is always removed. What a run
+  changes in its workspace stays in that container and is never copied back to
+  the host.
+- `runShell` runs `/bin/sh -c <command>`. `runCode` runs the interpreter's argv
+  prefix plus the code: by default `python3 -c` (`python`, `python3`),
+  `bash -c`, `sh -c` (`sh`, `shell`) and `node -e` (`javascript`, `js`,
+  `node`). The image must contain the interpreter. An unknown language returns
+  `exitCode: null` without starting anything. The image's `ENTRYPOINT` is
+  reset, so the argv runs exactly as given.
+- `cwd` resolves inside the container workspace; a path outside it is refused
+  with `exitCode: null` and the reason in `stderr`, and nothing runs.
+- A run without `timeoutMs` is killed after 30 seconds
+  (`DEFAULT_DOCKER_SANDBOX.runTimeoutMs`) with `docker kill`.
+- Output is the tail of each stream, at most `maxOutputBytes`; `truncated: {
+  stdout, stderr }` says which one was cut.
+- Environment values travel in a private, temporary env file and never appear
+  on a command line.
+- An infrastructure failure (no daemon, a missing image, an oversized staging
+  archive) rejects with a `DockerSandboxError`. What the program itself does is
+  the result.
+
+## Isolation defaults
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `image` | required | Resolved once to its immutable image id; never pulled (`image_not_found` when it is not local) |
+| `dockerPath` | `'docker'` | The CLI, always spawned with `shell: false` |
+| `dockerArgs` | none | Global CLI flags before every subcommand, such as `['--context', 'build-box']` |
+| `user` | `'10001:10001'` | Numeric `uid` or `uid:gid`; staged files are owned by it |
+| `network` | `'none'` | The container network |
+| `limits.cpus`, `limits.memoryBytes`, `limits.pids` | `1`, 512 MiB, `128` | Memory swap is set to the same value, so there is no swap |
+| `limits.storageBytes` | unset | `--storage-opt size=N`, only on storage drivers that support it |
+| `workdir` | `'/workspace'` | Absolute; its parent must exist in the image |
+| `workspace` | none | Files staged into every container through a bounded archive |
+| `readOnlyRootFilesystem` | `false` | `--read-only`, a tmpfs `/tmp` and a writable workspace volume |
+| `tmpfsBytes` | 64 MiB | The tmpfs `/tmp` size with `readOnlyRootFilesystem` |
+| `maxStagingBytes` | 256 MiB | The staging archive at most (`staging_too_large`) |
+| `maxArtifactBytes` | 64 MiB | One artifact read at most (`artifact_too_large`) |
+| `maxOutputBytes` | 1 MiB | The output tail kept per stream |
+| `scope` | none | Written to the `deuz.scope` label |
+| `labels` | none | Extra labels; a `deuz.*` key throws a `TypeError` |
+| `interpreters` | see above | `runCode` argv prefixes by language |
+| `deps` | host defaults | Clock, ids, logger and observer (`deuz.process.*` spans) |
+
+Every container also gets `--cap-drop ALL`, `--security-opt
+no-new-privileges`, `--restart no`, `--entrypoint=` (the image's `ENTRYPOINT`
+is reset, so the argv runs exactly as given) and the labels `deuz.operation-id`,
+`deuz.scope`, `deuz.sdk-version` and `deuz.kind` (`process`, `sandbox` or
+`staging`), plus `deuz.run-timeout-ms` on sandbox runs and
+`deuz.request-digest` on runner operations. No host directory and no Docker
+socket is mounted.
+
+`readOnlyRootFilesystem: true` adds `--read-only`, a tmpfs `/tmp` of
+`tmpfsBytes` (`rw`, `nosuid`, `nodev`, mode 1777) and a named workspace volume
+`<container>-ws`, filled through a staging helper container that is never
+started (`docker cp` cannot write into a read-only root or a tmpfs). The volume
+is removed with the container. It is off by default because some images write
+to their root.
+
+Without `limits.storageBytes`, a container can fill the host's disk through
+its writable layer. Set it where the storage driver supports it.
+
+## The process runner
+
+```ts
+import {
+  createDockerProcessRunner,
+  createSqliteProcessOperationStore,
+} from '@deuz-sdk/core/compute/docker';
+
+const store = createSqliteProcessOperationStore({ path: ':memory:' });
+const runner = createDockerProcessRunner({ image: 'alpine:3.20', store });
+
+const request = {
+  operationId: 'report-2026-10-15',
+  scope: 'acme',
+  command: ['sh', '-c', 'mkdir -p out && echo "total: 42" > out/report.txt && echo done'],
+  deadlineAt: Date.now() + 60_000,
+};
+
+let session = await runner.start(request);
+console.log(session.state, session.durableTimeout); // running false (or exited, if it was quick)
+
+// After a host restart, the same call reconnects instead of starting again.
+session = await runner.start(request);
+while (session.state === 'running') {
+  await new Promise((resolve) => setTimeout(resolve, 250));
+  session = await runner.poll('acme', request.operationId);
+}
+console.log(session.state, session.exitCode); // exited 0
+
+console.log(await runner.readOutput('acme', request.operationId));
+// { stdout: 'done\n', stderr: '', truncated: { stdout: false, stderr: false } }
+const artifact = await runner.readArtifact('acme', request.operationId, 'out/report.txt');
+console.log(artifact.size, artifact.digest.slice(0, 7), new TextDecoder().decode(artifact.bytes)); // 10 sha256: total: 42
+
+await runner.dispose('acme', request.operationId); // removes the container; the record stays 'disposed'
+console.log((await runner.poll('acme', request.operationId)).state); // disposed
+console.log(await store.prune({ terminalBefore: Date.now() + 1 })); // 1
+await store.close?.();
+```
+
+A `ProcessStartRequest` has an `operationId` (the idempotency key), a `scope`,
+the `command` argv (run without a shell), and optional `files` staged into the
+workspace, `env`, `stdin` and `deadlineAt`.
+
+### Start order and recovery
+
+`start` always goes through the same steps, each recorded before the next:
+record the operation, create the container, stage the files, write
+`start-dispatched` durably, issue one start command, inspect.
+
+| State | Meaning |
+| --- | --- |
+| `recorded`, `created`, `staged` | The steps before the start |
+| `start-dispatched` | Durable before the single start command |
+| `running`, `exited` | The process runs; it ended (`exitCode`) |
+| `cancel-requested`, `cancelled` | A cancel was recorded; it completed |
+| `needs-reconcile` | The start's outcome is unknown; only `reconcile` resolves it |
+| `lost` | The container vanished; it is never recreated under the same id |
+| `failed` | With `error.code`: `start_unconfirmed`, `start_failed`, `oom_killed`, `container_conflict`, ... |
+| `disposed` | The container is removed; the record stays until pruned |
+
+- The container is named `deuz-` plus 40 hex digits of the SHA-256 of the scope
+  and the operation id, so a create a crash cut short is adopted, never
+  repeated.
+- `start` again with the same id and the same request continues the operation
+  where it stopped, and a running or exited container is never started again.
+  The request digest covers the command, the env values, the file digests, a
+  digest of `stdin` and `deadlineAt`, so pass the same values when you
+  reconnect. The same id with another request throws `OperationConflictError`.
+- The record stores only the env keys and file sizes, never env values or file
+  contents.
+- A request with `stdin` starts with `docker start --attach --interactive`; the
+  stdin is delivered and then closed.
+- A start whose outcome is unknown stays `needs-reconcile`. Once its record is
+  30 seconds old, `reconcile()` marks it `failed` with `start_unconfirmed`; the
+  start is never retried.
+- A start the daemon refuses (an executable not found, say) is `failed` with
+  `start_failed`; an out-of-memory kill sets `oom_killed`.
+- Reusing an operation id whose old container was never disposed fails the new
+  operation with `container_conflict`: `dispose`, then prune, before reusing an
+  id.
+
+### Cancel
+
+`cancel(scope, operationId)` records the request first, then runs `docker stop
+-t 2`, kills the container if it still runs, and checks its state. While the
+daemon is unreachable the operation stays `cancel-requested` with
+`error.code: 'docker_unavailable'`: a cancel is not complete until Docker
+confirms it. A container still running after the kill gets `cancel_unverified`.
+A container that is already gone counts as stopped.
+
+### Deadlines: `durableTimeout: false`
+
+`deadlineAt` is not durable, and every session says so with
+`durableTimeout: false`. The runner enforces the deadline with its own timer
+while the host runs (unref'd unless `deps.clock` is given). Nothing ends the
+process while the host is down; a deadline that passed meanwhile cancels the
+process at the next `poll`, `start` or `reconcile`.
+
+### Output and artifacts
+
+`readOutput` returns the live `docker logs` tail, or after exit or dispose the
+tail stored at exit, with `truncated` per stream. A log too long to read in 120
+seconds gives `docker_failed`, and the exit is recorded without output.
+
+`readArtifact(scope, operationId, path)` reads one file from a stopped
+container only (`process_running` otherwise):
+
+- `path` must be a normalized relative workspace path.
+- Every parent must be a real directory and the target a regular file of at most
+  `maxArtifactBytes`.
+- A link, a directory, a device, a linked parent or a path that leaves the
+  workspace gives `artifact_rejected`; a missing file `not_found`; a large one
+  `artifact_too_large`.
+- The returned `ProcessArtifact` has `path`, `size`, `bytes` and `digest`
+  (`sha256:<hex>`), the per-file digest of the
+  [`deuz-workspace-v1`](/docs/modules/goal-runtime#workspace-digests) workspace
+  digest, so it can back acceptance evidence.
+- Nothing is applied to the host workspace automatically.
+
+A hard link is refused when the archive marks it as one. Docker archives a
+single hard-linked file as a regular file, so that case is read as a regular
+file.
+
+### Reconcile and cleanup
+
+Nothing is deleted in the background.
+
+- `dispose(scope, operationId)` removes the container; the record stays as
+  `disposed`.
+- `reconcile({ scope?, removeOrphans? })` matches the `deuz`-labelled
+  containers to the store. It returns `matched` (states refreshed), `lost`
+  (records whose container is gone, now `lost`), `orphans` (labelled containers
+  with no record) and `removed`. Orphans are only reported unless you pass
+  `removeOrphans: true`, which removes them and the dangling `deuz`-labelled
+  volumes (with a `scope`, only that scope's volumes).
+- A sandbox container or staging helper never has a record. It is reported as
+  an orphan only 30 minutes after its create or exit, or, while it runs,
+  30 minutes past its start plus its run timeout.
+- `store.prune({ terminalBefore })` deletes the records of terminal operations
+  (`exited`, `cancelled`, `lost`, `failed`, `disposed`) last updated before the
+  cutoff and returns the count. The cutoff is exclusive: a record updated
+  exactly at it stays. A malformed `terminalBefore` throws a `TypeError`
+  before anything is deleted.
+
+### Operation stores
+
+A `ProcessOperationStore` keeps one record per scope and operation id, with a
+`revision` that every update compares and sets. `update` applies its changes
+only at `expectedRevision`; a key set to `undefined` removes that field. It
+never changes `operationId`, `scope` or `createdAt`, and `updatedAt` comes from
+the store's clock. `list({ scope?, states?, limit?, cursor? })` orders by
+`createdAt`, then scope, then operation id (both in UTF-8 byte order), with
+`limit` from 1 to 1000 (default 100). It returns `{ records, cursor? }`: the
+cursor is opaque and set only when more records remain, and a malformed one
+throws a `TypeError`.
+
+The SQLite store uses the table `deuz_process_ops` and its own version table
+`deuz_process_ops_schema` (version 1); `PRAGMA user_version` and every existing
+schema version are untouched, and a newer stored version is refused. A
+`database` you pass in is left open on `close()`. There is no PostgreSQL store:
+a container lives on one host's daemon.
+
+## Errors
+
+`DockerSandboxError` carries a `code`, and `command` (the subcommand) and
+`exitCode` when the CLI ran:
+
+| `code` | When |
+| --- | --- |
+| `docker_unavailable` | The CLI could not run, the daemon did not answer, or a command timed out |
+| `docker_failed` | The CLI ran and failed for another reason |
+| `image_not_found` | The image is not local |
+| `not_found` | The container or file does not exist |
+| `staging_too_large`, `artifact_too_large` | Over `maxStagingBytes` or `maxArtifactBytes` |
+| `artifact_rejected` | Not a regular file under the workspace |
+| `process_running` | An artifact read from a running container |
+| `operation_not_found` | No operation under that scope and id |
+
+## The Node sandbox in 2.4
+
+`createNodeSandbox` from `@deuz-sdk/core/compute/node` stays a reference for
+local development, not an isolation boundary. 2.4 fixes it in four ways:
+
+- A timeout or abort kills the whole process tree: the process group on POSIX,
+  where each child leads its own group, and `taskkill /T /F` on Windows. A
+  killed run reports `exitCode: null` on every platform. On POSIX a terminal's
+  Ctrl-C now reaches the host but no longer a running child directly.
+- Children spawn with `windowsHide`.
+- `runShell`'s `cwd` is confined to the sandbox root, `options.cwd` or else the
+  host's working directory. A relative `cwd` resolves against the root; an
+  absolute one is allowed only inside it. `..`, an absolute path elsewhere, a
+  symlink or junction pointing out, or a missing directory is refused with
+  `exitCode: null` and the reason in `stderr`, and nothing runs. This is a
+  behaviour change: a 2.3 call that relied on a `cwd` outside the root now
+  fails. The `shellTool` `cwd` description the model sees now reads "Working
+  directory relative to the sandbox root; paths outside it are refused."
+- `CodeExecutionResult.truncated?: { stdout, stderr }` is set when a stream was
+  cut at `maxOutputBytes`. The Node sandbox keeps the head of each stream; the
+  Docker sandbox keeps the tail.
+
+## Telemetry
+
+| Span | Attributes |
+| --- | --- |
+| `deuz.process.start`, `deuz.process.poll`, `deuz.process.cancel` | `deuz.process.operation_id`, `deuz.process.state`; on a start also `deuz.process.replayed` (the operation was already recorded) |
+| `deuz.process.exit` | `deuz.process.operation_id`, `deuz.process.exit_code`, `deuz.process.truncated` |
+| `deuz.process.reconcile` | `deuz.process.matched`, `deuz.process.orphans`, `deuz.process.lost`, `deuz.process.removed`, `deuz.process.reconcile_result` (`clean` or `drift`) |
+
+No output or other content goes into a span.
+
+## Limits
+
+- Preview: the API may change in 2.5.
+- Linux containers only. On Windows and macOS, Docker Desktop runs them in a
+  VM; Windows containers are not supported.
+- The image is never pulled. Pull and pin it yourself (an image id or digest
+  avoids surprises when a tag moves).
+- `deadlineAt` is not enforced while the host is down (`durableTimeout: false`).
+- No PostgreSQL operation store, and a runner manages only the daemon its CLI
+  talks to.
+- Workspace changes are never copied back to the host; read what you need with
+  `readArtifact`.

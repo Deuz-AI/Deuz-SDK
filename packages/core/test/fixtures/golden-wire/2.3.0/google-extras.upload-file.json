@@ -1,0 +1,33 @@
+{
+  "scenario": "google-extras.upload-file",
+  "recordedFrom": "2.3.0",
+  "requests": [
+    {
+      "method": "POST",
+      "url": "https://generativelanguage.googleapis.com/upload/v1beta/files",
+      "headers": {
+        "content-type": "application/json",
+        "x-goog-api-key": "<secret>",
+        "x-goog-upload-command": "start",
+        "x-goog-upload-header-content-length": "15",
+        "x-goog-upload-header-content-type": "application/pdf",
+        "x-goog-upload-protocol": "resumable"
+      },
+      "json": {
+        "file": {
+          "displayName": "golden.pdf"
+        }
+      }
+    },
+    {
+      "method": "POST",
+      "url": "https://upload.example.test/session/golden",
+      "headers": {
+        "content-length": "15",
+        "x-goog-upload-command": "upload, finalize",
+        "x-goog-upload-offset": "0"
+      },
+      "bodyBase64": "JVBERi0xLjQgZ29sZGVu"
+    }
+  ]
+}

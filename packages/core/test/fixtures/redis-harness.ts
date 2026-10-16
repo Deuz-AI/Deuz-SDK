@@ -10,13 +10,13 @@
  * Lua state per script, so the prelude never outlives one call.
  *
  * Live: DEUZ_TEST_REDIS_URL names a real server (the CI `integration` job
- * runs redis:7); time is the server's own, and advancing it means waiting.
+ * runs redis:7), looked up with `redisUrl()` from ./services; time is the
+ * server's own, and advancing it means waiting.
  */
 import RedisMock from 'ioredis-mock';
 import { createClient } from 'redis';
 import { wrapIoredisClient, type RedisScriptClient } from '../../src/node/store-redis';
-
-export const liveRedisUrl = process.env.DEUZ_TEST_REDIS_URL || undefined;
+import { estimateClockSkew } from './clock-skew';
 
 // ioredis-mock shares data per host and port, as one server would: a fresh
 // server per mock.
@@ -62,7 +62,7 @@ export function mockRedisServer(start = 1_700_000_000_000): MockRedisServer {
 /** A node-redis connection to the live server, and its clock. */
 export async function liveRedisServer(url: string): Promise<{
   client: ReturnType<typeof createClient>;
-  /** Server time minus host time, measured at connect. */
+  /** Server time minus host time, measured at connect (best of several round trips). */
   skew: number;
   /** A key prefix of its own for every call, so suites on one server never meet. */
   prefix(): string;
@@ -71,9 +71,10 @@ export async function liveRedisServer(url: string): Promise<{
 }> {
   const client = createClient({ url });
   await client.connect();
-  const sent = Date.now();
-  const [seconds, micros] = (await client.sendCommand(['TIME'])) as [string, string];
-  const skew = Number(seconds) * 1000 + Math.floor(Number(micros) / 1000) - (sent + Date.now()) / 2;
+  const { skew } = await estimateClockSkew(async () => {
+    const [seconds, micros] = (await client.sendCommand(['TIME'])) as [string, string];
+    return Number(seconds) * 1000 + Math.floor(Number(micros) / 1000);
+  });
   const run = `deuz-live-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
   let count = 0;
   return {

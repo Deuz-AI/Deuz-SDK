@@ -1,0 +1,17 @@
+{
+  "name": "@deuz-examples/21-versioned-memory-context",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "Versioned memory with provenance and revisions, placed by the context compiler in a V3 native run, then a forget that redacts the run's stored context.",
+  "scripts": {
+    "dev": "node --experimental-strip-types index.ts",
+    "start": "node --experimental-strip-types index.ts"
+  },
+  "dependencies": {
+    "@deuz-sdk/core": "^2.4.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0"
+  }
+}

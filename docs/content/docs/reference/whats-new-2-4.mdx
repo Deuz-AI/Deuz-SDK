@@ -1,0 +1,963 @@
+---
+title: What is new in 2.4
+description: Versioned memory, a context compiler with working memory, transcript search, V3 native runs, a goal supervisor with a durable scheduler and webhooks, acceptance evidence, a local Docker runner, conditional chats, durable streams and React chat snapshots, with the release's bug fixes, upgrade notes, known limits and the 2.5 targets.
+---
+
+2.4 is about what an agent remembers, what it sees on each call, and work that
+outlives one process. Memory gains versioned, provenance-tracked records. A
+context compiler places memory, RAG, past conversations and the skill catalog
+into one token budget, next to a structured working memory that keeps the goal,
+the constraints and the decisions of a long task. Past chats become searchable.
+Goals get a supervisor, a durable inbox, a timezone-aware scheduler and a
+webhook handler, and a local Docker runner (a preview) runs code and processes
+that survive a host restart. Chats and streams gain compare-and-set writes,
+persist-before-publish streams, a capability handshake and React chat
+snapshots. Native runs carry all of it in a new V3 record. Seven bugs found in
+2.3 are fixed.
+
+Every 2.4 feature is off until you configure it. With none of them configured,
+provider requests are byte-identical to 2.3.0's. Every change
+to the public API is additive, so 2.3 code compiles against 2.4, except an
+exhaustive `switch` over one of the [widened unions](#widened-unions). Some
+behaviours change on purpose: read [Upgrading from 2.3](#upgrading-from-23)
+before you deploy.
+
+<Callout type="info" title="Verified offline">
+Nothing in 2.4 was run against a model provider. Model calls are tested
+against scripted models, as in 2.3. The new SQLite, PostgreSQL and Redis
+stores run against real SQLite, a real PostgreSQL 16 and a real Redis 7 when
+the test environment provides them, and the Docker runner against a scripted
+Docker CLI and a real Docker Engine (Engine 29.8 under Docker Desktop on
+Windows 11, Linux containers). The pgvector path of the versioned PostgreSQL store was checked
+only against an emulated `vector` type. Where this page or a module page says
+**not live-verified**, make one real call before you depend on it.
+</Callout>
+
+## Install and choose an entry
+
+```bash
+npm install @deuz-sdk/core@2.4.0
+```
+
+`@deuz-sdk/react` 2.4.0 ships with it. Its peer range still accepts core 2.0
+and later. Chat snapshots work against any route; the features that need the
+server (replay by message id, `messageIds` in request bodies, resuming a dropped
+read) wait until a route announces them (see
+[the capability handshake](#the-capability-handshake-in-routes)). No runtime
+dependency and no peer is added. [Compatibility](/docs/reference/compatibility#what-changed-in-24)
+lists what each new subpath needs, and
+[Edge & Runtimes](/docs/advanced/edge#the-24-subpaths) what runs at the edge.
+
+| Entry                                  | New surface                                                                                                                                                                                                                                           | Runtime   |
+| -------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------- |
+| `@deuz-sdk/core/memory/versioned`      | `createMemorySession`, `createVersionedMemoryTools`, `createInMemoryVersionedMemoryStore`, `importLegacyMemory`, `defineAccountedMemoryLLM`, `isAccounted`, `RevisionConflictError`, `OperationConflictError`, `EmbeddingMismatchError`                 | Edge-safe |
+| `@deuz-sdk/core/memory/versioned/sqlite` | `createSqliteVersionedMemoryStore`                                                                                                                                                                                                                  | Node      |
+| `@deuz-sdk/core/memory/versioned/postgres` | `createPostgresVersionedMemoryStore`                                                                                                                                                                                                            | Node      |
+| `@deuz-sdk/core/context`               | `compileContext`, `createContextCompiler` (preview), the four sources (`createMemoryContextSource`, `createRagContextSource`, `createTranscriptContextSource`, `createSkillsContextSource`), `createWorkingMemory`, `applyWorkingMemoryPatch`, `workingMemoryTools`, `createTokenEstimator`, `estimateTextTokens`, `estimateRequestTokens`, `estimateRequestOverhead`, `contextPackageBlob`, `contextWarnings`, `ContextBudgetExceededError` | Edge-safe |
+| `@deuz-sdk/core/goal/runtime`          | `createGoalSupervisor`, `createNativeRunLauncher`, `createInMemoryGoalRuntimeStore`, `createDurableScheduler`, `createWebhookHandler`, `toNodeHandler`, `verifyGoalAcceptance`, `settleGoalEvent`, `goalDeliveryDigest`, `goalDependencyEvents`, `goalInboxKey`, `goalLeaseKey`, `GoalError` | Edge-safe |
+| `@deuz-sdk/core/goal/runtime/sqlite`   | `createSqliteGoalRuntimeStore`                                                                                                                                                                                                                        | Node      |
+| `@deuz-sdk/core/goal/runtime/postgres` | `createPostgresGoalRuntimeStore`                                                                                                                                                                                                                      | Node      |
+| `@deuz-sdk/core/compute/docker`        | `createDockerSandbox`, `createDockerProcessRunner`, `createInMemoryProcessOperationStore`, `createSqliteProcessOperationStore`, `DockerSandboxError` (preview)                                                                                         | Node      |
+| `@deuz-sdk/core/skills/learning`       | `proposeSkillFromRun`, `SkillLearningError` (experimental)                                                                                                                                                                                            | Edge-safe |
+
+Existing entries grow too:
+
+- **`@deuz-sdk/core/agent`**: `createInMemoryAgentRunStoreV3`,
+  `UnsupportedStoreError` and the V3 types; `runAgent`, `streamAgent`,
+  `resumeAgent`, `resumeStreamAgent` and `reconcileAgentRun` take the V3 path.
+  `@deuz-sdk/core/ops/sqlite` and `/ops/postgres` add
+  `createSqliteAgentRunStoreV3` and `createPostgresAgentRunStoreV3`.
+- **`@deuz-sdk/core/chat`**: `createInMemoryConditionalChatStore`,
+  `createInMemoryTranscriptIndex`, `indexChat`, `updateConditionalChat` and
+  `isConditionalChatStore`, and the `ChatSnapshotV1` and `ChatSnapshotGateV1`
+  types (type-only, also on `@deuz-sdk/core/ui`). `@deuz-sdk/core/stores/sqlite` and
+  `/stores/postgres` add `createSqliteConditionalChatStore` and
+  `createPostgresConditionalChatStore`, each with its own transcript index.
+- **`@deuz-sdk/core/ui`**: `createInMemoryDurableStreamStateStore`, the
+  `durable` and `capabilities` options of the stream responses, and the
+  handshake helpers `DEUZ_CAPABILITIES_HEADER`, `DEUZ_CAPABILITY`,
+  `formatDeuzCapabilities` and `parseDeuzCapabilities`. The SQLite, PostgreSQL
+  and Redis store packs add `createSqliteDurableStreamStateStore`,
+  `createPostgresDurableStreamStateStore` and
+  `createRedisDurableStreamStateStore`.
+- **`@deuz-sdk/core/schedule`** (and `/edge`): `zonedOccurrencesBetween`,
+  `nextZonedOccurrence`, `timeZoneOffset` and `assertTimeZone`.
+- **`@deuz-sdk/core/workspace`**: `digestWorkspace`.
+- **`@deuz-sdk/core/memory`**: `applyMutations`, `defineAccountedMemoryLLM` and
+  `isAccounted`. **`@deuz-sdk/core/rag`**: `countTokensWith` and the
+  `estimator` and accounting options.
+- **`@deuz-sdk/react`**: `useChat` takes `initialSnapshot` and
+  `capabilityHandshake` and returns `exportSnapshot()` and `capabilities`; the
+  `ChatSnapshotV1` type is new.
+
+## Stability
+
+| Label            | What it covers                                                                                                                                                                                                                                               |
+| ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **Stable**       | Versioned memory, the pure `compileContext`, working memory, transcript search, the durable scheduler, inbox and webhook handler, the goal supervisor and `GoalRuntimeStore`, `ConditionalChatStore`, `ChatSnapshotV1`, the acceptance evidence fields, the V3 run path, and the fixes to existing behaviour |
+| **Preview**      | `createContextCompiler`'s adaptive refresh, the Docker sandbox and process runner, and `DurableStreamStateStore`. Their API can still change in 2.5; their stored records are versioned either way                                                              |
+| **Experimental** | `@deuz-sdk/core/skills/learning`                                                                                                                                                                                                                             |
+
+## Versioned memory
+
+`@deuz-sdk/core/memory/versioned` is a second memory API next to
+`@deuz-sdk/core/memory`, whose API stays as it was (its 2.4 fixes are under
+[Behaviour changes](#memory)). A record keeps a stable id and a
+revision that goes up with every change. It carries an `asserted` or `inferred`
+origin and cites its sources: the kind (`user`, `assistant`, `tool`, `external`
+or `host`), the run, the message or tool call id, and a `sha256:` digest of the
+content. Only an explicit host `remember` asserts; whatever a model extracts or
+writes is inferred, and a model can never change a record's scope, origin or
+source kinds.
+
+`createMemorySession({ store, scope, llm?, embedder?, extraction?, onForget?,
+execution? })` gives one scope `remember`, `extract`, `recall`, `revise`,
+`retract`, `forget`, `history` and `reembed`.
+
+- **Every write is one operation with a receipt.** The record, its immutable
+  revision, the search index and the receipt commit together or not at all.
+  Repeating an `operationId` with the same request returns the stored receipt
+  (`replayed: true`); reusing it with another request throws
+  `OperationConflictError`.
+- **Compare-and-set.** `remember` and `extract` read and reconcile again when a
+  concurrent writer moved the scope, up to `maxConflictRetries` attempts in all
+  (default 3), then throw `RevisionConflictError`. `revise` and `retract` take
+  the caller's `expectedRevision`. Memory LLM and embedding calls never run
+  inside a store transaction, and the vector is computed from the final text.
+- **Embeddings stay matched.** A vector is bound to its record revision, the
+  text digest and the embedding generation, so a revised text never keeps the
+  old vector. A vector from another model or of another size throws
+  `EmbeddingMismatchError`; it is never scored as zero. `reembed({ embedder,
+  modelId, dims })` fills a new generation in resumable batches while search
+  keeps the active one, and switches when every current record has a vector.
+- **Untrusted sources.** `extract` reads user messages, host input and the
+  results of the tools in `extraction.trustedTools` by default. External or
+  unmarked tool content needs `extraction.allowExternal` and is stored with
+  source kind `external`; assistant turns need `extraction.allowAssistant`.
+- **Retract and forget.** `retract` takes a record out of normal retrieval and
+  keeps its history; `recall({ recordedAsOf })` answers what the store knew at
+  a time. `forget` deletes the content, every revision and every vector, keeps
+  the receipts without content, and then calls every `onForget` listener, so a
+  V3 run store can redact the context packages that held the record and the
+  runs' stored copies of their retrieval blocks.
+- **Tools.** `createVersionedMemoryTools(session)` gives the model
+  `memory_remember`, `memory_recall`, `memory_revise` and `memory_retract`,
+  bound to the session's scope. There is no forget tool, the tools never change
+  an asserted record, and a replayed tool call applies once.
+- **Stores.** `createInMemoryVersionedMemoryStore` is the reference store.
+  `createSqliteVersionedMemoryStore` (FTS5, with a LIKE fallback) and
+  `createPostgresVersionedMemoryStore` (a `simple` tsvector with a GIN index,
+  and pgvector when it is installed) fuse full-text and vector ranking. Both
+  keep their data in new `deuz_vmem_*` tables with their own
+  `deuz_vmem_schema` version table and never touch the legacy memory tables.
+- **Import.** `importLegacyMemory({ from, to, scope })` turns the records of any
+  legacy `MemoryStore`, the SQLite and PostgreSQL `deuz_memory` tables
+  included, into first revisions. Running it again replays and duplicates
+  nothing. It carries no vectors over.
+
+```ts title="memory-and-context.ts"
+import { createInMemoryAgentRunStoreV3, runAgent } from '@deuz-sdk/core/agent';
+import { createMemoryContextSource } from '@deuz-sdk/core/context';
+import {
+  createInMemoryVersionedMemoryStore,
+  createMemorySession,
+} from '@deuz-sdk/core/memory/versioned';
+import { createMockModel } from '@deuz-sdk/core/testing';
+
+const runs = createInMemoryAgentRunStoreV3();
+const memory = createMemorySession({
+  store: createInMemoryVersionedMemoryStore(),
+  scope: { userId: 'ada' },
+  // A forget redacts every stored context package that holds the record.
+  onForget: async (event) => {
+    await runs.redactForgotten(event);
+  },
+});
+
+// A host write: asserted, cited to the host, committed with a receipt.
+const { records } = await memory.remember({ text: 'Ada ships from the Izmir warehouse.' });
+const fact = records[0]!;
+console.log(fact.revision, fact.origin); // 1 asserted
+
+const result = await runAgent({
+  model: createMockModel({ responses: [{ text: 'It ships from Izmir.' }] }),
+  prompt: 'Which warehouse does Ada ship from?',
+  checkpointVersion: 3,
+  session: { store: runs, runId: 'ada-1', scope: 'acme' },
+  context: { sources: [createMemoryContextSource({ session: memory })] },
+});
+console.log(result.status); // completed
+
+// The step's manifest names the record and its revision, never its text.
+const step = (await runs.load('ada-1'))!.context!.steps[0]!;
+console.log(step.manifest.entries.map((entry) => [entry.revision, entry.reason])); // [[1, 'ranked']]
+
+await memory.forget(fact.id);
+console.log((await runs.getBlob(step.blob.digest)).status); // redacted
+```
+
+See [Versioned memory](/docs/modules/versioned-memory).
+
+## Context compiler and working memory
+
+`@deuz-sdk/core/context` chooses what a model call sees beyond the
+conversation. `compileContext(input)` is pure and deterministic: the same input
+gives the same package, byte for byte.
+
+- **One budget.** The added context gets 20% of what the request leaves free,
+  at most 8192 tokens. The working memory is placed first, up to 1024 tokens.
+  The rest is shared by source kind, memory 2 : RAG 2 : skills 1, plus
+  transcript 1 when a transcript source answers, and a share a source leaves
+  unused goes to the others. Each source offers at most 20 candidates. The
+  defaults are `DEFAULT_CONTEXT_BUDGET`.
+- **Mandatory content is never cut.** The working memory's goal, constraints and
+  active task, and the skill bodies the model loaded, are always placed. When
+  they do not fit, the call throws `ContextBudgetExceededError`
+  (`context_budget_exceeded`).
+- **Placement keeps the prompt cache.** Retrieval enters the conversation as
+  one append-only user message that adds only what is new. The working memory
+  is a separate tail message that is never written to history, except on models
+  that bind preserved thinking to the prefix (Claude 5.x), where each step's copy
+  is kept so the bytes before every replayed thinking block stay the same
+  (`placement.tailKept`). The system
+  message and the tool schemas never change, so a refresh keeps the cached
+  prefix and preserved thinking. Retrieved content is escaped and labelled with
+  its source, origin and source kinds, so it reads as data.
+- **A manifest for every package.** `ContextManifest` records each candidate's
+  source, record id, revision, digest, query, tokens and why it was selected or
+  left out. It never carries the content.
+- **Sources.** `createMemoryContextSource` reads a versioned `MemorySession` or a
+  legacy `MemoryStore`. `createRagContextSource` wraps your `retrieve` or
+  `hybridRetrieve`, the first link between `/rag` and the agent loop.
+  `createTranscriptContextSource` searches a `TranscriptIndex` and resolves the
+  chat messages that memory records cite. `createSkillsContextSource` offers
+  catalog lines only; a skill's body is budgeted once the model loads it.
+  Every source reads only within the scope you pin.
+- **The adaptive compiler (preview).** `createContextCompiler(options)` queries
+  the sources for the native loop: on the first call, when the active task
+  changes (at least `refresh.minSteps`, default 2, steps after the last
+  retrieval) and on `requestRefresh()`, at most `refresh.maxPasses` times per
+  run (default 4). An optional source that fails gives a
+  `context-source-failed` warning and the step goes on; a required one stops
+  the call. `state()` is plain JSON for a checkpoint.
+- **One token estimator.** `createTokenEstimator` (about 3.6 characters per
+  token, corrected by real usage, or your own tokenizer), and
+  `estimateRequestTokens` and `estimateRequestOverhead` for a whole request.
+  `/rag` can count through the same estimator (`ChunkOptions.estimator`); its
+  default stays at 4 characters per token, so 2.3 chunk boundaries do not move.
+
+Working memory keeps what a long task must not lose: the goal and the host's
+constraints, a copy of the task list with the active task, observations,
+hypotheses, decisions, open questions and the approaches already tried, each
+with its source references. `createWorkingMemory` starts a plain-JSON
+snapshot, and `applyWorkingMemoryPatch` is the only way to change it: a list of
+named, schema-checked operations with an `expectedRevision` and an
+`operationId`, answered `'applied'`, `'duplicate'`, `'conflict'` or
+`'rejected'`. Only the host sets the goal, the constraints and the task list,
+or confirms a hypothesis or accepts a decision; what a model adds stays
+`'proposed'`. `workingMemoryTools` gives the model `working_memory_read`,
+`working_memory_add` and `working_memory_update`.
+
+See [Context compiler and working memory](/docs/modules/context).
+
+## Transcript search
+
+A `TranscriptIndex` searches past messages lexically within a memory scope,
+never across one. `search(scope, query, { limit, around, chatIds, before,
+after })` returns the matching messages with their stable message id, position
+and score, best first, and with `around` the messages on each side. Terms are
+case- and diacritic-folded; system messages are not indexed. `resolveSource`
+resolves a memory record's source reference to its message under the same scope
+check. `createInMemoryTranscriptIndex` is the in-memory index, the SQLite and
+PostgreSQL conditional chat stores carry their own as `store.transcript`
+(FTS5 with a LIKE fallback; a `simple` tsvector with a GIN index), updated in
+the same transaction as every chat write, and `indexChat` backfills a chat
+saved through a legacy `ChatStore`. There are no embeddings in transcript
+search in 2.4.
+
+See [Transcript search](/docs/modules/transcript-search).
+
+## Native runs: the V3 record
+
+Pass `checkpointVersion: 3` with a session on an `AgentRunStoreV3` and
+`runAgent`, `streamAgent`, `resumeAgent`, `resumeStreamAgent` and
+`reconcileAgentRun` take the V3 path, on the same executor. A V3 record can
+hold compiled context, working memory and versioned-memory intents. The stores
+are `createInMemoryAgentRunStoreV3` (`/agent`), `createSqliteAgentRunStoreV3`
+(`/ops/sqlite`) and `createPostgresAgentRunStoreV3` (`/ops/postgres`). They
+keep V3 runs in `deuz_runs_v3*` tables with their own `deuz_runs_v3_schema`
+version table, accept only version 3 records, and save only at the stored
+revision plus one (`RevisionConflictError` otherwise). Redis has no V3 store in
+2.4: a Redis `AgentRunStore` with `checkpointVersion: 3` fails at configuration
+time with `UnsupportedStoreError` (`unsupported_store`).
+
+- **`context`** puts the compiler into the native loop. Each model step runs
+  compaction, then your `prepareStep`, then the step's real model and active
+  tools, then a source refresh when one is due, then the compile with the final
+  budget check (tool schemas, output schema and provider framing counted). The
+  package is stored as a content-addressed blob (an unchanged package once) and
+  its manifest is saved with the run, both before the model call. Retrieval
+  never reaches the chat transcript or the UI wire.
+- **Overflow.** On a provider overflow the loop compacts again as before and
+  the compiler places the step's context again for just under the size of the
+  request that overflowed. Mandatory content that cannot fit fails the run with
+  `ContextBudgetExceededError`.
+- **Restart and forget.** A step reopened after a restart uses its stored
+  package again without asking the sources. A package a `forget` redacted is
+  compiled again (`redacted: true` in its manifest), the one case where a
+  reopened step does not reuse its stored context, and a resumed run drops the
+  stand-ins and any block that held a forgotten record from its history before
+  the next request; a block under the same marker whose package is still found
+  (an overflow retry's) stays. The store already rewrote the stored copies of
+  those blocks (history, checkpoints, `result.messages`, a terminal run
+  included) into stand-ins with no record when the forget landed.
+- **`workingMemory: { snapshot?, create?, tools? }`** keeps the snapshot, with
+  the task list and the active task, in the V3 record, so the active task
+  survives a restart. A model's patch becomes durable in the same save as its
+  tool receipt.
+- **`versionedMemory: { session, tools?, extract? }`** connects a versioned
+  memory session. Every write follows a durable intent, a prepared plan, the
+  atomic memory commit with its receipt, then the native acknowledgment
+  (`intended`, `committed`, `acknowledged` in `memoryIntents`). A lost
+  acknowledgment is settled from the receipt, and a memory change is never
+  applied twice, even when a model call repeats after a crash. `extract` is off
+  by default.
+- **No double injection.** A V3 run whose compiler has a memory source and
+  whose `memory.recall` is on is refused at configuration time. Set
+  `memory.recall: false` to keep only the legacy extraction.
+- **Events.** `streamAgent` returns an `AgentStreamV3`: still an `AgentStream`,
+  so `toDeuzAgentStreamResponse` serializes it as before, plus `eventsV3` with
+  `context`, `working-memory` and `memory-intent` events.
+
+Without `checkpointVersion: 3` a run takes the 2.3 path, and version 1 and 2
+records are never converted.
+
+See [Native agents](/docs/modules/native-agents).
+
+## Goal runtime: supervisor, scheduler and webhooks
+
+`@deuz-sdk/core/goal/runtime` drives the 2.3 goal records. Everything in it is
+a library loop or a Fetch handler in your process, never a service, and nothing
+runs until you create it.
+
+- **`GoalRuntimeStore`.** `createInMemoryGoalRuntimeStore`,
+  `createSqliteGoalRuntimeStore` and `createPostgresGoalRuntimeStore` keep a
+  goal, its inbox, the supervisor's runtime state, durable schedules with their
+  cursors and occurrence records, run intents and ledger watermarks under one
+  transaction boundary. They are `GoalStore`s, so goals become durable. Every
+  write is a revision compare-and-set, never authorized by a lease token alone.
+  The SQL stores use new `deuz_goal_runtime_*` tables with their own
+  `deuz_goal_runtime_schema` version table. `load(goalId, { scope })` reads a
+  goal of another scope as undefined, and `createInMemoryGoalStore` gains the
+  same option.
+- **The supervisor.** `createGoalSupervisor({ store, launcher, lease })` claims
+  each goal through your `LeaseProvider` under `goalLeaseKey(scope, goalId)`,
+  records a run intent before every launch, and starts runs through a
+  `RunLauncher`, such as `createNativeRunLauncher` (V3 runs on the native
+  executor, loaded lazily). Defaults: one goal at a time, a 30 s goal lease, a 1 s poll, at most 10 automatic runs
+  per goal, and at most 3 retries 1, 5 and 30 s apart, only for failures the
+  native layer marks retryable. A cancel is recorded durably before it is
+  applied, so a cancel for an idle run is never lost. `drain()` stops new work
+  and brings each running run to its next safe checkpoint. A supervisor that
+  loses a goal lease drains its run and writes nothing more; the next holder
+  resumes the same run and never starts it twice. A run that completes goes
+  through your `verify` hook. A goal's next run inherits the last working
+  memory snapshot only when its scope and spec generation match.
+- **The durable scheduler.** `createDurableScheduler({ store })` turns cron
+  schedules into goal inbox deliveries that survive restarts. Each step moves
+  the schedule cursor and queues its deliveries in one write. Schedules take an
+  IANA `timezone` (default `'UTC'`), evaluated with `Intl`, with the same
+  results on any host time zone. A local time the clock skips runs once after
+  the gap (`dstGap: 'shift'`, the default) or not at all (`'skip'`); a repeated
+  local time runs once (`dstOverlap: 'first'`) or at both instants (`'both'`).
+  Catch-up after downtime is `'latest'` by default, `'all'` or `'none'`. The
+  2.2 `createScheduler` stays as it was: in-process and UTC only.
+- **Webhooks.** `createWebhookHandler({ store, verify, target, namespace })` is a
+  Fetch handler that runs on the edge. It verifies GitHub, Slack, HMAC or your
+  own signatures, takes the scope and the goal from your configuration only,
+  and dedupes by scope, namespace and delivery id. It answers `202` only after
+  the delivery is durably in the inbox, `200` for a duplicate with the same
+  payload and target, `409` for the same delivery id with another payload or
+  target, and `500` (never `202`) when the store fails. `toNodeHandler` serves it
+  from Node's `http` server or Express.
+- **Inbox rules.** `settleGoalEvent`, `goalDeliveryDigest` and
+  `goalDependencyEvents` apply the inbox's event rules to anyone settling
+  entries: an early event stays pending, and an event is never re-dated onto a
+  wait that began after it.
+
+See [Goal runtime](/docs/modules/goal-runtime).
+
+## Acceptance evidence
+
+- **Evidence bound to its source.** `GoalEvidence` gains `criterionId`,
+  `verifier: { id, version }`, `specGeneration`, `artifactDigest` and
+  `workspaceDigest`, all optional. Evidence that names a criterion supports a
+  `passed` verdict on that criterion only. 2.3 records carry none of the fields
+  and read as before.
+- **Spec generations (opt-in).** On a goal that carries `specGeneration`, a new
+  objective, a change to the criteria, or `revise({ nextSpecGeneration: true })`
+  starts the next generation and turns every earlier verdict `inconclusive`, so
+  the goal cannot complete until it is verified again. A goal without the field
+  keeps the 2.3 rules. The supervisor's `submit` opts goals in.
+- **`verifyGoalAcceptance`** runs your `GoalVerifier`s against the artifacts or
+  workspace a run left, resolved through a `GoalArtifactResolver`, and returns
+  the `evaluate` command for `transitionGoal`. A missing piece, a digest that
+  differs, an artifact that changes while it is checked or a verifier that
+  throws gives `inconclusive`, never `passed`. Remembered facts and model claims
+  are never evidence.
+- **`digestWorkspace(workspace, { include, exclude })`** returns the
+  `deuz-workspace-v1` digest of a workspace's files, computed with WebCrypto.
+  The Docker runner's artifacts use the same format.
+
+See [Goal runtime](/docs/modules/goal-runtime).
+
+## Docker sandbox and process runner (preview)
+
+`@deuz-sdk/core/compute/docker` is Node-only and drives the Docker CLI with
+`shell: false`, for Linux containers.
+
+- **`createDockerSandbox({ image })`** implements `ComputeSandbox`. Every
+  `runCode` and `runShell` runs in a fresh container that is always removed:
+  the image resolved once to its immutable id and never pulled, UID/GID 10001,
+  no network, 1 CPU, 512 MiB of memory without swap, 128 processes, every
+  capability dropped, `no-new-privileges`, no host directory and no Docker
+  socket mounted. The workspace is copied in through a bounded archive, `cwd`
+  stays inside it, env values travel in a private env file, the output is a
+  tail of 1 MiB per stream with `truncated`, and a run without `timeoutMs`
+  stops after 30 s. `readOnlyRootFilesystem: true` adds a read-only root with a
+  tmpfs `/tmp`.
+- **`createDockerProcessRunner({ image, store })`** runs a process that outlives
+  its host process: `start`, `poll`, `readOutput`, `readArtifact`, `cancel`,
+  `dispose` and `reconcile`. Each step is recorded with a compare-and-set in a
+  `ProcessOperationStore` before the next, so a restarted host calls `start`
+  with the same operation id and carries on. A running or exited container is
+  never started again, a start whose outcome is unknown is never retried, and a
+  vanished container makes the operation `lost`. `durableTimeout` is `false`:
+  the runner enforces `deadlineAt` while it runs, and a deadline that passed
+  while the host was down cancels the process when the host reconnects.
+  `reconcile()` reports orphan containers and removes them only with
+  `removeOrphans: true`.
+- **Stores.** `createInMemoryProcessOperationStore` and
+  `createSqliteProcessOperationStore`, which adds its own tables with a
+  `deuz_process_ops_schema` version table.
+
+See [Docker sandbox](/docs/modules/docker).
+
+## Chat and stream continuity
+
+- **Conditional chats.** `createInMemoryConditionalChatStore`,
+  `createSqliteConditionalChatStore` and `createPostgresConditionalChatStore`
+  return a `ConditionalChatStore`: still a `ChatStore`, with a revision on every
+  chat. `writeChat(record, { expectedRevision })` writes only at the expected
+  revision and otherwise answers `conflict` with what is stored. A deleted chat
+  becomes a tombstone that no later write goes over, conditional or legacy.
+  `updateConditionalChat` reads, merges and writes again on a conflict, three
+  attempts by default. The SQL stores use new tables with their own
+  `deuz_chat_conditional_schema` version table and never touch `deuz_chats`.
+- **Stable message ids.** The ids a native run gives its chat
+  (`ChatRecord.messageIds`) survive every conditional store, and
+  `uiFromMessages(messages, generateId, { messageIds })` renders a stored chat
+  under them, so a transcript hit and a memory source reference name the
+  message the UI shows.
+- **Durable streams (preview): persist before publish.** The stream responses
+  (`toDeuzStreamResponse`, `toDeuzObjectStreamResponse`,
+  `toDeuzAgentStreamResponse`, `createDeuzStream`) take a `durable` option.
+  Every frame is committed to a `DurableStreamStateStore` before it is sent, in
+  batches of 20 ms or 16 KiB, so a client that reconnects to
+  `resumeDeuzStreamResponse` gets every frame once, in order, and never a frame
+  the store lacks. One producer writes a stream at a time, fenced by its lease
+  token under `stream:<streamId>`. A durable response fails closed: when it
+  cannot commit, it sends nothing more, ends with an `error` frame and hands the
+  store error to `onStoreError`. The stores are in-memory (`/ui`), SQLite,
+  PostgreSQL and Redis 7 (the only 2.4 store on Redis).
+- **The capability handshake.** `useChat` sends `x-deuz-capabilities:
+  chat-snapshot-v1, durable-stream, message-ids` on every POST and on resume
+  reads from a URL endpoint (a function endpoint receives the value as
+  `ctx.capabilities`). A 2.4 route that passes
+  `capabilities: { request, announce }` answers in the same response header and
+  in a first `capabilities` frame, and the hook uses a feature only once the
+  server announced it: id-based dedupe on a replay (`message-ids`),
+  `messageIds` in request bodies (`chat-snapshot-v1`), and, with `resume`
+  configured, an automatic resume of a dropped POST read (`durable-stream`). A
+  request without the header, which is every 2.3 client, gets the same stream as
+  before, byte for byte.
+- **React chat snapshots.** `exportSnapshot()` captures a chat as plain JSON
+  (`ChatSnapshotV1`): the history with one id per message, the resume cursor,
+  the assistant turn that was still streaming, and the approvals and client
+  tool calls the chat is paused on, with what was already answered.
+  `useChat({ initialSnapshot })` restores all of it at mount, so a page reload
+  resumes the chat as it was.
+
+See [Chat and stream durability](/docs/modules/chat-durability).
+
+## Skill proposals (experimental)
+
+`proposeSkillFromRun(options)` in `@deuz-sdk/core/skills/learning` drafts an
+Agent Skill from one run that completed and passed its host's verification. The
+draft's `status` is always `'proposed'` and its `evaluation`
+`'not-evaluated'`: the run's verification describes the task, not the skill.
+The model reads a numbered projection of the run's user-facing turns, never the
+raw transcript or raw tool results, and every method step must cite items of
+it. The suggested `allowedTools` must be a subset of the tools the run itself
+called, with a receipt recording the call completed; a tool call only in the
+input history never counts. The `SKILL.md` text must pass `parseSkill`. A
+source reference's `messageId` is the id the message keeps in the run's chat
+projection (an input message carried over from the stored chat keeps that
+chat's id), otherwise `<runId>:<index>`. The call needs a `budget` and is
+charged to a ledger of its own. The helper writes no file, changes no registry,
+and never evaluates or activates the skill.
+
+## Accounting for helper calls
+
+Several calls of 2.3 never reached a budget ledger. In 2.4:
+
+- `embed` and `embedMany` take `accounting: { execution, requestId }`, and
+  `createVerifier` takes `execution`: the call is reserved before its first
+  request and settled with the provider's usage.
+- `retrieve`, `hybridRetrieve` and `indexChunks` take an optional `accounting`
+  for their embedding calls. In a V3 run, the RAG context source hands its
+  `retrieve` a fourth `charge` argument; spread into `retrieve` or
+  `hybridRetrieve`, it charges the query embedding to the run's ledger, and so
+  to the goal supervisor's watermark (see
+  [Context compiler](/docs/modules/context#sources)).
+- Memory LLM and embedder callbacks, in `MemorySeams` (`seams.execution`) and in
+  a versioned memory session (`execution`), are reserved before they run. A
+  callback marked as accounted settles the usage it reports
+  (`defineAccountedMemoryLLM`, or an embedder object with `accounted: true`
+  whose `embed` returns the usage with the vectors). In `MemorySeams` the
+  accounted LLM goes in `seams.accountedLlm`; `seams.llm` keeps the 2.3 type.
+  An unmarked one is held at its estimate as unaccounted, never treated as free, and reports one
+  `unaccounted-usage` warning. A budget with `unknownPrice: 'reject'` refuses
+  an unaccounted call with `BudgetLedgerError` code `'unaccounted_call'`.
+- Native runs charge their built-in `memory` calls to the run's execution
+  context (see [Behaviour changes](#memory)).
+
+Without these options, requests are byte-identical to 2.3.
+
+## Observability
+
+The 2.4 subsystems report the spans below as `operation.started`,
+`operation.completed` and `operation.failed` events. `ObservedSubsystem` gains
+`'context'`, `'goal'`, `'schedule'`, `'process'` and `'stream'`, and the three
+events gain an optional `attributes` field: counts, ids, digests, token numbers
+and small enums under `deuz.<subsystem>.*` keys, never content.
+`createOtelObserver` copies them onto the span.
+
+| Subsystem         | Spans                                                                                                                                       |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| Context compiler  | `deuz.context.compile`, a child of the step's span in a native run                                                                          |
+| Versioned memory  | `deuz.memory.op` (remember, extract, revise, retract, forget, reembed and import, and the SQL stores' prunes)                                |
+| Goal supervisor   | `deuz.goal.claim`, `deuz.goal.dispatch`, `deuz.goal.retry`, `deuz.goal.cancel_requested`, `deuz.goal.cancel_applied`, `deuz.goal.drain`, `deuz.goal.generation` |
+| Durable scheduler | `deuz.schedule.delivery`                                                                                                                    |
+| Docker runner     | `deuz.process.start`, `deuz.process.poll`, `deuz.process.cancel`, `deuz.process.exit`, `deuz.process.reconcile` (the sandbox: start and exit) |
+| Durable streams   | `deuz.stream.batch`, `deuz.stream.fenced`                                                                                                   |
+
+Chat writes and transcript searches report no span. The attribute keys of
+each subsystem are listed in [Observation events](/docs/reference/observe-events#24-spans).
+
+See [Observability](/docs/modules/observability).
+
+## Retention
+
+The SDK deletes nothing in the background. Every cleanup is a call you make,
+which you can run from a durable schedule.
+
+| Store                    | Cleanup                                                                                                                                                                                   |
+| ------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Versioned memory         | `pruneHistory({ olderThan })` deletes past revisions of retracted or expired records; receipts stay. `pruneOperations({ olderThan })` deletes old receipts and warns that those operation ids lose their dedupe protection |
+| Goal runtime             | `prunePayloads({ before })` replaces the payloads of settled inbox entries with content-free tombstones (ids stay, so dedupe holds; the policy's `retainPayloadMs` is 7 days). `pruneInbox`, `pruneOccurrences` and `pruneIntents` delete settled entries, occurrence records and finished intents |
+| Durable streams          | `prune({ terminalBefore })` deletes finished streams; `DEFAULT_DURABLE_STREAM_RETAIN_MS` (24 hours, from `/ui`) is the default window                                                    |
+| Process operations       | `prune({ terminalBefore })` removes finished records; `dispose` removes a container                                                                                                       |
+| V3 runs                  | `prune({ terminalBefore })` deletes terminal runs and the context packages only they used                                                                                                 |
+| Conditional chats        | `pruneTombstones(before)` removes old tombstones, after which a chat id can be used again                                                                                                  |
+
+Every cutoff is exclusive: a record stamped exactly at it stays. A forget also
+reaches the V3 run stores subscribed to it: they redact the context packages
+that held the record and rewrite the runs' stored copies of the exact
+retrieval blocks that hold it, a terminal run's `result.messages` included.
+A resumed run drops those stand-ins, and an overflow retry's block under the
+same marker whose package is still found stays (see
+[Known limits](#known-limits) for what a forget does not reach). See
+[Retention](/docs/modules/retention).
+
+## Bug fixes
+
+Seven bugs found in 2.3 are fixed, each with a regression test:
+
+| #   | Where                               | 2.3 behaviour                                                                                                                         | 2.4                                                                                                                                                                                     |
+| --- | ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| H1  | A stream response with a `StreamStateStore` | When the store could not tell the last stored seq, the response numbered its frames from 0 again and journaled them over the stored ones | The response leaves the journal alone (no records, no `id:` lines), calls `onStoreError` and sends a `stream-store-error` warning. In durable mode the response fails closed              |
+| H2  | The same, on an append              | Store writes were not awaited despite the "store before wire" comment, and a failed write was silent                                  | The first failed append stops journaling the response, calls `onStoreError` once and sends the same warning. Durable mode commits each batch before it is sent                         |
+| H3  | `createNodeSandbox` `runShell`      | `cwd` was not confined to the sandbox root, although the tool's description said "relative to the sandbox root"                        | `cwd` resolves against the root; a path that leaves it is refused without running the command                                                                                          |
+| H4  | `createNodeSandbox`                 | Output past `maxOutputBytes` was cut without saying so                                                                                 | The result carries `truncated: { stdout, stderr }` when a stream was cut                                                                                                                |
+| H5  | Native memory extraction            | `reconcileAgentRun` settled an interrupted extraction as `'completed'` once one record of it was stored, losing the facts it never wrote | The extraction saves its planned mutation count first and completes only when every planned mutation is confirmed; otherwise it is `'failed'` with code `'memory-extraction-partial'` |
+| H6  | `memory_update`                     | Changing a record's text kept the vector of the old text                                                                               | The stale vector is dropped; the record is found by text until it is embedded again                                                                                                    |
+| H7  | `uiFromMessages`                    | Every message got a new id, so `ChatRecord.messageIds` never reached the UI                                                            | Stored ids are kept through `{ messageIds }`; a new id is only the fallback                                                                                                            |
+
+Also fixed:
+
+- **Mismatched embeddings in legacy recall.** A vector query no longer fills
+  its results with records that have no vector at score 0, and a record whose
+  vector has another length or another embedding model no longer enters the
+  vector ranking. See [Memory](#memory).
+- **Process trees.** A `createNodeSandbox` timeout or abort kills the whole
+  process tree, not only the direct child, so a program the shell started no
+  longer outlives the timeout holding the output pipes.
+- **OpenTelemetry.** `createOtelObserver` no longer loses a run's state when an
+  operation happens inside it. Before, a run with built-in `memory` never ended
+  its `invoke_agent` span, and its later model and tool spans lost their
+  parent.
+- **SQLite ops store.** When SQLite had already rolled back a failed
+  transaction, `createSqliteOpsStore` threw the error of its own `ROLLBACK`
+  instead of the error that failed the transaction. A second `close()` made
+  while the store waits for its calls now resolves only once the database is
+  closed.
+
+## What the 2.3 notes listed for 2.4, and where it landed
+
+| Listed for 2.4                                                         | In 2.4                                                                                                                                       |
+| ---------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| A CLI and TUI, a control server and a local daemon                      | Not in 2.4; moved to [2.5](#next-25)                                                                                                         |
+| A running supervisor, a durable inbox and timezone-aware wakeups       | Shipped: [the goal runtime](#goal-runtime-supervisor-scheduler-and-webhooks)                                                                 |
+| Realtime voice over WebRTC                                             | Not in 2.4; moved to 2.5                                                                                                                     |
+| A persistent scheduler and webhook service, and a messaging connector  | The durable scheduler and the webhook handler shipped, as a library loop and a Fetch handler rather than a service; no messaging connector    |
+| Dynamic agent tasks with a durable mailbox, and a worktree integrator  | Not in 2.4; moved to 2.5                                                                                                                     |
+| Isolated runners and background process sessions                       | Shipped as a preview: [the Docker sandbox and process runner](#docker-sandbox-and-process-runner-preview)                                     |
+| Transcript search, lazy tool search and a local plugin lifecycle       | [Transcript search](#transcript-search) shipped; lazy tool search and the plugin lifecycle moved to 2.5                                       |
+| An optional LSP or ACP preview                                         | Not in 2.4; moved to 2.5                                                                                                                     |
+
+## Upgrading from 2.3
+
+Code upgrades in place, and nothing new runs until you configure it. Plan for
+the [behaviour changes](#behaviour-changes) below, and read the section of each
+2.4 feature before you turn it on.
+
+### Sharing a database with 2.3 processes
+
+The rollback test proves this on every change: `npm run test:rollback -w @deuz-sdk/core`, also a CI job, installs `@deuz-sdk/core@2.3.0` from npm, opens the SQLite file and the PostgreSQL schema 2.4 wrote, continues the legacy work in them and refuses the V3 runs without calling a model.
+
+- **No existing schema version moves.** Every 2.4 store keeps its data in new
+  tables with a version table of its own: `deuz_vmem_schema`,
+  `deuz_goal_runtime_schema`, `deuz_runs_v3_schema`,
+  `deuz_chat_conditional_schema`, `deuz_stream_state_schema` and
+  `deuz_process_ops_schema`. The 2.3 tables, `deuz_ops_schema`, the store
+  pack's `PRAGMA user_version` and the Postgres migrate versions stay as 2.3
+  wrote them, so a 2.3 process keeps opening and using a database that 2.4
+  wrote. It does not see what lives only in the new tables: V3 runs,
+  versioned memory, goal runtime state, conditional chats, durable streams and
+  process operations.
+- **What holds this.** A schema pin test records every 2.3 schema version and
+  the 2.3 table layout and fails if 2.4 moves either. Type fixtures written
+  against the published 2.3.0 typings hold the 2.3 consumer surface, and golden
+  fixtures recorded with 2.3.0 (179 scenarios across the provider factories)
+  hold the provider requests with the 2.4 features off.
+- **Rolling back.** Stop the 2.4 workers (supervisors, durable schedulers,
+  V3 runs, durable stream producers) and keep the tables. 2.3 continues the
+  legacy work. V3 runs are not continued by 2.3: a 2.3 `resumeAgent` refuses a
+  V3 record before it calls a model or a tool, and the runs wait in their
+  tables until a 2.4 worker comes back.
+
+### Adopting versioned memory
+
+1. Stop the legacy memory writers of the scopes you move. There is no dual
+   write: a record the legacy store changes after its import is skipped by the
+   next import, with a warning.
+2. Create a versioned store (`createSqliteVersionedMemoryStore` or
+   `createPostgresVersionedMemoryStore`; the PostgreSQL one needs a pool such as
+   `pg.Pool`). Like every 2.4 store, it creates its tables on first use; the
+   PostgreSQL stores also offer `migrate()` to create them up front.
+3. Run `importLegacyMemory({ from, to, scope })`. Each legacy record becomes
+   revision 1 under the operation `import:<legacy id>`, keeps its id and its own
+   scope, gets one `host` source, and is `inferred` unless you pass
+   `origin: 'asserted'`. Expired and invalidated records are skipped. Running
+   it again replays and adds nothing.
+4. Vectors are not carried over: run `session.reembed({ embedder, modelId,
+   dims })`. Until then the records are found by text.
+5. Read through a session: `createMemoryContextSource({ session })` for the
+   context compiler, or `versionedMemory: { session }` in a V3 run. Wire the
+   session's `onForget` to the `redactForgotten` of every V3 run store that
+   holds its records.
+
+### Adopting V3 runs
+
+- Pass `checkpointVersion: 3` and a session on an `AgentRunStoreV3`. Its tables
+  are created on first use (`migrate()` on the PostgreSQL store creates them up
+  front). Redis has no V3 store.
+- There is no automatic conversion. A version 1 or 2 run finishes on the 2.3
+  path, and a V3 record is never written back as version 1 or 2, not even by a
+  terminal or maintenance save.
+- A run that passes `context`, `workingMemory` or `versionedMemory`, or a V3
+  store, without `checkpointVersion: 3` is refused with a `TypeError` instead of
+  having the options ignored.
+- With a compiler that has a memory source, set `memory.recall: false`.
+- Rolling back keeps the V3 tables; see
+  [Sharing a database with 2.3 processes](#sharing-a-database-with-23-processes).
+
+### Conditional chats
+
+- Stop the legacy chat writers of the scopes you move before a conditional
+  store writes them. Legacy `deuz_chats` rows are not migrated automatically:
+  copy each chat with `writeChat(record, { expectedRevision: 0 })`.
+- A legacy `saveChat` on a conditional store is last-writer-wins at the stored
+  revision plus one, and throws `RevisionConflictError` over a tombstone.
+- A native run whose `chat.store` is conditional writes its chat projection with
+  `writeChat` at the revision it read (see [Native runs](#native-runs)).
+- `indexChat` backfills the transcript index from a chat saved through a legacy
+  store; a SQL store's index skips a chat that it holds a tombstone for.
+
+### Durable streams
+
+- Durable mode is off unless a response sets `durable: { store, lease }` with a
+  `streamId`. Pick a `DurableStreamStateStore` (in-memory, SQLite, PostgreSQL or
+  Redis 7) and a `LeaseProvider`, and serve replays with
+  `resumeDeuzStreamResponse` over the same store.
+- A durable response fails closed instead of degrading. Keep the legacy `store`
+  mode where a best-effort journal is enough; its failures now warn (see
+  [UI wire](#ui-wire)).
+- Prune finished streams with `prune({ terminalBefore })`, for example
+  `now - DEFAULT_DURABLE_STREAM_RETAIN_MS` (24 hours), from a durable schedule.
+
+### The capability handshake in routes
+
+A route takes part in the handshake once it passes the request. Announce what
+the route supports; a durable response and a durable resume store add
+`durable-stream` themselves:
+
+```ts title="app/api/chat/route.ts"
+import { streamChat, type Message } from '@deuz-sdk/core';
+import { createInMemoryLeaseProvider } from '@deuz-sdk/core/ops';
+import { createMockModel } from '@deuz-sdk/core/testing';
+import {
+  DEUZ_CAPABILITY,
+  createInMemoryDurableStreamStateStore,
+  resumeDeuzStreamResponse,
+  toDeuzStreamResponse,
+} from '@deuz-sdk/core/ui';
+
+const model = createMockModel({ responses: [{ text: 'Hello from the route.' }] });
+const store = createInMemoryDurableStreamStateStore(); // or the SQLite, Postgres or Redis store
+const leases = createInMemoryLeaseProvider();
+const announce = [DEUZ_CAPABILITY.messageIds, DEUZ_CAPABILITY.chatSnapshot];
+
+export async function POST(request: Request): Promise<Response> {
+  const { streamId, messages } = (await request.json()) as {
+    streamId: string;
+    messages: Message[];
+  };
+  const result = streamChat({ model, messages });
+  return toDeuzStreamResponse(result, {
+    streamId,
+    durable: { store, lease: { provider: leases } },
+    capabilities: { request, announce },
+  });
+}
+
+export function GET(request: Request): Response {
+  const streamId = new URL(request.url).searchParams.get('streamId') ?? '';
+  return resumeDeuzStreamResponse(store, streamId, {
+    lastEventId: request.headers.get('last-event-id'),
+    capabilities: { request, announce },
+  });
+}
+```
+
+- Announce `chat-snapshot-v1` only when the route stores the `messageIds` the
+  hook then sends with `messages` (as `ChatRecord.messageIds`).
+- A cross-origin chat API whose preflight lists allowed headers explicitly must
+  add `x-deuz-capabilities`, or the app passes `capabilityHandshake: false` to
+  `useChat`, which sends no header and keeps the 2.3 requests. To let the
+  browser read the response header, expose it with
+  `Access-Control-Expose-Headers`; otherwise the hook reads the first frame.
+- A stored chat restores as
+  `useChat({ initialSnapshot: { version: 1, messages: record.messages, messageIds: record.messageIds } })`.
+- The header values, the first frame and what each capability promises are
+  in [the stream protocol](/docs/reference/stream-protocol#the-capability-handshake-24).
+
+### Behaviour changes
+
+Each change below is intended. Where it needs action, the entry says what to
+do.
+
+#### Node sandbox
+
+- **`runShell`'s `cwd` is confined to the sandbox root** (`options.cwd`, else
+  the host's working directory). A relative path resolves against the root. A
+  path that leaves it (`..`, an absolute path elsewhere, a symlink or junction
+  pointing out) or that does not exist is refused without running the command,
+  with `exitCode: null` and the reason in `stderr`. Pass an absolute `cwd` only
+  for a directory inside the root.
+- **A timeout or abort kills the whole process tree**: the process group on
+  POSIX, where each child now leads its own group, and `taskkill /T /F` on
+  Windows. Children start with `windowsHide`. A Ctrl-C at the host's terminal no
+  longer reaches a POSIX child directly.
+- **A timed-out or aborted run reports `exitCode: null` on every platform**, as
+  in 2.3, with `timedOut: true`; the tree kill does not turn it into an exit
+  code.
+
+#### Memory
+
+- **Legacy recall leaves mismatched vectors out of the vector ranking**, in all
+  five built-in stores (in-memory, Markdown, SQLite, PostgreSQL and Redis). A
+  vector query no longer returns records without a vector at score 0, and a
+  record whose vector has another length or another `embeddingModelId` than the
+  query's is found by its text only. `recall` reports such records once per run
+  as an `embedding-mismatch` warning (through the new `onWarning` option, else
+  one logger line). The PostgreSQL store no longer tops up a short pgvector
+  result with records that have no vector. A store of your own can do the same
+  with `MemoryQuery.embeddingModelId` and `MemoryQuery.onEmbeddingMismatch`.
+- **`memory_update` drops the record's vector**, and every built-in store's
+  `update` drops it when the text changes without a new embedding. The record is
+  found by text until it is embedded again; no embedding call is added.
+- **Native extraction that wrote only part of its plan is `'failed'`**, for
+  version 1 and 2 runs too. The extraction record gains `planned`, saved before
+  any memory is written; `reconcileAgentRun` completes it only when every
+  planned mutation is confirmed, records a partial one as `'failed'` with error
+  code `'memory-extraction-partial'`, never runs it again, and reports a
+  `memory-extraction-partial` warning on `AgentRunReconciliation.warnings`. The
+  status union is unchanged; only a V3 run records `'partial'`. A record a 2.3
+  process left without `planned` is settled as before. A native run also saves
+  its record once or twice more per extraction, and a record an extraction
+  updates now carries that extraction's `metadata.deuz` ids.
+- **Native runs charge their built-in memory to the run.** The memory LLM and
+  embedder calls of `memory` are reserved on the run's execution context
+  (unless you set `seams.execution`), so they count against its budget and
+  policy, and `embedding-mismatch` and `unaccounted-usage` warnings appear on
+  the run's stream. The reservations name the models `'memory-llm'` and
+  `'memory-embedder'` and carry no USD price: an `allowedModels` policy must
+  list them, a USD bound adds nothing for them, and a budget with
+  `unknownPrice: 'reject'` refuses them (`'unaccounted_call'` for an unmarked
+  callback, `'unpriced_model'` under a USD bound). `generateText` and
+  `streamChat` report the same warnings in `warnings` and charge `execution`
+  when the call has one.
+
+#### Native runs
+
+- **2.4 options without the V3 path are refused.** A 2.3-style run that passes
+  `context`, `workingMemory` or `versionedMemory`, or a V3 store, gets a
+  `TypeError`.
+- **A conditional chat store makes the chat projection compare-and-set.** On a
+  conflict the run reads the chat again and decides again (three attempts, then
+  the projection is `'failed'` and a later save or `reconcileAgentRun` repairs
+  it). A deletion tombstone stops the projection, and the run's chat state is
+  `'superseded'` with a `chat` warning. Other chat stores keep the 2.3
+  behaviour.
+
+#### UI wire
+
+- **A failing legacy stream store warns instead of corrupting the journal**
+  (H1, H2 above). The client gets a `warning` part of type
+  `'stream-store-error'` (wire v2 only), and the response cannot be resumed.
+  Use durable mode when it must be.
+- **`useChat` sends one more request header**, `x-deuz-capabilities`, unless
+  `capabilityHandshake: false`. See the CORS note in
+  [the capability handshake](#the-capability-handshake-in-routes).
+
+#### Deprecated: `@deuz-sdk/core/react`
+
+The frozen `useChat` and `useObject` hooks of the core package are deprecated
+in favour of `@deuz-sdk/react` and will be removed in 3.0. Their behaviour is
+unchanged; a development build logs one console warning per page, a production
+build stays silent.
+
+### Widened unions
+
+Exhaustive `switch` statements over these types need a new case:
+
+| Type                    | New members                                                                                                  |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------ |
+| `CallWarning['type']`   | `'embedding-mismatch'`, `'unaccounted-usage'`, `'context-source-failed'`, `'stream-store-error'`, `'memory-extraction-partial'` |
+| `BudgetLedgerErrorCode` | `'unaccounted_call'`                                                                                         |
+| `GoalErrorCode`         | `'delivery_conflict'`; `'lease_lost'`, `'stale'` and `'policy_limit'` are reserved and never thrown in 2.4   |
+| `ObservedSubsystem`     | `'context'`, `'goal'`, `'schedule'`, `'process'`, `'stream'`                                                 |
+| `DeuzUIPart`            | `{ type: 'capabilities' }`, consumed by `useChat` and ignored by `applyUIPart`                              |
+
+`AgentRunEnvelope.version`, `AgentEvent` and the extraction status union stay
+closed: the V3 record, its events and the `'partial'` status are separate
+types (`AgentRunEnvelopeV3`, `AgentEventV3`).
+
+### New members for custom implementations
+
+Calling code is unaffected. The new members are optional:
+`AgentRunMemoryExtraction.planned`, `AgentRunReconciliation.warnings`,
+`CodeExecutionResult.truncated`, `MemorySeams.execution` and `accountedLlm`,
+`MemoryQuery.embeddingModelId` and `onEmbeddingMismatch`,
+`BudgetReservation.unaccounted`, `BudgetTotals.unaccounted` and
+`BudgetAggregate.unaccounted`, and the five `GoalEvidence` fields. A store or
+sandbox of your own keeps working; set them to give your callers the 2.4
+behaviour. No 2.3 interface gains a required member. Where a 2.4 store
+interface builds on a 2.3 one, it has every member of it, so it goes wherever
+the 2.3 one goes: a `ConditionalChatStore` is a `ChatStore`, a
+`DurableStreamStateStore` a `StreamStateStore`, and a `GoalRuntimeStore` a
+`GoalStore`.
+
+## Known limits
+
+- **Not live-verified.** No provider behaviour in 2.4 was checked against a
+  live API. The context compiler's token estimates are estimates, corrected by
+  the usage a provider reports, and the manifest names the estimator it used.
+- **The context compiler runs in V3 native runs only.** `generateText`,
+  `streamChat` and 2.3 native runs take no `context` option; call
+  `compileContext` yourself there.
+- **What a forget reaches in V3 runs.** A forget redacts every stored context
+  package that held the record, and the run store rewrites, in place, each
+  stored copy of those packages' retrieval blocks that holds a forgotten record
+  (history, checkpoints and stored result messages, a finished run's
+  `result.messages` included) into a stand-in that keeps the marker and holds
+  no record. Only the exact blocks the compiler appended are replaced: a user's
+  message that only opens with a `<deuz_context pass=... step=...>` marker
+  stays, and so does an overflow retry's block that dropped the forgotten
+  record. A forget also does not reach a retrieval block a run received in its
+  input messages, such as a previous run's `result.messages` passed to
+  `runAgent({ messages })`: it is not redacted in that run's record, so
+  continue from the chat projection or the transcript, which carry no
+  retrieval blocks. Nor does it reach text the model wrote from a block
+  (assistant turns, `result.text`, a compaction summary), memory tool results
+  (`memory_recall` output in tool messages, the run transcript, a chat store),
+  the in-memory history of a leg running at forget time until it ends or is
+  resumed, or run stores not subscribed through `onForget`.
+- **pgvector.** The versioned PostgreSQL store's pgvector path was checked only
+  against an emulated `vector` type in PGlite. Without pgvector, cosine runs in
+  the process over the freshest `candidateLimit` rows (default 1000).
+- **Legacy memory callbacks are unpriced in USD.** The memory LLM and embedder
+  calls of `MemorySeams` are charged in tokens under the model names
+  `'memory-llm'` and `'memory-embedder'`, without a price, because a host
+  callback names its model only in its answer. A versioned memory session can
+  name priced models with `llmModelId` and `embedderModelId`, priced through
+  `deps.priceProvider`.
+- **Size.** The root entry grows by about 1.2 KB raw (0.4 KB gzip) and the
+  `/edge` consumer by about 7.3 KB raw (2.4 KB gzip), measured with the release
+  gate's esbuild consumers before release. The new entries are larger; each
+  one loads only when you import it, and durable mode, the conditional chat
+  projection and the native V3 executor load lazily.
+- **Full-text search.** Transcript search is lexical, with no embeddings. The
+  versioned PostgreSQL store's text side uses the `simple` configuration: no
+  stemming, and unlike FTS5 it does not fold diacritics.
+- **Redis** backs only the durable stream store among the 2.4 stores: there is
+  no Redis V3 run store, versioned memory store, goal runtime store or
+  conditional chat store.
+- **Docker.** The runner targets Linux containers through the Docker CLI. It
+  was verified locally with Docker Desktop on Windows 11; the repository's CI
+  has a job that runs the same tests against Docker on Linux. Docker archives a
+  single hard-linked file as a regular file.
+- **Skill proposals** are a draft from one run; nothing evaluates them, and a
+  repeated call costs again.
+- **The frozen `@deuz-sdk/core/react` hook** stays at its 2.2 behaviour and is
+  deprecated.
+
+## Next: 2.5
+
+These are the roadmap's targets for 2.5, not commitments. Each of them was out
+of scope for 2.4:
+
+- a CLI and TUI on top of the headless preview;
+- a local daemon and a control server;
+- realtime voice over WebRTC;
+- lazy tool search (tools discovered when a run needs them);
+- a local plugin lifecycle;
+- dynamic agent tasks with a durable mailbox;
+- a worktree integrator;
+- an optional LSP or ACP preview.
+
+Previous releases remain documented in
+[What is new in 2.3](/docs/reference/whats-new-2-3) and the
+[Changelog](/docs/changelog).

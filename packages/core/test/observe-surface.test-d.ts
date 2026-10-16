@@ -194,4 +194,10 @@ expectTypeOf<ObservedSubsystem>().toEqualTypeOf<
   | 'speech'
   | 'transcription'
   | 'video'
+  // 2.4 (widened once, in W0): the new subsystems.
+  | 'context'
+  | 'goal'
+  | 'schedule'
+  | 'process'
+  | 'stream'
 >();

@@ -1,0 +1,32 @@
+{
+  "scenario": "google-compat.gemini-2.5-flash.generate-text",
+  "recordedFrom": "2.3.0",
+  "requests": [
+    {
+      "method": "POST",
+      "url": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+      "headers": {
+        "authorization": "Bearer <secret>",
+        "content-type": "application/json"
+      },
+      "json": {
+        "model": "gemini-2.5-flash",
+        "messages": [
+          {
+            "role": "system",
+            "content": "You are a concise assistant."
+          },
+          {
+            "role": "user",
+            "content": "Say hello."
+          }
+        ],
+        "stream": true,
+        "max_tokens": 64000,
+        "stream_options": {
+          "include_usage": true
+        }
+      }
+    }
+  ]
+}

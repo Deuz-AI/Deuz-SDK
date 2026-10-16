@@ -1,0 +1,72 @@
+{
+  "scenario": "batch.google-native.gemini-2.5-flash.submit",
+  "recordedFrom": "2.3.0",
+  "requests": [
+    {
+      "method": "POST",
+      "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:batchGenerateContent",
+      "headers": {
+        "content-type": "application/json",
+        "x-goog-api-key": "<secret>"
+      },
+      "json": {
+        "batch": {
+          "displayName": "deuz-batch",
+          "inputConfig": {
+            "requests": {
+              "requests": [
+                {
+                  "request": {
+                    "contents": [
+                      {
+                        "role": "user",
+                        "parts": [
+                          {
+                            "text": "One?"
+                          }
+                        ]
+                      }
+                    ],
+                    "generationConfig": {
+                      "maxOutputTokens": 64
+                    }
+                  },
+                  "metadata": {
+                    "key": "q1"
+                  }
+                },
+                {
+                  "request": {
+                    "contents": [
+                      {
+                        "role": "user",
+                        "parts": [
+                          {
+                            "text": "Two?"
+                          }
+                        ]
+                      }
+                    ],
+                    "generationConfig": {
+                      "maxOutputTokens": 64000
+                    },
+                    "systemInstruction": {
+                      "parts": [
+                        {
+                          "text": "Answer in French."
+                        }
+                      ]
+                    }
+                  },
+                  "metadata": {
+                    "key": "q2"
+                  }
+                }
+              ]
+            }
+          }
+        }
+      }
+    }
+  ]
+}

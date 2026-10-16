@@ -16,6 +16,7 @@ export type {
   UseChatAgent,
   UseChatStopDetails,
 } from './use-chat';
+export type { ChatSnapshotV1, ChatSnapshotGateV1 } from './chat-snapshot';
 
 export { useObject } from './use-object';
 export type { UseObjectOptions, UseObjectResult } from './use-object';

@@ -32,7 +32,13 @@ export type BudgetLedgerErrorCode =
    */
   | 'admission_failed'
   /** A model with no price was refused under a USD bound with `unknownPrice: 'reject'` (2.3). */
-  | 'unpriced_model';
+  | 'unpriced_model'
+  /**
+   * An attempt through a callback that reports no usage (`unaccounted`) was
+   * refused by a budget with `unknownPrice: 'reject'` (2.4): a strict budget
+   * needs the accounted variant of the callback.
+   */
+  | 'unaccounted_call';
 
 /** Attempts at closing a hold (settle, release) in the persistent store (2.3, F17). */
 const CLOSE_ATTEMPTS = 3;
@@ -186,6 +192,9 @@ function record(input: BudgetReservation): BudgetReservation {
   if (input.unpriced !== undefined && input.unpriced !== true) {
     throw new BudgetLedgerError('invalid_snapshot', 'Invalid unpriced marker.');
   }
+  if (input.unaccounted !== undefined && input.unaccounted !== true) {
+    throw new BudgetLedgerError('invalid_snapshot', 'Invalid unaccounted marker.');
+  }
   const actual = amounts(input.actual);
   const usage = input.usage === undefined ? undefined : copyUsage(input.usage);
   if (usage && usage.totalTokens !== actual.tokens) {
@@ -216,8 +225,21 @@ function record(input: BudgetReservation): BudgetReservation {
     state: input.state,
     ...(usage ? { usage } : {}),
     ...(input.unpriced ? { unpriced: true as const } : {}),
+    ...(input.unaccounted ? { unaccounted: true as const } : {}),
   });
 }
+
+/** An unaccounted attempt whose actual amounts are still unknown (2.4). */
+const unaccountedUnknown = (item: BudgetReservation): boolean =>
+  item.unaccounted === true &&
+  item.state !== 'released' &&
+  (item.actual.tokens === undefined || item.actual.usd === undefined);
+
+const unaccountedRefusal = (candidate: BudgetReservation, where: string) =>
+  new BudgetLedgerError(
+    'unaccounted_call',
+    `${candidate.requestId} runs through a callback that reports no usage, so ${where} cannot admit it (unknownPrice: 'reject'); use the accounted variant of the callback.`,
+  );
 
 /** The USD of this attempt is unknown because its model has no price (2.3). */
 const unpricedUsd = (item: BudgetReservation): boolean =>
@@ -247,6 +269,9 @@ function fits(
   unreserved: (dimension: 'tokens' | 'usd') => boolean,
   scopeId?: string,
 ): void {
+  // 2.4: a strict budget admits only attempts that report their usage.
+  if (candidate.unaccounted && cap.unknownPrice === 'reject')
+    throw unaccountedRefusal(candidate, scopeId ? `the budget of ${scopeId}` : 'the budget');
   for (const dimension of dimensions) {
     const maximum = cap[dimension];
     if (maximum === undefined) continue;
@@ -313,12 +338,15 @@ function aggregate(input: BudgetAggregate): BudgetAggregate {
   const unestimatedUsd = count(input.unestimatedUsd, 'Aggregate unestimatedUsd');
   const unpriced =
     input.unpricedUsd === undefined ? 0 : count(input.unpricedUsd, 'Aggregate unpricedUsd');
+  const unaccounted =
+    input.unaccounted === undefined ? 0 : count(input.unaccounted, 'Aggregate unaccounted');
   if (
     unknownTokens > folded ||
     unknownUsd > folded ||
     unestimatedTokens > unknownTokens ||
     unestimatedUsd > unknownUsd ||
-    unpriced > unestimatedUsd
+    unpriced > unestimatedUsd ||
+    unaccounted > folded
   )
     throw new BudgetLedgerError('invalid_snapshot', 'Budget aggregate counts are inconsistent.');
   return Object.freeze({
@@ -331,6 +359,7 @@ function aggregate(input: BudgetAggregate): BudgetAggregate {
     unestimatedTokens,
     unestimatedUsd,
     ...(unpriced ? { unpricedUsd: unpriced } : {}),
+    ...(unaccounted ? { unaccounted } : {}),
   });
 }
 
@@ -474,9 +503,12 @@ function fold(
     unestimatedTokens: previous?.unestimatedTokens ?? 0,
     unestimatedUsd: previous?.unestimatedUsd ?? 0,
     unpricedUsd: previous?.unpricedUsd ?? 0,
+    unaccounted: previous?.unaccounted ?? 0,
   };
   if (item) {
     next.count++;
+    // Still unknown after folding (2.4): it keeps counting as unaccounted.
+    if (unaccountedUnknown(item)) next.unaccounted++;
     for (const dimension of dimensions) {
       const actual = item.actual[dimension];
       if (actual !== undefined) {
@@ -532,6 +564,8 @@ function reservationOf(input: BudgetReservationInput): BudgetReservation {
       'invalid_budget',
       'An unpriced reservation carries no usd estimate.',
     );
+  if (input.unaccounted !== undefined && typeof input.unaccounted !== 'boolean')
+    throw new BudgetLedgerError('invalid_budget', 'unaccounted must be boolean.');
   return record({
     requestId: input.requestId,
     modelId: input.modelId,
@@ -541,6 +575,7 @@ function reservationOf(input: BudgetReservationInput): BudgetReservation {
     scopes: input.scopes ?? [],
     state: 'reserved',
     ...(input.unpriced ? { unpriced: true as const } : {}),
+    ...(input.unaccounted ? { unaccounted: true as const } : {}),
   });
 }
 
@@ -551,7 +586,8 @@ function sameReservation(existing: BudgetReservation, candidate: BudgetReservati
     existing.kind === candidate.kind &&
     same(existing.reservation, candidate.reservation) &&
     same(existing.scopes, candidate.scopes) &&
-    existing.unpriced === candidate.unpriced
+    existing.unpriced === candidate.unpriced &&
+    existing.unaccounted === candidate.unaccounted
   );
 }
 
@@ -740,6 +776,9 @@ export function createBudgetLedger(options: BudgetLedgerOptions = {}): BudgetLed
   async function admitPersistent(candidate: BudgetReservation, strict: boolean): Promise<void> {
     if (!admission) return;
     for (const scope of admission.scopes) {
+      // 2.4: as with an unpriced model, the run's policy or the scope's own refuses it.
+      if (candidate.unaccounted && (strict || scope.limits.unknownPrice === 'reject'))
+        throw unaccountedRefusal(candidate, `persistent scope ${scope.key}`);
       for (const dimension of dimensions) {
         if (scope.limits[dimension] === undefined || candidate.reservation[dimension] !== undefined)
           continue;
@@ -863,6 +902,7 @@ export function createBudgetLedger(options: BudgetLedgerOptions = {}): BudgetLed
     let unknownTokens = 0;
     let unknownUsd = 0;
     let unpriced = 0;
+    let unaccounted = 0;
     for (const item of entries.values()) {
       if (
         item.state === 'released' ||
@@ -879,6 +919,7 @@ export function createBudgetLedger(options: BudgetLedgerOptions = {}): BudgetLed
         }
       }
       if (unpricedUsd(item)) unpriced++;
+      if (unaccountedUnknown(item)) unaccounted++;
     }
     for (const item of aggregates.values()) {
       if (!inScope(item.scopes, scopeId)) continue;
@@ -889,6 +930,7 @@ export function createBudgetLedger(options: BudgetLedgerOptions = {}): BudgetLed
       unknownTokens += item.unknownTokens;
       unknownUsd += item.unknownUsd;
       unpriced += item.unpricedUsd ?? 0;
+      unaccounted += item.unaccounted ?? 0;
     }
     return Object.freeze({
       spent: Object.freeze(spent),
@@ -900,6 +942,7 @@ export function createBudgetLedger(options: BudgetLedgerOptions = {}): BudgetLed
       unknownTokens,
       unknownUsd,
       ...(unpriced ? { unpriced } : {}),
+      ...(unaccounted ? { unaccounted } : {}),
     });
   }
 

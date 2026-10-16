@@ -18,7 +18,11 @@ import {
   sortableNumber,
 } from '../src/node/redis-scripts';
 import type { RedisScriptClient } from '../src/node/store-redis';
-import { liveRedisServer, liveRedisUrl, mockRedisServer } from './fixtures/redis-harness';
+import { liveRedisServer, mockRedisServer } from './fixtures/redis-harness';
+import { redisUrl } from './fixtures/services';
+import { SLOW_TEST_TIMEOUT_MS } from './fixtures/timeouts';
+
+const liveRedisUrl = redisUrl();
 
 const byCodeUnits = (left: string, right: string) => (left < right ? -1 : left > right ? 1 : 0);
 
@@ -241,7 +245,7 @@ describe.skipIf(!liveRedisUrl)('live Redis', () => {
   let server: Awaited<ReturnType<typeof liveRedisServer>>;
   beforeAll(async () => {
     server = await liveRedisServer(liveRedisUrl!);
-  }, 30_000);
+  }, SLOW_TEST_TIMEOUT_MS);
   afterAll(() => server?.close());
   helperContracts('live', async () => server.client);
 });

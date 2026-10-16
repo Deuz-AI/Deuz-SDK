@@ -33,6 +33,7 @@ interface Writable {
   once(event: 'drain', listener: () => void): void;
 }
 interface ChildProcessLike {
+  pid?: number;
   stdout: Readable | null;
   stderr: Readable | null;
   stdin: Writable | null;
@@ -47,7 +48,9 @@ interface ChildProcessModule {
     options: {
       cwd?: string;
       env?: Record<string, string | undefined>;
-      stdio: ['ignore' | 'pipe', 'pipe', 'pipe'];
+      stdio: ['ignore' | 'pipe', 'pipe' | 'ignore', 'pipe' | 'ignore'];
+      windowsHide?: boolean;
+      detached?: boolean;
     },
   ): ChildProcessLike;
 }
@@ -56,6 +59,19 @@ interface ChildProcessModule {
 interface NodeProcess {
   env: Record<string, string | undefined>;
   platform: string;
+  cwd(): string;
+  kill(pid: number, signal?: string): boolean;
+}
+
+/** Minimal `node:path` / `node:fs/promises` shapes for the cwd check (H3). */
+interface NodePath {
+  resolve(...segments: string[]): string;
+  relative(from: string, to: string): string;
+  isAbsolute(path: string): boolean;
+  sep: string;
+}
+interface NodeFs {
+  realpath(path: string): Promise<string>;
 }
 
 async function loadSpawn(): Promise<ChildProcessModule['spawn']> {
@@ -73,8 +89,61 @@ async function loadSpawn(): Promise<ChildProcessModule['spawn']> {
 let cachedProcess: NodeProcess | undefined;
 async function loadProcess(): Promise<NodeProcess> {
   if (cachedProcess) return cachedProcess;
-  cachedProcess = (await import('node:process' as string)) as unknown as NodeProcess;
+  const mod = (await import('node:process' as string)) as unknown as {
+    default?: NodeProcess;
+  } & NodeProcess;
+  // The default export is `process` itself, so its methods keep their receiver.
+  cachedProcess = mod.default ?? mod;
   return cachedProcess;
+}
+
+async function loadPathAndFs(): Promise<{ path: NodePath; fs: NodeFs }> {
+  const [path, fs] = await Promise.all([
+    import('node:path' as string) as Promise<NodePath>,
+    import('node:fs/promises' as string) as Promise<NodeFs>,
+  ]);
+  return { path, fs };
+}
+
+/** Whether `target` is `root` or below it (both absolute, same flavour). */
+function isWithin(path: NodePath, root: string, target: string): boolean {
+  const rel = path.relative(root, target);
+  return !(rel === '..' || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel));
+}
+
+/**
+ * Resolves a `runShell` cwd against the sandbox root (H3, 2.4): a relative
+ * path is taken from the root, an absolute one must lie inside it, and the
+ * real path (symlinks and junctions followed) must stay inside the real root.
+ * Returns the directory to spawn in (the lexical path, once both checks
+ * pass), or the refusal to report.
+ */
+async function resolveShellCwd(
+  root: string,
+  requested: string,
+): Promise<{ cwd: string } | { refusal: string }> {
+  const { path, fs } = await loadPathAndFs();
+  const base = path.resolve(root);
+  const target = path.resolve(base, requested);
+  const outside = `Working directory '${requested}' is outside the sandbox root (${base}).`;
+  if (!isWithin(path, base, target)) return { refusal: outside };
+  let realBase: string;
+  let realTarget: string;
+  try {
+    realBase = await fs.realpath(base);
+  } catch {
+    return { refusal: `The sandbox root (${base}) does not exist.` };
+  }
+  try {
+    realTarget = await fs.realpath(target);
+  } catch {
+    return { refusal: `Working directory '${requested}' does not exist in the sandbox root.` };
+  }
+  if (!isWithin(path, realBase, realTarget)) return { refusal: outside };
+  // The real path only decides containment. The spawn gets the lexical path:
+  // the real path of a mapped network drive is a UNC path, which cmd.exe
+  // refuses as a working directory (it runs in C:\Windows instead).
+  return { cwd: target };
 }
 
 /** language id → how to invoke an interpreter with an inline program. */
@@ -100,7 +169,10 @@ export interface NodeSandboxOptions {
   cwd?: string;
   /** Default wall-clock timeout in ms (per run). Default 30_000. */
   defaultTimeoutMs?: number;
-  /** Max captured bytes per stream before truncation. Default 1_000_000. */
+  /**
+   * Max captured bytes per stream; the head is kept and the result's
+   * `truncated` (2.4) says which stream was cut. Default 1_000_000.
+   */
   maxOutputBytes?: number;
   /** Language → interpreter overrides (merged over the built-ins). */
   interpreters?: Record<string, Interpreter>;
@@ -132,6 +204,8 @@ function buildEnv(
 }
 
 interface ExecInput {
+  /** The host process: its platform picks the tree kill, POSIX group kill goes through it. */
+  host: NodeProcess;
   command: string;
   args: string[];
   cwd?: string;
@@ -159,6 +233,54 @@ const STDIN_CHUNK_BYTES = 64 * 1024;
  * program to exit on its own, so the timeout bounded nothing.
  */
 const KILL_GRACE_MS = 500;
+
+/**
+ * Kills `child` and every process it started (2.4). Before 2.4 only the child
+ * got SIGKILL, so a program the shell or the code had started lived on. On
+ * POSIX the child leads its own process group (`detached`), so one signal to
+ * the group reaches the whole tree. Windows has no process groups: `taskkill
+ * /T /F` walks the tree, which it can only do while the child is alive, so the
+ * child is killed directly only when taskkill cannot run.
+ */
+function killProcessTree(
+  spawn: ChildProcessModule['spawn'],
+  host: NodeProcess,
+  child: ChildProcessLike,
+): void {
+  const pid = child.pid;
+  if (pid === undefined) {
+    child.kill('SIGKILL');
+    return;
+  }
+  if (host.platform !== 'win32') {
+    try {
+      host.kill(-pid, 'SIGKILL');
+    } catch {
+      child.kill('SIGKILL');
+    }
+    return;
+  }
+  const systemRoot = host.env.SystemRoot ?? host.env.SYSTEMROOT;
+  const taskkill = systemRoot ? `${systemRoot}\\System32\\taskkill.exe` : 'taskkill';
+  let fallback = false;
+  const directly = (): void => {
+    if (fallback) return;
+    fallback = true;
+    child.kill('SIGKILL');
+  };
+  try {
+    const killer = spawn(taskkill, ['/PID', String(pid), '/T', '/F'], {
+      stdio: ['ignore', 'ignore', 'ignore'],
+      windowsHide: true,
+    });
+    killer.on('error', directly);
+    killer.on('exit', (code) => {
+      if (code !== 0) directly();
+    });
+  } catch {
+    directly();
+  }
+}
 
 /**
  * Feed `text` to the child's stdin as UTF-8, then close it (EOF).
@@ -225,6 +347,10 @@ async function execProcess(
         // No stdin given: the null device, not a pipe nobody ever closes (a
         // program reading to EOF used to wait out the whole timeout, F10).
         stdio: [input.stdin === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'],
+        // 2.4: no console window flashes up on Windows, and on POSIX the child
+        // leads its own process group so a kill reaches everything it started.
+        windowsHide: true,
+        detached: input.host.platform !== 'win32',
       });
     } catch (err) {
       resolve({
@@ -239,16 +365,21 @@ async function execProcess(
     const errChunks: Uint8Array[] = [];
     let outBytes = 0;
     let errBytes = 0;
+    /** Bytes past maxOutputBytes were dropped (H4): reported, no longer silent. */
+    const cut = { stdout: false, stderr: false };
     let timedOut = false;
     let settled = false;
     /** From 'exit', for a killed run that settles before 'close' comes. */
     let exitCode: number | null = null;
+    /** 'exit' came: Node has let go of the child's pid, which the OS may reuse. */
+    let exited = false;
     let graceTimer: ReturnType<typeof setTimeout> | undefined;
 
     const collect = (chunks: Uint8Array[], countRef: 'out' | 'err') => (chunk: Uint8Array) => {
       const current = countRef === 'out' ? outBytes : errBytes;
-      if (current >= input.maxOutputBytes) return;
       const room = input.maxOutputBytes - current;
+      if (chunk.byteLength > room) cut[countRef === 'out' ? 'stdout' : 'stderr'] = true;
+      if (room <= 0) return;
       const slice = chunk.byteLength > room ? chunk.subarray(0, room) : chunk;
       chunks.push(slice);
       if (countRef === 'out') outBytes += slice.byteLength;
@@ -269,11 +400,17 @@ async function execProcess(
       return decoder.decode(merged);
     };
 
-    // Timeout and abort both kill the child and report `timedOut: true`.
+    // Timeout and abort both kill the child's process tree and report `timedOut: true`.
     const kill = (): void => {
       if (settled || timedOut) return;
       timedOut = true;
-      child.kill('SIGKILL');
+      // After 'exit' (a program the child started still holds the pipes) the
+      // child's pid is free: on Windows `taskkill /PID <pid> /T` could hit an
+      // unrelated process and its tree, and cannot walk a dead process's tree
+      // anyway, so only the grace and the pipe close remain. A POSIX process
+      // group id stays reserved while any member lives, and those members are
+      // what holds the pipes: the group signal still goes out.
+      if (!(exited && input.host.platform === 'win32')) killProcessTree(spawn, input.host, child);
       graceTimer = setTimeout(() => finish(exitCode), KILL_GRACE_MS);
     };
     const timer = setTimeout(kill, input.timeoutMs);
@@ -294,15 +431,19 @@ async function execProcess(
       resolve({
         stdout: concat(outChunks),
         stderr: error ? `${concat(errChunks)}${error.message}` : concat(errChunks),
-        exitCode: code,
+        // A killed run has no exit code of its own, as before 2.4 (Node's
+        // emulated SIGKILL gave null); taskkill /F would report 1.
+        exitCode: timedOut ? null : code,
         ...(timedOut ? { timedOut: true } : {}),
         durationMs: Date.now() - start,
+        ...(cut.stdout || cut.stderr ? { truncated: { ...cut } } : {}),
       });
     };
 
     child.on('error', (err) => finish(null, err));
     child.on('exit', (code) => {
       exitCode = code;
+      exited = true;
     });
     child.on('close', (code) => finish(code));
 
@@ -317,9 +458,19 @@ async function execProcess(
  * `runCode` and `runShell` take the same `stdin`: omitted, the child's stdin is
  * the null device (a read sees EOF at once); a string, `''` included, is piped
  * as UTF-8 and then closed. Neither offers interactive input. A timeout or abort
- * kills the spawned process and settles within a short grace period even when a
- * program it started still holds the output pipes; that program is NOT killed
- * (one more reason this is not an isolation boundary).
+ * kills the spawned process and every process it started (2.4: the process
+ * group on POSIX, `taskkill /T /F` on Windows) and settles within a short grace
+ * period even if a program escaped the tree (a daemon that started its own
+ * group or session) and still holds the output pipes. Children run with
+ * `windowsHide`. On POSIX each child leads its own process group, so a
+ * terminal's Ctrl-C reaches the host but not the child: the host's own exit
+ * does not end a running child (one more reason this is not an isolation
+ * boundary).
+ *
+ * `runShell`'s `cwd` is confined to the sandbox root, `options.cwd` or else the
+ * host's working directory (H3, 2.4): relative paths resolve against it, and a
+ * path that leaves it (`..`, an absolute path elsewhere, a symlink or junction
+ * pointing out) is refused without running the command (`exitCode: null`).
  */
 export function createNodeSandbox(options: NodeSandboxOptions = {}): ComputeSandbox {
   const interpreters = { ...DEFAULT_INTERPRETERS, ...options.interpreters };
@@ -346,6 +497,7 @@ export function createNodeSandbox(options: NodeSandboxOptions = {}): ComputeSand
       }
       const [spawn, proc] = await Promise.all([loadSpawn(), loadProcess()]);
       return execProcess(spawn, {
+        host: proc,
         command: interpreter.command,
         args: interpreter.args(request.code),
         ...(options.cwd !== undefined ? { cwd: options.cwd } : {}),
@@ -372,8 +524,16 @@ export function createNodeSandbox(options: NodeSandboxOptions = {}): ComputeSand
       const isWindows = proc.platform === 'win32';
       const shellCommand = isWindows ? 'cmd.exe' : 'bash';
       const shellArgs = isWindows ? ['/c', request.command] : ['-c', request.command];
-      const cwd = request.cwd ?? options.cwd;
+      let cwd = options.cwd;
+      if (request.cwd !== undefined) {
+        // H3 (2.4): the cwd is confined to the sandbox root, as the shell tool
+        // promises the model; before 2.4 any path was handed to spawn as given.
+        const resolved = await resolveShellCwd(options.cwd ?? proc.cwd(), request.cwd);
+        if ('refusal' in resolved) return { stdout: '', stderr: resolved.refusal, exitCode: null };
+        cwd = resolved.cwd;
+      }
       return execProcess(spawn, {
+        host: proc,
         command: shellCommand,
         args: shellArgs,
         ...(cwd !== undefined ? { cwd } : {}),

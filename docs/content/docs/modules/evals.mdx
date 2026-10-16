@@ -15,6 +15,15 @@ offline tasks and 33 fault-injection scenarios on every `npm test`. Eleven
 real-model tasks are defined but were not run for 2.3, so there are no
 real-model results. This page ranks nothing and makes no claim about other SDKs.
 
+2.4 adds 56 acceptance scenarios for its ten areas (versioned memory, context,
+transcript search, skill proposals, the goal supervisor, the durable scheduler,
+Docker, chat and stream durability with React, acceptance evidence, retention)
+under `packages/core/test/scenarios-2-4/`. 16 of them are fault scenarios: each
+runs three times on fresh stores and is never retried. They run on every
+`npm test`; the legs that need Postgres, Redis or Docker run when those test
+services are configured. They are offline too, so they make no real-model claim
+either.
+
 ## A task
 
 A task manifest has a stable `id` and a `version` you bump whenever its start

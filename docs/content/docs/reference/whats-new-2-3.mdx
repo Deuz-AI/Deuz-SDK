@@ -470,8 +470,8 @@ browser connects with an ephemeral token minted on your server by
 `createOpenAIClientSecret` or `createGeminiAuthToken`. Tools are ordinary Deuz
 tools, validated and approval-gated. Usage is split by modality and priced
 through `deps.priceProvider` (`realtimePriceTable` builds the rows; no realtime
-prices ship). Not live-verified; WebRTC is planned for 2.4. See
-[Realtime voice](/docs/modules/realtime).
+prices ship). Not live-verified; WebRTC was planned for 2.4 and moved to 2.5.
+See [Realtime voice](/docs/modules/realtime).
 
 ## Batch requests
 
@@ -712,8 +712,8 @@ The 2.2 notes deferred seven items to 2.3. All seven ship:
 | Redis swarm and ops backends                         | Shipped: `ops/redis` (leases, native runs, claims, budgets), `swarm/redis`, and the pack's `runs`                           | [Operations](/docs/modules/operations#redis), [Persistent stores](/docs/modules/stores#runs-23) | The shared conformance suites, offline on ioredis-mock, which runs the same Lua scripts; the same suites run against a real Redis 7 in the CI integration job (`DEUZ_TEST_REDIS_URL`)                                             |
 | `chat`, `memory` and `fallbackModels` in native runs | Shipped                                                                                                                     | [Native agents](/docs/modules/native-agents#memory-chat-and-model-fail-over-23)                 | Offline with scripted models and stores; provider behaviour not live-verified                                                                                                                                                     |
 
-Parts of these areas stay outside 2.3: realtime over WebRTC (planned for 2.4),
-and the items listed under [Known limits](#known-limits).
+Parts of these areas stay outside 2.3: realtime over WebRTC (planned for 2.4,
+since moved to 2.5), and the items listed under [Known limits](#known-limits).
 
 The verification level of every model row and protocol 2.3 added, kept apart
 as documented, fixture-tested and live-verified, with the test files behind
@@ -1082,9 +1082,9 @@ reference, and the error classes 2.3 adds, with their codes, in
   retention behaviour, the DeepSeek and Kimi `reasoning_content` round trip,
   Gemini thought signatures, realtime, batch, and A2A and MCP against
   third-party hosts.
-- **Realtime** runs over WebSocket only; WebRTC is planned for 2.4. Vertex AI
-  Live and OpenAI transcription-only sessions are not covered, and no realtime
-  prices ship.
+- **Realtime** runs over WebSocket only; WebRTC was planned for 2.4 and moved
+  to 2.5. Vertex AI Live and OpenAI transcription-only sessions are not
+  covered, and no realtime prices ship.
 - **Anthropic features that are not wired**: server-side compaction (the beta
   `compaction` parameter, whose signed blocks would need a new canonical part
   kind, which 2.x does not add), and the `clear_at` and per-message
@@ -1155,6 +1155,18 @@ These are the roadmap's targets for 2.4, not commitments:
 - isolated runners and background process sessions;
 - transcript search, lazy tool search and a local plugin lifecycle;
 - an optional LSP or ACP preview.
+
+<Callout type="info" title="Where these landed">
+2.4 shipped the goal supervisor, the durable inbox, timezone-aware wakeups, a
+durable scheduler and a webhook handler (library loops and a Fetch handler in
+your process, not a service), a local Docker sandbox with process sessions that
+survive a host restart (a preview), and transcript search. The CLI and TUI, the
+control server and the local daemon, realtime over WebRTC, dynamic agent tasks
+with a durable mailbox, the worktree integrator, lazy tool search, the local
+plugin lifecycle and the LSP or ACP preview moved to the 2.5 targets. The
+messaging connector is not part of 2.4. See
+[What is new in 2.4](/docs/reference/whats-new-2-4).
+</Callout>
 
 Previous releases remain documented in
 [What is new in 2.2](/docs/reference/whats-new-2-2) and the

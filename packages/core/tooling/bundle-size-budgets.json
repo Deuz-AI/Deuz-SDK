@@ -4,7 +4,8 @@
     "Budgets are a RATCHET against ACCIDENTAL bloat, not a hard product limit. Raise them",
     "deliberately when a release adds real user-facing surface; never raise them to make a red",
     "gate go away. check-bundle-size.mjs reads only `bundles[*].from/exports/maxRawBytes/",
-    "maxGzipBytes`, so this `note` key is inert (JSON carries no comments).",
+    "maxGzipBytes` (plus the lazy limits and, for a Node-only entry, `platform`/`external`), so this",
+    "`note` key is inert (JSON carries no comments).",
     "",
     "RAISED FOR 1.9.0 SPRINT 2 (ergonomics + parity). Measured, minified, tree-shaken:",
     "  core  126275 B raw / 39362 B gzip   (was: limits 120000 / 37000; Sprint 1 measured 36880 gzip)",
@@ -259,13 +260,123 @@
     "  mcp-server lazy  281325 B raw / 90338 gzip -> 285000 / 91200",
     "What grew: agent-run.ts +1.4 KB raw (B1: the settle record before a resume's first model call, the",
     "client-result settle tools, the 2.2 envelope-version rule, the reconcilable-receipt filter), the",
-    "loops +0.2 KB (internal hooks), the adapters +0.4 KB (K4/C1: Gemini finish reasons, OpenAI refusals)."
+    "loops +0.2 KB (internal hooks), the adapters +0.4 KB (K4/C1: Gemini finish reasons, OpenAI refusals).",
+    "",
+    "ADDED FOR 2.4 (W0D). Measured on wip/2.4-w0d, same pipeline, ~10% headroom:",
+    "  skills            5113 B raw / 2256 gzip -> 5650 / 2500 (2.3 code, budgeted for the first time)",
+    "  skills-node       4906 B raw / 2101 gzip -> 5400 / 2350 (lazy node: imports, so it bundles here)",
+    "  memory-versioned  1124 B raw /  595 gzip -> 1250 /  660",
+    "  context           2080 B raw / 1028 gzip -> 2300 / 1150 (includes the real createTokenEstimator)",
+    "  goal-runtime      1274 B raw /  693 gzip -> 1400 /  770",
+    "  skills-learning    867 B raw /  531 gzip ->  960 /  590",
+    "The last four measure the W0 contract STUBS (each factory throws NotImplementedError). They are",
+    "meant to trip: raise each one deliberately, with its measurement, when its W1 lane lands the",
+    "implementation. The Node-only 2.4 entries (versioned memory and goal runtime stores, compute/docker)",
+    "were left unbudgeted at first, like the 2.3 Node-only stores; see ADDED FOR 2.4 (final audit A-6) below.",
+    "",
+    "RAISED FOR 2.4 (W0E, H5: the extraction plan saves planned/mutations before it writes). Measured",
+    "13167 / 5418 on feat/2.4 and 14544 / 5910 with H5; native-memory lazy 13800 / 5700 -> 15000 / 6150",
+    "(edge, native-agent, native-swarm).",
+    "",
+    "RAISED FOR 2.4 (W1a integration, pass 1): measured on feat/2.4 after the ten W1a lanes; +5% headroom (lazy totals +10%):",
+    "  core/native-request lazy: 4300 / 1950 -> 4800 / 2100 (measured 4544 / 1996)",
+    "  core/memory-pipeline lazy: 11350 / 4750 -> 14350 / 5850 (measured 13651 / 5524)",
+    "  edge: 178000 / 55100 -> 178000 / 57900 (measured 177707 / 55130)",
+    "  edge/memory-pipeline lazy: 11350 / 4750 -> 13150 / 5450 (measured 12498 / 5145)",
+    "  edge/sdk-v2 lazy: 13100 / 5300 -> 13100 / 5600 (measured 13099 / 5315)",
+    "  edge/native-chat lazy: 3300 / 1550 -> 3800 / 1750 (measured 3581 / 1644)",
+    "  edge/native-memory lazy: 15000 / 6150 -> 17300 / 6950 (measured 16439 / 6599)",
+    "  native-agent/memory-pipeline lazy: 11350 / 4750 -> 13100 / 5400 (measured 12470 / 5132)",
+    "  native-agent/sdk-v2 lazy: 13100 / 5300 -> 13100 / 5600 (measured 13071 / 5304)",
+    "  native-agent/native-chat lazy: 3300 / 1550 -> 3800 / 1750 (measured 3581 / 1645)",
+    "  native-agent/native-memory lazy: 15000 / 6150 -> 17250 / 6950 (measured 16411 / 6588)",
+    "  native-swarm/memory-pipeline lazy: 11350 / 4750 -> 13100 / 5400 (measured 12470 / 5133)",
+    "  native-swarm/sdk-v2 lazy: 13100 / 5300 -> 13100 / 5600 (measured 13071 / 5307)",
+    "  native-swarm/native-chat lazy: 3300 / 1550 -> 3800 / 1750 (measured 3581 / 1646)",
+    "  native-swarm/native-memory lazy: 15000 / 6150 -> 17250 / 6950 (measured 16411 / 6588)",
+    "  evolve/memory-pipeline lazy: 11350 / 4750 -> 12900 / 5350 (measured 12281 / 5051)",
+    "  ui: 18900 / 6700 -> 22850 / 8350 (measured 21756 / 7939)",
+    "  ui (lazy): - / - -> 15300 / 5600 (measured 13907 / 5064)",
+    "  mcp-server (lazy): 285000 / 91200 -> 320800 / 103100 (measured 291612 / 93720)",
+    "  goal: 24700 / 7800 -> 27300 / 8550 (measured 25967 / 8130)",
+    "  memory-versioned: 1250 / 660 -> 66500 / 21150 (measured 63295 / 20112)",
+    "  context: 2300 / 1150 -> 55100 / 19300 (measured 52456 / 18359)",
+    "  goal-runtime: 1400 / 770 -> 80500 / 25250 (measured 76622 / 24008)",
+    "",
+    "RAISED FOR 2.4 (W1a integration, pass 2): the new optional chunks (durable-journal, embed-accounting, memory-accounting, chat-projection-cas) sized from their first measurement, +5%:",
+    "  core/embed-accounting lazy: 1 / 1 -> 2650 / 1200 (measured 2497 / 1130)",
+    "  core/memory-accounting lazy: 1 / 1 -> 2750 / 1300 (measured 2602 / 1214)",
+    "  edge/chat-projection-cas lazy: 1 / 1 -> 1250 / 650 (measured 1153 / 606)",
+    "  edge/durable-journal lazy: 1 / 1 -> 5900 / 2350 (measured 5576 / 2193)",
+    "  edge/embed-accounting lazy: 1 / 1 -> 1300 / 750 (measured 1230 / 674)",
+    "  edge/memory-accounting lazy: 1 / 1 -> 1300 / 750 (measured 1232 / 694)",
+    "  native-agent/chat-projection-cas lazy: 1 / 1 -> 2300 / 1100 (measured 2151 / 1040)",
+    "  native-agent/embed-accounting lazy: 1 / 1 -> 1300 / 750 (measured 1230 / 675)",
+    "  native-agent/memory-accounting lazy: 1 / 1 -> 1300 / 750 (measured 1232 / 693)",
+    "  native-swarm/chat-projection-cas lazy: 1 / 1 -> 2300 / 1100 (measured 2151 / 1040)",
+    "  native-swarm/embed-accounting lazy: 1 / 1 -> 1300 / 750 (measured 1230 / 674)",
+    "  native-swarm/memory-accounting lazy: 1 / 1 -> 1300 / 750 (measured 1232 / 697)",
+    "  evolve/embed-accounting lazy: 1 / 1 -> 1300 / 750 (measured 1230 / 675)",
+    "  evolve/memory-accounting lazy: 1 / 1 -> 1300 / 750 (measured 1232 / 694)",
+    "",
+    "RAISED FOR 2.4 (W1b integration, pass 1): measured on feat/2.4 after W1b (V3 loop wiring, supervisor, skill learning) and fix lane FC; +5% headroom (lazy totals +10%). The edge/native-agent/native-swarm eager growth is the V3 wiring in the shared loop, flagged for the W1b review:",
+    "  edge: 178000 / 57900 -> 191650 / 57900 (measured 182477 / 56742)",
+    "  native-agent: 257500 / 80400 -> 277650 / 87350 (measured 264398 / 83160)",
+    "  native-swarm: 263500 / 82500 -> 280550 / 88100 (measured 267172 / 83863)",
+    "  mcp-server: 17150 / 6570 -> 18250 / 6570 (measured 17347 / 6497)",
+    "  mcp-server (lazy): 320800 / 103100 -> 389200 / 125750 (measured 353818 / 114312)",
+    "  goal-runtime: 80500 / 25250 -> 133950 / 40900 (measured 127527 / 38934)",
+    "  goal-runtime (lazy): - / - -> 370300 / 118500 (measured 336623 / 107686)",
+    "  skills-learning: 960 / 590 -> 19750 / 7450 (measured 18795 / 7090)",
+    "  skills-learning (lazy): - / - -> 119450 / 36300 (measured 108558 / 32958)",
+    "",
+    "RAISED FOR 2.4 (W1b integration, pass 2): the new agent-run-v3-run optional chunk sized from its first measurement, +5%:",
+    "  edge/agent-run-v3-run lazy: 1 / 1 -> 57850 / 20150 (measured 55093 / 19147)",
+    "  native-agent/agent-run-v3-run lazy: 1 / 1 -> 57500 / 20000 (measured 54721 / 19012)",
+    "  native-swarm/agent-run-v3-run lazy: 1 / 1 -> 60800 / 20950 (measured 57877 / 19950)",
+    "",
+    "TIGHTENED (W1b integration): bundles over 100 KB keep 1% headroom instead of 5%:",
+    "  core: 188500 / 58600 -> 188300 / 58600 (measured 186393 / 58222)",
+    "  edge: 191650 / 57900 -> 184350 / 57350 (measured 182477 / 56742)",
+    "  native-agent: 277650 / 87350 -> 267050 / 84000 (measured 264398 / 83160)",
+    "  native-swarm: 280550 / 88100 -> 269850 / 84750 (measured 267172 / 83863)",
+    "  evolve: 216000 / 68000 -> 214350 / 67550 (measured 212217 / 66871)",
+    "  mcp-server (lazy): 389200 / 125750 -> 357400 / 115500 (measured 353818 / 114312)",
+    "  goal-runtime: 133950 / 40900 -> 128850 / 39350 (measured 127527 / 38934)",
+    "  goal-runtime (lazy): 370300 / 118500 -> 340000 / 108800 (measured 336623 / 107686)",
+    "  skills-learning (lazy): 119450 / 36300 -> 109650 / 33300 (measured 108558 / 32958)",
+    "",
+    "RAISED FOR 2.4 (W2 integration): the agent-run-v3-run optional chunk took the V3 package and store-check code that GA's S1-4 moved out of the eager graph, plus E2's retrieval-block redaction, +5%:",
+    "  edge/agent-run-v3-run lazy: 57850 / 20150 -> 62850 / 21850 (measured 59856 / 20805)",
+    "  native-agent/agent-run-v3-run lazy: 57500 / 20000 -> 62500 / 21750 (measured 59484 / 20688)",
+    "  native-swarm/agent-run-v3-run lazy: 60800 / 20950 -> 64450 / 22350 (measured 61334 / 21263)",
+    "",
+    "RE-MEASURED FOR 2.4 (after the W2 review fix lanes HA, HB, HC): over-budget entries raised (+1% above 100 KB, +5% below); the eager edge and native-agent budgets tightened to 1% over the measurement:",
+    "  goal-runtime: 128850 / 39350 -> 132650 / 40600 (measured 131309 / 40175)",
+    "  goal-runtime (lazy): 340000 / 108800 -> 344100 / 110250 (measured 340660 / 109157)",
+    "  mcp-server (lazy): 357400 / 115500 -> 361500 / 117050 (measured 357911 / 115856)",
+    "  edge/native-memory lazy: 17300 / 6950 -> 18300 / 7300 (measured 17390 / 6905)",
+    "  native-agent/native-memory lazy: 17250 / 6950 -> 18300 / 7300 (measured 17390 / 6908)",
+    "  native-swarm/native-memory lazy: 17250 / 6950 -> 18300 / 7300 (measured 17390 / 6908)",
+    "  edge/durable-journal lazy: 5900 / 2350 -> 6350 / 2500 (measured 6010 / 2359)",
+    "  edge (tightened): 184350 / 57350 -> 183300 / 57000 (measured 181456 / 56419)",
+    "  native-agent (tightened): 267050 / 84000 -> 266150 / 83750 (measured 263470 / 82888)",
+    "",
+    "ADDED FOR 2.4 (final audit A-6, spec §4.3 \"size budget for each\"): the five Node-only 2.4 subpaths.",
+    "They import `node:` modules (and the optional `pg` peer) statically, so they are measured with",
+    "`platform: 'node'` and `pg`/`pg-native` external (the consumer installs the driver); ~10% headroom.",
+    "Measured on wip/2.4-hd:",
+    "  memory-versioned-sqlite   47569 / 15180 -> 52350 / 16700",
+    "  memory-versioned-postgres 48615 / 15374 -> 53500 / 16950",
+    "  goal-runtime-sqlite       52257 / 14490 -> 57500 / 15950",
+    "  goal-runtime-postgres     54225 / 15420 -> 59650 / 17000",
+    "  compute-docker            65585 / 22391 -> 72150 / 24650"
   ],
   "bundles": {
     "core": {
       "from": "@deuz-sdk/core",
       "exports": ["streamChat", "generateText", "generateObject", "createClient"],
-      "maxRawBytes": 188500,
+      "maxRawBytes": 188300,
       "maxGzipBytes": 58600,
       "maxLazyRawBytes": 22500,
       "maxLazyGzipBytes": 8450,
@@ -273,8 +384,8 @@
       "lazyFeatures": {
         "native-request": {
           "entryPoint": "native-request",
-          "maxRawBytes": 4300,
-          "maxGzipBytes": 1950
+          "maxRawBytes": 4800,
+          "maxGzipBytes": 2100
         },
         "usage-cost": {
           "entryPoint": "usage-cost",
@@ -283,21 +394,31 @@
         },
         "memory-pipeline": {
           "entryPoint": "memory-pipeline",
-          "maxRawBytes": 11350,
-          "maxGzipBytes": 4750
+          "maxRawBytes": 14350,
+          "maxGzipBytes": 5850
         },
         "sdk-v2": {
           "entryPoint": "sdk-v2",
           "maxRawBytes": 13100,
           "maxGzipBytes": 5300
+        },
+        "embed-accounting": {
+          "entryPoint": "embed-accounting",
+          "maxRawBytes": 2650,
+          "maxGzipBytes": 1200
+        },
+        "memory-accounting": {
+          "entryPoint": "memory-accounting",
+          "maxRawBytes": 2750,
+          "maxGzipBytes": 1300
         }
       }
     },
     "edge": {
       "from": "@deuz-sdk/core/edge",
       "exports": ["streamChat", "generateText", "generateObject", "createApprovalSigner"],
-      "maxRawBytes": 178000,
-      "maxGzipBytes": 55100,
+      "maxRawBytes": 183300,
+      "maxGzipBytes": 57000,
       "maxLazyRawBytes": 22500,
       "maxLazyGzipBytes": 8450,
       "legacyLazyEntryPoint": "resolve",
@@ -314,13 +435,13 @@
         },
         "memory-pipeline": {
           "entryPoint": "memory-pipeline",
-          "maxRawBytes": 11350,
-          "maxGzipBytes": 4750
+          "maxRawBytes": 13150,
+          "maxGzipBytes": 5450
         },
         "sdk-v2": {
           "entryPoint": "sdk-v2",
           "maxRawBytes": 13100,
-          "maxGzipBytes": 5300
+          "maxGzipBytes": 5600
         },
         "native-mcp": {
           "entryPoint": "native-mcp",
@@ -329,18 +450,43 @@
         },
         "native-chat": {
           "entryPoint": "native-chat",
-          "maxRawBytes": 3300,
-          "maxGzipBytes": 1550
+          "maxRawBytes": 3800,
+          "maxGzipBytes": 1750
         },
         "native-memory": {
           "entryPoint": "native-memory",
-          "maxRawBytes": 13800,
-          "maxGzipBytes": 5700
+          "maxRawBytes": 18300,
+          "maxGzipBytes": 7300
         },
         "native-fallback": {
           "entryPoint": "native-fallback",
           "maxRawBytes": 1000,
           "maxGzipBytes": 600
+        },
+        "chat-projection-cas": {
+          "entryPoint": "chat-projection-cas",
+          "maxRawBytes": 1250,
+          "maxGzipBytes": 650
+        },
+        "durable-journal": {
+          "entryPoint": "durable-journal",
+          "maxRawBytes": 6350,
+          "maxGzipBytes": 2500
+        },
+        "embed-accounting": {
+          "entryPoint": "embed-accounting",
+          "maxRawBytes": 1300,
+          "maxGzipBytes": 750
+        },
+        "memory-accounting": {
+          "entryPoint": "memory-accounting",
+          "maxRawBytes": 1300,
+          "maxGzipBytes": 750
+        },
+        "agent-run-v3-run": {
+          "entryPoint": "agent-run-v3-run",
+          "maxRawBytes": 62850,
+          "maxGzipBytes": 21850
         }
       }
     },
@@ -361,8 +507,8 @@
         "createInMemoryBudgetStore",
         "BudgetStoreError"
       ],
-      "maxRawBytes": 257500,
-      "maxGzipBytes": 80400,
+      "maxRawBytes": 266150,
+      "maxGzipBytes": 83750,
       "maxLazyRawBytes": 22500,
       "maxLazyGzipBytes": 8450,
       "legacyLazyEntryPoint": "resolve",
@@ -379,13 +525,13 @@
         },
         "memory-pipeline": {
           "entryPoint": "memory-pipeline",
-          "maxRawBytes": 11350,
-          "maxGzipBytes": 4750
+          "maxRawBytes": 13100,
+          "maxGzipBytes": 5400
         },
         "sdk-v2": {
           "entryPoint": "sdk-v2",
           "maxRawBytes": 13100,
-          "maxGzipBytes": 5300
+          "maxGzipBytes": 5600
         },
         "native-mcp": {
           "entryPoint": "native-mcp",
@@ -394,26 +540,46 @@
         },
         "native-chat": {
           "entryPoint": "native-chat",
-          "maxRawBytes": 3300,
-          "maxGzipBytes": 1550
+          "maxRawBytes": 3800,
+          "maxGzipBytes": 1750
         },
         "native-memory": {
           "entryPoint": "native-memory",
-          "maxRawBytes": 13800,
-          "maxGzipBytes": 5700
+          "maxRawBytes": 18300,
+          "maxGzipBytes": 7300
         },
         "native-fallback": {
           "entryPoint": "native-fallback",
           "maxRawBytes": 1000,
           "maxGzipBytes": 600
+        },
+        "chat-projection-cas": {
+          "entryPoint": "chat-projection-cas",
+          "maxRawBytes": 2300,
+          "maxGzipBytes": 1100
+        },
+        "embed-accounting": {
+          "entryPoint": "embed-accounting",
+          "maxRawBytes": 1300,
+          "maxGzipBytes": 750
+        },
+        "memory-accounting": {
+          "entryPoint": "memory-accounting",
+          "maxRawBytes": 1300,
+          "maxGzipBytes": 750
+        },
+        "agent-run-v3-run": {
+          "entryPoint": "agent-run-v3-run",
+          "maxRawBytes": 62500,
+          "maxGzipBytes": 21750
         }
       }
     },
     "native-swarm": {
       "from": "@deuz-sdk/core/swarm",
       "exports": ["createSwarm", "createInMemorySwarmStore", "SwarmConflictError"],
-      "maxRawBytes": 263500,
-      "maxGzipBytes": 82500,
+      "maxRawBytes": 269850,
+      "maxGzipBytes": 84750,
       "maxLazyRawBytes": 22500,
       "maxLazyGzipBytes": 8450,
       "legacyLazyEntryPoint": "resolve",
@@ -430,13 +596,13 @@
         },
         "memory-pipeline": {
           "entryPoint": "memory-pipeline",
-          "maxRawBytes": 11350,
-          "maxGzipBytes": 4750
+          "maxRawBytes": 13100,
+          "maxGzipBytes": 5400
         },
         "sdk-v2": {
           "entryPoint": "sdk-v2",
           "maxRawBytes": 13100,
-          "maxGzipBytes": 5300
+          "maxGzipBytes": 5600
         },
         "native-mcp": {
           "entryPoint": "native-mcp",
@@ -445,18 +611,38 @@
         },
         "native-chat": {
           "entryPoint": "native-chat",
-          "maxRawBytes": 3300,
-          "maxGzipBytes": 1550
+          "maxRawBytes": 3800,
+          "maxGzipBytes": 1750
         },
         "native-memory": {
           "entryPoint": "native-memory",
-          "maxRawBytes": 13800,
-          "maxGzipBytes": 5700
+          "maxRawBytes": 18300,
+          "maxGzipBytes": 7300
         },
         "native-fallback": {
           "entryPoint": "native-fallback",
           "maxRawBytes": 1000,
           "maxGzipBytes": 600
+        },
+        "chat-projection-cas": {
+          "entryPoint": "chat-projection-cas",
+          "maxRawBytes": 2300,
+          "maxGzipBytes": 1100
+        },
+        "embed-accounting": {
+          "entryPoint": "embed-accounting",
+          "maxRawBytes": 1300,
+          "maxGzipBytes": 750
+        },
+        "memory-accounting": {
+          "entryPoint": "memory-accounting",
+          "maxRawBytes": 1300,
+          "maxGzipBytes": 750
+        },
+        "agent-run-v3-run": {
+          "entryPoint": "agent-run-v3-run",
+          "maxRawBytes": 64450,
+          "maxGzipBytes": 22350
         }
       }
     },
@@ -489,8 +675,8 @@
         "applySearchReplace",
         "parseEvolveBlocks"
       ],
-      "maxRawBytes": 216000,
-      "maxGzipBytes": 68000,
+      "maxRawBytes": 214350,
+      "maxGzipBytes": 67550,
       "maxLazyRawBytes": 22500,
       "maxLazyGzipBytes": 8450,
       "legacyLazyEntryPoint": "resolve",
@@ -507,13 +693,23 @@
         },
         "memory-pipeline": {
           "entryPoint": "memory-pipeline",
-          "maxRawBytes": 11350,
-          "maxGzipBytes": 4750
+          "maxRawBytes": 12900,
+          "maxGzipBytes": 5350
         },
         "sdk-v2": {
           "entryPoint": "sdk-v2",
           "maxRawBytes": 13100,
           "maxGzipBytes": 5300
+        },
+        "embed-accounting": {
+          "entryPoint": "embed-accounting",
+          "maxRawBytes": 1300,
+          "maxGzipBytes": 750
+        },
+        "memory-accounting": {
+          "entryPoint": "memory-accounting",
+          "maxRawBytes": 1300,
+          "maxGzipBytes": 750
         }
       }
     },
@@ -533,8 +729,10 @@
         "toDeuzAgentStreamResponse",
         "agentStateFromParts"
       ],
-      "maxRawBytes": 18900,
-      "maxGzipBytes": 6700
+      "maxRawBytes": 22850,
+      "maxGzipBytes": 8350,
+      "maxLazyRawBytes": 15300,
+      "maxLazyGzipBytes": 5600
     },
     "otel": {
       "from": "@deuz-sdk/core/otel",
@@ -581,10 +779,10 @@
     "mcp-server": {
       "from": "@deuz-sdk/core/mcp/server",
       "exports": ["createMcpServer"],
-      "maxRawBytes": 17150,
+      "maxRawBytes": 18250,
       "maxGzipBytes": 6570,
-      "maxLazyRawBytes": 285000,
-      "maxLazyGzipBytes": 91200
+      "maxLazyRawBytes": 361500,
+      "maxLazyGzipBytes": 117050
     },
     "realtime": {
       "from": "@deuz-sdk/core/realtime",
@@ -618,8 +816,8 @@
         "createInMemoryGoalStore",
         "GoalError"
       ],
-      "maxRawBytes": 24700,
-      "maxGzipBytes": 7800
+      "maxRawBytes": 27300,
+      "maxGzipBytes": 8550
     },
     "batch": {
       "from": "@deuz-sdk/core/batch",
@@ -653,6 +851,115 @@
       ],
       "maxRawBytes": 50500,
       "maxGzipBytes": 16800
+    },
+    "skills": {
+      "from": "@deuz-sdk/core/skills",
+      "exports": [
+        "parseSkill",
+        "createSkillRegistry",
+        "renderSkillCatalog",
+        "lexicalMatcher",
+        "scopeToolsToSkill"
+      ],
+      "maxRawBytes": 5650,
+      "maxGzipBytes": 2500
+    },
+    "skills-node": {
+      "from": "@deuz-sdk/core/skills/node",
+      "exports": ["nodeSkillSource"],
+      "maxRawBytes": 5400,
+      "maxGzipBytes": 2350
+    },
+    "memory-versioned": {
+      "from": "@deuz-sdk/core/memory/versioned",
+      "exports": [
+        "createMemorySession",
+        "createVersionedMemoryTools",
+        "createInMemoryVersionedMemoryStore",
+        "importLegacyMemory"
+      ],
+      "maxRawBytes": 66500,
+      "maxGzipBytes": 21150
+    },
+    "context": {
+      "from": "@deuz-sdk/core/context",
+      "exports": [
+        "compileContext",
+        "createContextCompiler",
+        "createWorkingMemory",
+        "applyWorkingMemoryPatch",
+        "workingMemoryTools",
+        "createTokenEstimator"
+      ],
+      "maxRawBytes": 55100,
+      "maxGzipBytes": 19300
+    },
+    "goal-runtime": {
+      "from": "@deuz-sdk/core/goal/runtime",
+      "exports": [
+        "createGoalSupervisor",
+        "createDurableScheduler",
+        "createWebhookHandler",
+        "createInMemoryGoalRuntimeStore",
+        "verifyGoalAcceptance"
+      ],
+      "maxRawBytes": 132650,
+      "maxGzipBytes": 40600,
+      "maxLazyRawBytes": 344100,
+      "maxLazyGzipBytes": 110250
+    },
+    "skills-learning": {
+      "from": "@deuz-sdk/core/skills/learning",
+      "exports": ["proposeSkillFromRun"],
+      "maxRawBytes": 19750,
+      "maxGzipBytes": 7450,
+      "maxLazyRawBytes": 109650,
+      "maxLazyGzipBytes": 33300
+    },
+    "memory-versioned-sqlite": {
+      "from": "@deuz-sdk/core/memory/versioned/sqlite",
+      "exports": ["createSqliteVersionedMemoryStore"],
+      "platform": "node",
+      "maxRawBytes": 52350,
+      "maxGzipBytes": 16700
+    },
+    "memory-versioned-postgres": {
+      "from": "@deuz-sdk/core/memory/versioned/postgres",
+      "exports": ["createPostgresVersionedMemoryStore"],
+      "platform": "node",
+      "external": ["pg", "pg-native"],
+      "maxRawBytes": 53500,
+      "maxGzipBytes": 16950
+    },
+    "goal-runtime-sqlite": {
+      "from": "@deuz-sdk/core/goal/runtime/sqlite",
+      "exports": ["createSqliteGoalRuntimeStore"],
+      "platform": "node",
+      "maxRawBytes": 57500,
+      "maxGzipBytes": 15950
+    },
+    "goal-runtime-postgres": {
+      "from": "@deuz-sdk/core/goal/runtime/postgres",
+      "exports": ["createPostgresGoalRuntimeStore"],
+      "platform": "node",
+      "external": ["pg", "pg-native"],
+      "maxRawBytes": 59650,
+      "maxGzipBytes": 17000
+    },
+    "compute-docker": {
+      "from": "@deuz-sdk/core/compute/docker",
+      "exports": [
+        "createDockerSandbox",
+        "createDockerProcessRunner",
+        "createInMemoryProcessOperationStore",
+        "createSqliteProcessOperationStore",
+        "DockerSandboxError",
+        "OperationConflictError",
+        "DEFAULT_DOCKER_SANDBOX"
+      ],
+      "platform": "node",
+      "maxRawBytes": 72150,
+      "maxGzipBytes": 24650
     }
   }
 }

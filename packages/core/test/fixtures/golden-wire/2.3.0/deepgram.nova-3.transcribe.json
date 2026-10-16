@@ -1,0 +1,15 @@
+{
+  "scenario": "deepgram.nova-3.transcribe",
+  "recordedFrom": "2.3.0",
+  "requests": [
+    {
+      "method": "POST",
+      "url": "https://api.deepgram.com/v1/listen?model=nova-3&language=en&smart_format=true",
+      "headers": {
+        "authorization": "Token <secret>",
+        "content-type": "audio/mpeg"
+      },
+      "bodyBase64": "SUQzBAAAAAA="
+    }
+  ]
+}

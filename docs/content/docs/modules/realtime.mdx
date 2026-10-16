@@ -18,7 +18,7 @@ The module is edge-safe (Web APIs only — the runtime's `WebSocket`, `fetch`, `
 Neither wire has been exercised against the real OpenAI or Google endpoints. The message shapes were derived from the providers' official SDK type definitions (`openai` 7.32 and `@google/genai` 2.28), and the module is tested offline: a scripted fake socket drives every event mapping, and a second suite runs both wires through Node's real global `WebSocket` against a local RFC 6455 server. That proves the SDK **sends and parses what this page says**; it does not prove the providers still agree. Make one real call before you ship, and use [`providerOptions`](#provideroptions) or [`sendRaw`](#raw-escape-hatches) to correct a field without waiting for a release.
 </Callout>
 
-WebRTC is not covered (planned for 2.4); neither are Vertex AI's Live endpoint, OpenAI transcription-only or translation sessions, and SIP.
+WebRTC is not covered: the 2.3 notes planned it for 2.4, and it moved to the 2.5 targets ([Next: 2.5](/docs/reference/whats-new-2-4#next-25)). Neither are Vertex AI's Live endpoint, OpenAI transcription-only or translation sessions, and SIP.
 
 ## Run it offline
 

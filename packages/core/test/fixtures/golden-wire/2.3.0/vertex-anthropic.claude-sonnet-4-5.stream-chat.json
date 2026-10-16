@@ -1,0 +1,48 @@
+{
+  "scenario": "vertex-anthropic.claude-sonnet-4-5.stream-chat",
+  "recordedFrom": "2.3.0",
+  "requests": [
+    {
+      "method": "POST",
+      "url": "https://us-east5-aiplatform.googleapis.com/v1/projects/golden-project/locations/us-east5/publishers/anthropic/models/claude-sonnet-4-5:streamRawPredict",
+      "headers": {
+        "authorization": "Bearer <secret>",
+        "content-type": "application/json"
+      },
+      "json": {
+        "max_tokens": 64000,
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "What is 2 + 2?"
+              }
+            ]
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "text",
+                "text": "4"
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "And 3 + 3?"
+              }
+            ]
+          }
+        ],
+        "stream": true,
+        "anthropic_version": "vertex-2023-10-16"
+      }
+    }
+  ]
+}

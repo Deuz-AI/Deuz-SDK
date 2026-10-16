@@ -56,7 +56,7 @@ import { matchesScope } from '../memory';
 import type { AgentCheckpoint, SessionStore } from '../types/session';
 import type { RunRecord, RunStatus, RunStore } from '../types/runtime';
 import { serializeCheckpoint, deserializeCheckpoint, CheckpointVersionError } from '../durable';
-import { cosineSimilarity } from '../internal/vector';
+import { vectorHits, withoutStaleVector } from '../internal/memory-vectors';
 import { redisConnection } from './redis-scripts';
 
 // ===================================================================
@@ -523,11 +523,14 @@ export function createRedisStores(options: RedisStoreOptions): RedisStores {
       );
       let scored: MemoryHit[];
       if (query.embedding) {
-        const embedding = query.embedding;
-        scored = candidates.map((record) => ({
-          record,
-          score: record.embedding ? cosineSimilarity(embedding, record.embedding) : 0,
-        }));
+        // 2.4: only comparable vectors are ranked; the rest are found by text or not at all.
+        const needle = query.text?.toLowerCase() ?? '';
+        scored = vectorHits(
+          candidates,
+          query,
+          (record) => record.embedding,
+          (record) => record.text.toLowerCase().includes(needle),
+        );
       } else if (query.text) {
         const needle = query.text.toLowerCase();
         // Substring grep, non-matches DROPPED (the markdown store's rule) —
@@ -565,7 +568,8 @@ export function createRedisStores(options: RedisStoreOptions): RedisStores {
       if (!record) return;
       // Through `upsert`, never a bare `set`: a patch may move the scope, the
       // hash or the TTL, and those live in indexes the write has to reconcile.
-      await upsertRecords([{ ...record, ...patch }]);
+      // H6 (2.4): a new text without a new embedding leaves no stale vector behind.
+      await upsertRecords([{ ...withoutStaleVector(record, patch), ...patch }]);
     },
 
     async findByHash(hashes, scope) {
@@ -762,3 +766,7 @@ export function createRedisStores(options: RedisStoreOptions): RedisStores {
     close: connection.close,
   };
 }
+
+// 2.4 stores on this entry: their own modules and tables (W0 skeleton; W1 lanes
+// implement them in place, never in this file).
+export * from './stream-state-redis';

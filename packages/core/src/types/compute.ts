@@ -57,13 +57,24 @@ export interface CodeExecutionResult {
   artifacts?: ComputeArtifact[];
   /** Wall-clock duration in ms, when the backend measures it. */
   durationMs?: number;
+  /**
+   * Which streams the backend cut at its output limit (2.4): set when at
+   * least one was cut, absent otherwise. The Node sandbox keeps the head of a
+   * stream (`maxOutputBytes`), the Docker sandbox its tail.
+   */
+  truncated?: { stdout: boolean; stderr: boolean };
 }
 
 /** A request to run a shell command in the sandbox. */
 export interface ShellExecutionRequest {
   /** The command line to run (interpreted by the backend's shell). */
   command: string;
-  /** Working directory, relative to the sandbox root. */
+  /**
+   * Working directory, relative to the sandbox root. A path that leaves the
+   * root (`..`, an absolute path elsewhere, a symlink pointing out) is refused
+   * by the 2.4 Node and Docker sandboxes; before 2.4 the Node sandbox ran the
+   * command wherever the path pointed.
+   */
   cwd?: string;
   timeoutMs?: number;
   signal?: AbortSignal;

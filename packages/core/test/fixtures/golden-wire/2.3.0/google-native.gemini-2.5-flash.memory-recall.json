@@ -1,0 +1,49 @@
+{
+  "scenario": "google-native.gemini-2.5-flash.memory-recall",
+  "recordedFrom": "2.3.0",
+  "requests": [
+    {
+      "method": "POST",
+      "url": "https://api.openai.com/v1/embeddings",
+      "headers": {
+        "authorization": "Bearer <secret>",
+        "content-type": "application/json"
+      },
+      "json": {
+        "model": "text-embedding-3-small",
+        "input": ["What is the weather in Paris?"],
+        "encoding_format": "base64"
+      }
+    },
+    {
+      "method": "POST",
+      "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse",
+      "headers": {
+        "content-type": "application/json",
+        "x-goog-api-key": "<secret>"
+      },
+      "json": {
+        "contents": [
+          {
+            "role": "user",
+            "parts": [
+              {
+                "text": "What is the weather in Paris?"
+              }
+            ]
+          }
+        ],
+        "generationConfig": {
+          "maxOutputTokens": 64000
+        },
+        "systemInstruction": {
+          "parts": [
+            {
+              "text": "Relevant memories:\n- The user prefers temperatures in Celsius."
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

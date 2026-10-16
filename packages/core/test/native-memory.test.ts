@@ -229,7 +229,8 @@ describe('native memory: extraction', () => {
     // Nothing was written to memory before the run's outcome was durable.
     expect(sizes[terminal]).toBe(1);
     const settled = saves.at(-1)!.memory!.extraction!;
-    expect(settled).toEqual({ ...pending, status: 'completed', mutations: 1 });
+    // 2.4 (H5): the planned count, saved before the write, stays on the record.
+    expect(settled).toEqual({ ...pending, status: 'completed', mutations: 1, planned: 1 });
     expect(sizes.at(-1)).toBe(2);
     const written = (await memory.store.list({ userId: 'ada' })).find(
       (memoryRecord) => memoryRecord.text === 'prefers tea',

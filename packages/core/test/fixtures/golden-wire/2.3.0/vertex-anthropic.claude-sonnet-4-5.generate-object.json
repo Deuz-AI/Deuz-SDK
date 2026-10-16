@@ -1,0 +1,48 @@
+{
+  "scenario": "vertex-anthropic.claude-sonnet-4-5.generate-object",
+  "recordedFrom": "2.3.0",
+  "requests": [
+    {
+      "method": "POST",
+      "url": "https://us-east5-aiplatform.googleapis.com/v1/projects/golden-project/locations/us-east5/publishers/anthropic/models/claude-sonnet-4-5:streamRawPredict",
+      "headers": {
+        "authorization": "Bearer <secret>",
+        "content-type": "application/json"
+      },
+      "json": {
+        "max_tokens": 64000,
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "Report the weather in Paris."
+              }
+            ]
+          }
+        ],
+        "stream": true,
+        "output_config": {
+          "format": {
+            "type": "json_schema",
+            "schema": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string"
+                },
+                "tempC": {
+                  "type": "number"
+                }
+              },
+              "required": ["city", "tempC"],
+              "additionalProperties": false
+            }
+          }
+        },
+        "anthropic_version": "vertex-2023-10-16"
+      }
+    }
+  ]
+}

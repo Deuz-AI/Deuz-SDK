@@ -272,12 +272,10 @@ describe.skipIf(!hasSqlite)('sqlite store pack — vector search', () => {
     ]);
 
     const hits = await pack.memory.search({ scope: SCOPE, embedding: [1, 0, 0], topK: 4 });
-    expect(hits.map((h) => h.record.id).slice(0, 3)).toEqual(['near', 'mid', 'far']);
+    expect(hits.map((h) => h.record.id)).toEqual(['near', 'mid', 'far']);
     expect(hits[0]!.score).toBeCloseTo(1, 5);
     expect(hits[1]!.score).toBeCloseTo(0.6, 5); // float32 of 0.6/0.8, not float64
-    // A record with no vector scores 0 — it never outranks a real match.
-    expect(hits[3]!.record.id).toBe('novec');
-    expect(hits[3]!.score).toBe(0);
+    // 2.4: a record with no vector never fills the page at score 0 (2.3 did).
     await pack.close();
   });
 });
@@ -398,15 +396,12 @@ describe.skipIf(!hasSqlite)('sqlite store pack — lexical search (LIKE fallback
       text: 'Istanbul',
       topK: 3,
     });
-    // `both` wins both lists. `lex-only` is invisible to cosine but tops a SHORT
-    // lexical list, so RRF lifts it over `vec-only`, which only ever placed
-    // second on one list — that lift is the whole point of fusing ranks.
+    // `both` wins both lists. `lex-only` is invisible to cosine (no vector:
+    // 2.4 never ranks it there at score 0) but places on the lexical list, so
+    // fusing the ranks still brings it in beside `vec-only`, and the noise,
+    // on neither list, stays out.
     expect(hits[0]!.record.id).toBe('both');
-    const order = hits.map((h) => h.record.id);
-    expect(order.indexOf('lex-only')).toBeGreaterThanOrEqual(0);
-    expect(order.indexOf('lex-only')).toBeLessThan(
-      order.indexOf('vec-only') === -1 ? Number.MAX_SAFE_INTEGER : order.indexOf('vec-only'),
-    );
+    expect(hits.map((h) => h.record.id).sort()).toEqual(['both', 'lex-only', 'vec-only']);
     await pack.close();
   });
 });

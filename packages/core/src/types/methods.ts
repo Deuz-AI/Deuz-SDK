@@ -1,3 +1,4 @@
+import type { CallAccounting } from './accounting';
 import type { CommonCallOptions } from './config';
 import type { Usage, FinishReason } from './usage';
 import type { StreamPart } from './stream';
@@ -21,6 +22,8 @@ import type { MemoryMutation } from '../memory';
  * `unpriced-model` (2.3): the model has no price, so a USD budget could not be
  * applied to that call. The call still runs and token limits still apply; set
  * `unknownPrice: 'reject'` to refuse unpriced models instead.
+ *
+ * 2.4 adds five members; each is described on the union below.
  */
 export interface CallWarning {
   type:
@@ -29,6 +32,40 @@ export interface CallWarning {
     | 'unknown-model'
     | 'unsupported-tool'
     | 'unpriced-model'
+    /**
+     * 2.4: memory recall left out records whose stored vector does not match
+     * the current embedder (another dimension or `embeddingModelId`). They stay
+     * out of the vector ranking and are still found by text search. Reported
+     * once per mismatch, not once per record.
+     */
+    | 'embedding-mismatch'
+    /**
+     * 2.4: a call made for the run (a memory LLM callback, an embedder, a
+     * verifier) reported no usage. It is recorded as unaccounted, never as
+     * free; a strict budget (`unknownPrice: 'reject'`) requires an accounted
+     * adapter instead.
+     */
+    | 'unaccounted-usage'
+    /**
+     * 2.4: an optional context source (memory, RAG, transcript, skills) failed
+     * while the context was compiled, and the package was built without it. A
+     * required source that fails stops the model call instead.
+     */
+    | 'context-source-failed'
+    /**
+     * 2.4: the legacy resumable stream could not read from or write to its
+     * `StreamStateStore`. The frames still reach the client, but that leg is
+     * not journaled and cannot be replayed. A durable stream fails closed
+     * instead.
+     */
+    | 'stream-store-error'
+    /**
+     * 2.4: `reconcileAgentRun` found fewer records of an interrupted native
+     * memory extraction than it planned. The extraction is not marked
+     * completed (it stays `'failed'`, with `mutations` counting what was
+     * found), and the missing facts are not written.
+     */
+    | 'memory-extraction-partial'
     | 'other';
   /** The option that triggered it, when there is one (e.g. 'topP', 'effort'). */
   setting?: string;
@@ -299,6 +336,11 @@ export type EmbeddingTaskType =
 export interface EmbedOptions {
   model: EmbeddingModel;
   value: string;
+  /**
+   * Charge this embedding to a budget ledger (2.4). Without it the call is not accounted,
+   * exactly as in 2.3.
+   */
+  accounting?: CallAccounting;
   /** Matryoshka truncation (OpenAI `dimensions` / Gemini `outputDimensionality` / Voyage `output_dimension`). */
   dimensions?: number;
   taskType?: EmbeddingTaskType;

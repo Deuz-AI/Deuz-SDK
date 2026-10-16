@@ -3,6 +3,14 @@
  * JSX, no framework coupling; React is an OPTIONAL peer (^18 || ^19). SSR-safe:
  * network only runs inside user-triggered callbacks, never at render time.
  * Edge-lint applies here — ids come from a module counter, not crypto.
+ *
+ * DEPRECATED since 2.4, removal planned for 3.0: these hooks are frozen at
+ * their 1.x feature set. `@deuz-sdk/react` supersedes them (`useChat`,
+ * `useObject`, and everything added since: resume, client tools, snapshots).
+ * Behaviour is unchanged; a development build warns once per page.
+ *
+ * @deprecated Use `useChat` and `useObject` from `@deuz-sdk/react`. This
+ * subpath is removed in 3.0.
  */
 import { useCallback, useRef, useState } from 'react';
 import type { DeepPartial } from './types/methods';
@@ -14,8 +22,38 @@ import { readDeuzStream } from './ui';
 let nextUiId = 0;
 const genId = (): string => `deuz-ui-${nextUiId++}`;
 
+/**
+ * Whether this is a development build (2.4). Bundlers inline
+ * `process.env.NODE_ENV`, so a production build drops the warning below; a
+ * runtime without `process` (a browser without a bundler, an edge worker) is
+ * treated as production and stays silent.
+ */
+declare const process: { env: Record<string, string | undefined> } | undefined;
+function isDevelopment(): boolean {
+  try {
+    return process!.env.NODE_ENV !== 'production';
+  } catch {
+    return false;
+  }
+}
+
+/** Set once the deprecation warning was shown: once per page, not per render. */
+let deprecationWarned = false;
+
+/** The one-time deprecation warning (2.4), development builds only. */
+function warnDeprecated(): void {
+  if (deprecationWarned || !isDevelopment()) return;
+  deprecationWarned = true;
+  // eslint-disable-next-line no-restricted-syntax -- a dev-only, one-time deprecation notice has no deps to log through
+  console.warn(
+    '[deuz] `@deuz-sdk/core/react` is deprecated and will be removed in 3.0. ' +
+      'Use `useChat` / `useObject` from `@deuz-sdk/react` instead.',
+  );
+}
+
 // --- useObject ---
 
+/** @deprecated Use `UseObjectOptions` from `@deuz-sdk/react`; removed in 3.0. */
 export interface UseObjectOptions {
   /** Endpoint serving `toDeuzObjectStreamResponse` output. */
   api: string;
@@ -24,6 +62,7 @@ export interface UseObjectOptions {
   fetch?: typeof fetch;
 }
 
+/** @deprecated Use `UseObjectResult` from `@deuz-sdk/react`; removed in 3.0. */
 export interface UseObjectResult<T> {
   /** Latest partial (each `object-delta` replaces it wholesale). */
   object: DeepPartial<T> | undefined;
@@ -35,7 +74,14 @@ export interface UseObjectResult<T> {
   stop: () => void;
 }
 
+/**
+ * Streams a structured object from a `toDeuzObjectStreamResponse` route.
+ *
+ * @deprecated Use `useObject` from `@deuz-sdk/react`. This frozen hook is
+ * removed in 3.0; a development build warns once.
+ */
 export function useObject<T = unknown>(options: UseObjectOptions): UseObjectResult<T> {
+  warnDeprecated();
   const [object, setObject] = useState<DeepPartial<T> | undefined>(undefined);
   const [isLoading, setLoading] = useState(false);
   const [error, setError] = useState<Error | undefined>(undefined);
@@ -85,6 +131,7 @@ export function useObject<T = unknown>(options: UseObjectOptions): UseObjectResu
 
 // --- useChat ---
 
+/** @deprecated Use `UIToolCall` from `@deuz-sdk/react` (or `@deuz-sdk/core/chat`); removed in 3.0. */
 export interface UIToolCall {
   toolCallId: string;
   toolName: string;
@@ -95,7 +142,11 @@ export interface UIToolCall {
   state: 'call' | 'result' | 'approval-requested';
 }
 
-/** Render-friendly message. The canonical `Message[]` history is kept internally for POSTing. */
+/**
+ * Render-friendly message. The canonical `Message[]` history is kept internally for POSTing.
+ *
+ * @deprecated Use `UIMessage` from `@deuz-sdk/react` (or `@deuz-sdk/core/chat`); removed in 3.0.
+ */
 export interface UIMessage {
   id: string;
   role: 'user' | 'assistant';
@@ -104,6 +155,7 @@ export interface UIMessage {
   toolCalls?: UIToolCall[];
 }
 
+/** @deprecated Use `UseChatOptions` from `@deuz-sdk/react`; removed in 3.0. */
 export interface UseChatOptions {
   /** Endpoint serving `toDeuzStreamResponse` output. */
   api: string;
@@ -127,6 +179,7 @@ export interface UseChatOptions {
   fetch?: typeof fetch;
 }
 
+/** @deprecated Use `UseChatResult` from `@deuz-sdk/react`; removed in 3.0. */
 export interface UseChatResult {
   messages: UIMessage[];
   status: 'idle' | 'streaming' | 'error';
@@ -146,7 +199,14 @@ export interface UseChatResult {
   addToolApprovalResponse: (response: ToolApprovalResponse) => Promise<void>;
 }
 
+/**
+ * A chat over a `toDeuzStreamResponse` route, frozen at its 1.x feature set.
+ *
+ * @deprecated Use `useChat` from `@deuz-sdk/react`, which supersedes this
+ * hook. It is removed in 3.0; a development build warns once.
+ */
 export function useChat(options: UseChatOptions): UseChatResult {
+  warnDeprecated();
   const [messages, setMessages] = useState<UIMessage[]>([]);
   const [status, setStatus] = useState<'idle' | 'streaming' | 'error'>('idle');
   const [error, setError] = useState<Error | undefined>(undefined);
@@ -385,7 +445,10 @@ export function useChat(options: UseChatOptions): UseChatResult {
   };
 }
 
-/** @deprecated The hooks are live — use `useChat` directly. Kept for the locked export name. */
+/**
+ * @deprecated The hooks are live — use `useChat` directly. Kept for the locked
+ * export name; the whole subpath is removed in 3.0 (use `@deuz-sdk/react`).
+ */
 export function createUseChat(): typeof useChat {
   return useChat;
 }

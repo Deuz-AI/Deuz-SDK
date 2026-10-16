@@ -1187,15 +1187,33 @@ function uiPartsFromContent(content: string | Part[]): UIMessagePart[] {
  * Since 1.9 each message also carries the ordered `parts` projection (in
  * canonical array order — the same order the model produced), which is what
  * makes attachments visible and lets `canonicalFromUI` invert this faithfully.
+ *
+ * `options.messageIds` (2.4) are ids aligned with `messages`, as
+ * `ChatRecord.messageIds` holds them: the UI message made from `messages[i]`
+ * keeps `messageIds[i]`, so a reloaded chat renders under the ids the server
+ * stored. `generateId` covers a message without one (an empty or missing
+ * entry) and a repeat of an id an earlier message already kept.
  */
-export function uiFromMessages(messages: Message[], generateId: () => string): UIMessage[] {
+export function uiFromMessages(
+  messages: Message[],
+  generateId: () => string,
+  options?: { messageIds?: readonly string[] },
+): UIMessage[] {
   const ui: UIMessage[] = [];
-  for (const message of messages) {
+  const stored = options?.messageIds;
+  const taken = new Set<string>();
+  const idAt = (index: number): string => {
+    const id = stored?.[index];
+    if (typeof id !== 'string' || id === '' || taken.has(id)) return generateId();
+    taken.add(id);
+    return id;
+  };
+  for (const [index, message] of messages.entries()) {
     if (message.role === 'system') continue;
     if (message.role === 'user') {
       const ordered = uiPartsFromContent(message.content);
       ui.push({
-        id: generateId(),
+        id: idAt(index),
         role: 'user',
         content: textOf(message.content),
         ...(ordered.length > 0 ? { parts: ordered } : {}),
@@ -1225,7 +1243,7 @@ export function uiFromMessages(messages: Message[], generateId: () => string): U
         }));
       const ordered = uiPartsFromContent(message.content);
       ui.push({
-        id: generateId(),
+        id: idAt(index),
         role: 'assistant',
         content: textOf(message.content),
         ...(reasoning ? { reasoning } : {}),
@@ -1622,3 +1640,24 @@ export function deserializeChatRecord(json: string): ChatRecord {
  */
 export { validateChatRequest, parseDeuzChatRequest } from './chat-request';
 export type { DeuzChatRequest, ValidateChatOptions, ValidateChatResult } from './chat-request';
+
+// ===================================================================
+// Conditional chat and transcript search (2.4) — re-exported onto this subpath
+// ===================================================================
+
+export type * from './types/chat-conditional';
+export {
+  createInMemoryConditionalChatStore,
+  createInMemoryTranscriptIndex,
+  indexChat,
+  isConditionalChatStore,
+  updateConditionalChat,
+} from './chat-conditional';
+export type { InMemoryConditionalChatStoreOptions } from './chat-conditional';
+export { RevisionConflictError } from './errors';
+
+// ===================================================================
+// Chat snapshot (2.4) — type only; `@deuz-sdk/react` keeps an identical copy
+// ===================================================================
+
+export type { ChatSnapshotGateV1, ChatSnapshotV1 } from './types/chat-snapshot';

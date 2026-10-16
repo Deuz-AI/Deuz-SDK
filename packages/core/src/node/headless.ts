@@ -62,6 +62,7 @@ export type {
   ProjectInstructions,
   ProjectInstructionsOptions,
 } from '../headless/instructions';
+import type { AgentRunEnvelopeV3, AgentRunStoreV3 } from '../types/agent-run-v3';
 
 // Minimal node shapes; the `as string` specifiers keep tsup's dts builder from
 // statically resolving node: (matches node/observe.ts / node/compute.ts).
@@ -529,12 +530,16 @@ export async function resumeHeadless<T = string>(
  * whose effect is unknown; that is accurate only when no executor still drives
  * it. Rejects an unknown run ID with a TypeError.
  */
-export async function inspectRun(store: AgentRunStore, runId: string): Promise<HeadlessReport> {
-  const envelope = await store.load(runId);
+export async function inspectRun(
+  store: AgentRunStore | AgentRunStoreV3,
+  runId: string,
+): Promise<HeadlessReport> {
+  // 2.4: a V3 store works too; its record shares the fields the report reads.
+  const envelope = (await store.load(runId)) as AgentRunEnvelope | AgentRunEnvelopeV3 | undefined;
   if (!envelope) throw new TypeError(`Unknown native run: ${runId}`);
   if (envelope.kind !== 'deuz-agent-run' || envelope.runId !== runId)
     throw new TypeError(`Not a native run record: ${runId}`);
-  return reportFromEnvelope(envelope);
+  return reportFromEnvelope(envelope as AgentRunEnvelope);
 }
 
 /**

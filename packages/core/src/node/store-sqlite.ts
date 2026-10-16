@@ -21,11 +21,24 @@
 import type { ChatRecord, ChatStore } from '../chat';
 import { serializeChatRecord, deserializeChatRecord } from '../chat';
 import { serializeCheckpoint, deserializeCheckpoint, CheckpointVersionError } from '../durable';
-import type { MemoryHit, MemoryKind, MemoryRecord, MemoryScope, MemoryStore } from '../memory';
+import type {
+  MemoryHit,
+  MemoryKind,
+  MemoryQuery,
+  MemoryRecord,
+  MemoryScope,
+  MemoryStore,
+} from '../memory';
 import type { AgentCheckpoint, SessionStore } from '../types/session';
 import type { RunRecord, RunStore } from '../types/runtime';
-import { cosineSimilarity, decodeVector, encodeVector, rankFuse } from '../internal/vector';
-import { ensureBusyTimeout } from './sqlite-open';
+import { decodeVector, encodeVector, rankByVector, rankFuse } from '../internal/vector';
+import { reportEmbeddingMismatch, withoutStaleVector } from '../internal/memory-vectors';
+import {
+  createSqliteOpener,
+  createSqliteStatementCache,
+  sqliteTransaction,
+  sqliteUnavailableMessage,
+} from './sqlite-handle';
 
 // ===================================================================
 // The structural driver seam
@@ -83,14 +96,7 @@ export interface SqliteStores {
  * module, the flag that unlocks it on the ones that don't, and the escape hatch
  * that needs neither.
  */
-const UNAVAILABLE =
-  'createSqliteStores: node:sqlite is unavailable. It ships unflagged from Node 22.13 / 23.4; ' +
-  'on Node 22.5–22.12 run node with --experimental-sqlite, or pass options.database ' +
-  '(a better-sqlite3-compatible handle).';
-
-interface NodeSqliteModule {
-  DatabaseSync: new (path: string) => SqliteDatabaseLike;
-}
+const UNAVAILABLE = sqliteUnavailableMessage('createSqliteStores');
 
 // ===================================================================
 // Schema v1
@@ -416,26 +422,6 @@ interface SqliteHandle {
   transaction<T>(fn: () => T): T;
 }
 
-async function openDatabase(options: SqliteStoreOptions): Promise<SqliteDatabaseLike> {
-  if (options.database) return options.database;
-  let Database: NodeSqliteModule['DatabaseSync'] | undefined;
-  try {
-    // `as string` keeps tsup's dts builder from statically resolving the
-    // node: specifier (same trick as node/chat-store.ts). Reading the export
-    // happens INSIDE the try: a runtime that ships a stub module can throw on
-    // the property access rather than on the import, and both mean the same
-    // thing to the caller.
-    const mod = (await import('node:sqlite' as string)) as unknown as NodeSqliteModule;
-    if (typeof mod?.DatabaseSync === 'function') Database = mod.DatabaseSync;
-  } catch (err) {
-    throw new Error(UNAVAILABLE, { cause: err });
-  }
-  if (!Database) throw new Error(UNAVAILABLE);
-  // Deliberately outside the try — an unwritable path is a different problem
-  // and deserves SQLite's own message, not the version matrix.
-  return new Database(options.path);
-}
-
 function migrate(handle: SqliteHandle): void {
   const current = numberOf(handle.get('PRAGMA user_version')?.user_version) ?? 0;
   if (current >= SCHEMA_VERSION) return;
@@ -480,15 +466,8 @@ function setupFts(handle: SqliteHandle): boolean {
 }
 
 function createHandle(db: SqliteDatabaseLike): SqliteHandle {
-  const statements = new Map<string, SqliteStatementLike>();
-  const prepare = (sql: string): SqliteStatementLike => {
-    let statement = statements.get(sql);
-    if (!statement) {
-      statement = db.prepare(sql);
-      statements.set(sql, statement);
-    }
-    return statement;
-  };
+  const statement = createSqliteStatementCache();
+  const prepare = (sql: string): SqliteStatementLike => statement(db, sql);
   return {
     db,
     fts: false,
@@ -503,19 +482,8 @@ function createHandle(db: SqliteDatabaseLike): SqliteHandle {
       return numberOf((result as { changes?: unknown } | undefined)?.changes) ?? 0;
     },
     transaction(fn) {
-      db.exec('BEGIN');
-      try {
-        const value = fn();
-        db.exec('COMMIT');
-        return value;
-      } catch (err) {
-        try {
-          db.exec('ROLLBACK');
-        } catch {
-          /* the failure that got us here may already have unwound it */
-        }
-        throw err;
-      }
+      // A plain BEGIN: the pack's transactions take the write lock at their first write.
+      return sqliteTransaction(db, fn, 'deferred');
     },
   };
 }
@@ -537,30 +505,10 @@ function createHandle(db: SqliteDatabaseLike): SqliteHandle {
  * ```
  */
 export function createSqliteStores(options: SqliteStoreOptions): SqliteStores {
-  let opening: Promise<SqliteHandle> | undefined;
   let closed = false;
 
-  const open = async (): Promise<SqliteHandle> => {
-    const db = await openDatabase(options);
-    try {
-      return prepare(db);
-    } catch (error) {
-      // An injected handle stays open: the next call retries on it.
-      if (!options.database) db.close();
-      throw error;
-    }
-  };
-
   const prepare = (db: SqliteDatabaseLike): SqliteHandle => {
-    ensureBusyTimeout(db);
     const handle = createHandle(db);
-    if (options.path !== ':memory:' && options.wal !== false) {
-      try {
-        db.exec('PRAGMA journal_mode = WAL');
-      } catch {
-        /* a read-only mount / an injected in-memory handle keeps its journal */
-      }
-    }
     // REQUIRED for correctness, not tuning: `INSERT OR REPLACE` deletes the
     // conflicting row, and with recursive triggers OFF that delete does NOT
     // fire `deuz_memory_fts_ad`. The old rowid then lingers in the external-
@@ -580,16 +528,14 @@ export function createSqliteStores(options: SqliteStoreOptions): SqliteStores {
     return handle;
   };
 
-  const handle = (): Promise<SqliteHandle> => {
-    if (!opening) {
-      opening = open();
-      // A failed open must not poison the pack for the rest of the process.
-      opening.catch(() => {
-        opening = undefined;
-      });
-    }
-    return opening;
-  };
+  // Opens on first use, memoized. A failed open is retried by the next call,
+  // and an injected handle stays open when it fails. A WAL switch that fails
+  // keeps the journal: a read-only mount, an injected in-memory handle.
+  const handle = createSqliteOpener(options, {
+    setup: prepare,
+    unavailable: UNAVAILABLE,
+    walFailure: 'ignore',
+  });
 
   // --- memory ------------------------------------------------------
 
@@ -629,8 +575,14 @@ export function createSqliteStores(options: SqliteStoreOptions): SqliteStores {
    * A pure-SQL cosine would need a distance extension; a bounded prefetch
    * (`max(1000, topK * 50)`) keeps one round-trip and stays honest about being
    * an approximation on very large scopes.
+   *
+   * 2.4 (spec §2.2): only vectors comparable with the query's are ranked. A row
+   * without one, or with one of another length or `embeddingModelId`, is left
+   * out instead of scoring 0 (a hybrid query still finds it through the lexical
+   * list), and the mismatch is reported once through `onEmbeddingMismatch`.
    */
   const vectorSearch = async (
+    query: MemoryQuery,
     embedding: number[],
     where: { sql: string; params: SqlValue[] },
     topK: number,
@@ -641,17 +593,13 @@ export function createSqliteStores(options: SqliteStoreOptions): SqliteStores {
       `SELECT ${MEMORY_SELECT} FROM deuz_memory m WHERE ${where.sql} ORDER BY m.updated_at DESC, m.id ASC LIMIT ?`,
       [...where.params, Math.max(1000, topK * 50)],
     );
-    return rows
-      .map((row) => {
-        const record = hydrateMemory(row);
-        return {
-          record,
-          score: record.embedding ? cosineSimilarity(embedding, record.embedding) : 0,
-        };
-      })
-      .filter((hit) => keep(hit.record))
-      .sort((a, b) => b.score - a.score)
-      .slice(0, topK);
+    const ranking = rankByVector(
+      rows.map(hydrateMemory).filter(keep),
+      (record) => ({ vector: record.embedding, modelId: record.embeddingModelId }),
+      { vector: embedding, modelId: query.embeddingModelId },
+    );
+    reportEmbeddingMismatch({ ...query, embedding }, ranking.mismatched);
+    return ranking.ranked.slice(0, topK).map(({ item, score }) => ({ record: item, score }));
   };
 
   /**
@@ -766,14 +714,14 @@ export function createSqliteStores(options: SqliteStoreOptions): SqliteStores {
           .filter((hit) => keep(hit.record))
           .slice(0, topK);
       }
-      if (embedding && !text) return vectorSearch(embedding, where, topK, keep);
+      if (embedding && !text) return vectorSearch(query, embedding, where, topK, keep);
       if (text && !embedding) return lexicalSearch(text, where, topK, keep, scanFor(topK));
 
       // Hybrid: cosine and bm25 live on incomparable scales, so only their
       // RANKS are fused (RRF, k = 60) — the same merge `hybridRetrieve` uses.
       const window = Math.max(topK, 20);
       const [dense, lexical] = await Promise.all([
-        vectorSearch(embedding!, where, window, keep),
+        vectorSearch(query, embedding!, where, window, keep),
         lexicalSearch(text!, where, window, keep, scanFor(window)),
       ]);
       const byId = new Map<string, MemoryRecord>();
@@ -813,7 +761,7 @@ export function createSqliteStores(options: SqliteStoreOptions): SqliteStores {
       if (!existing) return;
       // Read-modify-write through the same upsert path: one statement, one
       // encoding of the record, no column-by-column UPDATE to keep in sync.
-      await memory.upsert([{ ...existing, ...patch, id }]);
+      await memory.upsert([{ ...withoutStaleVector(existing, patch), ...patch, id }]);
     },
 
     async findByHash(hashes, scope) {
@@ -1014,11 +962,11 @@ export function createSqliteStores(options: SqliteStoreOptions): SqliteStores {
     },
 
     async close() {
-      if (!opening || closed) return;
+      if (!handle.pending || closed) return;
       closed = true;
       let open: SqliteHandle;
       try {
-        open = await opening;
+        open = await handle.pending;
       } catch {
         return; // the handle never existed — nothing to release
       }
@@ -1026,3 +974,8 @@ export function createSqliteStores(options: SqliteStoreOptions): SqliteStores {
     },
   };
 }
+
+// 2.4 stores on this entry: their own modules and tables (W0 skeleton; W1 lanes
+// implement them in place, never in this file).
+export * from './chat-conditional-sqlite';
+export * from './stream-state-sqlite';

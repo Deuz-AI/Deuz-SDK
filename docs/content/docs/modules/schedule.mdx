@@ -1,6 +1,6 @@
 ---
 title: Schedules and signals
-description: Five-field UTC cron, a tick-driven scheduler with dedupe and catch-up, and verified GitHub, Slack and HMAC webhooks.
+description: Five-field cron in UTC or an IANA time zone, a tick-driven scheduler with dedupe and catch-up, verified GitHub, Slack and HMAC webhooks, and when to use the durable scheduler instead.
 ---
 
 `@deuz-sdk/core/schedule` starts work from two kinds of outside events: time
@@ -259,6 +259,61 @@ const stopped = scheduler.start({
 controller.abort();
 await stopped;
 ```
+
+## Time zones and the durable scheduler (2.4)
+
+`createScheduler` and the cron functions above stay UTC-only. 2.4 adds
+zone-aware cron reading to this subpath, with no dependency (zones come from
+`Intl`) and the same results whatever the host's own time zone is:
+
+```ts
+import { nextZonedOccurrence, timeZoneOffset, zonedOccurrencesBetween } from '@deuz-sdk/core/schedule';
+
+const newYork = { timezone: 'America/New_York' };
+const iso = (ms: number) => new Date(ms).toISOString();
+
+// 2026-03-08: New York skips 02:00-03:00. 'shift' (default) runs 02:30 at 03:00 EDT.
+const spring = zonedOccurrencesBetween('30 2 * * *', Date.parse('2026-03-07T12:00:00Z'), Date.parse('2026-03-09T12:00:00Z'), newYork);
+console.log(spring.map((o) => [iso(o.at), o.shifted ?? false]));
+// [ [ '2026-03-08T07:00:00.000Z', true ], [ '2026-03-09T06:30:00.000Z', false ] ]
+
+// 2026-11-01: 01:00-02:00 happens twice. 'both' runs 01:30 at each instant.
+const fall = zonedOccurrencesBetween('30 1 1 11 *', Date.parse('2026-10-31T12:00:00Z'), Date.parse('2026-11-01T12:00:00Z'), { ...newYork, dstOverlap: 'both' });
+console.log(fall.map((o) => [iso(o.at), o.repeated ?? false]));
+// [ [ '2026-11-01T05:30:00.000Z', false ], [ '2026-11-01T06:30:00.000Z', true ] ]
+
+console.log(iso(nextZonedOccurrence('0 9 * * MON-FRI', Date.parse('2026-10-16T12:00:00Z'), { timezone: 'Europe/Istanbul' })));
+// 2026-10-19T06:00:00.000Z (09:00 in Istanbul, UTC+3, no DST)
+console.log(timeZoneOffset('America/New_York', Date.parse('2026-07-01T00:00:00Z')) / 3_600_000); // -4
+```
+
+| Function | Returns |
+| --- | --- |
+| `zonedOccurrencesBetween(cron, fromMs, toMs, options?, limit = 1000)` | `{ at, wall, shifted?, repeated? }` for each UTC instant in `(fromMs, toMs]`, earliest first; `wall` is the matched local time read as UTC |
+| `nextZonedOccurrence(cron, afterMs, options?)` | The first UTC instant strictly after `afterMs` |
+| `timeZoneOffset(zone, atMs)` | The zone's wall clock minus UTC at that instant, in ms |
+| `assertTimeZone(zone)` | The zone, or a `TypeError` for an unknown one |
+
+`options` takes `timezone` (default `'UTC'`), `dstGap` (`'shift'`, the default,
+or `'skip'`) and `dstOverlap` (`'first'`, the default, or `'both'`); see
+[Time zones and DST](/docs/modules/goal-runtime#time-zones-and-dst).
+
+The durable scheduler in
+[`@deuz-sdk/core/goal/runtime`](/docs/modules/goal-runtime#durable-scheduler)
+uses these rules. It is a separate API, and `createScheduler` does not change:
+
+| | `createScheduler` (here) | `createDurableScheduler` (`/goal/runtime`) |
+| --- | --- | --- |
+| Time | UTC only | UTC or an IANA zone, with DST policies |
+| Cursor | In memory; a restart knows only `lookbackMs` | In the store, moved with the delivery in one transaction |
+| What it starts | Your `run` callback, after `claim(key)` | An event in a goal's inbox, which a goal supervisor applies |
+| A failed run | Keeps its claim and is not retried | The supervisor retries what the native run marks retryable |
+| Several processes | Safe only with a durable `claim` | Safe: each occurrence is delivered once |
+
+Use `createScheduler` for a cron trigger that calls a function, such as a
+digest or a [retention pass](/docs/modules/retention#a-retention-pass). Use
+`createDurableScheduler` when the work is a goal that must survive restarts,
+must not run twice and should be retried.
 
 ## Verify webhooks
 

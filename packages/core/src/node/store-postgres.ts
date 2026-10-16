@@ -61,7 +61,8 @@ import type { AgentCheckpoint, SessionStore } from '../types/session';
 import { serializeCheckpoint, deserializeCheckpoint } from '../durable';
 import type { RunRecord, RunStore } from '../types/runtime';
 import { InvalidRequestError } from '../errors';
-import { cosineSimilarity } from '../internal/vector';
+import { rankByVector } from '../internal/vector';
+import { comparableModels, dropsVector, reportEmbeddingMismatch } from '../internal/memory-vectors';
 import { retryPostgres, SCHEMA_RACE_CODES, SERIALIZATION_CODES } from './postgres-migrate';
 
 // ===================================================================
@@ -699,48 +700,71 @@ export function createPostgresStores(options: PostgresStoreOptions): PostgresSto
     };
 
     /**
-     * The rows a vector query would otherwise never see. Every other backend
-     * (in-memory reference, SQLite, Redis) SCORES an embedding-less record 0 and
-     * still returns it; restricting the candidate set to rows that happen to
-     * carry a vector makes the same query answer differently per backend and
-     * loses every text-only memory written before an embedder was wired up.
+     * 2.4 (spec §2.2): only vectors comparable with the query's are ranked. A
+     * row without one, or with one of another length or `embeddingModelId`,
+     * never fills the page at score 0 (2.3 topped a short page up with them):
+     * it is found by its text instead (ILIKE, score 1, the score a text query
+     * gives), and the mismatch is reported once through `onEmbeddingMismatch`.
      */
-    const unembedded = async (column: string, take: number): Promise<MemoryHit[]> => {
-      if (take <= 0) return [];
+    const models = comparableModels(query.embeddingModelId);
+    const textHits = async (extra: (bind: Binder) => string[]): Promise<MemoryHit[]> => {
+      if (!query.text?.trim()) return [];
       const bind = binder();
-      const where = [...conditions(bind), `${column} IS NULL`];
+      const where = [
+        ...conditions(bind),
+        ...extra(bind),
+        `text ILIKE ${bind.add(likePattern(query.text))}`,
+      ];
       const rows = await exec(
         `SELECT ${MEMORY_READ_COLUMNS} FROM ${table('deuz_memory')}${whereClause(where)} ` +
-          `ORDER BY updated_at DESC LIMIT ${bind.add(take)}`,
+          `ORDER BY updated_at DESC LIMIT ${bind.add(topK)}`,
         bind.params,
       );
-      return rows.map((row) => ({ record: rowToMemory(row), score: 0 }));
+      return rows.map((row) => ({ record: rowToMemory(row), score: 1 }));
     };
+    const best = (hits: MemoryHit[]): MemoryHit[] =>
+      hits.sort((a, b) => b.score - a.score).slice(0, topK);
 
-    // 1. pgvector: the index does the ranking.
+    // 1. pgvector: the index does the ranking. The column has ONE width, so a
+    //    query of another width compares with nothing.
     if (query.embedding && vectorEnabled) {
-      const bind = binder();
-      const vector = bind.add(toVectorLiteral(query.embedding));
-      const where = conditions(bind);
-      where.push('embedding IS NOT NULL');
-      const rows = await exec(
-        `SELECT ${MEMORY_READ_COLUMNS}, 1 - (embedding <=> ${vector}::vector) AS score ` +
-          `FROM ${table('deuz_memory')}${whereClause(where)} ` +
-          `ORDER BY embedding <=> ${vector}::vector LIMIT ${bind.add(topK)}`,
-        bind.params,
+      const sameWidth = query.embedding.length === dimensions;
+      let hits: MemoryHit[] = [];
+      if (sameWidth) {
+        const bind = binder();
+        const vector = bind.add(toVectorLiteral(query.embedding));
+        const where = conditions(bind);
+        where.push('embedding IS NOT NULL');
+        if (models)
+          where.push(
+            `(embedding_model_id IS NULL OR embedding_model_id = ANY(${bind.add(models)}))`,
+          );
+        const rows = await exec(
+          `SELECT ${MEMORY_READ_COLUMNS}, 1 - (embedding <=> ${vector}::vector) AS score ` +
+            `FROM ${table('deuz_memory')}${whereClause(where)} ` +
+            `ORDER BY embedding <=> ${vector}::vector LIMIT ${bind.add(topK)}`,
+          bind.params,
+        );
+        hits = rows.map((row) => ({ record: rowToMemory(row), score: toNumber(row['score']) }));
+      }
+      if (query.onEmbeddingMismatch && (!sameWidth || models)) {
+        const bind = binder();
+        const where = [...conditions(bind), 'embedding IS NOT NULL'];
+        if (sameWidth) where.push(`NOT (embedding_model_id = ANY(${bind.add(models)}))`);
+        const [row] = await exec(
+          `SELECT COUNT(*)::int AS n FROM ${table('deuz_memory')}${whereClause(where)}`,
+          bind.params,
+        );
+        reportEmbeddingMismatch(query, toNumber(row?.['n'] ?? 0));
+      }
+      const found = await textHits((bind) =>
+        !sameWidth
+          ? []
+          : models
+            ? [`(embedding IS NULL OR NOT (embedding_model_id = ANY(${bind.add(models)})))`]
+            : ['embedding IS NULL'],
       );
-      const hits = rows.map((row) => ({
-        record: rowToMemory(row),
-        score: toNumber(row['score']),
-      }));
-      // A score-0 row can only ever outrank a NEGATIVE cosine, so a full page
-      // whose worst hit is >= 0 is already the answer — which keeps the
-      // flagship HNSW path at ONE round-trip for real (non-negative) embeddings.
-      const worst = hits[hits.length - 1]?.score ?? 0;
-      if (hits.length >= topK && worst >= 0) return hits;
-      return [...hits, ...(await unembedded('embedding', topK))]
-        .sort((a, b) => b.score - a.score)
-        .slice(0, topK);
+      return best([...hits, ...found]);
     }
 
     // 2. No pgvector: pull the freshest candidates and rank them here.
@@ -752,16 +776,24 @@ export function createPostgresStores(options: PostgresStoreOptions): PostgresSto
           `${whereClause(where)} ORDER BY updated_at DESC LIMIT ${FALLBACK_CANDIDATE_LIMIT}`,
         bind.params,
       );
-      return rows
-        .map((row) => {
-          const vector = toFloatArray(row['embedding_json']);
-          return {
-            record: rowToMemory(row),
-            score: vector && vector.length > 0 ? cosineSimilarity(query.embedding!, vector) : 0,
-          };
-        })
-        .sort((a, b) => b.score - a.score)
-        .slice(0, topK);
+      const ranking = rankByVector(
+        rows.map((row) => ({
+          record: rowToMemory(row),
+          vector: toFloatArray(row['embedding_json']),
+        })),
+        (candidate) => ({ vector: candidate.vector, modelId: candidate.record.embeddingModelId }),
+        { vector: query.embedding, modelId: query.embeddingModelId },
+      );
+      reportEmbeddingMismatch(query, ranking.mismatched);
+      const hits: MemoryHit[] = ranking.ranked.map(({ item, score }) => ({
+        record: item.record,
+        score,
+      }));
+      const needle = query.text?.trim() ? query.text.toLowerCase() : undefined;
+      if (needle)
+        for (const { record } of ranking.excluded)
+          if (record.text.toLowerCase().includes(needle)) hits.push({ record, score: 1 });
+      return best(hits);
     }
 
     // 3. Keyword / plain scope listing.
@@ -815,6 +847,16 @@ export function createPostgresStores(options: PostgresStoreOptions): PostgresSto
      */
     async update(id, patch) {
       await ready();
+      // H6 (2.4): a new text without a new embedding leaves no stale vector
+      // behind. The read set has no vector, so the stored text decides.
+      let staleVector = 'embedding' in patch && patch.embedding === undefined;
+      if (!staleVector && patch.text !== undefined && !('embedding' in patch)) {
+        const [current] = await exec(`SELECT text FROM ${table('deuz_memory')} WHERE id = $1`, [
+          id,
+        ]);
+        staleVector =
+          current !== undefined && dropsVector({ text: String(current['text']) }, patch);
+      }
       const bind = binder([id]);
       const sets: string[] = [];
       const simple: [keyof MemoryRecord, string][] = [
@@ -847,6 +889,11 @@ export function createPostgresStores(options: PostgresStoreOptions): PostgresSto
         if (vectorEnabled) {
           sets.push(`embedding = ${bind.add(toVectorLiteral(patch.embedding))}::vector`);
         }
+      } else if (staleVector) {
+        sets.push(`embedding_json = ${bind.add(null)}`);
+        if (vectorEnabled) sets.push(`embedding = ${bind.add(null)}::vector`);
+        if (patch.embeddingModelId === undefined)
+          sets.push(`embedding_model_id = ${bind.add(null)}`);
       }
       if (sets.length === 0) return;
       await write(
@@ -1072,3 +1119,8 @@ export function createPostgresStores(options: PostgresStoreOptions): PostgresSto
     },
   };
 }
+
+// 2.4 stores on this entry: their own modules and tables (W0 skeleton; W1 lanes
+// implement them in place, never in this file).
+export * from './chat-conditional-postgres';
+export * from './stream-state-postgres';

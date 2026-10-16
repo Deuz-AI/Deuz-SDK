@@ -78,6 +78,7 @@ import {
   script,
   versionedClient,
 } from './redis-scripts';
+import { markAgentRunStoreBackend } from '../agent-run-v3';
 
 // The Redis budget store shares this Node-only subpath, as on SQLite and
 // Postgres: one import for every durable ops store on Redis.
@@ -687,5 +688,7 @@ export function createRedisOpsStore(options: RedisOpsStoreOptions): RedisOpsStor
     },
   );
 
+  // 2.4: V3 runs are not supported on Redis; assertAgentRunStoreV3 refuses this store.
+  markAgentRunStoreBackend(agentRuns, 'redis');
   return { leases, agentRuns, claims, close: connection.close };
 }

@@ -1,0 +1,20 @@
+{
+  "scenario": "image.gpt-image-1.generate-image",
+  "recordedFrom": "2.3.0",
+  "requests": [
+    {
+      "method": "POST",
+      "url": "https://api.openai.com/v1/images/generations",
+      "headers": {
+        "authorization": "Bearer <secret>",
+        "content-type": "application/json"
+      },
+      "json": {
+        "model": "gpt-image-1",
+        "prompt": "A lighthouse at dusk.",
+        "n": 1,
+        "size": "1024x1024"
+      }
+    }
+  ]
+}

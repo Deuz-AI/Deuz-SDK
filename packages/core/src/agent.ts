@@ -102,6 +102,10 @@ export {
   createInMemoryAgentRunStore,
 } from './agent-run';
 export type * from './types/agent-run';
+export { createInMemoryAgentRunStoreV3 } from './agent-run-v3-store';
+export type * from './types/agent-run-v3';
+export { UnsupportedStoreError } from './errors';
+export type * from './types/accounting';
 export {
   createExecutionContext,
   intersectExecutionPolicies,

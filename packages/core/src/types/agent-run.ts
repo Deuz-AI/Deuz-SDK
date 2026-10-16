@@ -13,7 +13,7 @@ import type { JSONSchema, StandardSchemaV1 } from './schema';
 import type { Tool, ToolApprovalRequest, ToolCall, ToolExecuteContext } from './tool';
 import type { BudgetTotals, ExecutionContextSnapshot, NativeExecutionContext } from './execution';
 import type { FinishReason } from './usage';
-import type { StopDetails } from './methods';
+import type { CallWarning, StopDetails } from './methods';
 import type { LeaseProvider } from './lease';
 import type { LanguageModel, ModelSurface } from './model';
 import type { Dependencies } from './deps';
@@ -354,8 +354,21 @@ export interface AgentRunMemoryExtraction {
   status: 'pending' | 'completed' | 'failed';
   /** Whether the pass infers facts with the memory LLM (`extract.infer`). */
   infer: boolean;
-  /** How many store mutations it applied, once completed. */
+  /**
+   * How many store mutations it applied, once completed. Before that (2.4),
+   * what is known to have landed: the deletions applied so far, or, after a
+   * reconciliation found the pass partial, every mutation it could confirm.
+   */
   mutations?: number;
+  /**
+   * How many store mutations the pass planned (2.4), saved before its first
+   * memory write. `reconcileAgentRun` settles an interrupted pass against it:
+   * it is completed only when every planned mutation is confirmed (records
+   * found under `operationId`, plus the deletions counted in `mutations`);
+   * otherwise it stays `'failed'` with a `memory-extraction-partial` warning.
+   * Absent on a record a 2.3 process wrote.
+   */
+  planned?: number;
   error?: { name: string; message: string; code?: string };
 }
 
@@ -747,9 +760,13 @@ export interface AgentRunReconcileOptions {
    */
   chat?: ChatPersistOptions;
   /**
-   * Settle an extraction the run left pending: when records of its operation
-   * already exist it is recorded completed without another memory LLM call;
-   * otherwise it runs now.
+   * Settle an extraction the run left pending (or that failed). A pass that
+   * saved its planned count (2.4, `AgentRunMemoryExtraction.planned`) is
+   * recorded completed when all of it is confirmed, and `'failed'` with a
+   * `memory-extraction-partial` warning when only part of it is; neither calls
+   * the memory LLM again. A pass with nothing confirmed runs now. A record a
+   * 2.3 process left is settled as before: completed when records of its
+   * operation exist, otherwise it runs now.
    */
   memory?: MemoryCallOptions;
   /**
@@ -776,4 +793,16 @@ export interface AgentRunReconciliation {
   chat?: AgentRunChatState['status'] | 'current';
   /** The extraction's state after the call; absent when the run has none. */
   memory?: AgentRunMemoryExtraction['status'];
+  /**
+   * What the call found and could not settle (2.4): a
+   * `memory-extraction-partial` warning when an interrupted extraction wrote
+   * only part of what it planned. Absent when there is nothing to report.
+   */
+  warnings?: CallWarning[];
+  /**
+   * V3 runs (2.4): the operation ids of the versioned-memory writes whose
+   * acknowledgment the call settled from the session's receipts. Absent when
+   * there were none.
+   */
+  memoryIntents?: string[];
 }

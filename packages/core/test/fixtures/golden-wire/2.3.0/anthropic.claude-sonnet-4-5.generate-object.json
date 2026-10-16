@@ -1,0 +1,49 @@
+{
+  "scenario": "anthropic.claude-sonnet-4-5.generate-object",
+  "recordedFrom": "2.3.0",
+  "requests": [
+    {
+      "method": "POST",
+      "url": "https://api.anthropic.com/v1/messages",
+      "headers": {
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+        "x-api-key": "<secret>"
+      },
+      "json": {
+        "model": "claude-sonnet-4-5",
+        "max_tokens": 64000,
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "Report the weather in Paris."
+              }
+            ]
+          }
+        ],
+        "stream": true,
+        "output_config": {
+          "format": {
+            "type": "json_schema",
+            "schema": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string"
+                },
+                "tempC": {
+                  "type": "number"
+                }
+              },
+              "required": ["city", "tempC"],
+              "additionalProperties": false
+            }
+          }
+        }
+      }
+    }
+  ]
+}

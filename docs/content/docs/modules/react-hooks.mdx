@@ -1,12 +1,12 @@
 ---
 title: React Hooks
-description: useChat and useObject from @deuz-sdk/react — ordered part rendering, writable state, multimodal input, client-tool round-trips and approval pauses.
+description: useChat and useObject from @deuz-sdk/react — ordered part rendering, writable state, multimodal input, client-tool round-trips, approval pauses, chat snapshots and the capability handshake.
 ---
 
-> **Import from `@deuz-sdk/react`.** The frozen `@deuz-sdk/core/react` subpath still works, but every feature since 1.7 lands in the package. The hooks bind the pure chat engine at [`@deuz-sdk/core/chat`](/docs/modules/chat-persistence) to React state; no business logic lives in them.
+> **Import from `@deuz-sdk/react`.** The `@deuz-sdk/core/react` subpath (`useChat`, `useObject`, `createUseChat` and their types) is deprecated since 2.4 and will be removed in 3.0. It still works, frozen at 2.2, and its behaviour is unchanged; a development build (`process.env.NODE_ENV !== 'production'`) logs one `console.warn` per page, while production builds and runtimes without `process` stay silent. Every feature since 1.7 lands in the package. The hooks bind the pure chat engine at [`@deuz-sdk/core/chat`](/docs/modules/chat-persistence) to React state; no business logic lives in them.
 
 <Callout type="warn" title="The 2.3 settlement fixes are not in `@deuz-sdk/core/react`">
-The frozen hook is unchanged, so it still has the bugs 2.3 fixed in `@deuz-sdk/react`. A verdict sent when nothing is pending still POSTs a new round and adds an empty assistant bubble, and a double click sends the continuation twice. It also drops the approval's signed `token`, so it cannot approve calls made with an `approvalSigner`. It has no `reconnect()`, and with no `onToolCall` it drops client tool calls instead of parking them. It sends no reasoning back and drops a tool call's provider metadata, so a Gemini 3 client-tool loop through it can fail with 400 (not live-verified). It cannot drive a [native agent route](#native-agent-routes) either: it does not read agent frames, so it never sends a run id back. `@deuz-sdk/core/react` stays frozen; fixes and new features ship in `@deuz-sdk/react` only. Migrate to `@deuz-sdk/react` for [verdict matching](#verdicts-answer-the-open-gate), [resumed client tools](#client-tools-after-a-reconnect) and native agent routes.
+The frozen hook is unchanged, so it still has the bugs 2.3 fixed in `@deuz-sdk/react`. A verdict sent when nothing is pending still POSTs a new round and adds an empty assistant bubble, and a double click sends the continuation twice. It also drops the approval's signed `token`, so it cannot approve calls made with an `approvalSigner`. It has no `reconnect()`, and with no `onToolCall` it drops client tool calls instead of parking them. It sends no reasoning back and drops a tool call's provider metadata, so a Gemini 3 client-tool loop through it can fail with 400 (not live-verified). It cannot drive a [native agent route](#native-agent-routes) either: it does not read agent frames, so it never sends a run id back. It has none of the 2.4 additions either: no `initialSnapshot`, `exportSnapshot` or capability handshake. `@deuz-sdk/core/react` stays frozen; fixes and new features ship in `@deuz-sdk/react` only. Migrate to `@deuz-sdk/react` for [verdict matching](#verdicts-answer-the-open-gate), [resumed client tools](#client-tools-after-a-reconnect), native agent routes and [snapshots](#snapshots-and-the-handshake-24).
 </Callout>
 
 **React is an optional peer** (`^18 || ^19`) — install it yourself; nothing else in the SDK depends on it. The hooks are plain TypeScript (no JSX) and SSR-safe: network runs only inside user-triggered callbacks, never at render time.
@@ -52,6 +52,8 @@ const {
   citations,
   plan,
   activity,
+  capabilities, // what the server announced in the handshake (2.4)
+  exportSnapshot, // () => ChatSnapshotV1: the chat as plain data (2.4)
 } = useChat({ api: '/api/chat' });
 ```
 
@@ -61,6 +63,7 @@ const {
 | --- | --- | --- |
 | `api` | `string` | Route returning [`toDeuzStreamResponse`](/docs/modules/ui-streaming) output. |
 | `initialMessages` | `Message[]` | Seed canonical history. **Read once at mount** — see the note below. |
+| `initialSnapshot` | `ChatSnapshotV1` | Restore a chat with its ids, cursor, open turn and gates (2.4). Read once at mount; takes precedence over `initialMessages`. See [Snapshots](#snapshots-and-the-handshake-24). |
 | `headers` / `body` | records | Merged into every request; `body` fields ride next to `messages`. |
 | `chatId` | `string` | Merged into every request body (server-side `ChatStore` persistence). |
 | `resume` | `UseChatResumeOptions` | `{ endpoint, auto?, lastEventId?, cursor? }` — see [Resuming](#resuming). |
@@ -71,6 +74,7 @@ const {
 | `onError` | `(error: Error) => void` | Called when the stream fails (state also carries the error). |
 | `onHttpError` | `'error-part' \| 'ignore'` | Default `'error-part'`: a non-2xx from `api` becomes `status: 'error'` instead of an empty bubble. Forwarded verbatim to `readDeuzStream`. |
 | `fetch` | `typeof fetch` | Injectable transport (tests, custom auth). |
+| `capabilityHandshake` | `boolean` | Default `true` (2.4): list what the hook understands in an `x-deuz-capabilities` header. `false` makes requests and behaviour exactly 2.3's. |
 
 <Callout title="`initialMessages` is read once, deliberately">
 It is not re-adopted when the prop changes: apps pass an inline array literal, so a new identity arrives on **every** render, and adopting it would reset the transcript continuously — mid-stream it would clobber the turn being folded. Switching chats or hydrating later is an explicit action: call `setHistory`. Same rule and remedy as React's own `useState`.
@@ -478,10 +482,83 @@ useChat({
 
 - **`auto`** fires `reconnect()` **once per mounted hook** — the canonical scenario resumability exists for (the user refreshes mid-generation) with zero app wiring. A ref guard survives React 18/19 StrictMode's deliberate mount → unmount → mount double-invoke.
 - **A failing automatic attempt is silent**: no `error`, no `status: 'error'`, no `onError`. The user did not ask for it, and every cold load of an app whose resume endpoint answers 404 would otherwise paint a permanent error. `reconnect()` called by hand keeps 1.8's exact error semantics.
-- **A caught-up endpoint is a no-op.** A resume that folds zero parts (an immediate `[DONE]`) changes nothing at all; 1.8 pre-pushed the assistant bubble before reading and left a permanently empty one on screen.
+- **A caught-up endpoint is a no-op.** A resume that folds zero parts (an immediate `[DONE]`) changes nothing at all; 1.8 pre-pushed the assistant bubble before reading and left a permanently empty one on screen. One exception (2.4): a continued in-flight turn that already got its `finish` settles there. Such a turn comes from a read that dropped between `finish` and `[DONE]` (continued over `durable-stream` or through `reconnect()`), or from a snapshot taken in that window and restored with `resume.auto`. Its answer joins `history.canonical`, and an approval or client-call leg opens its gate. This changes a 2.3 path: a manual `reconnect()` that finds the endpoint caught up used to do nothing for such a turn. A turn without its `finish` stays unsettled.
 - **`cursor` is an injectable adapter** — no `localStorage` is hardcoded (that would break SSR and React Native), and a throwing adapter cannot kill a live stream.
 - **A resumed turn settles like a streamed one** (2.3). Its approvals pause the chat, and its client calls reach `onToolCall` or `pendingToolCalls`; see [Client tools after a reconnect](#client-tools-after-a-reconnect). Under `auto` the read stays silent, but a POST it triggers (an `onToolCall` result continuing the chat) reports a failure like any other request.
-- **The cursor follows the POST read too (2.3).** When the POST response carries the journal's `id:` lines (the route passes `store` and `streamId`), they move the hook's in-memory cursor. A `reconnect()` after a settled turn, or after a leg the hook continued with a POST, then resumes after it and appends nothing the history already holds; a reconnect after a dropped POST continues that turn from the last part it showed. Before 2.3 the POST read left the cursor alone, so such a reconnect appended the replayed turn to the history a second time. The persisted cursor (`resume.cursor`) still moves on resume reads only, because a reload mid-turn must replay that turn from its start. `setHistory` and `setMessages` drop the in-memory cursor, so after a chat switch the new chat is read from its persisted cursor or its start. After a reload, a replay of a journal that also holds legs the restored history already has (a lost or old cursor) still appends them again: the restored history is all the hook knows. Let the resume endpoint answer 404 when nothing is in flight, and journal one run per `streamId`.
+- **The cursor follows the POST read too (2.3).** When the POST response carries the journal's `id:` lines (the route passes `store` and `streamId`), they move the hook's in-memory cursor. A `reconnect()` after a settled turn, or after a leg the hook continued with a POST, then resumes after it and appends nothing the history already holds; a reconnect after a dropped POST continues that turn from the last part it showed. Before 2.3 the POST read left the cursor alone, so such a reconnect appended the replayed turn to the history a second time. The persisted cursor (`resume.cursor`) still moves on resume reads only, because a reload mid-turn must replay that turn from its start. `setHistory` and `setMessages` drop the in-memory cursor, so after a chat switch the new chat is read from its persisted cursor or its start. After a reload, a replay of a journal that also holds legs the restored history already has (a lost or old cursor) still appends them again: the restored history is all the hook knows. Let the resume endpoint answer 404 when nothing is in flight, and journal one run per `streamId`. Since 2.4 a route that announces `message-ids` closes that gap: a replayed message whose id the history already holds is skipped (see [Snapshots and the handshake](#snapshots-and-the-handshake-24)).
+
+## Snapshots and the handshake (2.4)
+
+`exportSnapshot()` returns the chat as a `ChatSnapshotV1`, plain data you can
+persist with `JSON.stringify`: the canonical messages with the id each one
+renders under, the cursor, a turn still streaming, pending approvals with the
+verdicts already given, parked client calls with the results already given, a
+native run's gate, and the announced capabilities. It reads the latest state,
+not the last render. For a user bubble the id comes from `generateId`; for an
+assistant turn it is the stream's start `messageId`, the id a route stores. A
+tool or system message gets a generated id on its first export and keeps it,
+so every export names it the same. Fields with nothing to carry are left out.
+`initialSnapshot` restores all of it at mount.
+
+A chat stored server-side restores from its `ChatRecord` directly:
+
+```tsx
+import { useChat } from '@deuz-sdk/react';
+import type { ChatRecord } from '@deuz-sdk/core/chat';
+
+export function SavedChat({ record }: { record: ChatRecord }) {
+  const chat = useChat({
+    api: '/api/chat',
+    chatId: record.chatId,
+    // Each message renders under its stored id, so two equal texts stay two messages.
+    initialSnapshot: { version: 1, messages: record.messages, messageIds: record.messageIds },
+  });
+  return (
+    <ul>
+      {chat.messages.map((message) => (
+        <li key={message.id}>{message.content}</li>
+      ))}
+    </ul>
+  );
+}
+```
+
+A missing, empty or repeated id gets a fresh one from `generateId`. A snapshot
+whose `version` is not 1, or whose `messages`, `messageIds`,
+`pendingApprovals`, `pendingToolCalls` or `capabilities` is not an array,
+throws a `TypeError`. A restored turn continues from the snapshot's cursor on
+`reconnect()` or `resume.auto`, every frame once; without `resume` it is sealed.
+This also works against a 2.3 core: the hook applies the ids itself when
+`uiFromMessages` ignores its third argument. `setHistory` still drops gates and
+the cursor.
+
+With `capabilityHandshake` on (the default), every POST and every resume read
+to a URL endpoint sends `x-deuz-capabilities: chat-snapshot-v1, durable-stream,
+message-ids`. A function resume endpoint receives the same string as
+`ctx.capabilities`, to forward as the header or as `capabilities.request` to
+`resumeDeuzStreamResponse`. A 2.4 route that takes part answers in the response
+header and in a first `capabilities` frame, which the hook consumes: it never
+reaches the turn, `onData` or the transcript; a resume read that sends only
+that frame is still a silent no-op. `capabilities` on the result holds the
+announced set, sorted; it is absent until a response takes part (a 2.3 route
+never does) or a restored snapshot recorded one. Each announcing response
+replaces the set, a response that announces nothing leaves it, and a string the
+hook does not know is kept as it is. The hook uses a feature
+only while it is announced:
+
+| Capability | What the hook does |
+| --- | --- |
+| `message-ids` | A resume read that delivers again a message whose id the history holds skips that message's frames, so a replay after a lost cursor renders, appends and runs nothing twice; two messages with the same text and their own ids are both kept. A leg that continued the run on the same stream without a `start` of its own (an approval or client-result continuation) is skipped only while the history holds a later assistant message for it; otherwise it renders and settles as its own message. An error frame is never skipped |
+| `chat-snapshot-v1` | POST bodies gain `messageIds`, aligned with `messages` |
+| `durable-stream` | A POST read that drops before it ends continues from `resume.endpoint` instead of ending in `status: 'error'`; this needs `resume` and a read that already got event ids |
+
+Without an announcement all three stay off and request bodies are the 2.3
+bodies. A cross-origin `api` whose preflight lists allowed headers explicitly
+must add `x-deuz-capabilities`, or set `capabilityHandshake: false`; add
+`Access-Control-Expose-Headers: x-deuz-capabilities` to let the browser read
+the response header, otherwise the hook reads the first frame. The server side,
+durable streams and the full snapshot fields are on
+[Chat and stream durability](/docs/modules/chat-durability#the-capability-handshake).
 
 ## Truncated turns
 
@@ -545,6 +622,13 @@ export async function POST(req: Request): Promise<Response> {
   return toDeuzStreamResponse(result);
 }
 ```
+
+To take part in the [capability handshake](#snapshots-and-the-handshake-24),
+pass `capabilities: { request: req, announce: [DEUZ_CAPABILITY.messageIds,
+DEUZ_CAPABILITY.chatSnapshot] }` to `toDeuzStreamResponse` and to
+`resumeDeuzStreamResponse`, and store the `messageIds` the client posts as
+`ChatRecord.messageIds`; see
+[Chat and stream durability](/docs/modules/chat-durability#the-capability-handshake).
 
 ## See also
 

@@ -26,6 +26,7 @@ import {
 import { createMcpClient, type McpClientOptions, type McpRootsClient } from '../src/mcp/index';
 import { createMockModel } from '../src/testing';
 import { manualClock } from './fixtures/manual-clock';
+import { SLOW_TEST_TIMEOUT_MS } from './fixtures/timeouts';
 import { startV2TestServer, type V2TestServerHandle } from './helpers/mcp-v2-server';
 import { startTestMcpServer, type TestMcpServerHandle } from './helpers/mcp-http-server';
 
@@ -81,20 +82,26 @@ const ECHO = {
 };
 
 describe('v2 line ↔ a 2026-07-28 server — negotiation', () => {
-  it('negotiates 2026-07-28 by default and serves tools over it', async () => {
-    const server = v2Server({ tools: [ECHO], name: 'modern-tools', version: '3.1.0' });
-    const client = await connect(server);
+  it(
+    'negotiates 2026-07-28 by default and serves tools over it',
+    async () => {
+      const server = v2Server({ tools: [ECHO], name: 'modern-tools', version: '3.1.0' });
+      const client = await connect(server);
 
-    expect(client.protocolVersion?.()).toBe('2026-07-28');
-    expect(client.serverInfo?.()).toEqual({ name: 'modern-tools', version: '3.1.0' });
-    // The era was settled by the `server/discover` probe — no `initialize` at all.
-    expect(server.methods[0]).toBe('server/discover');
-    expect(server.methods).not.toContain('initialize');
+      expect(client.protocolVersion?.()).toBe('2026-07-28');
+      expect(client.serverInfo?.()).toEqual({ name: 'modern-tools', version: '3.1.0' });
+      // The era was settled by the `server/discover` probe — no `initialize` at all.
+      expect(server.methods[0]).toBe('server/discover');
+      expect(server.methods).not.toContain('initialize');
 
-    const tools = await client.listTools();
-    expect(tools.echo!.parameters).toEqual(ECHO.inputSchema); // verbatim, as on 2025-11-25
-    expect(await tools.echo!.execute!({ value: 'modern' }, TOOL_CTX)).toBe('echo:modern');
-  });
+      const tools = await client.listTools();
+      expect(tools.echo!.parameters).toEqual(ECHO.inputSchema); // verbatim, as on 2025-11-25
+      expect(await tools.echo!.execute!({ value: 'modern' }, TOOL_CTX)).toBe('echo:modern');
+      // The file's first handshake also pays for loading the v2 SDK; under a full run that
+      // passed the 5 s default.
+    },
+    SLOW_TEST_TIMEOUT_MS,
+  );
 
   it("versionNegotiation: 'legacy' keeps the 2025-11-25 handshake against the same server", async () => {
     const server = v2Server({ tools: [ECHO] });

@@ -1,0 +1,17 @@
+{
+  "name": "@deuz-examples/23-docker-runner",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "The local Docker sandbox and the reconnectable process runner on a pinned alpine image: isolation defaults, a durable start, artifacts, a reconnect after a restart, cancel and reconcile. Prints a skip message when Docker is not available.",
+  "scripts": {
+    "dev": "node --experimental-strip-types index.ts",
+    "start": "node --experimental-strip-types index.ts"
+  },
+  "dependencies": {
+    "@deuz-sdk/core": "^2.4.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0"
+  }
+}

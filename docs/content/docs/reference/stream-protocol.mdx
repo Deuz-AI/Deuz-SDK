@@ -95,4 +95,42 @@ See [Native agent runs](/docs/modules/ui-streaming#native-agent-runs-todeuzagent
 
 The 2.3 wire fields are pinned by `test/ui-display.test.ts`, `test/chat-reasoning.test.ts`, `test/ui-text-signature.test.ts` and `test/ui-agent.test.ts` in `packages/core`.
 
+### Additive parts in 2.4
+
+2.4 adds no member to `StreamPart` and one to `DeuzUIPart`, and new values of the open `CallWarning['type']` union. With none of the 2.4 options set, and for every request that does not ask for the handshake, the wire is what 2.3 sent, byte for byte.
+
+| Wire frame | Source | Wire versions | Notes |
+| --- | --- | --- | --- |
+| `capabilities` | The serializer, when the route passes `capabilities` and the request asked for the handshake | v2 only | `{ type: 'capabilities', capabilities: string[] }`, the same list as the `x-deuz-capabilities` response header. The first frame of the response, with no `id:` line, never journaled and never replayed as a stored frame. `applyUIPart` ignores it; `useChat` reads it. See [the capability handshake](#the-capability-handshake-24). |
+| `warning.warning.type: 'stream-store-error'` | The serializer, when a legacy `StreamStateStore` fails (H1, H2) | v2 only | The frames still reach the client, but that response is no longer journaled and cannot be resumed. The store's own error goes to `onStoreError` only, never to the client. |
+| `warning.warning.type: 'embedding-mismatch'`, `'unaccounted-usage'`, `'context-source-failed'`, `'memory-extraction-partial'` | `WarningPart.warning` | v2 only | New values of the open union. A run that reports one on its stream sends it as a `warning` frame like any other warning. |
+
+A native V3 run's `eventsV3` (`context`, `working-memory` and `memory-intent`) are not serialized: `toDeuzAgentStreamResponse` frames an `AgentStreamV3` as it frames an `AgentStream`, so compiled context, retrieval results and memory intents never reach the UI wire.
+
+The frozen `@deuz-sdk/core/react` hook ignores the 2.3 and 2.4 additions and is deprecated in favour of `@deuz-sdk/react`; it will be removed in 3.0.
+
+### The capability handshake (2.4)
+
+The handshake tells a 2.4 client which chat and stream features the route behind it supports. It is separate from the v1/v2 negotiation and does not change it.
+
+1. A client lists what it understands in the `x-deuz-capabilities` request header. `useChat` sends `chat-snapshot-v1, durable-stream, message-ids` on every POST and on a resume read from a URL endpoint, unless `capabilityHandshake: false`.
+2. A route that passes `capabilities: { request, announce }` to `toDeuzStreamResponse`, `toDeuzObjectStreamResponse`, `toDeuzAgentStreamResponse`, `createDeuzStream` or `resumeDeuzStreamResponse` answers a request that listed anything with the same response header, on any wire version, and on v2 with the first `capabilities` frame. The list is `announce` plus what the serializer knows itself: `durable-stream` for a durable response, or for a resume over a `DurableStreamStateStore`. Values are lower-case tokens, each once, sorted and joined by `', '`; another value throws a `TypeError` when the response is built.
+3. A request without the header, which is every 2.3 client, gets no header and no frame.
+4. The client uses a feature only once the server announced it.
+
+| Capability | `DEUZ_CAPABILITY` key | What the route promises |
+| --- | --- | --- |
+| `message-ids` | `messageIds` | Every stored message reaches the UI with its stable id (`ChatRecord.messageIds`), so a client dedupes a replay by id |
+| `chat-snapshot-v1` | `chatSnapshot` | The route accepts the `messageIds` a client sends with `messages`, aligned with them, and stores them as `ChatRecord.messageIds` |
+| `durable-stream` | `durableStream` | Frames are committed to a `DurableStreamStateStore` before they are sent, so a replay from `Last-Event-ID` has no gap and repeats no frame |
+| `conditional-chat` | `conditionalChat` | Chat writes are compare-and-set on a revision (`ConditionalChatStore`) |
+
+`parseDeuzCapabilities(source)` reads the set from a `Request`, `Response`, `Headers` or header value, and `formatDeuzCapabilities` builds a header value. A browser reads a cross-origin response header only when the server exposes it with `Access-Control-Expose-Headers`; otherwise the client reads the first frame.
+
+### Durable responses (2.4, preview)
+
+A response with `durable: { store, lease }` and a `streamId` keeps the 2.3 frame format, `id:` numbering and replay through `resumeDeuzStreamResponse`. What changes is the order: each frame is committed to the `DurableStreamStateStore` before it is sent, in batches (20 ms or 16 KiB by default), by one producer fenced by its lease token under `stream:<streamId>`. When the producer is fenced off, the stored log moved past it, or the store fails, the response sends nothing it did not commit, ends with a redacted `error` frame without an event id and without `[DONE]`, and hands a thrown store error to `onStoreError`. A client that reconnects to the resume endpoint gets every committed frame once, in order.
+
+The 2.4 wire behaviour is pinned by `test/ui-capabilities.test.ts`, `test/internal-capabilities.test.ts`, `test/ui-durable.test.ts` and `test/stream-durable-store.test.ts` in `packages/core`.
+
 Run the focused protocol suite with `npm run test:protocol`.

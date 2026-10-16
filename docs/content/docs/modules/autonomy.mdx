@@ -42,9 +42,11 @@ const tools = {
 
 A thrown run becomes a self-healing `is_error` result the loop feeds back, so the model can switch strategy (Python fails → shell) — the CodeAct self-correction loop.
 
-`runCode` and `runShell` take an optional `stdin`, written as UTF-8 and then closed; without it the process reads EOF at once, so `sort`, `cat` or a script that reads stdin finishes instead of waiting out the timeout. There is no interactive input. A timeout or abort returns `timedOut: true`; `createNodeSandbox` settles within about half a second of the kill even if a program the command started still holds the output, but it does not kill that program.
+`runCode` and `runShell` take an optional `stdin`, written as UTF-8 and then closed; without it the process reads EOF at once, so `sort`, `cat` or a script that reads stdin finishes instead of waiting out the timeout. There is no interactive input. A timeout or abort returns `timedOut: true` with `exitCode: null`. Since 2.4, `createNodeSandbox` kills the whole process tree (the process group on POSIX, `taskkill /T /F` on Windows), spawns children with `windowsHide`, and settles within about half a second of the kill even if a program that escaped the tree still holds the output.
 
-> **`createNodeSandbox` is a reference, not a security sandbox** — it runs code as a child process of the host. For untrusted input or production, back `ComputeSandbox` with real isolation (Docker, E2B, Daytona, Fly Machines, a microVM). The seam is identical; only the backend changes. Approval gates *whether* a call runs, not *what it can reach*.
+`runShell`'s `cwd` is confined to the sandbox root, `options.cwd` or else the host's working directory (2.4, a behaviour change): a relative path resolves against the root, and `..`, an absolute path elsewhere, a symlink or junction pointing out, or a missing directory is refused with `exitCode: null` and the reason in `stderr`, without running anything. When a stream passes `maxOutputBytes`, the result's `truncated: { stdout, stderr }` (2.4) says which one was cut.
+
+> **`createNodeSandbox` is a reference, not a security sandbox** — it runs code as a child process of the host. For untrusted input or production, back `ComputeSandbox` with real isolation. [`createDockerSandbox`](/docs/modules/docker) (2.4, preview) is the built-in option: local Linux containers with no network, a non-root user and resource limits. E2B, Daytona, Fly Machines or a microVM fit the same seam; only the backend changes. Approval gates *whether* a call runs, not *what it can reach*.
 
 ## Planner → Executor → Verifier
 

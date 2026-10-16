@@ -12,9 +12,13 @@ and [swarm scheduler](/docs/modules/swarm), since 2.2 the
 [evolve](/docs/modules/evolve) and [schedule](/docs/modules/schedule) modules,
 and since 2.3 the [MCP server](/docs/modules/mcp-server), [A2A](/docs/modules/a2a),
 [realtime](/docs/modules/realtime), [batch](/docs/modules/batch),
-[goal](/docs/modules/goals) and [headless](/docs/modules/headless) modules.
-Existing generation APIs remain available. See
-[What is new in 2.3](/docs/reference/whats-new-2-3) for upgrade notes.
+[goal](/docs/modules/goals) and [headless](/docs/modules/headless) modules,
+and since 2.4 [versioned memory](/docs/modules/versioned-memory), the
+[context compiler](/docs/modules/context), the
+[goal runtime](/docs/modules/goal-runtime) and the
+[Docker runner](/docs/modules/docker) (a preview). Existing generation APIs
+remain available. See [What is new in 2.4](/docs/reference/whats-new-2-4) for
+upgrade notes.
 
 ## Install
 
@@ -77,7 +81,7 @@ Install a peer only when you reach for the feature in its row. The last column i
 | `unpdf`                                                                                                | PDF parsing in [`/rag/node`](/docs/modules/rag)                                                                                                                                                 | **Raw module-resolution error** (`ERR_MODULE_NOT_FOUND`) at first parse — the parsers import the peer directly, so the message is your runtime's, not ours.                                         |
 | `mammoth`                                                                                              | DOCX parsing in `/rag/node`                                                                                                                                                                     | Same — raw `ERR_MODULE_NOT_FOUND`.                                                                                                                                                                  |
 | `xlsx`                                                                                                 | XLSX parsing in `/rag/node`                                                                                                                                                                     | Same — raw `ERR_MODULE_NOT_FOUND`.                                                                                                                                                                  |
-| `react`                                                                                                | [`@deuz-sdk/core/react`](/docs/modules/react-hooks) (frozen legacy hooks)                                                                                                                       | You would not import it without React. Prefer the separate `@deuz-sdk/react` package for new work.                                                                                                  |
+| `react`                                                                                                | [`@deuz-sdk/core/react`](/docs/modules/react-hooks) (deprecated in 2.4, removed in 3.0)                                                                                                                       | You would not import it without React. Prefer the separate `@deuz-sdk/react` package for new work.                                                                                                  |
 
 ```bash title="schema-typed generateObject"
 npm install zod @standard-community/standard-json
@@ -180,7 +184,7 @@ Capabilities use separate subpaths as part of the tree-shaking contract. Every s
 | `@deuz-sdk/core/rag` · `/rag/node`                                    | MIME sniff, chunkers, BM25 + RRF hybrid retrieval; the Node half adds PDF/DOCX/XLSX          |
 | `@deuz-sdk/core/stores/sqlite` · `/stores/redis` · `/stores/postgres` | You want memory / chats / sessions / runs in a real database instead of memory (2.0)         |
 | `@deuz-sdk/core/ui`                                                   | The versioned Deuz UI wire: `toDeuzStreamResponse` (server) + `readDeuzStream` (client); native runs through `toDeuzAgentStreamResponse` (2.3) |
-| `@deuz-sdk/core/react`                                                | Frozen legacy React hooks — prefer `@deuz-sdk/react` for new work                            |
+| `@deuz-sdk/core/react`                                                | Deprecated (2.4), removed in 3.0: frozen legacy React hooks; a development build warns once. Use `@deuz-sdk/react`                            |
 | `@deuz-sdk/core/observe` · `/observe/node`                            | Local observers, run summaries; the Node half is a bounded JSONL sink                        |
 | `@deuz-sdk/core/otel`                                                 | You already run OpenTelemetry and want spans + events to land there                          |
 | `@deuz-sdk/core/image` · `/midjourney`                                | Synchronous OpenAI-compatible image generation; Midjourney's async submit/poll/action        |
@@ -263,7 +267,7 @@ const { generateText } = require('@deuz-sdk/core');
 
 ## Next steps
 
-- [What is new in 2.3](/docs/reference/whats-new-2-3) — release scope, upgrade notes and known limits.
+- [What is new in 2.4](/docs/reference/whats-new-2-4) — release scope, upgrade notes and known limits.
 - [Native agents](/docs/modules/native-agents) and [Swarm](/docs/modules/swarm) — opt-in validated runs and durable DAG scheduling.
 - [streamChat](/docs/core/stream-chat) — the synchronous, never-throws streaming entry point.
 - [generateText](/docs/core/generate-text) — buffered text plus the agentic tool loop.

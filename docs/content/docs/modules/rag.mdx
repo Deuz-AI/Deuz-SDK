@@ -388,6 +388,80 @@ export async function ragOnEdge(bytes: Uint8Array, question: string, embedder: E
 }
 ```
 
+## Token counting and accounting (2.4)
+
+**Counting.** The chunkers can count through the shared token estimator of
+[`@deuz-sdk/core/context`](/docs/modules/context#counting-tokens):
+`ChunkOptions.estimator` (used when `countTokens` is absent),
+`estimateTokens(text, estimator)` and `countTokensWith(estimator)`, which
+returns a `CountTokens`. The default stays `approxCountTokens` (about 4
+characters per token), so 2.3 chunk boundaries do not move.
+
+**Accounting.** `indexChunks`, `retrieve` and `hybridRetrieve` take
+`{ accounting?, onWarning? }` (the third argument of `indexChunks` is new).
+With `accounting: { execution, requestId, kind?, tokens?, usd? }`, each
+embedding call is reserved on that execution context before it runs: kind
+`'embedding'` by default, `tokens` the shared estimate of the inputs, unpriced
+unless you give `usd`. Then:
+
+- an accounted embedder (`accounted: true`, answering `{ vectors, usage,
+  modelId }`) settles the reservation with the usage it reports;
+  `defineAccountedEmbedder({ embed, dims })` from `@deuz-sdk/core/rag` marks
+  one (a `TypeError` without `embed` or `dims`);
+- a plain embedder (bare vectors) leaves the reservation `unknown` at its
+  estimate and reports one `unaccounted-usage` warning through `onWarning`;
+- a failed call is marked `unknown` (it may have been billed) and the error is
+  rethrown.
+
+Without `accounting`, nothing is charged, as in 2.3. Inside a V3 run, the RAG
+context source passes its `retrieve` a fourth `charge` argument with the run's
+accounting; spread it into these options
+(`hybridRetrieve(q, deps, { topK, ...charge })`) and the query embedding
+reaches the run's ledger and the goal supervisor's watermark. See
+[Context compiler](/docs/modules/context#sources).
+
+```ts
+import { createExecutionContext } from '@deuz-sdk/core/agent';
+import { createMemoryVectorStore, indexChunks, retrieve } from '@deuz-sdk/core/rag';
+import type { CallWarning } from '@deuz-sdk/core';
+
+const vectorOf = (text: string) => [text.length % 7, text.includes('deploy') ? 1 : 0, 1];
+const store = createMemoryVectorStore();
+const execution = createExecutionContext({ budget: { tokens: 10_000 } });
+const warnings: CallWarning[] = [];
+
+// An embedder that reports its usage: `accounted: true`, and vectors with usage and modelId.
+const accounted = {
+  dims: 3,
+  accounted: true as const,
+  async embed(texts: string[]) {
+    const usage = { inputTokens: 12, outputTokens: 0, reasoningTokens: 0, cachedReadTokens: 0, cacheWriteTokens: 0, cacheWrite1hTokens: 0, totalTokens: 12 };
+    return { vectors: texts.map(vectorOf), usage, modelId: 'text-embedding-3-small' };
+  },
+};
+await indexChunks(
+  [{ text: 'Every deploy needs a green CI run.', index: 0 }],
+  { embedder: accounted, store },
+  { accounting: { execution, requestId: 'index-1' } },
+);
+
+// A plain embedder (bare vectors) is charged at its estimate and reported as unaccounted.
+const plain = { dims: 3, embed: async (texts: string[]) => texts.map(vectorOf) };
+const hits = await retrieve('How do I deploy?', { embedder: plain, store }, {
+  accounting: { execution, requestId: 'query-1' },
+  onWarning: (warning) => warnings.push(warning),
+});
+console.log(hits.length, warnings.map((w) => w.type)); // 1 [ 'unaccounted-usage' ]
+const totals = execution.ledger.totals();
+console.log(totals.spent.tokens, totals.reserved.tokens, totals.unaccounted); // 12 5 1: the query's estimate stays held
+```
+
+An embedder over `embedMany` becomes accounted by returning what it already
+gets back: `{ vectors: embeddings, usage, modelId }`. The reservation names the
+embedder's `modelId` property when it has one, else `'rag-embedder'`. Under a
+budget with `unknownPrice: 'reject'` a plain embedder is refused before it
+runs; see [Unaccounted calls](/docs/modules/budgets#unaccounted-calls-24).
+
 ## See also
 
 - [Embeddings](/docs/core/embeddings) — `embed` / `embedMany` and the `EmbeddingModel` kind.

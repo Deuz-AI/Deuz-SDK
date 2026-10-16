@@ -1,0 +1,41 @@
+{
+  "scenario": "openai-responses.gpt-5.4.reasoning-replay",
+  "recordedFrom": "2.3.0",
+  "requests": [
+    {
+      "method": "POST",
+      "url": "https://api.openai.com/v1/responses",
+      "headers": {
+        "authorization": "Bearer <secret>",
+        "content-type": "application/json"
+      },
+      "json": {
+        "model": "gpt-5.4",
+        "input": [
+          {
+            "role": "user",
+            "content": "Where should I travel?"
+          },
+          {
+            "type": "reasoning",
+            "id": "rs_golden",
+            "encrypted_content": "b3BhcXVl",
+            "summary": []
+          },
+          {
+            "role": "assistant",
+            "content": "Paris."
+          },
+          {
+            "role": "user",
+            "content": "Why?"
+          }
+        ],
+        "stream": true,
+        "max_output_tokens": 128000,
+        "store": false,
+        "include": ["reasoning.encrypted_content"]
+      }
+    }
+  ]
+}

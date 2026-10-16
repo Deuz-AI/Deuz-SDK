@@ -374,3 +374,230 @@ export class ToolExecutionError extends DeuzError {
     this.toolCallId = options?.toolCallId;
   }
 }
+
+// ===================================================================
+// 2.4 codes: context budgets, the new stores' conflicts, store support
+// ===================================================================
+
+/**
+ * Content the next model call cannot go without does not fit its budget
+ * (2.4): host instructions, the user input the call needs, an open tool
+ * call/result pair, a mandatory constraint or the working memory's critical
+ * fields. The context compiler never truncates those silently; it throws this
+ * instead, before the model is called. `phase` says when: compiling the
+ * package for a step, or recompiling it under the smaller budget of an
+ * overflow retry. Never retried.
+ */
+export class ContextBudgetExceededError extends DeuzError {
+  readonly code = 'context_budget_exceeded';
+  /** Estimated tokens of the mandatory content. */
+  readonly requiredTokens: number;
+  /** Tokens the request budget leaves for it. */
+  readonly availableTokens: number;
+  readonly phase: 'compile' | 'overflow-retry';
+  constructor(options: {
+    requiredTokens: number;
+    availableTokens: number;
+    phase: 'compile' | 'overflow-retry';
+    message?: string;
+  }) {
+    super(
+      options.message ??
+        `Mandatory context needs ${options.requiredTokens} tokens but only ${options.availableTokens} fit the request budget (${options.phase}).`,
+    );
+    this.requiredTokens = options.requiredTokens;
+    this.availableTokens = options.availableTokens;
+    this.phase = options.phase;
+  }
+
+  override toJSON(): DeuzErrorJSON {
+    return {
+      ...super.toJSON(),
+      details: {
+        requiredTokens: this.requiredTokens,
+        availableTokens: this.availableTokens,
+        phase: this.phase,
+      },
+    };
+  }
+}
+
+/**
+ * The 2.4 stores whose writes are compare-and-set: versioned memory, the
+ * conditional chat store, the durable stream store, process operations and V3
+ * runs. (Goal runtime conflicts stay `GoalError`, as in 2.3.)
+ */
+export type ConflictSubsystem = 'memory' | 'chat' | 'stream' | 'process' | 'run';
+
+/**
+ * A write whose expected revision is no longer the stored one (2.4): another
+ * writer got there first. Thrown once the caller's own retries are spent
+ * (versioned memory and the conditional chat store re-read and reconcile up to
+ * three times first); nothing of the write was applied.
+ */
+export class RevisionConflictError extends DeuzError {
+  readonly code = 'revision_conflict';
+  readonly subsystem: ConflictSubsystem;
+  /** The record, chat, stream, operation or run whose revision moved. */
+  readonly key: string;
+  readonly expectedRevision?: number;
+  /** The stored revision; absent when the record does not exist. */
+  readonly actualRevision?: number;
+  /** How many times the write was tried, the first included. */
+  readonly attempts?: number;
+  constructor(options: {
+    subsystem: ConflictSubsystem;
+    key: string;
+    expectedRevision?: number;
+    actualRevision?: number;
+    attempts?: number;
+    message?: string;
+  }) {
+    super(
+      options.message ??
+        `Revision conflict on ${options.subsystem} '${options.key}': expected ${String(options.expectedRevision)}, found ${String(options.actualRevision)}.`,
+    );
+    this.subsystem = options.subsystem;
+    this.key = options.key;
+    if (options.expectedRevision !== undefined) this.expectedRevision = options.expectedRevision;
+    if (options.actualRevision !== undefined) this.actualRevision = options.actualRevision;
+    if (options.attempts !== undefined) this.attempts = options.attempts;
+  }
+
+  override toJSON(): DeuzErrorJSON {
+    return {
+      ...super.toJSON(),
+      details: {
+        subsystem: this.subsystem,
+        key: this.key,
+        ...(this.expectedRevision !== undefined ? { expectedRevision: this.expectedRevision } : {}),
+        ...(this.actualRevision !== undefined ? { actualRevision: this.actualRevision } : {}),
+        ...(this.attempts !== undefined ? { attempts: this.attempts } : {}),
+      },
+    };
+  }
+}
+
+/**
+ * An operation ID used again with a different request (2.4). The same ID with
+ * the same request replays the stored receipt; a different request under it
+ * is refused, and nothing is applied. The digests are the canonical-JSON
+ * `sha256:<hex>` of each request, when the store keeps them.
+ */
+export class OperationConflictError extends DeuzError {
+  readonly code = 'operation_conflict';
+  readonly subsystem: ConflictSubsystem;
+  readonly operationId: string;
+  readonly storedDigest?: string;
+  readonly requestDigest?: string;
+  constructor(options: {
+    subsystem: ConflictSubsystem;
+    operationId: string;
+    storedDigest?: string;
+    requestDigest?: string;
+    message?: string;
+  }) {
+    super(
+      options.message ??
+        `Operation '${options.operationId}' was already used with a different ${options.subsystem} request.`,
+    );
+    this.subsystem = options.subsystem;
+    this.operationId = options.operationId;
+    if (options.storedDigest !== undefined) this.storedDigest = options.storedDigest;
+    if (options.requestDigest !== undefined) this.requestDigest = options.requestDigest;
+  }
+
+  override toJSON(): DeuzErrorJSON {
+    return {
+      ...super.toJSON(),
+      details: {
+        subsystem: this.subsystem,
+        operationId: this.operationId,
+        ...(this.storedDigest !== undefined ? { storedDigest: this.storedDigest } : {}),
+        ...(this.requestDigest !== undefined ? { requestDigest: this.requestDigest } : {}),
+      },
+    };
+  }
+}
+
+/**
+ * A vector from another embedding model or of another size than the store's
+ * active embedding generation (2.4). Versioned memory never scores such a
+ * vector as zero: the query or write is refused. Re-embed the records
+ * (`MemorySession.reembed`) or embed with the generation's model.
+ */
+export class EmbeddingMismatchError extends DeuzError {
+  readonly code = 'embedding_mismatch';
+  readonly expected: {
+    readonly modelId: string;
+    readonly dims: number;
+    readonly generation?: number;
+  };
+  readonly actual: { readonly modelId: string; readonly dims: number };
+  constructor(options: {
+    expected: { modelId: string; dims: number; generation?: number };
+    actual: { modelId: string; dims: number };
+    message?: string;
+  }) {
+    super(
+      options.message ??
+        `Embedding mismatch: the store expects ${options.expected.modelId} (${options.expected.dims} dimensions), got ${options.actual.modelId} (${options.actual.dims}).`,
+    );
+    this.expected = { ...options.expected };
+    this.actual = { ...options.actual };
+  }
+
+  override toJSON(): DeuzErrorJSON {
+    return {
+      ...super.toJSON(),
+      details: {
+        expectedModelId: this.expected.modelId,
+        expectedDims: this.expected.dims,
+        ...(this.expected.generation !== undefined
+          ? { expectedGeneration: this.expected.generation }
+          : {}),
+        actualModelId: this.actual.modelId,
+        actualDims: this.actual.dims,
+      },
+    };
+  }
+}
+
+/** The 2.4 features a store backend may not carry. */
+export type StoreFeature =
+  | 'agent-run-v3'
+  | 'versioned-memory'
+  | 'goal-runtime'
+  | 'conditional-chat'
+  | 'transcript-index'
+  | 'process-operations';
+
+/**
+ * A store backend that cannot carry a 2.4 feature (2.4), refused at
+ * configuration time, before anything is read or written: in 2.4 Redis backs
+ * only the durable stream store, so a Redis `AgentRunStore` with
+ * `checkpointVersion: 3` is refused with this. Fatal: never a tool error a
+ * model could retry.
+ */
+export class UnsupportedStoreError extends DeuzError {
+  readonly code = 'unsupported_store';
+  readonly fatalExecution = true;
+  /** The backend, e.g. `'redis'`. */
+  readonly backend: string;
+  readonly feature: StoreFeature;
+  constructor(options: { backend: string; feature: StoreFeature; message?: string }) {
+    super(
+      options.message ??
+        `The ${options.backend} store does not support ${options.feature} in this build.`,
+    );
+    this.backend = options.backend;
+    this.feature = options.feature;
+  }
+
+  override toJSON(): DeuzErrorJSON {
+    return {
+      ...super.toJSON(),
+      details: { backend: this.backend, feature: this.feature },
+    };
+  }
+}

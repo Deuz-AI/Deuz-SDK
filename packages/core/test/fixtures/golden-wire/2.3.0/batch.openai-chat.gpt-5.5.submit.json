@@ -1,0 +1,40 @@
+{
+  "scenario": "batch.openai-chat.gpt-5.5.submit",
+  "recordedFrom": "2.3.0",
+  "requests": [
+    {
+      "method": "POST",
+      "url": "https://api.openai.com/v1/files",
+      "headers": {
+        "authorization": "Bearer <secret>"
+      },
+      "form": [
+        {
+          "name": "purpose",
+          "value": "batch"
+        },
+        {
+          "name": "file",
+          "file": {
+            "name": "deuz-batch.jsonl",
+            "type": "application/jsonl",
+            "text": "{\"custom_id\":\"q1\",\"method\":\"POST\",\"url\":\"/v1/chat/completions\",\"body\":{\"model\":\"gpt-5.5\",\"messages\":[{\"role\":\"user\",\"content\":\"One?\"}],\"max_completion_tokens\":64}}\n{\"custom_id\":\"q2\",\"method\":\"POST\",\"url\":\"/v1/chat/completions\",\"body\":{\"model\":\"gpt-5.5\",\"messages\":[{\"role\":\"developer\",\"content\":\"Answer in French.\"},{\"role\":\"user\",\"content\":\"Two?\"}],\"max_completion_tokens\":128000}}\n"
+          }
+        }
+      ]
+    },
+    {
+      "method": "POST",
+      "url": "https://api.openai.com/v1/batches",
+      "headers": {
+        "authorization": "Bearer <secret>",
+        "content-type": "application/json"
+      },
+      "json": {
+        "input_file_id": "file-golden",
+        "endpoint": "/v1/chat/completions",
+        "completion_window": "24h"
+      }
+    }
+  ]
+}

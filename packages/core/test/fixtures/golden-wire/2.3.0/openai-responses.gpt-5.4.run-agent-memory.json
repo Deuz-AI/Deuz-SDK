@@ -1,0 +1,116 @@
+{
+  "scenario": "openai-responses.gpt-5.4.run-agent-memory",
+  "recordedFrom": "2.3.0",
+  "requests": [
+    {
+      "method": "POST",
+      "url": "https://api.openai.com/v1/embeddings",
+      "headers": {
+        "authorization": "Bearer <secret>",
+        "content-type": "application/json"
+      },
+      "json": {
+        "model": "text-embedding-3-small",
+        "input": ["What is the weather in Paris?"],
+        "encoding_format": "base64"
+      }
+    },
+    {
+      "method": "POST",
+      "url": "https://api.openai.com/v1/responses",
+      "headers": {
+        "authorization": "Bearer <secret>",
+        "content-type": "application/json"
+      },
+      "json": {
+        "model": "gpt-5.4",
+        "input": [
+          {
+            "role": "user",
+            "content": "What is the weather in Paris?"
+          },
+          {
+            "role": "system",
+            "content": "Relevant memories:\n- The user prefers temperatures in Celsius."
+          }
+        ],
+        "stream": true,
+        "max_output_tokens": 128000,
+        "store": false,
+        "include": ["reasoning.encrypted_content"],
+        "tools": [
+          {
+            "type": "function",
+            "name": "get_weather",
+            "description": "Current weather for a city.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string",
+                  "description": "The city name."
+                }
+              },
+              "required": ["city"],
+              "additionalProperties": false
+            }
+          }
+        ]
+      }
+    },
+    {
+      "method": "POST",
+      "url": "https://api.openai.com/v1/responses",
+      "headers": {
+        "authorization": "Bearer <secret>",
+        "content-type": "application/json"
+      },
+      "json": {
+        "model": "gpt-5.4",
+        "input": [
+          {
+            "role": "user",
+            "content": "What is the weather in Paris?"
+          },
+          {
+            "role": "system",
+            "content": "Relevant memories:\n- The user prefers temperatures in Celsius."
+          },
+          {
+            "type": "function_call",
+            "call_id": "call_golden_1",
+            "name": "get_weather",
+            "arguments": "{\"city\":\"Paris\"}"
+          },
+          {
+            "type": "function_call_output",
+            "call_id": "call_golden_1",
+            "output": "{\"city\":\"Paris\",\"tempC\":21,\"sky\":\"clear\"}"
+          }
+        ],
+        "stream": true,
+        "max_output_tokens": 128000,
+        "store": false,
+        "include": ["reasoning.encrypted_content"],
+        "tools": [
+          {
+            "type": "function",
+            "name": "get_weather",
+            "description": "Current weather for a city.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string",
+                  "description": "The city name."
+                }
+              },
+              "required": ["city"],
+              "additionalProperties": false
+            }
+          }
+        ]
+      }
+    }
+  ]
+}

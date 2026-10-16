@@ -1,0 +1,41 @@
+{
+  "scenario": "openai-responses.gpt-5.4.memory-recall",
+  "recordedFrom": "2.3.0",
+  "requests": [
+    {
+      "method": "POST",
+      "url": "https://api.openai.com/v1/embeddings",
+      "headers": {
+        "authorization": "Bearer <secret>",
+        "content-type": "application/json"
+      },
+      "json": {
+        "model": "text-embedding-3-small",
+        "input": ["What is the weather in Paris?"],
+        "encoding_format": "base64"
+      }
+    },
+    {
+      "method": "POST",
+      "url": "https://api.openai.com/v1/responses",
+      "headers": {
+        "authorization": "Bearer <secret>",
+        "content-type": "application/json"
+      },
+      "json": {
+        "model": "gpt-5.4",
+        "input": [
+          {
+            "role": "user",
+            "content": "What is the weather in Paris?"
+          }
+        ],
+        "stream": true,
+        "max_output_tokens": 128000,
+        "instructions": "Relevant memories:\n- The user prefers temperatures in Celsius.",
+        "store": false,
+        "include": ["reasoning.encrypted_content"]
+      }
+    }
+  ]
+}

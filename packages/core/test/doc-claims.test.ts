@@ -50,6 +50,16 @@ const NUMBERS = [
   'eighteen',
   'nineteen',
   'twenty',
+  'twenty-one',
+  'twenty-two',
+  'twenty-three',
+  'twenty-four',
+  'twenty-five',
+  'twenty-six',
+  'twenty-seven',
+  'twenty-eight',
+  'twenty-nine',
+  'thirty',
 ];
 
 describe('operations.mdx: Postgres serialization retries', () => {
@@ -195,12 +205,35 @@ describe('home-copy.ts: the deuz-sdk skill card (W3 review V4-4)', () => {
       name.endsWith('.md'),
     ).length;
     const copy = read('docs/lib/home-copy.ts');
-    const english = copy.match(/a task-to-file router, and (\w+) reference files/);
+    const english = copy.match(/a task-to-file router, and ([\w-]+) reference files/);
     expect(english).not.toBeNull();
     expect(NUMBERS.indexOf(english![1]!)).toBe(files);
     // The locales that write the count in digits (ja, ko).
     const digits = [...copy.matchAll(/(\d+) ?(?:個のリファレンス|개의 레퍼런스)/g)];
     expect(digits).toHaveLength(2);
     for (const m of digits) expect(Number(m[1])).toBe(files);
+  });
+});
+
+describe('evals.mdx: the 2.4 acceptance scenarios', () => {
+  it('counts the scenarios and the fault scenarios the registry declares', () => {
+    const dir = join(CORE, 'test/scenarios-2-4');
+    let all = 0;
+    let fault = 0;
+    for (const file of readdirSync(dir)) {
+      if (!file.endsWith('.test.ts') || file === 'scenarios-count.test.ts') continue;
+      const calls = readFileSync(join(dir, file), 'utf8')
+        .split(/\bscenario\(/)
+        .slice(1);
+      for (const call of calls) {
+        if (!/^\s*'[a-z-]+'\s*,\s*'[a-z0-9-]+'/.test(call)) continue;
+        all++;
+        // The options object closes the call, before the next scenario starts.
+        if (/fault:\s*true/.test(call)) fault++;
+      }
+    }
+    const page = prose('docs/content/docs/modules/evals.mdx');
+    expect(Number(page.match(/2\.4 adds (\d+) acceptance scenarios/)?.[1])).toBe(all);
+    expect(Number(page.match(/(\d+) of them are fault scenarios/)?.[1])).toBe(fault);
   });
 });

@@ -12,7 +12,12 @@ import type { Part } from './types/message';
 import type { CitationPart } from './types/stream';
 import type { ModelCapabilities } from './core/registry';
 import { DeuzError } from './errors';
+import { estimateTextTokens } from './context/count';
+import { isAccounted } from './internal/accounting';
+import type { TokenEstimator } from './internal/estimate-tokens';
 import { cosineSimilarity } from './internal/vector';
+import type { AccountedEmbedder, AccountedEmbeddings, CallAccounting } from './types/accounting';
+import type { CallWarning } from './types/methods';
 import { createHostedReranker, type HostedRerankerSettings } from './internal/rerank-http';
 
 // ===================================================================
@@ -352,6 +357,20 @@ export type CountTokens = (s: string) => number;
 /** Cheap default token estimate (~4 chars/token). Inject a real tokenizer for accuracy. */
 export const approxCountTokens: CountTokens = (s) => Math.ceil(s.length / 4);
 
+/**
+ * A `CountTokens` over the shared estimator (2.4): the tokens a text adds
+ * inside one message, through `createTokenEstimator` (or a host tokenizer it
+ * wraps), calibration included.
+ */
+export function countTokensWith(estimator: TokenEstimator): CountTokens {
+  return (s) => estimateTextTokens(s, estimator);
+}
+
+function counterOf(o: ChunkOptions | undefined): CountTokens {
+  if (o?.countTokens) return o.countTokens;
+  return o?.estimator ? countTokensWith(o.estimator) : approxCountTokens;
+}
+
 export interface Chunk {
   text: string;
   index: number;
@@ -366,6 +385,12 @@ export interface ChunkOptions {
   /** Overlap between consecutive chunks (same unit). */
   overlap?: number;
   countTokens?: CountTokens;
+  /**
+   * Counts through the shared token estimator when `countTokens` is absent
+   * (2.4). Without either, ~4 characters per token, so 2.3 chunk boundaries
+   * stay where they were.
+   */
+  estimator?: TokenEstimator;
 }
 
 export const DEFAULT_CHUNK_OPTIONS = { size: 512, overlap: 64 } as const;
@@ -375,7 +400,7 @@ export const DEFAULT_SEPARATORS: readonly string[] = ['\n\n\n', '\n\n', '\n', '.
 export function chunkFixed(text: string, o?: ChunkOptions): Chunk[] {
   const size = o?.size ?? DEFAULT_CHUNK_OPTIONS.size;
   const overlap = Math.min(o?.overlap ?? DEFAULT_CHUNK_OPTIONS.overlap, size - 1);
-  const count = o?.countTokens ?? approxCountTokens;
+  const count = counterOf(o);
   if (!text) return [];
 
   // Approximate chars-per-unit so we can window over the string.
@@ -407,7 +432,7 @@ export function chunkRecursive(
 ): Chunk[] {
   const size = o?.size ?? DEFAULT_CHUNK_OPTIONS.size;
   const overlap = o?.overlap ?? DEFAULT_CHUNK_OPTIONS.overlap;
-  const count = o?.countTokens ?? approxCountTokens;
+  const count = counterOf(o);
   const separators = o?.separators ?? [...DEFAULT_SEPARATORS];
   if (!text) return [];
 
@@ -465,7 +490,7 @@ function splitRecursive(
 /** Chunk pre-parsed structural blocks, never splitting across a heading boundary before packing. */
 export function chunkBlocks(blocks: DocBlock[], o?: ChunkOptions): Chunk[] {
   const size = o?.size ?? DEFAULT_CHUNK_OPTIONS.size;
-  const count = o?.countTokens ?? approxCountTokens;
+  const count = counterOf(o);
   const chunks: Chunk[] = [];
   let buf = '';
   let index = 0;
@@ -489,8 +514,10 @@ export function chunkBlocks(blocks: DocBlock[], o?: ChunkOptions): Chunk[] {
 // Native-doc-vs-vector threshold (PURE policy over ModelCapabilities)
 // ===================================================================
 
-export function estimateTokens(text: string, countTokens?: CountTokens): number {
-  return (countTokens ?? approxCountTokens)(text);
+/** Tokens of `text`: by `countTokens`, by the shared estimator (2.4), or ~4 characters per token. */
+export function estimateTokens(text: string, countTokens?: CountTokens | TokenEstimator): number {
+  if (typeof countTokens === 'function') return countTokens(text);
+  return countTokens ? estimateTextTokens(text, countTokens) : approxCountTokens(text);
 }
 
 /** Rough PDF token estimate (~700 tokens/page). */
@@ -658,6 +685,9 @@ export function citationsFromHits(
  * unchanged.
  */
 export { cosineSimilarity } from './internal/vector';
+/** Marks an embedder whose calls report their usage, so RAG charges them (2.4). */
+export { defineAccountedEmbedder } from './internal/accounting';
+export type { AccountedEmbedder, AccountedEmbeddings } from './types/accounting';
 
 /** Pure in-memory cosine vector store — reference impl for tests/examples ONLY. */
 export function createMemoryVectorStore(): VectorStore {
@@ -681,20 +711,88 @@ export interface RetrieveDeps {
   reranker?: Reranker;
 }
 
-export interface RetrieveOptions {
+/** Deps whose embedder reports its usage (2.4, `defineAccountedEmbedder`). */
+export type WithAccountedEmbedder<D extends { embedder: Embedder }> = Omit<D, 'embedder'> & {
+  embedder: AccountedEmbedder;
+};
+
+/** How an embedding call is charged (2.4). Without `accounting` nothing is, as in 2.3. */
+export interface EmbeddingAccountingOptions {
+  /**
+   * Charges the embedding call to a budget ledger: reserved before the call
+   * (`kind` `'embedding'` by default, `tokens` the shared estimate of the
+   * input, unpriced without `usd`), settled with the usage an accounted
+   * embedder reports, or marked unknown for an embedder that reports none
+   * and for a failed call.
+   */
+  accounting?: CallAccounting;
+  /** Receives the `unaccounted-usage` warning of an embedder that reports no usage. */
+  onWarning?: (warning: CallWarning) => void;
+}
+
+export interface RetrieveOptions extends EmbeddingAccountingOptions {
   topK?: number;
   topN?: number;
+}
+
+/** The model id a reservation names: the embedder's own, when it has one. */
+function embedderModelId(embedder: Embedder | AccountedEmbedder): string {
+  const modelId = (embedder as { modelId?: unknown }).modelId;
+  return typeof modelId === 'string' && modelId !== '' ? modelId : 'rag-embedder';
+}
+
+/**
+ * Runs one embedding call, charged per `options.accounting` (2.4). An
+ * accounted embedder's vectors are unwrapped either way.
+ */
+async function embedTexts(
+  embedder: Embedder | AccountedEmbedder,
+  texts: string[],
+  options: EmbeddingAccountingOptions | undefined,
+): Promise<number[][]> {
+  const unwrap = (result: number[][] | AccountedEmbeddings): number[][] =>
+    Array.isArray(result) ? result : result.vectors;
+  const accounting = options?.accounting;
+  if (!accounting) return unwrap(await embedder.embed(texts));
+  const accounted = isAccounted(embedder);
+  const { requestId, execution } = accounting;
+  await execution.reserve({
+    requestId,
+    modelId: embedderModelId(embedder),
+    kind: accounting.kind ?? 'embedding',
+    tokens: accounting.tokens ?? texts.reduce((sum, text) => sum + estimateTextTokens(text), 0),
+    ...(accounting.usd !== undefined ? { usd: accounting.usd } : { unpriced: true }),
+    ...(accounted ? {} : { unaccounted: true }),
+  });
+  let result: number[][] | AccountedEmbeddings;
+  try {
+    result = await embedder.embed(texts);
+  } catch (error) {
+    // The request may have been billed: keep the hold, never release it.
+    await execution.ledger.markUnknown(requestId).catch(() => undefined);
+    throw error;
+  }
+  if (accounted && !Array.isArray(result)) {
+    await execution.ledger.settle({ requestId, usage: result.usage });
+  } else {
+    await execution.ledger.markUnknown(requestId);
+    options?.onWarning?.({
+      type: 'unaccounted-usage',
+      message: `The RAG embedder reports no usage, so request '${requestId}' is recorded as unaccounted, not free. Wrap it with defineAccountedEmbedder to charge its real usage.`,
+    });
+  }
+  return unwrap(result);
 }
 
 /** Embed the query → vector search (topK) → rerank (topN). */
 export async function retrieve(
   query: string,
-  deps: RetrieveDeps,
+  deps: RetrieveDeps | WithAccountedEmbedder<RetrieveDeps>,
   o?: RetrieveOptions,
 ): Promise<ScoredChunk[]> {
   const topK = o?.topK ?? 8;
   const topN = o?.topN ?? topK;
-  const [vector] = await deps.embedder.embed([query]);
+  const [vector] = await embedTexts(deps.embedder, [query], o);
   if (!vector) return [];
   const candidates = await deps.store.query(vector, topK);
   const reranker = deps.reranker ?? identityReranker;
@@ -704,10 +802,15 @@ export async function retrieve(
 /** Embed chunks and upsert them into the store. */
 export async function indexChunks(
   chunks: Chunk[],
-  deps: { embedder: Embedder; store: VectorStore },
+  deps: { embedder: Embedder | AccountedEmbedder; store: VectorStore },
+  options?: EmbeddingAccountingOptions,
 ): Promise<void> {
   if (chunks.length === 0) return;
-  const vectors = await deps.embedder.embed(chunks.map((c) => c.text));
+  const vectors = await embedTexts(
+    deps.embedder,
+    chunks.map((c) => c.text),
+    options,
+  );
   const embedded: EmbeddedChunk[] = chunks.map((c, i) => ({ ...c, embedding: vectors[i] ?? [] }));
   await deps.store.upsert(embedded);
 }
@@ -854,13 +957,13 @@ export interface HybridRetrieveOptions extends RetrieveOptions {
  */
 export async function hybridRetrieve(
   query: string,
-  deps: HybridRetrieveDeps,
+  deps: HybridRetrieveDeps | WithAccountedEmbedder<HybridRetrieveDeps>,
   o?: HybridRetrieveOptions,
 ): Promise<ScoredChunk[]> {
   const topN = o?.topN ?? o?.topK ?? 8;
   const perStage = o?.perStageK ?? o?.topK ?? 8;
 
-  const [vector] = await deps.embedder.embed([query]);
+  const [vector] = await embedTexts(deps.embedder, [query], o);
   const [dense, lexical] = await Promise.all([
     vector ? deps.store.query(vector, perStage) : Promise.resolve([] as ScoredChunk[]),
     Promise.resolve(deps.bm25.search(query, perStage)),

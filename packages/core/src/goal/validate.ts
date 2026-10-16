@@ -5,6 +5,7 @@
  * releases only add optional fields, which a reader keeps as they are, and a
  * reader fills in the fields a writer may leave out.
  */
+import { isSha256Digest } from '../internal/digest';
 import { GoalError, type GoalErrorCode } from './errors';
 import type {
   GoalCriterion,
@@ -217,7 +218,26 @@ export function checkEvidence(
   check.optionalString(evidence.runId, `${path}.runId`);
   if (atOptional) check.optionalTime(evidence.at, `${path}.at`);
   else check.time(evidence.at, `${path}.at`);
+  // What binds it to its source (2.4).
+  check.optionalString(evidence.criterionId, `${path}.criterionId`);
+  if (evidence.verifier !== undefined) {
+    const verifier = check.object(evidence.verifier, `${path}.verifier`);
+    check.string(verifier.id, `${path}.verifier.id`);
+    check.string(verifier.version, `${path}.verifier.version`);
+  }
+  if (evidence.specGeneration !== undefined)
+    checkGeneration(check, evidence.specGeneration, `${path}.specGeneration`);
+  for (const field of ['artifactDigest', 'workspaceDigest'] as const)
+    if (evidence[field] !== undefined && !isSha256Digest(evidence[field]))
+      check.fail(`${path}.${field}`, 'must be sha256: and 64 lower-case hex digits');
   return evidence as unknown as GoalEvidence;
+}
+
+/** A spec generation (2.4): an integer of at least 1. */
+export function checkGeneration(check: GoalChecker, value: unknown, path: string): number {
+  if (!Number.isSafeInteger(value) || (value as number) < 1)
+    check.fail(path, 'must be an integer of at least 1');
+  return value as number;
 }
 
 /** A verdict; `at` and `evidence` may be left out where the caller fills them in. */
@@ -375,6 +395,8 @@ export function checkGoalRecord(value: unknown): GoalRecord {
     check.object(record.meta, 'meta');
     check.json(record.meta, 'meta');
   }
+  if (record.specGeneration !== undefined)
+    checkGeneration(check, record.specGeneration, 'specGeneration');
   return record as unknown as GoalRecord;
 }
 

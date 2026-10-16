@@ -1,14 +1,16 @@
-<!-- verified: 2026-10-12 against @deuz-sdk/core@2.3.0 · api-contract sha256:d0398bbef8c4
+<!-- verified: 2026-10-16 against @deuz-sdk/core@2.4.0 · api-contract sha256:da3643f44edc
      sources: packages/core/src/ui.ts, packages/core/src/chat.ts, packages/core/src/chat-request.ts,
      packages/core/src/types/methods.ts, packages/core/src/types/tool.ts, packages/core/src/types/stream.ts,
      packages/react/src/index.ts, packages/react/src/use-chat.ts, packages/react/src/use-object.ts,
      packages/react/src/components.tsx, docs/content/docs/modules/ui-streaming.mdx,
      docs/content/docs/modules/react-hooks.mdx, docs/content/docs/modules/request-validation.mdx,
-     docs/content/docs/modules/chat-persistence.mdx, docs/content/docs/modules/native-agents.mdx -->
+     docs/content/docs/modules/chat-persistence.mdx, docs/content/docs/modules/native-agents.mdx,
+     packages/core/src/{stream-durable,internal/capabilities}.ts, packages/react/src/chat-snapshot.ts,
+     .changeset/{2-4-l7b,2-4-l7c,2-4-w0d,2-4-w0e}.md -->
 
 # Streaming UI: the wire, the chat engine, the React hooks
 
-**Load when:** building a chat route and the client that reads it — serializing `streamChat` to SSE, serving a native agent run to a UI (2.3), validating a client-supplied history, streaming server data parts, surviving a refresh mid-generation, rendering ordered `UIMessage.parts`, or wiring `useChat` / `useObject`.
+**Load when:** building a chat route and the client that reads it — serializing `streamChat` to SSE, serving a native agent run to a UI (2.3), validating a client-supplied history, streaming server data parts, surviving a refresh mid-generation, rendering ordered `UIMessage.parts`, or wiring `useChat` / `useObject`. Durable (persist-before-publish) streams, the capability handshake, chat snapshots and conditional chat stores (2.4) are in `references/chat-stream-durability.md`.
 
 Three layers, all in the box:
 
@@ -116,7 +118,9 @@ export default {
 | `createDeuzStream(result, options?)` | `StreamChatResult` | `DeuzStreamWriter` = `{ response, writeData(name, payload, opts?), close() }` |
 | `toDeuzAgentStreamResponse(stream, options?)` | a native `AgentStream` (2.3) | the SSE shell plus `data-agent` frames — section 5 |
 
-`ToDeuzStreamOptions`, shared by the first three and by `createDeuzStream`: `messageId` (the id in the leading `start` part), `generateId` (used when `messageId` is absent — with neither, the id is the literal `'deuz-msg'`), `headers` (merged after the protocol headers), `wireVersion` (`'v1' | 'v2'`, default `'v2'`), `store` (a `StreamStateStore` to journal every event into), `streamId` (**required when `store` is set** — otherwise the call throws), `onStoreError` (append failures land here; journaling is best-effort and never kills the response).
+`ToDeuzStreamOptions`, shared by the first three and by `createDeuzStream`: `messageId` (the id in the leading `start` part), `generateId` (used when `messageId` is absent — with neither, the id is the literal `'deuz-msg'`), `headers` (merged after the protocol headers), `wireVersion` (`'v1' | 'v2'`, default `'v2'`), `store` (a `StreamStateStore` to journal every event into), `streamId` (**required when `store` or `durable` is set** — otherwise the call throws), `onStoreError` (store failures land here; legacy journaling is best-effort and never kills the response), `durable` (2.4 preview: commit every frame to a `DurableStreamStateStore` before sending it, one producer fenced by its lease; fails closed) and `capabilities` (2.4: `{ request, announce? }` for the capability handshake; a request without `x-deuz-capabilities` gets the 2.3 bytes). Both are in `references/chat-stream-durability.md`.
+
+**Behaviour change (2.4) for the legacy `store`:** a store that cannot report its last seq no longer makes the response renumber from 0 over stored frames — that response is not journaled, `onStoreError` fires, and a v2 client gets a `warning` part of type `'stream-store-error'`; the first failed append stops journaling the leg the same way (once). Such a response cannot be resumed; use `durable` when it must be.
 
 `CreateDeuzStreamOptions` adds `dataSchemas?: Record<string, StandardSchemaV1>` — one Standard Schema per data-part name, validated *before* serialization; an invalid payload is dropped and a redacted `error` part (`data part 'chart' failed validation.`) rides instead while the stream continues.
 
@@ -267,7 +271,7 @@ export async function GET(req: Request, ctx: { params: Promise<{ id: string }> }
 }
 ```
 
-`ResumeDeuzStreamOptions`: `lastEventId` (`string | number | null`; replay starts *after* it — parsing is strict, a garbled value means "no cursor", never seq 0), `wireVersion` (default `'v2'` — serve v2, `connectDeuzStream` needs the ids), `pollIntervalMs` (250), `idleTimeoutMs` (30 000; the response then closes **without** `[DONE]`, which a reconnecting client treats as another drop), `clock`, `headers`.
+`ResumeDeuzStreamOptions`: `lastEventId` (`string | number | null`; replay starts *after* it — parsing is strict, a garbled value means "no cursor", never seq 0), `wireVersion` (default `'v2'` — serve v2, `connectDeuzStream` needs the ids), `pollIntervalMs` (250), `idleTimeoutMs` (30 000; the response then closes **without** `[DONE]`, which a reconnecting client treats as another drop), `clock`, `headers`, `capabilities` (2.4; announces `durable-stream` when the store is a `DurableStreamStateStore`).
 
 Client side:
 
@@ -301,7 +305,8 @@ Discriminated on `type`, **open and additive**: always keep a `default` case. Pa
 | `tool-state` **v2** | `toolCallId, toolName?, state: ToolRunState, denied?, deniedReason?, outcome?` |
 | `cost` / `budget-exceeded` **v2** | `costUsd, deltaUsd?, cacheSavingsUsd?, stepIndex?` / `kind, limit, value` |
 | `verify` / `false-finish` **v2** | `stepIndex, attempt, ok, willRetry, feedback?` / `stepIndex, attempt, willRetry` |
-| `warning` **v2** | `warning: CallWarning` — `type` is an OPEN union; treat unknown as `'other'` |
+| `warning` **v2** | `warning: CallWarning` — `type` is an OPEN union; treat unknown as `'other'` (2.4 adds `'stream-store-error'` among others) |
+| `capabilities` **v2** | `capabilities: string[]` — 2.4: the first frame of a response that takes part in the capability handshake (no event id, never journaled); `useChat` consumes it and `applyUIPart` ignores it |
 | `plan-update` / `activity` **v2** | `goal?, tasks[]` / `message, level?, data?, agentPath?` |
 | `finish` / `error` | `finishReason, usage, stopDetails?` / `message` (already secret-redacted) — `stopDetails` (2.3) is the provider's explanation of an early stop, such as a refusal's category, secret-redacted |
 
@@ -318,7 +323,7 @@ Framework-agnostic, pure, total: new objects out, inputs untouched, unknown part
 | `sealAssistantTurn(turn)` | Every `'streaming'` text/reasoning element → `'done'`. Idempotent; returns the SAME object when there is nothing to seal. |
 | `assistantMessageFromTurn(turn)` / `clientToolResultMessage(results)` | The canonical assistant `Message` and the `role: 'tool'` message for client-executed results. Since 2.3 the message follows the ordered `parts`: every reasoning block rides back unchanged and in place, text and `tool_use` where they came (a plain answer is still a string), and a card the turn knows only from a `tool-state` / `tool-result` frame (no `input`: an earlier leg's call, such as an approved one the resumed leg ran) is left out. |
 | `userMessageFromInput(input)` / `filesToImageParts(files)` | `ChatInput` (`string \| { text?, parts? }`) → canonical user `Message` (a bare string stays a plain string `content`); picked files → `ImagePart[]` (Web APIs only; images AND PDFs). |
-| `uiFromMessages(messages, generateId)` | Canonical history → `UIMessage[]` with ordered `parts`; `tool` messages merge into the preceding assistant turn, `system` messages are not rendered. |
+| `uiFromMessages(messages, generateId, { messageIds? })` | Canonical history → `UIMessage[]` with ordered `parts`; `tool` messages merge into the preceding assistant turn, `system` messages are not rendered. Pass `{ messageIds: record.messageIds }` (2.4) to keep a stored chat's ids; `generateId` covers a missing, empty or repeated one. |
 | `canonicalFromUI(ui)` | The inverse — **lossy**, see below. |
 | `dropTrailingAssistant(history)` / `branchBeforeUserMessage(history, messageId)` | Regenerate: cut trailing assistant/tool turns from both views. Edit-and-resend: cut both views before that user turn (`undefined` if it is not a user message). |
 
@@ -422,9 +427,9 @@ export function Chat(): ReactElement {
 }
 ```
 
-`UseChatOptions`: `api` (required), `initialMessages`, `headers`, `body`, `chatId`, `resume`, `generateId`, `throttleMs`, `onToolCall`, `onData`, `onError`, `onHttpError`, `fetch`.
+`UseChatOptions`: `api` (required), `initialMessages`, `initialSnapshot` (2.4), `headers`, `body`, `chatId`, `resume`, `generateId`, `throttleMs`, `onToolCall`, `onData`, `onError`, `onHttpError`, `fetch`, `capabilityHandshake` (2.4, default `true`).
 
-`UseChatResult`: `messages`, `history`, `status` (`'idle' | 'streaming' | 'error'`), `error`, `pendingApprovals`, `pendingToolCalls`, `cost?`, `budgetExceeded?`, `dataParts`, `citations`, `plan?`, `activity`, `verifications?`, `warnings?`, `falseFinishes?`, `subAgents?`, `steps?`, `usage?`, `finishReason?`, `stopDetails?` (2.3), `agent?` (2.3), `sendMessage`, `stop`, `regenerate`, `editAndResend`, `setHistory`, `setMessages`, `addToolResult`, `clearError`, `addToolApprovalResponse`, `reconnect`.
+`UseChatResult`: `messages`, `history`, `status` (`'idle' | 'streaming' | 'error'`), `error`, `pendingApprovals`, `pendingToolCalls`, `cost?`, `budgetExceeded?`, `dataParts`, `citations`, `plan?`, `activity`, `verifications?`, `warnings?`, `falseFinishes?`, `subAgents?`, `steps?`, `usage?`, `finishReason?`, `stopDetails?` (2.3), `agent?` (2.3), `capabilities?` (2.4), `sendMessage`, `stop`, `regenerate`, `editAndResend`, `setHistory`, `setMessages`, `addToolResult`, `clearError`, `addToolApprovalResponse`, `reconnect`, `exportSnapshot` (2.4).
 
 - **Two histories, one commit.** `history` is `{ ui, canonical }` published in a single `setState`, so no render sees one a frame behind the other. Persist `history.canonical`.
 - **`initialMessages` is read once at mount** and deliberately never re-adopted (apps pass inline literals). Switching chats or hydrating later is `setHistory`.
@@ -435,7 +440,8 @@ export function Chat(): ReactElement {
 - **`resume: { endpoint, auto?, lastEventId?, cursor? }`** points at the resume GET route. `auto` fires once per mounted hook (StrictMode-safe) and **fails silently by design** — a cold load against a 404 must not paint a permanent error; call `reconnect()` yourself when you want the failure surfaced. `cursor` is an injectable `{ load, save }` adapter, never hardcoded `localStorage`. Since 2.3 a resumed turn settles like a streamed one: its approvals pause the chat and its client calls reach `onToolCall` (the chat then re-POSTs) or park in `pendingToolCalls`. A replayed call is dispatched at most once per mounted hook (skipped when its result is in the replay or in `history.canonical`, or while parked or running); across a reload only a persisted `history.canonical` proves a call ran. A POST response that carries the journal's `id:` lines (a route with `store` and `streamId`) moves the in-memory cursor too, so a `reconnect()` after a settled turn resumes after it instead of appending the turn again; the persisted `cursor` still moves on resume reads only (a reload mid-turn replays the turn from its start), and `setHistory` / `setMessages` drop the in-memory cursor. A `stop()` during a resume read appends nothing; the next `reconnect()` continues from the cursor.
 - **The history answers every call (2.3).** The hook adds the result of a call the server ran within a turn (the one the wire carried, which the model saw) to `history.canonical` as a `role: 'tool'` message right after the assistant turn, and after an approval it adds the approved call's result ahead of the resumed leg's turn, on a chat route and a native route alike. Before, the next request carried an open `tool_use`, which providers reject, and on a chat route an approval continuation ran the server call again. Two responses that name their message the same (a route without `messageId` starts every response with `'deuz-msg'`) each fill their own bubble.
 - **A native agent route (2.3)** needs no new option: point `api` at a route serving `toDeuzAgentStreamResponse` (section 5). When a turn's `agent` state is `suspended`, the run's terminal frame is the authority on what it waits for: its approvals pause the chat, its client calls run through `onToolCall` or park in `pendingToolCalls`, and the hook resumes the run in **one** request with `runId`, `approvalResponses` and `clientToolResults`, because a native resume proceeds only with every verdict and every client result. The client calls run inside that round, so `status` is `'streaming'` while they run and `stop()` cancels it. Read `agent` (`runId`, `status`, the latest unvalidated `partial` while it runs, `output` only once `completed`) and `stopDetails`; tool cards carry `outcome`. Agent frames stay out of `onData` and `dataParts`. The hook imports no new core export, so with a core older than 2.3 it behaves as before.
-- **`useChat` from `@deuz-sdk/core/react` is frozen at 2.2** and gets none of the 2.3 behaviour: no verdict matching, no resumed-turn settlement, no native route, and it drops approval tokens and the client calls of a chat without `onToolCall`. Use `@deuz-sdk/react`.
+- **`useChat` from `@deuz-sdk/core/react` is frozen at 2.2 and deprecated (2.4; removed in 3.0)**: it gets none of the 2.3 or 2.4 behaviour (no verdict matching, no resumed-turn settlement, no native route, no snapshots or capability handshake), drops approval tokens and the client calls of a chat without `onToolCall`, and a development build logs one console warning per page. Use `@deuz-sdk/react`.
+- **2.4: snapshots and the capability handshake.** `useChat({ initialSnapshot })` restores a `ChatSnapshotV1` (messages under their stored ids, the turn in progress, the cursor, pending approvals and parked client calls) and `exportSnapshot()` captures one; a stored chat restores as `{ version: 1, messages: record.messages, messageIds: record.messageIds }`. Every POST and resume read sends `x-deuz-capabilities: chat-snapshot-v1, durable-stream, message-ids` (`capabilityHandshake: false` turns it off — needed when a cross-origin preflight lists allowed headers without it), the result's `capabilities` lists what the route announced, and a feature is used only once announced. Details, the server half and durable streams: `references/chat-stream-durability.md`.
 - A stream that dies with neither `finish` nor `error` leaves the tail `'streaming'` — that is the truth about a truncated turn. `stop()` and a stream ending without `finish` call `sealAssistantTurn`; read `finishReason === 'length'` to tell "cut off" from "complete".
 
 ## 12. `useObject`, and the components

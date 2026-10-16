@@ -4,7 +4,7 @@
  * the host saves what they return, fenced by the record's revision.
  */
 import { GoalError } from './errors';
-import { UNSUPPORTED_PASS, assessGoal, supportsPass } from './acceptance';
+import { assessGoal, passProblem } from './acceptance';
 import {
   GOAL_RECORD_VERSION,
   GOAL_SEEN_LIMIT,
@@ -13,6 +13,7 @@ import {
   checkBudget,
   checkCriteria,
   checkEvidence,
+  checkGeneration,
   checkGoalEvent,
   checkResult,
   checkWaitDetails,
@@ -49,6 +50,11 @@ export interface CreateGoalInput {
   /** Epoch ms, after `now`. */
   deadline?: number;
   meta?: Record<string, unknown>;
+  /**
+   * Opt the goal into spec generations (2.4), starting at this one (usually
+   * 1): see `GoalRecord.specGeneration`. Left out, the goal keeps the 2.3 rules.
+   */
+  specGeneration?: number;
 }
 
 /** The time a goal function works at, and the revision it expects. */
@@ -112,24 +118,49 @@ function addedFields(criterion: GoalCriterion | undefined): Record<string, unkno
   return added;
 }
 
-const evidenceOf = (input: GoalEvidenceInput, now: number): GoalEvidence => ({
-  id: input.id,
-  source: input.source,
-  ref: input.ref,
-  ...(input.digest !== undefined ? { digest: input.digest } : {}),
-  ...(input.summary !== undefined ? { summary: input.summary } : {}),
-  ...(input.runId !== undefined ? { runId: input.runId } : {}),
-  at: input.at ?? now,
-});
+/**
+ * Evidence as a goal records it. On a goal with a spec generation, evidence
+ * given without one was produced against the current spec (2.4).
+ */
+const evidenceOf = (
+  input: GoalEvidenceInput,
+  now: number,
+  specGeneration: number | undefined,
+): GoalEvidence => {
+  const generation = input.specGeneration ?? specGeneration;
+  return {
+    id: input.id,
+    source: input.source,
+    ref: input.ref,
+    ...(input.digest !== undefined ? { digest: input.digest } : {}),
+    ...(input.summary !== undefined ? { summary: input.summary } : {}),
+    ...(input.runId !== undefined ? { runId: input.runId } : {}),
+    at: input.at ?? now,
+    ...(input.criterionId !== undefined ? { criterionId: input.criterionId } : {}),
+    ...(input.verifier !== undefined
+      ? { verifier: { id: input.verifier.id, version: input.verifier.version } }
+      : {}),
+    ...(generation !== undefined ? { specGeneration: generation } : {}),
+    ...(input.artifactDigest !== undefined ? { artifactDigest: input.artifactDigest } : {}),
+    ...(input.workspaceDigest !== undefined ? { workspaceDigest: input.workspaceDigest } : {}),
+  };
+};
 
 /**
  * Evidence that says the same, whenever it was recorded, on the fields this
- * build knows: what a later 2.x release added to it makes no conflict.
+ * build knows: what a later 2.x release added to it makes no conflict. A
+ * spec generation counts only when the new evidence names one; otherwise it
+ * would be stamped with the current one, and the stored evidence stands as it
+ * was recorded.
  */
-const sameEvidence = (left: GoalEvidence, right: GoalEvidence): boolean =>
-  (['id', 'source', 'ref', 'digest', 'summary', 'runId'] as const).every(
-    (field) => left[field] === right[field],
-  );
+const sameEvidence = (stored: GoalEvidence, input: GoalEvidenceInput): boolean =>
+  (
+    ['id', 'source', 'ref', 'digest', 'summary', 'runId', 'criterionId', 'artifactDigest'] as const
+  ).every((field) => stored[field] === input[field]) &&
+  stored.workspaceDigest === input.workspaceDigest &&
+  stored.verifier?.id === input.verifier?.id &&
+  stored.verifier?.version === input.verifier?.version &&
+  (input.specGeneration === undefined || stored.specGeneration === input.specGeneration);
 
 /**
  * A new goal (2.3): `active`, at revision 1. Without criteria, the objective
@@ -153,6 +184,8 @@ export function createGoal(input: CreateGoalInput, options: { now: number }): Go
     check.object(fields.meta, 'meta');
     check.json(fields.meta, 'meta');
   }
+  if (fields.specGeneration !== undefined)
+    checkGeneration(check, fields.specGeneration, 'specGeneration');
   return readGoal({
     kind: 'deuz-goal',
     version: GOAL_RECORD_VERSION,
@@ -174,6 +207,7 @@ export function createGoal(input: CreateGoalInput, options: { now: number }): Go
     createdAt: now,
     updatedAt: now,
     ...(input.meta !== undefined ? { meta: structuredClone(input.meta) } : {}),
+    ...(input.specGeneration !== undefined ? { specGeneration: input.specGeneration } : {}),
   });
 }
 
@@ -217,6 +251,8 @@ function checkCommand(command: GoalCommand): void {
       check.object(fields.meta, 'meta');
       check.json(fields.meta, 'meta');
     }
+    if (fields.nextSpecGeneration !== undefined && typeof fields.nextSpecGeneration !== 'boolean')
+      check.fail('nextSpecGeneration', 'must be a boolean');
   } else if (type === 'link-run') check.string(fields.runId, 'runId');
 }
 
@@ -569,12 +605,12 @@ function addEvidence(
   const known = new Map(draft.current.evidence.map((item) => [item.id, item]));
   const added: GoalEvidence[] = [];
   for (const input of inputs) {
-    const evidence = evidenceOf(input, draft.now);
-    const existing = known.get(evidence.id);
+    const existing = known.get(input.id);
     if (existing) {
-      if (!sameEvidence(existing, evidence)) return 'evidence-conflict';
+      if (!sameEvidence(existing, input)) return 'evidence-conflict';
       continue;
     }
+    const evidence = evidenceOf(input, draft.now, draft.current.specGeneration);
     known.set(evidence.id, evidence);
     added.push(evidence);
   }
@@ -611,11 +647,15 @@ function evaluate(
       ...(input.note !== undefined ? { note: input.note } : {}),
       at: input.at ?? draft.now,
     };
-    // A model saying "done" is recorded as what it is.
-    if (result.verdict === 'passed' && !supportsPass(result, recorded)) {
+    // A model saying "done" is recorded as what it is, and so is a pass on
+    // evidence for another criterion or an older spec generation (2.4).
+    const problem =
+      result.verdict === 'passed'
+        ? passProblem(result, recorded, draft.current.specGeneration)
+        : undefined;
+    if (problem !== undefined) {
       result.verdict = 'inconclusive';
-      result.note =
-        input.note !== undefined ? `${UNSUPPORTED_PASS} ${input.note}` : UNSUPPORTED_PASS;
+      result.note = input.note !== undefined ? `${problem} ${input.note}` : problem;
     }
     const index = results.findIndex((item) => item.criterionId === result.criterionId);
     if (index < 0) results.push(result);
@@ -627,15 +667,40 @@ function evaluate(
   return applied(assessGoal(draft.current));
 }
 
+/**
+ * Starts the goal's next spec generation (2.4): generation 1 for a goal that
+ * opts in now. Every verdict reached before it becomes inconclusive in the
+ * record itself, so no reader, a 2.3 one included, completes the goal on it;
+ * what each rested on stays.
+ */
+function nextGeneration(draft: Draft): void {
+  const next = draft.edit();
+  const previous = next.specGeneration;
+  const generation = (previous ?? 0) + 1;
+  next.specGeneration = generation;
+  const note =
+    previous === undefined
+      ? `Recorded before the goal had spec generations; it is now at generation ${generation}.`
+      : `Recorded for spec generation ${previous}; the goal is now at generation ${generation}.`;
+  next.results = next.results.map((result) =>
+    result.verdict === 'inconclusive' ? result : { ...result, verdict: 'inconclusive', note },
+  );
+}
+
 function revise(draft: Draft, command: Extract<GoalCommand, { type: 'revise' }>): Step {
   if (typeof command.deadline === 'number' && command.deadline <= draft.now)
     return rejected('deadline-passed');
   const goal = draft.current;
   const differs = (left: unknown, right: unknown) => JSON.stringify(left) !== JSON.stringify(right);
+  // A goal with spec generations (2.4) answers a change of its spec with the
+  // next generation; one without keeps the 2.3 rules below.
+  const generations = goal.specGeneration !== undefined;
   let changed = false;
+  let specChanged = command.nextSpecGeneration === true;
   if (command.objective !== undefined && command.objective !== goal.objective) {
     draft.edit().objective = command.objective;
     changed = true;
+    specChanged = true;
   }
   if (command.criteria !== undefined) {
     const criteria = command.criteria.map(criterionOf);
@@ -645,10 +710,13 @@ function revise(draft: Draft, command: Extract<GoalCommand, { type: 'revise' }>)
       criteria.some((criterion, index) => !sameCriterion(criterion, goal.criteria[index]!))
     ) {
       const next = draft.edit();
-      // A verdict stands only for a criterion that still says the same.
+      // A verdict stands only for a criterion that still says the same; under
+      // spec generations, for one that still exists, until the next generation
+      // below makes it inconclusive.
       next.results = next.results.filter((result) => {
         const before = stored.get(result.criterionId);
         const after = criteria.find((item) => item.id === result.criterionId);
+        if (generations) return after !== undefined;
         return before !== undefined && after !== undefined && sameCriterion(before, after);
       });
       // What a later 2.x release added to a criterion stays with it.
@@ -657,7 +725,20 @@ function revise(draft: Draft, command: Extract<GoalCommand, { type: 'revise' }>)
         ...addedFields(stored.get(criterion.id)),
       }));
       changed = true;
+      // The same criteria in another order are the same spec.
+      if (
+        criteria.length !== goal.criteria.length ||
+        criteria.some((criterion) => {
+          const before = stored.get(criterion.id);
+          return before === undefined || !sameCriterion(criterion, before);
+        })
+      )
+        specChanged = true;
     }
+  }
+  if (specChanged && (generations || command.nextSpecGeneration === true)) {
+    nextGeneration(draft);
+    changed = true;
   }
   if (command.budget !== undefined && differs(command.budget ?? undefined, goal.budget)) {
     const next = draft.edit();

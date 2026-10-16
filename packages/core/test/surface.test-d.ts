@@ -409,13 +409,19 @@ expectTypeOf<StreamObjectResult<{ a: string }>['consume']>().toEqualTypeOf<
 // --- Warnings channel. The TYPES are locked here even though no collector
 // populates them yet (Sprint 2 shipped the channel, not the emitters), so the
 // shape cannot drift before the producers land. 2.3 widens the union with
-// 'unpriced-model' (a USD budget could not be applied to that call). ---
+// 'unpriced-model' (a USD budget could not be applied to that call); 2.4 adds the
+// embedding, accounting, context-source, stream-store and partial-extraction members. ---
 expectTypeOf<CallWarning['type']>().toEqualTypeOf<
   | 'unsupported-setting'
   | 'clamped-setting'
   | 'unknown-model'
   | 'unsupported-tool'
   | 'unpriced-model'
+  | 'embedding-mismatch'
+  | 'unaccounted-usage'
+  | 'context-source-failed'
+  | 'stream-store-error'
+  | 'memory-extraction-partial'
   | 'other'
 >();
 expectTypeOf<CallWarning['message']>().toEqualTypeOf<string>();

@@ -5,8 +5,12 @@
  * lease changes hands at most once, an agent run save is a compare-and-set on
  * its revision, and a claim key is granted once. Node-only.
  */
-import type { SqliteDatabaseLike, SqliteStatementLike } from './store-sqlite';
-import { ensureBusyTimeout } from './sqlite-open';
+import type { SqliteDatabaseLike } from './store-sqlite';
+import {
+  createSqliteConnection,
+  createSqliteStatementCache,
+  sqliteTransaction,
+} from './sqlite-handle';
 import type {
   AgentRunEnvelope,
   AgentRunListPage,
@@ -102,92 +106,44 @@ async function claimRowKey(key: string): Promise<string> {
 
 export function createSqliteOpsStore(options: SqliteOpsStoreOptions): SqliteOpsStore {
   const clock = options.clock ?? resolveDependencies().clock;
-  let opening: Promise<SqliteDatabaseLike> | undefined;
-  let closed = false;
-  let admitted = 0;
-  let drained: (() => void) | undefined;
-  const statements = new Map<string, SqliteStatementLike>();
-  const statement = (db: SqliteDatabaseLike, sql: string) => {
-    let prepared = statements.get(sql);
-    if (!prepared) {
-      prepared = db.prepare(sql);
-      statements.set(sql, prepared);
-    }
-    return prepared;
-  };
-  const transaction = <T>(db: SqliteDatabaseLike, fn: () => T): T => {
-    db.exec('BEGIN IMMEDIATE');
-    try {
-      const result = fn();
-      db.exec('COMMIT');
-      return result;
-    } catch (error) {
-      db.exec('ROLLBACK');
-      throw error;
-    }
-  };
-  const open = async (): Promise<SqliteDatabaseLike> => {
-    opening ??= (async () => {
-      let db = options.database;
-      if (!db) {
-        const module = (await import('node:sqlite' as string)) as {
-          DatabaseSync: new (path: string) => SqliteDatabaseLike;
-        };
-        db = new module.DatabaseSync(options.path);
-      }
-      try {
-        ensureBusyTimeout(db);
-        if (options.path !== ':memory:' && options.wal !== false)
-          db.exec('PRAGMA journal_mode = WAL');
-        transaction(db, () => {
-          db.exec(
-            'CREATE TABLE IF NOT EXISTS deuz_ops_schema (singleton INTEGER PRIMARY KEY CHECK(singleton = 1), version INTEGER NOT NULL)',
-          );
-          const row = db!
-            .prepare('SELECT version FROM deuz_ops_schema WHERE singleton = 1')
-            .get() as { version: number } | undefined;
-          if (row && row.version !== SCHEMA_VERSION)
-            throw new Error('Unsupported SQLite ops schema version');
-          if (!row) {
-            db!.exec(`CREATE TABLE IF NOT EXISTS deuz_leases (
+  const statement = createSqliteStatementCache();
+  const transaction = <T>(db: SqliteDatabaseLike, fn: () => T): T => sqliteTransaction(db, fn);
+  // Opens on first use and retries after a failed open; close() refuses new
+  // calls, waits for admitted ones and closes the handle, an injected one too.
+  const connection = createSqliteConnection(options, {
+    injected: 'owned',
+    closedMessage: 'SQLite ops store is closed',
+    setup(db) {
+      transaction(db, () => {
+        db.exec(
+          'CREATE TABLE IF NOT EXISTS deuz_ops_schema (singleton INTEGER PRIMARY KEY CHECK(singleton = 1), version INTEGER NOT NULL)',
+        );
+        const row = db.prepare('SELECT version FROM deuz_ops_schema WHERE singleton = 1').get() as
+          | { version: number }
+          | undefined;
+        if (row && row.version !== SCHEMA_VERSION)
+          throw new Error('Unsupported SQLite ops schema version');
+        if (!row) {
+          db.exec(`CREATE TABLE IF NOT EXISTS deuz_leases (
               key TEXT PRIMARY KEY, owner TEXT NOT NULL, token INTEGER NOT NULL,
               expires_at INTEGER NOT NULL, signals TEXT NOT NULL);
               CREATE TABLE IF NOT EXISTS deuz_agent_runs (
               run_id TEXT PRIMARY KEY, scope TEXT NOT NULL, revision INTEGER NOT NULL,
               payload TEXT NOT NULL, updated_at INTEGER NOT NULL);`);
-            db!.exec(`INSERT INTO deuz_ops_schema(singleton,version) VALUES(1,${SCHEMA_VERSION})`);
-          }
-          // Outside the first-open branch, so files written before claims existed gain it.
-          db!.exec(
-            'CREATE TABLE IF NOT EXISTS deuz_claims (key TEXT PRIMARY KEY, claimed_at INTEGER NOT NULL)',
-          );
-          // 2.3, for retention: additions a 2.2 process ignores, so version 1 stays.
-          db!.exec(`CREATE INDEX IF NOT EXISTS deuz_claims_claimed_at ON deuz_claims(claimed_at);
+          db.exec(`INSERT INTO deuz_ops_schema(singleton,version) VALUES(1,${SCHEMA_VERSION})`);
+        }
+        // Outside the first-open branch, so files written before claims existed gain it.
+        db.exec(
+          'CREATE TABLE IF NOT EXISTS deuz_claims (key TEXT PRIMARY KEY, claimed_at INTEGER NOT NULL)',
+        );
+        // 2.3, for retention: additions a 2.2 process ignores, so version 1 stays.
+        db.exec(`CREATE INDEX IF NOT EXISTS deuz_claims_claimed_at ON deuz_claims(claimed_at);
             CREATE INDEX IF NOT EXISTS deuz_agent_runs_updated_at ON deuz_agent_runs(updated_at);`);
-        });
-        return db;
-      } catch (error) {
-        // An injected handle stays open: the next call retries on it.
-        if (!options.database) db.close();
-        throw error;
-      }
-    })();
-    // A failed open must not poison the store for the rest of the process.
-    opening.catch(() => {
-      opening = undefined;
-    });
-    return opening;
-  };
-  const use = async <T>(operation: (db: SqliteDatabaseLike) => T): Promise<T> => {
-    if (closed) throw new Error('SQLite ops store is closed');
-    admitted++;
-    try {
-      return operation(await open());
-    } finally {
-      admitted--;
-      if (admitted === 0) drained?.();
-    }
-  };
+      });
+      return db;
+    },
+  });
+  const use = <T>(operation: (db: SqliteDatabaseLike) => T) => connection.use(operation);
   const readLease = (db: SqliteDatabaseLike, key: string): LeaseRow | undefined =>
     statement(db, 'SELECT owner, token, expires_at, signals FROM deuz_leases WHERE key=?').get(
       key,
@@ -445,16 +401,12 @@ export function createSqliteOpsStore(options: SqliteOpsStoreOptions): SqliteOpsS
     agentRuns,
     claims,
     async close() {
-      if (closed) return;
-      closed = true;
-      if (admitted)
-        await new Promise<void>((resolve) => {
-          drained = resolve;
-        });
-      // A failed open already closed a handle the store made itself.
-      const db = await opening?.catch(() => undefined);
-      (db ?? options.database)?.close();
-      statements.clear();
+      await connection.close();
+      statement.clear();
     },
   };
 }
+
+// 2.4 stores on this entry: their own modules and tables (W0 skeleton; W1 lanes
+// implement them in place, never in this file).
+export * from './runs-v3-sqlite';

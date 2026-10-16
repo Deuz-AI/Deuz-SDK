@@ -34,3 +34,15 @@ export {
   verifySlackRequest,
   handleSignal,
 } from './schedule/signal';
+export {
+  assertTimeZone,
+  timeZoneOffset,
+  zonedOccurrencesBetween,
+  nextZonedOccurrence,
+} from './schedule/zoned';
+export type {
+  ZonedCronOptions,
+  ZonedOccurrence,
+  ZonedDstGap,
+  ZonedDstOverlap,
+} from './schedule/zoned';

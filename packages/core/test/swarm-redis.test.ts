@@ -11,7 +11,11 @@ import { createRedisSwarmStore } from '../src/node/swarm-redis';
 import { createSwarm, SwarmConflictError } from '../src/swarm';
 import type { SwarmSnapshot } from '../src/types/swarm';
 import { initialSnapshot, swarmStoreContracts } from './fixtures/swarm-store-conformance';
-import { liveRedisServer, liveRedisUrl, mockRedisServer } from './fixtures/redis-harness';
+import { liveRedisServer, mockRedisServer } from './fixtures/redis-harness';
+import { redisUrl } from './fixtures/services';
+import { SLOW_HOOK_TIMEOUT_MS, SLOW_TEST_TIMEOUT_MS } from './fixtures/timeouts';
+
+const liveRedisUrl = redisUrl();
 
 const freshStore = () => createRedisSwarmStore({ client: mockRedisServer().client });
 
@@ -250,7 +254,8 @@ describe('a swarm on the Redis store', () => {
 });
 
 // A network round trip per script, and real waits for server time.
-if (liveRedisUrl) vi.setConfig({ testTimeout: 30_000, hookTimeout: 60_000 });
+if (liveRedisUrl)
+  vi.setConfig({ testTimeout: SLOW_TEST_TIMEOUT_MS, hookTimeout: SLOW_HOOK_TIMEOUT_MS });
 
 describe.skipIf(!liveRedisUrl)('Redis swarm store on a live server', () => {
   let server: Awaited<ReturnType<typeof liveRedisServer>>;

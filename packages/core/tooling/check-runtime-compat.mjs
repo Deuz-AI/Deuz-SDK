@@ -85,6 +85,45 @@ const consumers = [
     source:
       "export { createMockModel, runEval, runGradedEval, runEvalSuite } from '@deuz-sdk/core/testing';",
   },
+  {
+    name: 'skills',
+    source: `export { parseSkill, createSkillRegistry, renderSkillCatalog, scopeToolsToSkill }
+      from '@deuz-sdk/core/skills';`,
+  },
+  // 2.4 edge-safe entries.
+  {
+    name: 'memory-versioned',
+    source: `export { createMemorySession, createVersionedMemoryTools,
+      createInMemoryVersionedMemoryStore, importLegacyMemory, RevisionConflictError }
+      from '@deuz-sdk/core/memory/versioned';`,
+  },
+  {
+    name: 'context',
+    source: `export { compileContext, createContextCompiler, createTokenEstimator,
+      createWorkingMemory, applyWorkingMemoryPatch, workingMemoryTools, createMemoryContextSource,
+      createRagContextSource, createTranscriptContextSource, createSkillsContextSource }
+      from '@deuz-sdk/core/context';`,
+  },
+  {
+    name: 'goal-runtime',
+    source: `export { createGoalSupervisor, createNativeRunLauncher, createDurableScheduler,
+      createWebhookHandler, toNodeHandler, createInMemoryGoalRuntimeStore, verifyGoalAcceptance }
+      from '@deuz-sdk/core/goal/runtime';`,
+  },
+  {
+    name: 'skills-learning',
+    source: "export { proposeSkillFromRun } from '@deuz-sdk/core/skills/learning';",
+  },
+  {
+    name: 'chat-conditional',
+    source: `export { createInMemoryConditionalChatStore, createInMemoryTranscriptIndex, indexChat,
+      isConditionalChatStore, updateConditionalChat } from '@deuz-sdk/core/chat';`,
+  },
+  {
+    name: 'ui-durable-stream',
+    source: `export { createInMemoryDurableStreamStateStore, parseDeuzCapabilities,
+      formatDeuzCapabilities } from '@deuz-sdk/core/ui';`,
+  },
 ];
 
 function browserBundle(consumer) {
@@ -112,7 +151,7 @@ function nodeOnlyReferences(result) {
   const output = result.outputFiles?.map((file) => file.text).join('\n') ?? '';
   if (forbiddenBuiltins.test(output)) issues.push('bundled output references a node: builtin');
   const nodeOnlyInput = Object.keys(result.metafile?.inputs ?? {}).find((input) =>
-    /(?:rag-node|memory-markdown|skills[\\/]node|mcp[\\/](?:server[\\/])?stdio|swarm[\\/](?:sqlite|postgres|redis)|ops[\\/](?:sqlite|postgres|redis)|evolve[\\/]sqlite|node[\\/](?:observe|chat-store|workspace|compute|browser|runtime|vertex-auth|mcp|store-sqlite|store-redis|store-postgres|swarm-sqlite|swarm-postgres|swarm-redis|ops-sqlite|ops-postgres|ops-redis|budget-sqlite|budget-postgres|redis-budget|redis-scripts|evolve-sqlite|headless))/.test(
+    /(?:rag-node|memory-markdown|skills[\\/]node|mcp[\\/](?:server[\\/])?stdio|swarm[\\/](?:sqlite|postgres|redis)|ops[\\/](?:sqlite|postgres|redis)|evolve[\\/]sqlite|node[\\/](?:observe|chat-store|workspace|compute|browser|runtime|vertex-auth|mcp|store-sqlite|store-redis|store-postgres|swarm-sqlite|swarm-postgres|swarm-redis|ops-sqlite|ops-postgres|ops-redis|budget-sqlite|budget-postgres|redis-budget|redis-scripts|evolve-sqlite|headless|store-connection|vmem-sqlite|vmem-postgres|goal-runtime-sqlite|goal-runtime-postgres|process-ops-sqlite|chat-conditional-sqlite|chat-conditional-postgres|stream-state-sqlite|stream-state-postgres|stream-state-redis|runs-v3-sqlite|runs-v3-postgres)|compute[\\/]docker|memory[\\/]versioned[\\/](?:sqlite|postgres)|goal[\\/]runtime[\\/](?:sqlite|postgres))/.test(
       input,
     ),
   );
@@ -146,6 +185,13 @@ const nodeOnlyEntries = [
   ['evolve/sqlite', 'createSqlitePopulationStore'],
   ['mcp/server/stdio', 'serveMcpStdio'],
   ['headless', 'runHeadless, resumeHeadless, inspectRun, doctor, loadProjectInstructions'],
+  ['skills/node', 'nodeSkillSource'],
+  // 2.4 Node-only entries.
+  ['memory/versioned/sqlite', 'createSqliteVersionedMemoryStore'],
+  ['memory/versioned/postgres', 'createPostgresVersionedMemoryStore'],
+  ['goal/runtime/sqlite', 'createSqliteGoalRuntimeStore'],
+  ['goal/runtime/postgres', 'createPostgresGoalRuntimeStore'],
+  ['compute/docker', 'createDockerSandbox, createDockerProcessRunner'],
 ];
 for (const [subpath, names] of nodeOnlyEntries) {
   try {
@@ -175,6 +221,13 @@ for (const entry of [
   'dist/batch.js',
   'dist/a2a.js',
   'dist/testing.js',
+  'dist/skills.js',
+  'dist/chat.js',
+  'dist/ui.js',
+  'dist/memory/versioned.js',
+  'dist/context.js',
+  'dist/goal/runtime.js',
+  'dist/skills/learning.js',
 ]) {
   const source = readFileSync(resolve(root, entry), 'utf8');
   if (forbiddenBuiltins.test(source)) failures.push(`${entry}: directly imports a node: builtin`);
