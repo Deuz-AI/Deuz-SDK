@@ -32,8 +32,10 @@ jobs:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
         with:
-          # npm trusted publishing requires Node >=22.14.
-          node-version: 22.14.0
+          # npm trusted publishing requires Node >=22.14. The latest 22 is what the
+          # CI Check jobs test; 22.14's node:sqlite has no FTS5, and its HTTP client
+          # does not pass the MCP reconnect test.
+          node-version: 22
           cache: npm
           registry-url: https://registry.npmjs.org
       - name: Require tag to match package version
