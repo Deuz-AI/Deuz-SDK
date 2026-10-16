@@ -26,6 +26,7 @@ import type { TelemetryParent } from '../internal/telemetry';
 import type { Message } from '../types/message';
 import type { LanguageModel } from '../types/model';
 import type { Usage } from '../types/usage';
+import type { CommonCallOptions } from '../types/config';
 
 /** What the loop knows when it asks for a step's context. */
 export interface LoopContextStep {
@@ -35,6 +36,8 @@ export interface LoopContextStep {
   messages: Message[];
   /** The model this step calls (a `prepareStep` or handoff model included). */
   model: LanguageModel;
+  /** Effective output settings after prepareStep, used to reserve shared context. */
+  outputOptions?: Pick<CommonCallOptions, 'maxOutputTokens' | 'effort'>;
   /** The tools on this step's wire, as the provider receives them. */
   wire?: WireToolRequest;
   /** The structured-output JSON Schema the request carries (a native final answer call). */

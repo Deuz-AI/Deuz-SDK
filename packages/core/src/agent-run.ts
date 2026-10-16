@@ -2261,6 +2261,7 @@ function makeAgentStream<T>(
             stepIndex: envelope.modelSteps - 1,
             messages: envelope.messages,
             model: callModel,
+            outputOptions: { maxOutputTokens: common.maxOutputTokens, effort: common.effort },
             ...(toolRequest ? { wire: toolRequest } : {}),
             ...(outputSchema ? { outputSchema } : {}),
           });
