@@ -386,6 +386,7 @@ async function* parseStream(
   let continuationToken: string | undefined;
   let sawFunctionCall = false;
   let blocked: string | undefined;
+  let hasPromptFeedback = false;
 
   for await (const ev of parseSSE(body)) {
     // Gemini SSE has NO '[DONE]' sentinel — loop until the stream ends.
@@ -397,6 +398,7 @@ async function* parseStream(
     }
     if (event.usageMetadata) lastUsage = event.usageMetadata; // last-wins
     if (event.promptFeedback?.blockReason) blocked = event.promptFeedback.blockReason;
+    if (event.promptFeedback != null) hasPromptFeedback = true;
 
     const candidate = event.candidates?.[0];
     if (!candidate) continue;
@@ -457,14 +459,13 @@ async function* parseStream(
       typeof lastUsage.candidatesTokenCount === 'number',
   );
   if (
-    !blocked &&
+    !hasPromptFeedback &&
     (lastFinish === 'CONTINUATION' || lastFinish === 'MAX_TOKENS') &&
     continuationToken
   ) {
     ctx.onContinuationCheckpoint?.({
       continuationToken,
       finishReason: lastFinish,
-      usage: mapGeminiUsage(lastUsage),
     });
   }
   if (!blocked && lastFinish === 'CONTINUATION') {

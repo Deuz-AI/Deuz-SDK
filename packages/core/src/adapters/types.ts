@@ -77,7 +77,6 @@ export interface ParseContext {
   onContinuationCheckpoint?: (checkpoint: {
     continuationToken: string;
     finishReason: 'CONTINUATION' | 'MAX_TOKENS';
-    usage: import('../types/usage').Usage;
   }) => void;
 }
 

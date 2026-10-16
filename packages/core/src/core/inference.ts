@@ -601,7 +601,7 @@ export function runStream(
 
       let firstContent = false;
       let continuationCheckpoint:
-        | Pick<GoogleContinuationCheckpoint, 'continuationToken' | 'finishReason' | 'usage'>
+        | Pick<GoogleContinuationCheckpoint, 'continuationToken' | 'finishReason'>
         | undefined;
       try {
         for await (const part of adapter.parseStream(res.body, {
@@ -676,6 +676,9 @@ export function runStream(
             finalFinish = part.finishReason;
             finalStopDetails = stopDetailsFrom(part.providerMetadata);
             if (continuationHandler && continuationCheckpoint) {
+              // Provider work is finished, even when the hop returned only a checkpoint.
+              // Storage still obeys the overall deadline, not the first-content timer.
+              timeout.firstByte();
               const signal =
                 combineSignals([userSignal, internal.failSignal, timeout.signal]) ?? timeout.signal;
               const { saveGoogleContinuation } = await import('../internal/google-continuation');

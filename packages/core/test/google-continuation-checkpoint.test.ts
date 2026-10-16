@@ -191,6 +191,73 @@ describe.each(providers)('$name opt-in terminal continuation capture', ({ create
     expect(handler).not.toHaveBeenCalled();
   });
 
+  it('does not checkpoint a response containing prompt feedback without a block reason', async () => {
+    const transport = mockFetchSequence([
+      () =>
+        sseResponse([
+          sseEvents([
+            {
+              data: {
+                promptFeedback: { safetyRatings: [] },
+                candidates: [{ finishReason: 'CONTINUATION', continuationToken: token }],
+                usageMetadata: { promptTokenCount: 4, candidatesTokenCount: 0, totalTokenCount: 4 },
+              },
+            },
+          ]),
+        ]),
+    ]);
+    const handler = vi.fn();
+    await generateText({ model: create(transport.fetch, handler), prompt: 'Explain' });
+    expect(handler).not.toHaveBeenCalled();
+    expect(transport.calls).toHaveLength(1);
+  });
+
+  it('stops the first-content timer before storing a completed thinking-only hop', async () => {
+    const transport = mockFetchSequence([
+      () =>
+        sseResponse([
+          sseEvents([
+            {
+              data: {
+                candidates: [{ finishReason: 'CONTINUATION', continuationToken: token }],
+                usageMetadata: {
+                  promptTokenCount: 4,
+                  candidatesTokenCount: 0,
+                  thoughtsTokenCount: 2,
+                  totalTokenCount: 6,
+                },
+              },
+            },
+          ]),
+        ]),
+    ]);
+    const timers = new Map<number, () => void>();
+    const handler = vi.fn<GoogleContinuationHandler>(() => {
+      expect(timers.has(10)).toBe(false);
+      expect(timers.has(100)).toBe(true);
+    });
+    const result = await generateText({
+      model: create(transport.fetch, handler),
+      prompt: 'Explain',
+      timeout: { ttftMs: 10, totalMs: 100 },
+      deps: {
+        clock: {
+          now: () => 0,
+          setTimeout(callback, milliseconds) {
+            timers.set(milliseconds, callback);
+            return () => {
+              timers.delete(milliseconds);
+            };
+          },
+        },
+      },
+    });
+    expect(result.finishReason).toBe('length');
+    expect(result.usage.reasoningTokens).toBe(2);
+    expect(handler).toHaveBeenCalledTimes(1);
+    expect(timers.size).toBe(0);
+  });
+
   it('enforces the overall deadline while waiting for storage', async () => {
     const transport = mockFetchSequence([reply('CONTINUATION')]);
     let expire: (() => void) | undefined;
