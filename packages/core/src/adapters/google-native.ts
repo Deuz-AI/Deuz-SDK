@@ -12,7 +12,6 @@ import {
   ModelNotFoundError,
   OverloadedError,
   RateLimitError,
-  UnsupportedCapabilityError,
 } from '../errors';
 import { extractSystem } from '../core/normalize';
 import {
@@ -261,10 +260,8 @@ function buildRequest(ctx: BuildContext): AdapterRequest {
     | { functionCallingConfig?: { streamFunctionCallArguments?: unknown } }
     | undefined;
   if (requestedToolConfig?.functionCallingConfig?.streamFunctionCallArguments === true) {
-    throw new UnsupportedCapabilityError({
+    throw new InvalidRequestError({
       provider: call.provider,
-      modelId: call.modelId,
-      capability: 'streamFunctionCallArguments',
       message:
         'The native adapter does not yet assemble partial function arguments. Disable streamFunctionCallArguments to receive complete calls.',
     });

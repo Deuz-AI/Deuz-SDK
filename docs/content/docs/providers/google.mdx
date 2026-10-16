@@ -95,7 +95,7 @@ const res = await generateText({
 
 ## Partial function arguments
 
-The native adapters currently accept complete function calls only. Requesting `streamFunctionCallArguments: true` through the active provider's `toolConfig` raises `UnsupportedCapabilityError` before HTTP. A response containing `partialArgs` or `willContinue` terminates the turn with a non-retryable error before its tools execute, rather than turning each partial frame into a separate empty call. Keep argument streaming disabled until assembly is supported. On Vertex, provider options use the `vertex-google` key. Ordinary text streaming and complete zero-argument function calls are unaffected.
+The native adapters currently accept complete function calls only. Requesting `streamFunctionCallArguments: true` through the active provider's `toolConfig` raises `InvalidRequestError` before HTTP. A response containing `partialArgs` or `willContinue` terminates the turn with a non-retryable error before its tools execute, rather than turning each partial frame into a separate empty call. Keep argument streaming disabled until assembly is supported. On Vertex, provider options use the `vertex-google` key. Ordinary text streaming and complete zero-argument function calls are unaffected.
 
 See the [official FunctionCall contract](https://googleapis.github.io/js-genai/release_docs/interfaces/types.FunctionCall.html) for this optional Vertex protocol. This guard does not implement incremental argument assembly.
 

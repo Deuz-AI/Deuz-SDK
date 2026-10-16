@@ -3,7 +3,7 @@ import { generateText, streamChat } from '../src/index';
 import { runAgent } from '../src/agent-run';
 import { createGoogleNative } from '../src/google';
 import { createVertexGoogleNative } from '../src/vertex';
-import { APICallError, UnsupportedCapabilityError } from '../src/errors';
+import { APICallError, InvalidRequestError } from '../src/errors';
 import { mockFetchSequence, sseEvents, sseResponse } from './fixtures/sse';
 
 // The optional Vertex partial-argument protocol is deliberately fail-closed until
@@ -81,7 +81,7 @@ describe.each(providers)('$name partial function argument boundary', ({ create, 
           ...(withTools ? { tools: t.definitions } : {}),
           maxRetries: 0,
         }),
-      ).rejects.toBeInstanceOf(UnsupportedCapabilityError);
+      ).rejects.toBeInstanceOf(InvalidRequestError);
       expect(transport.calls).toHaveLength(0);
       expect(t.execute).not.toHaveBeenCalled();
       expect(
