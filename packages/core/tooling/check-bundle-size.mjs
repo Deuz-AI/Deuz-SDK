@@ -56,7 +56,11 @@ for (const [name, budget] of Object.entries(config.bundles)) {
     legalComments: 'none',
     logLevel: 'silent',
     minify: true,
-    platform: 'browser',
+    // A Node-only entry (a SQLite or Postgres store, the Docker runner) imports
+    // `node:` modules and its optional peers statically: it is measured for
+    // Node, with those peers (`external`) left out as the consumer installs them.
+    platform: budget.platform ?? 'browser',
+    ...(budget.external ? { external: budget.external } : {}),
     target: ['es2022'],
     treeShaking: true,
     write: false,

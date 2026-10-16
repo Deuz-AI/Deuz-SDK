@@ -132,9 +132,14 @@ jobs:
     # DEUZ_TEST_REDIS_URL or DEUZ_TEST_POSTGRES_URL and skips without it, so the
     # `check` legs stay offline. Here DEUZ_TEST_REQUIRE_SERVICES=postgres,redis turns that
     # skip into a failure: a server that did not come up, or a URL that went
-    # missing, cannot pass as green.
-    name: Integration (Redis 7, Postgres 16)
+    # missing, cannot pass as green. Both supported Node lines run it (2.4 spec
+    # §5.3), each leg on its own.
+    name: Integration (Redis 7, Postgres 16, Node ${{ matrix.node }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [22, 24]
     services:
       redis:
         image: redis:7
@@ -159,7 +164,7 @@ jobs:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
         with:
-          node-version: 22
+          node-version: ${{ matrix.node }}
           cache: npm
       - run: npm ci
       - run: npm run build -w @deuz-sdk/core
@@ -172,9 +177,14 @@ jobs:
     # missing daemon or server fail instead of skipping. That is why this job
     # carries the same two service containers as `integration`: until the 2.4
     # Docker tests land it runs the whole core suite, and once they do it can
-    # narrow to them.
-    name: Docker (ubuntu-latest, Node 22)
+    # narrow to them. Both supported Node lines run it (spec §5.3 "Linux Node 22
+    # ve 24"), each leg on its own.
+    name: Docker (ubuntu-latest, Node ${{ matrix.node }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [22, 24]
     services:
       redis:
         image: redis:7
@@ -200,7 +210,7 @@ jobs:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
         with:
-          node-version: 22
+          node-version: ${{ matrix.node }}
           cache: npm
       # Fails here, once, if the runner has no usable Docker daemon.
       - run: docker version

@@ -4,7 +4,8 @@
     "Budgets are a RATCHET against ACCIDENTAL bloat, not a hard product limit. Raise them",
     "deliberately when a release adds real user-facing surface; never raise them to make a red",
     "gate go away. check-bundle-size.mjs reads only `bundles[*].from/exports/maxRawBytes/",
-    "maxGzipBytes`, so this `note` key is inert (JSON carries no comments).",
+    "maxGzipBytes` (plus the lazy limits and, for a Node-only entry, `platform`/`external`), so this",
+    "`note` key is inert (JSON carries no comments).",
     "",
     "RAISED FOR 1.9.0 SPRINT 2 (ergonomics + parity). Measured, minified, tree-shaken:",
     "  core  126275 B raw / 39362 B gzip   (was: limits 120000 / 37000; Sprint 1 measured 36880 gzip)",
@@ -271,7 +272,7 @@
     "The last four measure the W0 contract STUBS (each factory throws NotImplementedError). They are",
     "meant to trip: raise each one deliberately, with its measurement, when its W1 lane lands the",
     "implementation. The Node-only 2.4 entries (versioned memory and goal runtime stores, compute/docker)",
-    "are not budgeted, like the other Node-only stores.",
+    "were left unbudgeted at first, like the 2.3 Node-only stores; see ADDED FOR 2.4 (final audit A-6) below.",
     "",
     "RAISED FOR 2.4 (W0E, H5: the extraction plan saves planned/mutations before it writes). Measured",
     "13167 / 5418 on feat/2.4 and 14544 / 5910 with H5; native-memory lazy 13800 / 5700 -> 15000 / 6150",
@@ -359,7 +360,17 @@
     "  native-swarm/native-memory lazy: 17250 / 6950 -> 18300 / 7300 (measured 17390 / 6908)",
     "  edge/durable-journal lazy: 5900 / 2350 -> 6350 / 2500 (measured 6010 / 2359)",
     "  edge (tightened): 184350 / 57350 -> 183300 / 57000 (measured 181456 / 56419)",
-    "  native-agent (tightened): 267050 / 84000 -> 266150 / 83750 (measured 263470 / 82888)"
+    "  native-agent (tightened): 267050 / 84000 -> 266150 / 83750 (measured 263470 / 82888)",
+    "",
+    "ADDED FOR 2.4 (final audit A-6, spec §4.3 \"size budget for each\"): the five Node-only 2.4 subpaths.",
+    "They import `node:` modules (and the optional `pg` peer) statically, so they are measured with",
+    "`platform: 'node'` and `pg`/`pg-native` external (the consumer installs the driver); ~10% headroom.",
+    "Measured on wip/2.4-hd:",
+    "  memory-versioned-sqlite   47569 / 15180 -> 52350 / 16700",
+    "  memory-versioned-postgres 48615 / 15374 -> 53500 / 16950",
+    "  goal-runtime-sqlite       52257 / 14490 -> 57500 / 15950",
+    "  goal-runtime-postgres     54225 / 15420 -> 59650 / 17000",
+    "  compute-docker            65585 / 22391 -> 72150 / 24650"
   ],
   "bundles": {
     "core": {
@@ -904,6 +915,51 @@
       "maxGzipBytes": 7450,
       "maxLazyRawBytes": 109650,
       "maxLazyGzipBytes": 33300
+    },
+    "memory-versioned-sqlite": {
+      "from": "@deuz-sdk/core/memory/versioned/sqlite",
+      "exports": ["createSqliteVersionedMemoryStore"],
+      "platform": "node",
+      "maxRawBytes": 52350,
+      "maxGzipBytes": 16700
+    },
+    "memory-versioned-postgres": {
+      "from": "@deuz-sdk/core/memory/versioned/postgres",
+      "exports": ["createPostgresVersionedMemoryStore"],
+      "platform": "node",
+      "external": ["pg", "pg-native"],
+      "maxRawBytes": 53500,
+      "maxGzipBytes": 16950
+    },
+    "goal-runtime-sqlite": {
+      "from": "@deuz-sdk/core/goal/runtime/sqlite",
+      "exports": ["createSqliteGoalRuntimeStore"],
+      "platform": "node",
+      "maxRawBytes": 57500,
+      "maxGzipBytes": 15950
+    },
+    "goal-runtime-postgres": {
+      "from": "@deuz-sdk/core/goal/runtime/postgres",
+      "exports": ["createPostgresGoalRuntimeStore"],
+      "platform": "node",
+      "external": ["pg", "pg-native"],
+      "maxRawBytes": 59650,
+      "maxGzipBytes": 17000
+    },
+    "compute-docker": {
+      "from": "@deuz-sdk/core/compute/docker",
+      "exports": [
+        "createDockerSandbox",
+        "createDockerProcessRunner",
+        "createInMemoryProcessOperationStore",
+        "createSqliteProcessOperationStore",
+        "DockerSandboxError",
+        "OperationConflictError",
+        "DEFAULT_DOCKER_SANDBOX"
+      ],
+      "platform": "node",
+      "maxRawBytes": 72150,
+      "maxGzipBytes": 24650
     }
   }
 }

@@ -1,4 +1,4 @@
-<!-- verified: 2026-10-16 against @deuz-sdk/core@2.4.0 · api-contract sha256:e126e881213b
+<!-- verified: 2026-10-16 against @deuz-sdk/core@2.4.0 · api-contract sha256:da3643f44edc
      sources: packages/core/src/{autonomy,plan,verify,workspace,compute,browser,runtime,evolve,schedule}.ts,
      packages/core/src/evolve/*.ts, packages/core/src/schedule/*.ts, packages/core/src/goal/*.ts,
      docs/content/docs/modules/{evolve,schedule,goals}.mdx,

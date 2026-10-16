@@ -1100,6 +1100,8 @@
       "sseResponse"
     ],
     "./ui": [
+      "ChatSnapshotGateV1",
+      "ChatSnapshotV1",
       "ConnectDeuzStreamOptions",
       "CreateDeuzStreamOptions",
       "DEFAULT_DURABLE_STREAM_BATCH",
@@ -1159,6 +1161,8 @@
       "ChatInput",
       "ChatPersistOptions",
       "ChatRecord",
+      "ChatSnapshotGateV1",
+      "ChatSnapshotV1",
       "ChatStore",
       "ChatTombstone",
       "ConditionalChatMerge",
@@ -1794,6 +1798,7 @@
       "GoalRunIntentPage",
       "GoalRunIntentQuery",
       "GoalRuntimeCommitResult",
+      "GoalRuntimeOccurrencePruneOptions",
       "GoalRuntimePhase",
       "GoalRuntimePolicy",
       "GoalRuntimePruneOptions",
