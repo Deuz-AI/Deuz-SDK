@@ -31,6 +31,7 @@ import type {
   AgentRunStoreV3,
 } from '../../src/types/agent-run-v3';
 import { contextPackage, envelopeV3 } from './agent-run-v3';
+import { SLOW_TEST_TIMEOUT_MS } from './timeouts';
 import { createWorkingMemoryFixture } from './working-memory';
 
 export interface AgentRunStoreV3Harness {
@@ -96,7 +97,8 @@ export function agentRunStoreV3Contracts(
       }
     };
 
-  describe(name, () => {
+  // A loaded machine (a Linux gate leg) can take the in-memory store past 5 s too.
+  describe(name, { timeout: SLOW_TEST_TIMEOUT_MS }, () => {
     it(
       'is a V3 store and round-trips envelopes as copies',
       withHarness(async ({ store }) => {
