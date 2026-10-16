@@ -16,6 +16,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterAll, describe, expect, it } from 'vitest';
+import { SLOW_TEST_TIMEOUT_MS } from './fixtures/timeouts';
 
 interface Step {
   name?: string;
@@ -213,68 +214,80 @@ const FAKE_NPM = [
   '}',
 ].join('\n');
 
-describe.skipIf(!bashWorks())('release.yml: the post-publish npm check, run', () => {
-  const step = (release.jobs.publish?.steps ?? []).find((s) => s.run?.includes('npm view'));
-  const scratch = mkdtempSync(join(tmpdir(), 'deuz-release-check-'));
-  let calls = 0;
-  afterAll(() => rmSync(scratch, { recursive: true, force: true }));
+// Each attempt spawns bash and a fake npm: slow on Windows (Git Bash) under load.
+describe.skipIf(!bashWorks())(
+  'release.yml: the post-publish npm check, run',
+  { timeout: SLOW_TEST_TIMEOUT_MS },
+  () => {
+    const step = (release.jobs.publish?.steps ?? []).find((s) => s.run?.includes('npm view'));
+    const scratch = mkdtempSync(join(tmpdir(), 'deuz-release-check-'));
+    let calls = 0;
+    afterAll(() => rmSync(scratch, { recursive: true, force: true }));
 
-  function confirm(registry: string, overrides: Record<string, string> = {}) {
-    const log = join(scratch, `npm-${calls++}.log`).replace(/\\/g, '/');
-    const result = spawnSync(
-      'bash',
-      ['--noprofile', '--norc', '-eo', 'pipefail', '-c', `${FAKE_NPM}\n${step?.run ?? 'exit 99'}`],
-      {
-        encoding: 'utf8',
-        env: {
-          ...process.env,
-          ...Object.fromEntries(Object.entries(step?.env ?? {}).map(([k, v]) => [k, String(v)])),
-          GITHUB_REF_NAME: 'v9.8.7',
-          GITHUB_RUN_ID: '4242',
-          GITHUB_SERVER_URL: 'https://github.com',
-          GITHUB_REPOSITORY: 'Deuz-AI/Deuz-SDK',
-          ATTEMPTS: '4',
-          DELAY_SECONDS: '0',
-          FAKE_REGISTRY: registry,
-          FAKE_NPM_LOG: log,
-          ...overrides,
+    function confirm(registry: string, overrides: Record<string, string> = {}) {
+      const log = join(scratch, `npm-${calls++}.log`).replace(/\\/g, '/');
+      const result = spawnSync(
+        'bash',
+        [
+          '--noprofile',
+          '--norc',
+          '-eo',
+          'pipefail',
+          '-c',
+          `${FAKE_NPM}\n${step?.run ?? 'exit 99'}`,
+        ],
+        {
+          encoding: 'utf8',
+          env: {
+            ...process.env,
+            ...Object.fromEntries(Object.entries(step?.env ?? {}).map(([k, v]) => [k, String(v)])),
+            GITHUB_REF_NAME: 'v9.8.7',
+            GITHUB_RUN_ID: '4242',
+            GITHUB_SERVER_URL: 'https://github.com',
+            GITHUB_REPOSITORY: 'Deuz-AI/Deuz-SDK',
+            ATTEMPTS: '4',
+            DELAY_SECONDS: '0',
+            FAKE_REGISTRY: registry,
+            FAKE_NPM_LOG: log,
+            ...overrides,
+          },
         },
-      },
-    );
-    const lookups = existsSync(log) ? readFileSync(log, 'utf8').trim().split('\n') : [];
-    return { status: result.status, output: `${result.stdout}${result.stderr}`, lookups };
-  }
+      );
+      const lookups = existsSync(log) ? readFileSync(log, 'utf8').trim().split('\n') : [];
+      return { status: result.status, output: `${result.stdout}${result.stderr}`, lookups };
+    }
 
-  it("passes when both packages are on npm at the tag's version", () => {
-    const { status, lookups } = confirm('@deuz-sdk/core@9.8.7=1 @deuz-sdk/react@9.8.7=1');
-    expect(status).toBe(0);
-    expect(lookups.some((line) => line.includes(' @deuz-sdk/core@9.8.7 '))).toBe(true);
-    expect(lookups.some((line) => line.includes(' @deuz-sdk/react@9.8.7 '))).toBe(true);
-    // Fresh metadata on every look, not npm's cached packument.
-    expect(lookups.every((line) => line.includes('--prefer-online'))).toBe(true);
-  });
+    it("passes when both packages are on npm at the tag's version", () => {
+      const { status, lookups } = confirm('@deuz-sdk/core@9.8.7=1 @deuz-sdk/react@9.8.7=1');
+      expect(status).toBe(0);
+      expect(lookups.some((line) => line.includes(' @deuz-sdk/core@9.8.7 '))).toBe(true);
+      expect(lookups.some((line) => line.includes(' @deuz-sdk/react@9.8.7 '))).toBe(true);
+      // Fresh metadata on every look, not npm's cached packument.
+      expect(lookups.every((line) => line.includes('--prefer-online'))).toBe(true);
+    });
 
-  it('waits out registry lag: a package that shows up on the third look still passes', () => {
-    const { status, lookups } = confirm('@deuz-sdk/core@9.8.7=1 @deuz-sdk/react@9.8.7=3');
-    expect(status).toBe(0);
-    expect(lookups.filter((line) => line.includes('@deuz-sdk/react@')).length).toBe(3);
-  });
+    it('waits out registry lag: a package that shows up on the third look still passes', () => {
+      const { status, lookups } = confirm('@deuz-sdk/core@9.8.7=1 @deuz-sdk/react@9.8.7=3');
+      expect(status).toBe(0);
+      expect(lookups.filter((line) => line.includes('@deuz-sdk/react@')).length).toBe(3);
+    });
 
-  it('fails naming the missing package and how to re-run, after every attempt', () => {
-    const { status, output, lookups } = confirm('@deuz-sdk/react@9.8.7=1');
-    expect(status).not.toBe(0);
-    expect(lookups.filter((line) => line.includes('@deuz-sdk/core@')).length).toBe(4);
-    const error = output.split('\n').find((line) => line.startsWith('::error'));
-    expect(error).toContain('@deuz-sdk/core@9.8.7');
-    expect(error).not.toContain('@deuz-sdk/react@9.8.7');
-    expect(error).toContain('gh run rerun 4242 --failed');
-  });
+    it('fails naming the missing package and how to re-run, after every attempt', () => {
+      const { status, output, lookups } = confirm('@deuz-sdk/react@9.8.7=1');
+      expect(status).not.toBe(0);
+      expect(lookups.filter((line) => line.includes('@deuz-sdk/core@')).length).toBe(4);
+      const error = output.split('\n').find((line) => line.startsWith('::error'));
+      expect(error).toContain('@deuz-sdk/core@9.8.7');
+      expect(error).not.toContain('@deuz-sdk/react@9.8.7');
+      expect(error).toContain('gh run rerun 4242 --failed');
+    });
 
-  it("a version other than the tag's does not count", () => {
-    const { status, output } = confirm('@deuz-sdk/core@9.8.6=1 @deuz-sdk/react@9.8.6=1');
-    expect(status).not.toBe(0);
-    const error = output.split('\n').find((line) => line.startsWith('::error'));
-    expect(error).toContain('@deuz-sdk/core@9.8.7');
-    expect(error).toContain('@deuz-sdk/react@9.8.7');
-  });
-});
+    it("a version other than the tag's does not count", () => {
+      const { status, output } = confirm('@deuz-sdk/core@9.8.6=1 @deuz-sdk/react@9.8.6=1');
+      expect(status).not.toBe(0);
+      const error = output.split('\n').find((line) => line.startsWith('::error'));
+      expect(error).toContain('@deuz-sdk/core@9.8.7');
+      expect(error).toContain('@deuz-sdk/react@9.8.7');
+    });
+  },
+);
