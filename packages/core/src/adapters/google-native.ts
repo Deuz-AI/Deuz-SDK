@@ -256,6 +256,16 @@ function buildRequest(ctx: BuildContext): AdapterRequest {
   if (cached) body.cachedContent = cached;
 
   applyProviderOptions(body, call.provider, options);
+  const requestedToolConfig = options.providerOptions?.[call.provider]?.toolConfig as
+    | { functionCallingConfig?: { streamFunctionCallArguments?: unknown } }
+    | undefined;
+  if (requestedToolConfig?.functionCallingConfig?.streamFunctionCallArguments === true) {
+    throw new InvalidRequestError({
+      provider: call.provider,
+      message:
+        'The native adapter does not yet assemble partial function arguments. Disable streamFunctionCallArguments to receive complete calls.',
+    });
+  }
 
   // Two transports share the SAME body + SSE parser; only URL + auth differ:
   //  - AI Studio: {baseURL}/v1beta/models/{model}:streamGenerateContent, x-goog-api-key
@@ -399,6 +409,23 @@ async function* parseStream(
     const candidate = event.candidates?.[0];
     if (!candidate) continue;
     if (candidate.finishReason) lastFinish = candidate.finishReason;
+
+    // Validate the whole frame before emitting any tool delta. Partial calls
+    // must not become executable empty objects or a new call for every chunk.
+    if (
+      candidate.content?.parts?.some(
+        ({ functionCall }) =>
+          functionCall && ('partialArgs' in functionCall || 'willContinue' in functionCall),
+      )
+    ) {
+      throw new APICallError({
+        provider: ctx.provider,
+        statusCode: 200,
+        isRetryable: false,
+        message:
+          'Received unsupported partial function arguments. The native adapter requires complete functionCall.args; no tools from this turn may execute.',
+      });
+    }
 
     for (const part of candidate.content?.parts ?? []) {
       if (part.functionCall) {
