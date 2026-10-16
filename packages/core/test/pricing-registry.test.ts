@@ -76,6 +76,7 @@ const PRICED_ON_FALLBACK_BY_WIRE: Record<string, string> = {
  */
 const UNPRICED = new Set([
   'gemini-3.8-flash',
+  'gemini-4-argon', // Price validity dates need a separate pricing change; unknown is not zero.
   'gpt-6-luna',
   'llama-4-maverick',
   'deepseek-v4-flash',
