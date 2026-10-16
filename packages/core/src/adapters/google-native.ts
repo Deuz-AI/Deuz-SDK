@@ -18,6 +18,7 @@ import {
   assertToolSurface,
   describeToolChoice,
   effortWire,
+  googleNativeRequestRules,
   isForcedToolChoice,
   optionalOutputCap,
   planEffort,
@@ -189,6 +190,7 @@ function buildRequest(ctx: BuildContext): AdapterRequest {
   const { call, messages, options, object, tools } = ctx;
   const { systemInstruction, contents } = toGeminiContents(messages);
   assertToolSurface(ctx, 'native');
+  const nativeRules = googleNativeRequestRules(call.modelId);
 
   // An unknown model's placeholder cap is left off (2.3): Gemini's own default
   // (the model's maximum) applies instead of a guess.
@@ -197,7 +199,7 @@ function buildRequest(ctx: BuildContext): AdapterRequest {
     maxOutput !== undefined ? { maxOutputTokens: maxOutput } : {};
   for (const setting of ['temperature', 'topP'] as const) {
     if (options[setting] === undefined) continue;
-    if (call.modelId === 'gemini-4-argon') {
+    if (nativeRules.sampling === 'stripped') {
       reportDrop(
         ctx,
         setting,
@@ -268,7 +270,7 @@ function buildRequest(ctx: BuildContext): AdapterRequest {
 
   applyProviderOptions(body, call.provider, options);
   // Do not silently drop a cache reference: that would change the caller's context.
-  if (call.modelId === 'gemini-4-argon' && body.cachedContent !== undefined) {
+  if (nativeRules.cache === 'implicit' && body.cachedContent !== undefined) {
     throw new InvalidRequestError({
       message:
         'gemini-4-argon does not support explicit cachedContent. Remove the cache reference and supply the original context; implicit caching remains available.',

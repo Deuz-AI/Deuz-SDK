@@ -3,6 +3,7 @@ import { generateText } from '../src/index';
 import { createGoogleNative } from '../src/google';
 import { createVertexGoogleNative } from '../src/vertex';
 import { InvalidRequestError } from '../src/errors';
+import { resolveModelProfile } from '../src/model-profile';
 import type { CommonCallOptions } from '../src/types/config';
 import { mockFetch, sseEvents, sseResponse } from './fixtures/sse';
 
@@ -130,6 +131,39 @@ describe.each(providers)('$name Gemini 4 Argon request rules', ({ create, key })
     const { warnings } = await request();
     expect(warnings.filter((warning) => warning.type === 'unsupported-setting')).toEqual([]);
   });
+
+  it('reports the sampling and cache rules that the adapter actually enforces', async () => {
+    const noNetwork = (() => {
+      throw new Error('A profile must never request the network');
+    }) as typeof fetch;
+    const profile = resolveModelProfile(create(noNetwork, 'gemini-4-argon'));
+    expect(profile.sampling.handling).toBe('stripped');
+    expect(profile.cache.mode).toBe('implicit');
+    expect(Object.isFrozen(profile)).toBe(true);
+    const { body, warnings } = await request({ temperature: 0, topP: 0.5 });
+    for (const setting of ['temperature', 'topP']) {
+      expect(body.generationConfig).not.toHaveProperty(setting);
+      expect(profile.clamps).toContainEqual({
+        setting,
+        from: '*',
+        to: 'dropped',
+        warning: 'unsupported-setting',
+      });
+      expect(warnings).toEqual(
+        expect.arrayContaining([expect.objectContaining({ setting, type: 'unsupported-setting' })]),
+      );
+    }
+  });
+
+  it.each(['gemini-2.5-flash', 'gemini-3.8-flash', 'gemini-4-unreviewed-test-model'])(
+    'does not apply Argon profile rules to %s',
+    (modelId) => {
+      const { fetch } = transport();
+      const profile = resolveModelProfile(create(fetch, modelId));
+      expect(profile.sampling.handling).toBe('sent');
+      expect(profile.cache.mode).toBe('cached-content');
+    },
+  );
 
   it('rejects explicit cachedContent before HTTP without discarding cached context', async () => {
     const { fetch, calls } = transport();

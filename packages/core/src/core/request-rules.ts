@@ -80,6 +80,16 @@ function usesThinkingLevel(modelId: string): boolean {
   return modelId === 'gemini-4-argon' || /^gemini-3/.test(modelId);
 }
 
+/** Native request behavior shared by the adapter and its public model profile. */
+export function googleNativeRequestRules(modelId: string): {
+  sampling: 'sent' | 'stripped';
+  cache: 'implicit' | 'cached-content';
+} {
+  return modelId === 'gemini-4-argon'
+    ? { sampling: 'stripped', cache: 'implicit' }
+    : { sampling: 'sent', cache: 'cached-content' };
+}
+
 /** Pro-tier Gemini 3 models accept only low/high thinking levels. */
 function levelOnlyLowHigh(modelId: string): boolean {
   return /^gemini-3(\.\d+)?-pro/.test(modelId);
