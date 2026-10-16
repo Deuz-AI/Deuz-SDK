@@ -413,7 +413,12 @@ unless you give `usd`. Then:
 - a failed call is marked `unknown` (it may have been billed) and the error is
   rethrown.
 
-Without `accounting`, nothing is charged, as in 2.3.
+Without `accounting`, nothing is charged, as in 2.3. Inside a V3 run, the RAG
+context source passes its `retrieve` a fourth `charge` argument with the run's
+accounting; spread it into these options
+(`hybridRetrieve(q, deps, { topK, ...charge })`) and the query embedding
+reaches the run's ledger and the goal supervisor's watermark. See
+[Context compiler](/docs/modules/context#sources).
 
 ```ts
 import { createExecutionContext } from '@deuz-sdk/core/agent';
