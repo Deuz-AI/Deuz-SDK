@@ -53,7 +53,18 @@ function supervisorFlows(name: string, make: MakeStore): void {
         const b = w.supervisorFor('sup-b', launcher);
         await a.submit({ goalId: 'g', scope: SCOPE, objective: 'x' });
         const ticks = [a.tick(), b.tick()];
-        (await launcher.whenHeld()).finish({
+        // If both ticks end without holding a leg (one threw, say), fail with
+        // what they returned instead of waiting out the test timeout.
+        const noLeg = Promise.allSettled(ticks).then((settled) => {
+          throw new Error(
+            `no leg was held: ${JSON.stringify(
+              settled.map((s) => (s.status === 'rejected' ? String(s.reason) : s.value)),
+            )}`,
+          );
+        });
+        // Once the held leg finishes the ticks settle too: that rejection is expected.
+        noLeg.catch(() => undefined);
+        (await Promise.race([launcher.whenHeld(), noLeg])).finish({
           runId: 'g:run:1',
           result: results.completed('g:run:1'),
         });

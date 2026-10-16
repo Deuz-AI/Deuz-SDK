@@ -246,8 +246,11 @@ describe('examples/23-docker-runner', () => {
         'seq 1 1000 with a 64-byte tail: ends "1000", truncated={"stdout":true,"stderr":false}',
       );
 
+      // The local image id differs by engine for the same pinned digest: Docker
+      // Desktop's containerd store reports the index digest, a classic engine
+      // (the CI runner) the config digest.
       expect(processed).toMatch(
-        /start: (running|exited), container [0-9a-f]{12}, image d9e853e87e55/,
+        /start: (running|exited), container [0-9a-f]{12}, image [0-9a-f]{12}\n/,
       );
       expect(processed).toContain('poll: exited, exit code 0');
       expect(processed).toContain(String.raw`output: "done\n", truncated false`);

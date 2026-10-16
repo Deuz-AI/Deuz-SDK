@@ -413,12 +413,16 @@ describe('createNodeSandbox — runShell cwd stays inside the sandbox root (H3)'
   it('resolves a relative cwd against the root', async () => {
     const res = await pwd('sub');
     expect(res.exitCode).toBe(0);
-    expect(res.stdout).toBe(await realpath(join(root, 'sub')));
+    // The spawn gets the lexical path; compare real paths (a CI runner's
+    // tmpdir is an 8.3 short name such as C:\Users\RUNNER~1).
+    expect(await realpath(res.stdout)).toBe(await realpath(join(root, 'sub')));
   });
 
   it('keeps the root when no cwd is given, and accepts an absolute path inside it', async () => {
-    expect((await pwd(undefined)).stdout).toBe(await realpath(root));
-    expect((await pwd(join(root, 'sub'))).stdout).toBe(await realpath(join(root, 'sub')));
+    expect(await realpath((await pwd(undefined)).stdout)).toBe(await realpath(root));
+    expect(await realpath((await pwd(join(root, 'sub'))).stdout)).toBe(
+      await realpath(join(root, 'sub')),
+    );
   });
 
   it.each([
