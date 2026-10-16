@@ -121,7 +121,7 @@ export interface ModelProfileThinking {
 export interface ModelProfileLimits {
   /** Total context window in tokens; absent when undocumented. */
   contextWindow?: number;
-  /** The provider's output maximum in tokens; absent when undocumented. */
+  /** Documented maximum for one request on this wire, not a multi-hop generation budget. */
   maxOutput?: number;
   /**
    * The output cap a request carries by default: a token count, or
@@ -451,10 +451,8 @@ const FACTS: Readonly<Record<string, Facts>> = /* @__PURE__ */ (() => ({
       rule: 'Sampling parameters are deprecated and ignored; use thinkingLevel instead.',
     },
     notes: [
-      'Input, thinking and output share one 1,048,576-token window.',
-      'The recorded 65,536 output limit is for one native streaming request; non-streaming requests are capped at 32,768.',
-      'The provider supports longer output via continuation, which this native adapter does not yet implement. No larger budget or timeout is selected automatically.',
-      'Caching is implicit only; explicit cached-content resources are unsupported.',
+      'Input, thinking and output share the context window. maxOutput is the per-stream cap (non-streaming: 32,768).',
+      'Implicit caching only. Automatic long decode is not implemented; budgets and timeouts are not raised.',
     ],
   },
   'gemini-3.1-pro-preview': {

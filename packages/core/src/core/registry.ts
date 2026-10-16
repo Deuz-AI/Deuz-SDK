@@ -49,9 +49,9 @@ export interface ModelCapabilities {
   audio: boolean;
   contextWindow: number;
   /**
-   * Output ceiling, sent as the wire's output cap when the caller gives no
-   * `maxOutputTokens`. When the row does not know the model's limit (an unknown
-   * slug, or a 2.3 row whose limit is undocumented) this is only a conservative
+   * Output ceiling for the selected wire. Usually the default request cap;
+   * documented provider-default rows may also omit that cap. When the row
+   * does not know the model's limit this is only a conservative
    * PLACEHOLDER (2.3): wires where the cap is optional (OpenAI Chat Completions
    * and Responses, Gemini native) omit it instead of truncating there, and the
    * Anthropic wire — where `max_tokens` is required — sends it; the
