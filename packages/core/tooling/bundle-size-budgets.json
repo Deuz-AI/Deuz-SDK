@@ -370,7 +370,12 @@
     "  memory-versioned-postgres 48615 / 15374 -> 53500 / 16950",
     "  goal-runtime-sqlite       52257 / 14490 -> 57500 / 15950",
     "  goal-runtime-postgres     54225 / 15420 -> 59650 / 17000",
-    "  compute-docker            65585 / 22391 -> 72150 / 24650"
+    "  compute-docker            65585 / 22391 -> 72150 / 24650",
+    "",
+    "GOOGLE CHECKPOINT CAPTURE: the new opt-in google-continuation chunk measures 552 raw / 339 gzip bytes.",
+    "Its feature budget is 600 / 375; skills-learning's existing aggregate lazy budget adds exactly that allowance:",
+    "  skills-learning lazy: 109650 / 33300 -> 110250 / 33675 (measured 110021 / 33435).",
+    "All existing eager limits and other lazy allowances remain unchanged. This does not cover cumulative growth from other PRs."
   ],
   "bundles": {
     "core": {
@@ -938,8 +943,8 @@
       "exports": ["proposeSkillFromRun"],
       "maxRawBytes": 19750,
       "maxGzipBytes": 7450,
-      "maxLazyRawBytes": 109650,
-      "maxLazyGzipBytes": 33300
+      "maxLazyRawBytes": 110250,
+      "maxLazyGzipBytes": 33675
     },
     "memory-versioned-sqlite": {
       "from": "@deuz-sdk/core/memory/versioned/sqlite",
