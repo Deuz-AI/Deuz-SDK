@@ -1142,6 +1142,10 @@ export function runStreamToolLoop(
           stepIndex,
           messages,
           model: prepared.options.model,
+          outputOptions: {
+            maxOutputTokens: prepared.options.maxOutputTokens,
+            effort: prepared.options.effort,
+          },
           wire: stepWire.wire,
           ...(lo && stepSpan
             ? { telemetry: { runtime: lo.rt, parentSpanId: stepSpan.spanId } }
