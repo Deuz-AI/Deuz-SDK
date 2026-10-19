@@ -41,8 +41,8 @@ interface GeminiPart {
   thoughtSignature?: string;
   inlineData?: { mimeType: string; data: string };
   fileData?: { mimeType?: string; fileUri: string };
-  functionCall?: { name: string; args: unknown };
-  functionResponse?: { name: string; response: unknown };
+  functionCall?: { id?: string; name: string; args: unknown };
+  functionResponse?: { id?: string; name: string; response: unknown };
 }
 
 interface GeminiContent {
@@ -88,7 +88,17 @@ function thoughtSignatureOf(meta: Record<string, unknown> | undefined): string |
   return typeof google?.thoughtSignature === 'string' ? google.thoughtSignature : undefined;
 }
 
-function partToGemini(part: Part, toolNameById: Map<string, string>): GeminiPart | null {
+/** Provider IDs are distinct from the SDK's canonical tool-call IDs. */
+function functionCallIdOf(meta: Record<string, unknown> | undefined): string | undefined {
+  const google = meta?.google as { functionCallId?: unknown } | undefined;
+  return typeof google?.functionCallId === 'string' ? google.functionCallId : undefined;
+}
+
+function partToGemini(
+  part: Part,
+  toolNameById: Map<string, string>,
+  providerIdById: Map<string, string>,
+): GeminiPart | null {
   switch (part.type) {
     case 'text': {
       // Gemini can sign a plain text part too (2.3, F21): echo it back on it.
@@ -109,7 +119,10 @@ function partToGemini(part: Part, toolNameById: Map<string, string>): GeminiPart
       const sig =
         (part.providerMetadata?.google as { thoughtSignature?: string } | undefined)
           ?.thoughtSignature ?? (part.providerMetadata?.thoughtSignature as string | undefined);
-      const gp: GeminiPart = { functionCall: { name: part.name, args: part.input } };
+      const id = functionCallIdOf(part.providerMetadata);
+      const gp: GeminiPart = {
+        functionCall: { name: part.name, args: part.input, ...(id !== undefined ? { id } : {}) },
+      };
       if (sig) gp.thoughtSignature = sig;
       return gp;
     }
@@ -117,7 +130,8 @@ function partToGemini(part: Part, toolNameById: Map<string, string>): GeminiPart
       const name = toolNameById.get(part.toolUseId) ?? part.toolUseId;
       const response =
         typeof part.result === 'string' ? { result: part.result } : (part.result as object);
-      return { functionResponse: { name, response } };
+      const id = providerIdById.get(part.toolUseId);
+      return { functionResponse: { name, response, ...(id !== undefined ? { id } : {}) } };
     }
     case 'reasoning': {
       // Echo thought summary; carry the signature so multi-step tool use round-trips.
@@ -144,9 +158,14 @@ function toGeminiContents(messages: NormalizedMessage[]): {
 
   // First pass: map tool_use id → function name so tool_result can reference it.
   const toolNameById = new Map<string, string>();
+  const providerIdById = new Map<string, string>();
   for (const m of sys.rest) {
     for (const p of m.content) {
-      if (p.type === 'tool_use') toolNameById.set(p.id, p.name);
+      if (p.type === 'tool_use') {
+        toolNameById.set(p.id, p.name);
+        const id = functionCallIdOf(p.providerMetadata);
+        if (id !== undefined) providerIdById.set(p.id, id);
+      }
     }
   }
 
@@ -154,7 +173,7 @@ function toGeminiContents(messages: NormalizedMessage[]): {
   for (const m of sys.rest) {
     const role: 'user' | 'model' = m.role === 'assistant' ? 'model' : 'user';
     const parts = m.content
-      .map((p) => partToGemini(p, toolNameById))
+      .map((p) => partToGemini(p, toolNameById, providerIdById))
       .filter((p): p is GeminiPart => p !== null);
     if (parts.length) contents.push({ role, parts });
   }
@@ -403,14 +422,22 @@ async function* parseStream(
     for (const part of candidate.content?.parts ?? []) {
       if (part.functionCall) {
         sawFunctionCall = true;
+        const functionCallId = part.functionCall.id;
         yield {
           type: 'tool-call-delta',
           id: ctx.generateId(),
           name: part.functionCall.name,
           // Gemini sends complete args per part — emit one full delta.
           argsTextDelta: JSON.stringify(part.functionCall.args ?? {}),
-          ...(part.thoughtSignature
-            ? { providerMetadata: { google: { thoughtSignature: part.thoughtSignature } } }
+          ...(part.thoughtSignature || typeof functionCallId === 'string'
+            ? {
+                providerMetadata: {
+                  google: {
+                    ...(part.thoughtSignature ? { thoughtSignature: part.thoughtSignature } : {}),
+                    ...(typeof functionCallId === 'string' ? { functionCallId } : {}),
+                  },
+                },
+              }
             : {}),
         };
       } else if (part.thought) {
