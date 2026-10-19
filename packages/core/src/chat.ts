@@ -37,6 +37,7 @@ import type { MemoryScope } from './memory';
 import type { DeuzAgentState, DeuzUIPart } from './ui';
 import { imagePart } from './parts';
 import { resolveMedia } from './internal/image';
+import { canMergeTextParts, hasGoogleTextSignature } from './internal/text-signature';
 import {
   agentFrameOf,
   applyAgentFrame,
@@ -531,14 +532,14 @@ export function applyUIPart(turn: AssistantTurnState, part: DeuzUIPart): Assista
     case 'text-delta': {
       const parts = partsOf(turn.message);
       const tail = parts.at(-1);
-      // The text's round-trip data (2.3, e.g. a Gemini signature on the last,
-      // often empty, chunk) merges onto the text it belongs to, as the
-      // canonical turn content does.
+      // Signed text, including an empty trailing part, must retain its boundary.
       const { providerMetadata: meta } = providerMetadataFromWire(
         (part as { providerMetadata?: unknown }).providerMetadata,
       );
       const next: UIMessagePart[] =
-        tail?.type === 'text' && tail.state === 'streaming'
+        tail?.type === 'text' &&
+        tail.state === 'streaming' &&
+        canMergeTextParts(tail, { providerMetadata: meta })
           ? [
               ...parts.slice(0, -1),
               {
@@ -1003,12 +1004,11 @@ export function assistantMessageFromTurn(turn: AssistantTurnState): Message {
     if (!ordered.some((p) => p.type === 'text' || p.type === 'tool_use')) {
       return { role: 'assistant', content: text };
     }
-    // Text the UI split around a step or data boundary is one run again, with
-    // its round-trip data merged as the canonical turn content merges it.
+    // Coalesce UI text only when doing so cannot change a signed replay part.
     const content: Part[] = [];
     for (const part of ordered) {
       const last = content.at(-1);
-      if (part.type === 'text' && last?.type === 'text') {
+      if (part.type === 'text' && last?.type === 'text' && canMergeTextParts(last, part)) {
         last.text += part.text;
         if (part.providerMetadata) {
           last.providerMetadata = { ...last.providerMetadata, ...part.providerMetadata };
@@ -1278,8 +1278,8 @@ function canonicalContentFromUI(message: UIMessage): string | Part[] {
     for (const p of ordered) {
       switch (p.type) {
         case 'text':
-          // An empty text block 400s some wires — drop it, do not send it.
-          if (p.text) {
+          // Empty unsigned blocks are not replayable; a signed empty part is.
+          if (p.text || hasGoogleTextSignature(p)) {
             parts.push({
               type: 'text',
               text: p.text,

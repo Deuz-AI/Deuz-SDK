@@ -5,6 +5,7 @@ import type { ReasoningDeltaPart, TextDeltaPart } from '../types/stream';
 import type { Usage, FinishReason } from '../types/usage';
 import { runStream, type InternalRunOptions } from '../core/inference';
 import { stopDetailsFrom } from '../internal/stop-details';
+import { canMergeTextParts, hasGoogleTextSignature } from '../internal/text-signature';
 
 type ToolUsePart = Extract<Part, { type: 'tool_use' }>;
 
@@ -68,7 +69,7 @@ type Segment =
  *   `display: 'omitted'` streams only the signature);
  * - encrypted and redacted payloads are always blocks of their own;
  * - blocks are placed where they arrived — thinking between two tool calls
- *   stays between them — and consecutive text deltas form one text part.
+ *   stays between them. Only unsigned consecutive text deltas form one text part.
  */
 export interface TurnContent {
   /** Record a text delta (an empty one with no round-trip data opens nothing). */
@@ -101,7 +102,7 @@ export function createTurnContent(): TurnContent {
     text(part) {
       if (!part.text && !part.providerMetadata) return;
       const last = segments.at(-1);
-      if (last?.kind === 'text') {
+      if (last?.kind === 'text' && canMergeTextParts(last, part)) {
         last.text += part.text;
         if (part.providerMetadata) {
           last.providerMetadata = { ...last.providerMetadata, ...part.providerMetadata };
@@ -170,10 +171,10 @@ export function createTurnContent(): TurnContent {
           content.push({ ...segment.part });
         } else if (segment.kind === 'tool') {
           if (dispatched.has(segment.id) && !placed.has(segment.id)) pushTool(segment.id);
-        } else if (segment.text) {
+        } else if (segment.text || hasGoogleTextSignature(segment)) {
           const last = content.at(-1);
-          // Text on both sides of a call that was not kept (a cut-off turn) is one run.
-          if (last?.type === 'text') {
+          // Unsigned text around a discarded tool call can still form one run.
+          if (last?.type === 'text' && canMergeTextParts(last, segment)) {
             last.text += segment.text;
             if (segment.providerMetadata) {
               last.providerMetadata = { ...last.providerMetadata, ...segment.providerMetadata };
