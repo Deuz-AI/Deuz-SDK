@@ -347,7 +347,7 @@ describe('gemini-3.8-flash (2.3, F08)', () => {
     expect(medium.warnings).toEqual([]);
   });
 
-  it('its output limit is undocumented, so no maxOutputTokens is invented', async () => {
+  it('keeps the default output cap omitted after its documented limit is known', async () => {
     const { body } = await geminiRequest('gemini-3.8-flash');
     expect(body.generationConfig).not.toHaveProperty('maxOutputTokens');
   });

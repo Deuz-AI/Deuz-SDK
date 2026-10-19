@@ -175,8 +175,8 @@ export async function prepareRequests(
       if (request[key] !== undefined) Object.assign(options, { [key]: request[key] });
     }
     reportDroppedSettings(options, caps, report);
-    // F12: under a bound, a row with no documented output limit sends its
-    // placeholder, so the hold covers what the provider may bill.
+    // A bounded request needs an explicit output hold even when the ordinary
+    // request leaves its default cap to the provider.
     const capped =
       input.bounded && wireOutputCap(model.surface, caps, options, model.modelId) === undefined;
     const callOptions: CommonCallOptions = capped
@@ -187,8 +187,8 @@ export async function prepareRequests(
         type: 'clamped-setting',
         setting: 'maxOutputTokens',
         message:
-          `maxOutputTokens ${caps.maxOutput} was sent: ${model.modelId} documents no output ` +
-          'limit and the batch has a budget; pass maxOutputTokens to raise it.',
+          `maxOutputTokens ${caps.maxOutput} was sent: ${model.modelId} leaves its default output ` +
+          'cap unset and the batch has a budget; pass maxOutputTokens to select a cap.',
       });
     let object: ObjectRequest | undefined;
     if (request.schema !== undefined) {

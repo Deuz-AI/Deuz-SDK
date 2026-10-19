@@ -77,7 +77,8 @@ describe('resolveModelProfile: the 16 tracked ids (2.3, roadmap 5.1/5.4)', () =>
       expect(profile.protocol, id).toBe(model.surface);
       expect(profile.liveVerified, id).toBe(false);
       expect(profile.sourceUrl, id).toMatch(/^https:\/\//);
-      expect(profile.checkedAt, id).toMatch(/^2026-10-0[69]$/);
+      if (id === 'gemini-3.8-flash') expect(profile.checkedAt).toBe('2026-10-17');
+      else expect(profile.checkedAt, id).toMatch(/^2026-10-0[69]$/);
     }
   });
 
@@ -329,7 +330,11 @@ describe('Gemini profiles', () => {
       { setting: 'effort', from: 'max', to: 'high', warning: 'clamped-setting' },
       { setting: 'effort', from: 'none', to: 'low', warning: 'clamped-setting' },
     ]);
-    expect(profile.limits).toEqual({ defaultOutputCap: 'omitted' });
+    expect(profile.limits).toEqual({
+      contextWindow: 1_048_576,
+      maxOutput: 65_536,
+      defaultOutputCap: 'omitted',
+    });
     expect(profile.usage.reasoningInclusive).toBe(false); // thoughts are counted apart
   });
 

@@ -49,9 +49,9 @@ export interface ModelCapabilities {
   audio: boolean;
   contextWindow: number;
   /**
-   * Output ceiling, sent as the wire's output cap when the caller gives no
-   * `maxOutputTokens`. When the row does not know the model's limit (an unknown
-   * slug, or a 2.3 row whose limit is undocumented) this is only a conservative
+   * Output ceiling for the selected wire. Usually the default request cap;
+   * documented provider-default rows may also omit that cap. When the row
+   * does not know the model's limit this is only a conservative
    * PLACEHOLDER (2.3): wires where the cap is optional (OpenAI Chat Completions
    * and Responses, Gemini native) omit it instead of truncating there, and the
    * Anthropic wire — where `max_tokens` is required — sends it; the
@@ -135,6 +135,22 @@ const PLACEHOLDER_MAX_OUTPUT = 4_096;
  */
 const PLACEHOLDER_ROWS = new WeakSet<Row>();
 const PLACEHOLDER_CAPS = new WeakSet<ModelCapabilities>();
+
+// A documented limit and an omitted default request cap are separate facts.
+// Keep the server's default without treating the known limit as a placeholder.
+const PROVIDER_OUTPUT_DEFAULT_ROWS = new WeakSet<Row>();
+const PROVIDER_OUTPUT_DEFAULT_CAPS = new WeakSet<ModelCapabilities>();
+
+function providerOutputDefault(provider: string, surface: ModelSurface, over: Partial<Row>): Row {
+  const result = row(provider, surface, over);
+  PROVIDER_OUTPUT_DEFAULT_ROWS.add(result);
+  return result;
+}
+
+/** Whether an optional wire cap is left to the provider unless explicitly overridden. */
+export function omitsDefaultOutputCap(caps: ModelCapabilities): boolean {
+  return isMaxOutputPlaceholder(caps) || PROVIDER_OUTPUT_DEFAULT_CAPS.has(caps);
+}
 
 /** A pinned row whose output limit is undocumented: `maxOutput` is a placeholder. */
 function undocumentedOutput(provider: string, surface: ModelSurface, over: Partial<Row>): Row {
@@ -764,17 +780,30 @@ const NATIVE_REGISTRY: Record<string, Row> = {
     contextWindow: 1_000_000,
     maxOutput: 64_000,
   }),
-  // 2.3 (F08) — GA; research-dated (roadmap 5.3, 2026-10-09), NOT live-verified.
-  // Documented: thinking levels low/medium/high (default medium), no `minimal`
-  // — so effort 'none' clamps to low. The output limit is undocumented (the
-  // cap is left off); the other flags keep the native-family defaults.
-  'gemini-3.8-flash': undocumentedOutput('google', 'native', {
+  // Official model cards checked 2026-10-17, not live-verified. Updating
+  // catalog facts must not silently start sending a larger default output cap.
+  'gemini-3.8-flash': providerOutputDefault('google', 'native', {
     vision: true,
     reasoning: true,
     caching: true,
     nativePdf: true,
     audio: true,
-    contextWindow: 1_000_000,
+    contextWindow: 1_048_576,
+    maxOutput: 65_536,
+    effortLevels: ['low', 'medium', 'high'],
+    effortDefault: 'medium',
+    effortNone: 'lowest',
+  }),
+  // Input, thinking and output share one window. This is the per-stream limit,
+  // not a claim that native long-decode continuation is implemented.
+  'gemini-4-argon': providerOutputDefault('google', 'native', {
+    vision: true,
+    reasoning: true,
+    caching: true,
+    nativePdf: true,
+    audio: true,
+    contextWindow: 1_048_576,
+    maxOutput: 65_536,
     effortLevels: ['low', 'medium', 'high'],
     effortDefault: 'medium',
     effortNone: 'lowest',
@@ -955,6 +984,13 @@ function finalize(
     overrides?.maxOutput === undefined
   ) {
     PLACEHOLDER_CAPS.add(frozen);
+  }
+  if (
+    PROVIDER_OUTPUT_DEFAULT_ROWS.has(row) &&
+    factory?.maxOutput === undefined &&
+    overrides?.maxOutput === undefined
+  ) {
+    PROVIDER_OUTPUT_DEFAULT_CAPS.add(frozen);
   }
   return frozen;
 }

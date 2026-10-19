@@ -33,6 +33,7 @@ import {
   getCapabilities,
   isMaxOutputPlaceholder,
   isUndocumentedRow,
+  omitsDefaultOutputCap,
   registryMatch,
   type EffortLevel,
   type EffortNoneMapping,
@@ -120,7 +121,7 @@ export interface ModelProfileThinking {
 export interface ModelProfileLimits {
   /** Total context window in tokens; absent when undocumented. */
   contextWindow?: number;
-  /** The provider's output maximum in tokens; absent when undocumented. */
+  /** Documented maximum for one request on this wire, not a multi-hop generation budget. */
   maxOutput?: number;
   /**
    * The output cap a request carries by default: a token count, or
@@ -431,14 +432,27 @@ const FACTS: Readonly<Record<string, Facts>> = /* @__PURE__ */ (() => ({
 
   // --- Google: research-dated (2026-10-09), not live-verified. ---
   'gemini-3.8-flash': {
-    sourceUrl: 'https://ai.google.dev/gemini-api/docs/latest-model',
-    checkedAt: RESEARCHED,
+    sourceUrl: 'https://ai.google.dev/gemini-api/docs/models/gemini-3.8-flash',
+    checkedAt: '2026-10-17',
     status: 'stable',
-    unknown: ['vision', 'caching', 'nativePdf', 'audio', 'contextWindow'],
     sampling: { accepted: 'unknown' },
     notes: [
       "Thinking levels low/medium/high (default medium); there is no 'minimal', so reasoning cannot be turned off.",
+      'Input and output budgets are separate. The known output limit is not automatically sent as a request cap.',
       'Do not carry thinking_budget, sampling, prefill or candidate_count settings over from older models automatically.',
+    ],
+  },
+  'gemini-4-argon': {
+    sourceUrl: 'https://ai.google.dev/gemini-api/docs/models/gemini-4-argon',
+    checkedAt: '2026-10-17',
+    status: 'stable',
+    sampling: {
+      accepted: 'none',
+      rule: 'Sampling parameters are deprecated and ignored; use thinkingLevel instead.',
+    },
+    notes: [
+      'Input, thinking and output share the context window. maxOutput is the per-stream cap (non-streaming: 32,768).',
+      'Implicit caching only. Automatic long decode is not implemented; budgets and timeouts are not raised.',
     ],
   },
   'gemini-3.1-pro-preview': {
@@ -632,7 +646,7 @@ export function resolveModelProfile(model: LanguageModel): ModelProfile {
     ...(maxOutput !== undefined ? { maxOutput } : {}),
     // Anthropic's max_tokens is required, so even a placeholder is sent there.
     defaultOutputCap:
-      protocol !== 'anthropic' && isMaxOutputPlaceholder(caps) ? 'omitted' : caps.maxOutput,
+      protocol !== 'anthropic' && omitsDefaultOutputCap(caps) ? 'omitted' : caps.maxOutput,
   };
 
   const thinking: ModelProfileThinking = {
