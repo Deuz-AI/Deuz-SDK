@@ -45,6 +45,7 @@ import {
   budgetPeers,
   clampEffortLevel,
   effortWire,
+  googleNativeRequestRules,
   type EffortField,
   type EffortWire,
 } from './core/request-rules';
@@ -579,6 +580,7 @@ export function resolveModelProfile(model: LanguageModel): ModelProfile {
   const claimed: Partial<Record<string, unknown>> = readConfig(model)?.capabilities ?? {};
   const protocol = model.surface;
   const wire = effortWire(protocol, caps, model.modelId);
+  const nativeRules = protocol === 'native' ? googleNativeRequestRules(model.modelId) : undefined;
   // A pinned row that leaves its output limit undocumented pins only what its
   // request rules need. Without a documentary entry, its other values are the
   // row's conservative defaults: never facts, whatever an override claims.
@@ -608,7 +610,7 @@ export function resolveModelProfile(model: LanguageModel): ModelProfile {
   };
 
   const handling: ModelProfileSampling['handling'] =
-    caps.samplingRestrictions && protocol !== 'native'
+    nativeRules?.sampling === 'stripped' || (caps.samplingRestrictions && protocol !== 'native')
       ? 'stripped'
       : protocol === 'anthropic' && caps.reasoning && wire.budgets
         ? 'stripped-while-thinking'
@@ -679,7 +681,7 @@ export function resolveModelProfile(model: LanguageModel): ModelProfile {
         protocol === 'anthropic'
           ? 'breakpoints'
           : protocol === 'native'
-            ? 'cached-content'
+            ? nativeRules!.cache
             : model.provider === 'openai'
               ? 'implicit'
               : 'unknown',

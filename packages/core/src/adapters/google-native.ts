@@ -18,10 +18,12 @@ import {
   assertToolSurface,
   describeToolChoice,
   effortWire,
+  googleNativeRequestRules,
   isForcedToolChoice,
   optionalOutputCap,
   planEffort,
   reportClamp,
+  reportDrop,
   reportRequestWarning,
 } from '../core/request-rules';
 import { applyProviderOptions } from '../internal/provider-options';
@@ -69,7 +71,7 @@ function usesJsonSchema(modelId: string): boolean {
 
 /**
  * The thinking config for `options.effort` — never both a level AND a budget
- * (400): gemini-3* takes `thinkingLevel`, gemini-2.5* `thinkingBudget`. The
+ * (400): Gemini 3 and Argon take `thinkingLevel`, Gemini 2.5 `thinkingBudget`. The
  * level wire's accepted set comes from the row when it lists one, else from
  * the family (Pro: low/high, others low/medium/high); every clamp on the way
  * is reported (2.3, F26). The table lives in core/request-rules.ts.
@@ -188,14 +190,25 @@ function buildRequest(ctx: BuildContext): AdapterRequest {
   const { call, messages, options, object, tools } = ctx;
   const { systemInstruction, contents } = toGeminiContents(messages);
   assertToolSurface(ctx, 'native');
+  const nativeRules = googleNativeRequestRules(call.modelId);
 
   // An unknown model's placeholder cap is left off (2.3): Gemini's own default
   // (the model's maximum) applies instead of a guess.
   const maxOutput = optionalOutputCap(ctx.caps, options);
   const generationConfig: Record<string, unknown> =
     maxOutput !== undefined ? { maxOutputTokens: maxOutput } : {};
-  if (options.temperature !== undefined) generationConfig.temperature = options.temperature;
-  if (options.topP !== undefined) generationConfig.topP = options.topP;
+  for (const setting of ['temperature', 'topP'] as const) {
+    if (options[setting] === undefined) continue;
+    if (nativeRules.sampling === 'stripped') {
+      reportDrop(
+        ctx,
+        setting,
+        `${setting} was omitted: gemini-4-argon deprecates sampling settings; use effort instead.`,
+      );
+    } else {
+      generationConfig[setting] = options[setting];
+    }
+  }
   if (options.stopSequences) generationConfig.stopSequences = options.stopSequences;
 
   // Thinking (gate strictly by model family — never send both level AND budget).
@@ -256,6 +269,14 @@ function buildRequest(ctx: BuildContext): AdapterRequest {
   if (cached) body.cachedContent = cached;
 
   applyProviderOptions(body, call.provider, options);
+  // Do not silently drop a cache reference: that would change the caller's context.
+  if (nativeRules.cache === 'implicit' && body.cachedContent !== undefined) {
+    throw new InvalidRequestError({
+      message:
+        'gemini-4-argon does not support explicit cachedContent. Remove the cache reference and supply the original context; implicit caching remains available.',
+      provider: call.provider,
+    });
+  }
 
   // Two transports share the SAME body + SSE parser; only URL + auth differ:
   //  - AI Studio: {baseURL}/v1beta/models/{model}:streamGenerateContent, x-goog-api-key

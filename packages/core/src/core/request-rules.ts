@@ -75,9 +75,19 @@ const GEMINI_BUDGETS: Readonly<Record<EffortLevel, number>> = {
   max: 32768,
 };
 
-/** gemini-3* uses thinkingLevel; gemini-2.5* uses thinkingBudget (never both → 400). */
+/** Gemini 3 and Argon use thinkingLevel; Gemini 2.5 uses thinkingBudget. */
 function usesThinkingLevel(modelId: string): boolean {
-  return /^gemini-3/.test(modelId);
+  return modelId === 'gemini-4-argon' || /^gemini-3/.test(modelId);
+}
+
+/** Native request behavior shared by the adapter and its public model profile. */
+export function googleNativeRequestRules(modelId: string): {
+  sampling: 'sent' | 'stripped';
+  cache: 'implicit' | 'cached-content';
+} {
+  return modelId === 'gemini-4-argon'
+    ? { sampling: 'stripped', cache: 'implicit' }
+    : { sampling: 'sent', cache: 'cached-content' };
 }
 
 /** Pro-tier Gemini 3 models accept only low/high thinking levels. */
@@ -107,6 +117,7 @@ export function effortWire(
         ? {
             field: 'thinkingConfig.thinkingLevel',
             accepted: levelOnlyLowHigh(modelId) ? ['low', 'high'] : ['low', 'medium', 'high'],
+            ...(modelId === 'gemini-4-argon' ? { noneDefault: 'lowest' as const } : {}),
           }
         : {
             field: 'thinkingConfig.thinkingBudget',
