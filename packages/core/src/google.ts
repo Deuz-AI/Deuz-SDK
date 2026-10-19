@@ -1,5 +1,10 @@
 import type { LanguageModel, Provider, EmbeddingModel, EmbeddingProvider } from './types/model';
 import { attachConfig } from './internal/config-symbol';
+import type { GoogleContinuationHandler } from './types/google-continuation';
+export type {
+  GoogleContinuationCheckpoint,
+  GoogleContinuationHandler,
+} from './types/google-continuation';
 
 /**
  * Google Gemini provider. `createGoogle` defaults to the OpenAI-compat endpoint
@@ -15,6 +20,8 @@ export interface GoogleSettings {
   headers?: Record<string, string>;
   /** Wire to target. Default 'chat_completions' (compat). 'native' = generateContent. */
   surface?: 'native' | 'chat_completions';
+  /** Native only: privately capture a completed continuation boundary; never auto-resumes. */
+  onContinuationCheckpoint?: GoogleContinuationHandler;
 }
 
 /** Native generateContent base; compat uses the resolve-call default ('…/v1beta/openai'). */
@@ -32,6 +39,9 @@ export function createGoogle(settings: GoogleSettings = {}): Provider {
         baseURL: settings.baseURL ?? (surface === 'native' ? NATIVE_BASE_URL : undefined),
         fetch: settings.fetch,
         headers: settings.headers,
+        ...(surface === 'native' && settings.onContinuationCheckpoint
+          ? { onContinuationCheckpoint: settings.onContinuationCheckpoint }
+          : {}),
       },
     );
 }

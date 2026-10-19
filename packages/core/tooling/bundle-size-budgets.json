@@ -370,7 +370,12 @@
     "  memory-versioned-postgres 48615 / 15374 -> 53500 / 16950",
     "  goal-runtime-sqlite       52257 / 14490 -> 57500 / 15950",
     "  goal-runtime-postgres     54225 / 15420 -> 59650 / 17000",
-    "  compute-docker            65585 / 22391 -> 72150 / 24650"
+    "  compute-docker            65585 / 22391 -> 72150 / 24650",
+    "",
+    "GOOGLE CHECKPOINT CAPTURE: the new opt-in google-continuation chunk measures 552 raw / 339 gzip bytes.",
+    "Its feature budget is 600 / 375; skills-learning's existing aggregate lazy budget adds exactly that allowance:",
+    "  skills-learning lazy: 109650 / 33300 -> 110250 / 33675 (measured 110021 / 33435).",
+    "All existing eager limits and other lazy allowances remain unchanged. This does not cover cumulative growth from other PRs."
   ],
   "bundles": {
     "core": {
@@ -411,6 +416,11 @@
           "entryPoint": "memory-accounting",
           "maxRawBytes": 2750,
           "maxGzipBytes": 1300
+        },
+        "google-continuation": {
+          "entryPoint": "google-continuation",
+          "maxRawBytes": 600,
+          "maxGzipBytes": 375
         }
       }
     },
@@ -487,6 +497,11 @@
           "entryPoint": "agent-run-v3-run",
           "maxRawBytes": 62850,
           "maxGzipBytes": 21850
+        },
+        "google-continuation": {
+          "entryPoint": "google-continuation",
+          "maxRawBytes": 600,
+          "maxGzipBytes": 375
         }
       }
     },
@@ -572,6 +587,11 @@
           "entryPoint": "agent-run-v3-run",
           "maxRawBytes": 62500,
           "maxGzipBytes": 21750
+        },
+        "google-continuation": {
+          "entryPoint": "google-continuation",
+          "maxRawBytes": 600,
+          "maxGzipBytes": 375
         }
       }
     },
@@ -643,6 +663,11 @@
           "entryPoint": "agent-run-v3-run",
           "maxRawBytes": 64450,
           "maxGzipBytes": 22350
+        },
+        "google-continuation": {
+          "entryPoint": "google-continuation",
+          "maxRawBytes": 600,
+          "maxGzipBytes": 375
         }
       }
     },
@@ -710,6 +735,11 @@
           "entryPoint": "memory-accounting",
           "maxRawBytes": 1300,
           "maxGzipBytes": 750
+        },
+        "google-continuation": {
+          "entryPoint": "google-continuation",
+          "maxRawBytes": 600,
+          "maxGzipBytes": 375
         }
       }
     },
@@ -913,8 +943,8 @@
       "exports": ["proposeSkillFromRun"],
       "maxRawBytes": 19750,
       "maxGzipBytes": 7450,
-      "maxLazyRawBytes": 109650,
-      "maxLazyGzipBytes": 33300
+      "maxLazyRawBytes": 110250,
+      "maxLazyGzipBytes": 33675
     },
     "memory-versioned-sqlite": {
       "from": "@deuz-sdk/core/memory/versioned/sqlite",

@@ -123,6 +123,17 @@ The default `chat_completions` surface streams through the OpenAI-compatible wir
 
 These are flagged in the capability registry and normalized before any consumer sees the canonical [stream](/docs/core/stream-chat). See the [model registry](/docs/advanced/model-registry) for the full quirk matrix. The native wire has its own usage handling (last-wins `usageMetadata`, no `[DONE]` sentinel) and is the recommended surface.
 
+## Native continuation checkpoints
+
+Automatic long decode is not implemented. A `CONTINUATION` finish still yields `length`, now with an explicit incomplete-output warning. No extra HTTP request is made and no output budget or timeout is raised.
+
+Server applications may opt into `onContinuationCheckpoint` on `createGoogleNative` or `createVertexGoogleNative`. At the end of a hop whose final reason is `CONTINUATION` or `MAX_TOKENS` and whose candidate has a nonempty token, the callback receives the detached original JSON request, token, provider, model, API version and that hop's usage. Authentication headers and configured keys are not included. The callback is awaited before the final result under the existing caller and total deadline; use its abort signal for storage. A storage failure fails the call without echoing private checkpoint data or retrying the model.
+
+This material contains private conversation data. Store it server-side under the authenticated run's owner, and never forward it to logs, UI frames or client callbacks. The SDK does not put it in public stream metadata. Capture is terminal-hop only: a broken stream without a final reason is not checkpointed, and this hook alone does not give crash recovery, output deduplication, automatic token accounting across hops, or exactly-once tool execution.
+
+Do not blindly replay a `MAX_TOKENS` checkpoint with the same cap or raise the caller's budget. Follow Google's [long-decode contract](https://ai.google.dev/gemini-api/docs/generate-content/long-decode) for the original request and cumulative budget. The [Cloud release notes](https://docs.cloud.google.com/release-notes/) currently restrict Vertex continuation to `v1beta1`, not `v1`; the Vertex adapter still uses `v1`. Capturing an injected checkpoint is not evidence that the live `v1` endpoint supports long decode. Interactions background execution is a separate API.
+
+
 ## Explicit caching + Files API
 
 The native adapter passes through an opaque `cachedContent` name and `fileData.fileUri` parts, but it does not create them. The `@deuz-sdk/core/google/extras` subpath is the producer side: `createGeminiCache` mints a reusable cache, and `uploadFile` pushes large media through the Files API. Both are edge-safe (`fetch` + Web APIs only). The cache helpers work against AI Studio (API key) or Vertex (OAuth2 Bearer + project/location); `uploadFile` (Files API) is AI Studio only — on Vertex it throws, so upload to Google Cloud Storage and pass a `gs://` fileUri instead.

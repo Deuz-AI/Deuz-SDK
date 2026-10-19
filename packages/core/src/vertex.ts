@@ -4,6 +4,11 @@ import { attachConfig } from './internal/config-symbol';
 import { AuthenticationError } from './errors';
 import { uint8ToBase64 } from './internal/image';
 import { redactObservationString } from './internal/redact';
+import type { GoogleContinuationHandler } from './types/google-continuation';
+export type {
+  GoogleContinuationCheckpoint,
+  GoogleContinuationHandler,
+} from './types/google-continuation';
 
 /**
  * Google Vertex AI transports. Vertex hosts BOTH Anthropic Claude and Gemini,
@@ -25,6 +30,8 @@ export interface VertexSettings {
   accessToken?: string;
   fetch?: typeof fetch;
   headers?: Record<string, string>;
+  /** Native Gemini only: captures a boundary, without enabling v1beta1 or automatic continuation. */
+  onContinuationCheckpoint?: GoogleContinuationHandler;
 }
 
 function vertexBase(location: string): string {
@@ -99,6 +106,9 @@ export function createVertexGoogleNative(settings: VertexSettings): Provider {
         fetch: settings.fetch,
         headers: settings.headers,
         vertex: { project, location },
+        ...(settings.onContinuationCheckpoint
+          ? { onContinuationCheckpoint: settings.onContinuationCheckpoint }
+          : {}),
       },
     );
 }

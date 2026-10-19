@@ -368,6 +368,7 @@ interface GeminiStreamEvent {
   candidates?: {
     content?: { role?: string; parts?: GeminiPart[] };
     finishReason?: string;
+    continuationToken?: string;
     groundingMetadata?: {
       groundingChunks?: { web?: { uri?: string; title?: string } }[];
     };
@@ -382,8 +383,10 @@ async function* parseStream(
 ): AsyncGenerator<StreamPart> {
   let lastUsage: GeminiUsageMetadata | undefined;
   let lastFinish: string | undefined;
+  let continuationToken: string | undefined;
   let sawFunctionCall = false;
   let blocked: string | undefined;
+  let hasPromptFeedback = false;
 
   for await (const ev of parseSSE(body)) {
     // Gemini SSE has NO '[DONE]' sentinel — loop until the stream ends.
@@ -395,10 +398,19 @@ async function* parseStream(
     }
     if (event.usageMetadata) lastUsage = event.usageMetadata; // last-wins
     if (event.promptFeedback?.blockReason) blocked = event.promptFeedback.blockReason;
+    if (event.promptFeedback != null) hasPromptFeedback = true;
 
     const candidate = event.candidates?.[0];
     if (!candidate) continue;
-    if (candidate.finishReason) lastFinish = candidate.finishReason;
+    if (candidate.finishReason) {
+      lastFinish = candidate.finishReason;
+      // Capture only a token associated with the terminal frame. An earlier
+      // checkpoint may precede already emitted content and needs output-cursor recovery.
+      continuationToken =
+        typeof candidate.continuationToken === 'string' && candidate.continuationToken.length > 0
+          ? candidate.continuationToken
+          : undefined;
+    }
 
     for (const part of candidate.content?.parts ?? []) {
       if (part.functionCall) {
@@ -446,6 +458,27 @@ async function* parseStream(
     typeof lastUsage?.promptTokenCount === 'number' &&
       typeof lastUsage.candidatesTokenCount === 'number',
   );
+  if (
+    !hasPromptFeedback &&
+    (lastFinish === 'CONTINUATION' || lastFinish === 'MAX_TOKENS') &&
+    continuationToken
+  ) {
+    ctx.onContinuationCheckpoint?.({
+      continuationToken,
+      finishReason: lastFinish,
+    });
+  }
+  if (!blocked && lastFinish === 'CONTINUATION') {
+    yield {
+      type: 'warning',
+      warning: {
+        type: 'unsupported-setting',
+        setting: 'automaticContinuation',
+        message:
+          'Native generation stopped at a continuation boundary. Automatic continuation is not implemented; this output is incomplete.',
+      },
+    };
+  }
   yield {
     type: 'finish',
     usage: mapGeminiUsage(lastUsage),
