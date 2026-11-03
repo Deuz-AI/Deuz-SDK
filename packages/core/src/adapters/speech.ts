@@ -52,6 +52,8 @@ export interface SpeechBuildContext {
  */
 export interface SpeechAdapter {
   buildRequest(ctx: SpeechBuildContext): AdapterRequest;
+  /** Native incremental audio request, when the provider supports it. */
+  buildStreamRequest?(ctx: SpeechBuildContext): AdapterRequest;
   fallbackMediaType(format: SpeechAudioFormat): string;
   mapError(status: number, body: unknown, headers: Headers): DeuzError;
 }
@@ -246,6 +248,33 @@ export const giggySpeech: SpeechAdapter = {
           ...call.headers,
         },
         body: JSON.stringify(body),
+      },
+    };
+  },
+  buildStreamRequest({ call, text, voice, providerOptions }): AdapterRequest {
+    if (!voice) {
+      throw new InvalidRequestError({
+        message: "Giggy.ai requires a voice UUID: pass streamSpeech({ voice: '<voice id>' }).",
+        provider: call.provider,
+      });
+    }
+    const { mode: _mode, output_format: _outputFormat, ...restOptions } = providerOptions ?? {};
+    return {
+      url: `${call.baseURL}/text-to-speech`,
+      init: {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'xi-api-key': call.apiKey,
+          ...call.headers,
+        },
+        body: JSON.stringify({
+          ...restOptions,
+          text,
+          voice_id: voice,
+          mode: 'streaming',
+          output_format: 'pcm_24000',
+        }),
       },
     };
   },

@@ -1,7 +1,7 @@
 <!-- GENERATED FILE — do not hand-edit.
      regenerate: node packages/core/tooling/skills/generate-api-index.mjs --date YYYY-MM-DD
      source: packages/core/{package.json exports, tsup.config.ts} + src walk (export * followed)
-     verified: 2026-11-03 against @deuz-sdk/core@2.4.0 · api-contract sha256:da3643f44edc -->
+     verified: 2026-11-02 against @deuz-sdk/core@2.4.0 · api-contract sha256:da3643f44edc -->
 
 # API index — every subpath, every export
 
@@ -343,9 +343,9 @@ Synchronous image generation.
 
 Text to speech.
 
-**Values** (4): createElevenLabs, createGiggy, createOpenAISpeech, generateSpeech
+**Values** (5): createElevenLabs, createGiggy, createOpenAISpeech, generateSpeech, streamSpeech
 
-**Types** (7): GenerateSpeechOptions, GenerateSpeechResult, SpeechAudioFormat, SpeechModel, SpeechModelSurface, SpeechProvider, SpeechProviderSettings
+**Types** (9): GenerateSpeechOptions, GenerateSpeechResult, SpeechAudioFormat, SpeechModel, SpeechModelSurface, SpeechProvider, SpeechProviderSettings, StreamSpeechOptions, StreamSpeechResult
 
 ## `@deuz-sdk/core/transcription`
 
@@ -1092,6 +1092,7 @@ Reverse lookup for "which subpath do I import this from?". Root exports are omit
 - `sseResponse` — `testing`
 - `staticSkillSource` — `skills`
 - `streamAgent` — `agent`
+- `streamSpeech` — `speech`
 - `submitAction` — `midjourney`
 - `submitBlend` — `midjourney`
 - `submitDescribe` — `midjourney`
