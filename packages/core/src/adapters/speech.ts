@@ -211,7 +211,7 @@ export const giggySpeech: SpeechAdapter = {
   buildRequest({ call, text, voice, providerOptions }): AdapterRequest {
     if (!voice) {
       throw new InvalidRequestError({
-        message: 'Giggy.ai requires a voice UUID: pass generateSpeech({ voice: \'<voice id>\' }).',
+        message: "Giggy.ai requires a voice UUID: pass generateSpeech({ voice: '<voice id>' }).",
         provider: call.provider,
       });
     }
@@ -228,8 +228,7 @@ export const giggySpeech: SpeechAdapter = {
         provider: call.provider,
       });
     }
-    const outputFormat =
-      typeof formatOverride === 'string' ? formatOverride : 'mp3_24000_160';
+    const outputFormat = typeof formatOverride === 'string' ? formatOverride : 'mp3_24000_160';
     const body: Record<string, unknown> = {
       ...restOptions,
       text,

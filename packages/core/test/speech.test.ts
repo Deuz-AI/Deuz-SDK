@@ -243,7 +243,9 @@ describe('generateSpeech — Giggy.ai wire (POST /text-to-speech)', () => {
 
   it('allows batch mode, an explicit output format, and optional compat model_id', async () => {
     const { fetch, calls } = audioFetch();
-    const model = createGiggy({ apiKey: 'k', fetch, baseURL: 'https://proxy.example/v1/' })('giggyspeech');
+    const model = createGiggy({ apiKey: 'k', fetch, baseURL: 'https://proxy.example/v1/' })(
+      'giggyspeech',
+    );
 
     await generateSpeech({
       model,
