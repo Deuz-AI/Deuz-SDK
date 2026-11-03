@@ -203,6 +203,66 @@ export const elevenLabsSpeech: SpeechAdapter = {
   },
 };
 
+// ===================================================================
+// Giggy.ai — POST /text-to-speech, xi-api-key
+// ===================================================================
+
+export const giggySpeech: SpeechAdapter = {
+  buildRequest({ call, text, voice, providerOptions }): AdapterRequest {
+    if (!voice) {
+      throw new InvalidRequestError({
+        message: 'Giggy.ai requires a voice UUID: pass generateSpeech({ voice: \'<voice id>\' }).',
+        provider: call.provider,
+      });
+    }
+
+    const {
+      mode: modeOverride,
+      output_format: formatOverride,
+      ...restOptions
+    } = providerOptions ?? {};
+    const mode = modeOverride ?? 'fast';
+    if (mode !== 'fast' && mode !== 'batch') {
+      throw new InvalidRequestError({
+        message: "Giggy.ai mode must be 'fast' or 'batch'.",
+        provider: call.provider,
+      });
+    }
+    const outputFormat =
+      typeof formatOverride === 'string' ? formatOverride : 'mp3_24000_160';
+    const body: Record<string, unknown> = {
+      ...restOptions,
+      text,
+      voice_id: voice,
+      mode,
+      output_format: outputFormat,
+    };
+    return {
+      url: `${call.baseURL}/text-to-speech`,
+      init: {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'xi-api-key': call.apiKey,
+          ...call.headers,
+        },
+        body: JSON.stringify(body),
+      },
+    };
+  },
+  fallbackMediaType: (format) => AUDIO_MEDIA_TYPES[format],
+  mapError(status, body, headers): DeuzError {
+    const payload = body as { message?: unknown; error?: unknown } | null;
+    const message =
+      typeof payload?.message === 'string'
+        ? payload.message
+        : typeof payload?.error === 'string'
+          ? payload.error
+          : `Giggy.ai speech request failed (HTTP ${status}).`;
+    return mapMediaError('giggy', status, body, headers, message);
+  },
+};
+
 /** Map a speech surface to its adapter. */
 export function getSpeechAdapter(surface: string): SpeechAdapter {
   switch (surface) {
@@ -210,6 +270,8 @@ export function getSpeechAdapter(surface: string): SpeechAdapter {
       return openaiSpeech;
     case 'elevenlabs-speech':
       return elevenLabsSpeech;
+    case 'giggy-speech':
+      return giggySpeech;
     default:
       throw new InvalidRequestError({ message: `Unknown speech surface '${surface}'.` });
   }

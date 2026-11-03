@@ -3,6 +3,7 @@ import {
   generateSpeech,
   createOpenAISpeech,
   createElevenLabs,
+  createGiggy,
   type SpeechModel,
 } from '../src/speech';
 import { getSpeechAdapter } from '../src/adapters/speech';
@@ -213,6 +214,72 @@ describe('generateSpeech — ElevenLabs wire (POST /text-to-speech/{voice})', ()
       text: 'hi',
       model_id: 'eleven_flash_v2_5',
       voice_settings: { stability: 0.4 },
+    });
+  });
+});
+
+describe('generateSpeech — Giggy.ai wire (POST /text-to-speech)', () => {
+  it('sends the native request with UUID voice_id, fast mode, mp3 format, and xi-api-key', async () => {
+    const { fetch, calls } = audioFetch([1, 2, 3], { 'content-type': 'audio/mpeg' });
+    const model = createGiggy({ apiKey: 'giggy-key', fetch })('giggyspeech');
+
+    const result = await generateSpeech({
+      model,
+      text: 'Hello Giggy',
+      voice: '123e4567-e89b-12d3-a456-426614174000',
+    });
+
+    expect(calls[0]!.url).toBe('https://api.giggy.ai/v1/text-to-speech');
+    expect(headersOf(calls[0]!)['xi-api-key']).toBe('giggy-key');
+    expect(headersOf(calls[0]!).authorization).toBeUndefined();
+    expect(bodyOf(calls[0]!)).toEqual({
+      text: 'Hello Giggy',
+      voice_id: '123e4567-e89b-12d3-a456-426614174000',
+      mode: 'fast',
+      output_format: 'mp3_24000_160',
+    });
+    expect([...result.audio]).toEqual([1, 2, 3]);
+  });
+
+  it('allows batch mode, an explicit output format, and optional compat model_id', async () => {
+    const { fetch, calls } = audioFetch();
+    const model = createGiggy({ apiKey: 'k', fetch, baseURL: 'https://proxy.example/v1/' })('giggyspeech');
+
+    await generateSpeech({
+      model,
+      text: 'Batch me',
+      voice: 'voice-uuid',
+      providerOptions: { mode: 'batch', output_format: 'mp3_24000_160', model_id: 'giggyspeech' },
+    });
+
+    expect(calls[0]!.url).toBe('https://proxy.example/v1/text-to-speech');
+    expect(bodyOf(calls[0]!)).toEqual({
+      text: 'Batch me',
+      voice_id: 'voice-uuid',
+      mode: 'batch',
+      output_format: 'mp3_24000_160',
+      model_id: 'giggyspeech',
+    });
+  });
+
+  it('rejects a missing voice and invalid mode before fetching', async () => {
+    const { fetch, calls } = audioFetch();
+    const model = createGiggy({ apiKey: 'k', fetch })('giggyspeech');
+
+    await expect(generateSpeech({ model, text: 'hi' })).rejects.toBeInstanceOf(InvalidRequestError);
+    await expect(
+      generateSpeech({ model, text: 'hi', voice: 'v', providerOptions: { mode: 'turbo' } }),
+    ).rejects.toBeInstanceOf(InvalidRequestError);
+    expect(calls).toHaveLength(0);
+  });
+
+  it('maps Giggy error messages through the shared error hierarchy', async () => {
+    const { fetch } = errorFetch(401, { message: 'Invalid Giggy key.' });
+    const model = createGiggy({ apiKey: 'bad', fetch })('giggyspeech');
+    await expect(generateSpeech({ model, text: 'hi', voice: 'v' })).rejects.toMatchObject({
+      name: 'AuthenticationError',
+      message: 'Invalid Giggy key.',
+      provider: 'giggy',
     });
   });
 });

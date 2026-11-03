@@ -26,7 +26,7 @@ import { getSpeechAdapter } from './adapters/speech';
 import { AuthenticationError } from './errors';
 
 /** Which TTS wire a descriptor speaks — the key `getSpeechAdapter` switches on. */
-export type SpeechModelSurface = 'openai-speech' | 'elevenlabs-speech';
+export type SpeechModelSurface = 'openai-speech' | 'elevenlabs-speech' | 'giggy-speech';
 
 /** A speech model descriptor — a separate kind from chat `LanguageModel`. */
 export interface SpeechModel {
@@ -93,6 +93,7 @@ export interface GenerateSpeechResult {
 const DEFAULT_BASE_URLS: Record<SpeechModelSurface, string> = {
   'openai-speech': 'https://api.openai.com/v1',
   'elevenlabs-speech': 'https://api.elevenlabs.io/v1',
+  'giggy-speech': 'https://api.giggy.ai/v1',
 };
 
 const DEFAULT_FORMAT: SpeechAudioFormat = 'mp3';
@@ -132,6 +133,11 @@ export function createOpenAISpeech(settings: SpeechProviderSettings = {}): Speec
  */
 export function createElevenLabs(settings: SpeechProviderSettings = {}): SpeechProvider {
   return createSpeechProvider('elevenlabs-speech', 'elevenlabs', settings);
+}
+
+/** Giggy.ai text-to-speech. Pass the voice UUID with `voice`; `mode` and `output_format` can be set in providerOptions. */
+export function createGiggy(settings: SpeechProviderSettings = {}): SpeechProvider {
+  return createSpeechProvider('giggy-speech', 'giggy', settings);
 }
 
 /**

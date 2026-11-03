@@ -1,18 +1,19 @@
 ---
 title: Speech (TTS)
-description: generateSpeech — one call, finished audio bytes, over the OpenAI and ElevenLabs text-to-speech wires.
+description: generateSpeech — one call, finished audio bytes, over the OpenAI, ElevenLabs, and Giggy.ai text-to-speech wires.
 ---
 
 `generateSpeech` is the audio sibling of [generateImage](/docs/modules/image-generation): one request, one answer, **no streaming**. A text-to-speech endpoint returns a finished audio file rather than a token sequence, so there is no canonical delta stream to speak of — you get the bytes, their media type, and the character count you were billed for.
 
-Two wires ship in 2.0 and both sit behind the same adapter seam:
+Three wires sit behind the same adapter seam:
 
 | Provider | Factory | Wire |
 | --- | --- | --- |
 | OpenAI (and OpenAI-compatible relays) | `createOpenAISpeech` | `POST {baseURL}/audio/speech`, `Authorization: Bearer` |
 | ElevenLabs | `createElevenLabs` | `POST {baseURL}/text-to-speech/{voice}?output_format=…`, `xi-api-key` |
+| Giggy.ai | `createGiggy` | `POST {baseURL}/text-to-speech`, `xi-api-key` |
 
-Speech models are a **separate kind** from chat `LanguageModel` (`surface: 'openai-speech' | 'elevenlabs-speech'`) — they cannot be passed to [streamChat](/docs/core/stream-chat) or [generateText](/docs/core/generate-text). Like every other module, this one is pure and edge-safe: HTTP goes through `deps.fetch` and the API key is resolved from the factory, `createClient`, or a `deps.keyProvider`, never from the environment.
+Speech models are a **separate kind** from chat `LanguageModel` — they cannot be passed to [streamChat](/docs/core/stream-chat) or [generateText](/docs/core/generate-text). Like every other module, this one is pure and edge-safe: HTTP goes through `deps.fetch` and the API key is resolved from the factory, `createClient`, or a `deps.keyProvider`, never from the environment.
 
 <Callout type="info" title="Audio input is a file part, not an audio part">
 Audio you want a **chat** model to *hear* travels as `filePart({ mediaType: 'audio/…' })` — the same way PDFs and images do. No `AudioPart` was added to the `Part` union: it stays at five members, so nothing about the canonical message shape changed in 2.0. This page is about the other direction, text → audio.
@@ -72,9 +73,9 @@ await writeFile(`out.${format}`, audio);
 
 | Option | Type | Default | Notes |
 | --- | --- | --- | --- |
-| `model` | `SpeechModel` | — | From `createOpenAISpeech` / `createElevenLabs`. Required. |
+| `model` | `SpeechModel` | — | From `createOpenAISpeech`, `createElevenLabs`, or `createGiggy`. Required. |
 | `text` | `string` | — | The text to speak. Required. Its length becomes `usage.characters`. |
-| `voice` | `string` | `'alloy'` on OpenAI | Provider voice id/name. **Required on ElevenLabs** — see below. |
+| `voice` | `string` | `'alloy'` on OpenAI | Provider voice id/name. **Required on ElevenLabs and Giggy.ai** — see below. |
 | `format` | `SpeechAudioFormat` | `'mp3'` | `'mp3' \| 'opus' \| 'aac' \| 'flac' \| 'wav' \| 'pcm'`. |
 | `speed` | `number` | unset | Playback rate where supported (OpenAI: `0.25`–`4.0`). |
 | `instructions` | `string` | unset | Delivery/tone steering (OpenAI `gpt-4o-mini-tts`). |
@@ -177,7 +178,7 @@ For a UI that shows the reply while the audio renders, run step 3 in parallel wi
 
 ## Creating speech model descriptors
 
-Both factories return a `SpeechProvider` — a `(modelId: string) => SpeechModel` function. Factory settings are carried on a private symbol, so the public `SpeechModel` shape stays clean and the key never leaks via enumeration.
+All factories return a `SpeechProvider` — a `(modelId: string) => SpeechModel` function. Factory settings are carried on a private symbol, so the public `SpeechModel` shape stays clean and the key never leaks via enumeration.
 
 | Setting | Type | Default | Notes |
 | --- | --- | --- | --- |
@@ -185,12 +186,30 @@ Both factories return a `SpeechProvider` — a `(modelId: string) => SpeechModel
 | `baseURL` | `string` | per-wire (below) | Point at any compatible relay. |
 | `fetch` | `typeof fetch` | `deps.fetch` | Factory `fetch` wins over `deps.fetch`. |
 | `headers` | `Record<string, string>` | — | Default headers for every call. |
-| `provider` | `string` | `'openai'` / `'elevenlabs'` | Logical id used for key/baseURL resolution. |
+| `provider` | `string` | `'openai'` / `'elevenlabs'` / `'giggy'` | Logical id used for key/baseURL resolution. |
 
 | Factory | Default `baseURL` | Typical models |
 | --- | --- | --- |
 | `createOpenAISpeech` | `https://api.openai.com/v1` | `tts-1`, `tts-1-hd`, `gpt-4o-mini-tts` |
 | `createElevenLabs` | `https://api.elevenlabs.io/v1` | `eleven_multilingual_v2`, `eleven_turbo_v2_5`, `eleven_flash_v2_5` |
+| `createGiggy` | `https://api.giggy.ai/v1` | `giggyspeech` |
+
+## Giggy.ai
+
+Giggy.ai accepts a voice UUID in the JSON body and authenticates with `xi-api-key`:
+
+```ts title="giggy.ts"
+import { generateSpeech, createGiggy } from '@deuz-sdk/core/speech';
+
+const giggy = createGiggy({ apiKey: process.env.GIGGY_API_KEY! });
+const { audio, mediaType } = await generateSpeech({
+  model: giggy('giggyspeech'),
+  text: 'Merhaba dünya.',
+  voice: '123e4567-e89b-12d3-a456-426614174000',
+});
+```
+
+The request is `POST /v1/text-to-speech` with `text`, `voice_id`, `mode: 'fast'`, and `output_format: 'mp3_24000_160'`. Use `providerOptions` to select `mode: 'batch'` or another exact `output_format`. Giggy's optional compatibility `model_id` can also be passed there. The SDK does not discover or validate voice UUIDs.
 
 ## ElevenLabs
 
@@ -254,7 +273,7 @@ await generateSpeech({
 //          voice: 'alloy', response_format: 'opus' }   ← `format` won
 ```
 
-On the ElevenLabs wire the remaining keys are spread into the request body, with `output_format` lifted into the query string instead (it is a query parameter there, so it is never echoed into the body).
+On the ElevenLabs wire the remaining keys are spread into the request body, with `output_format` lifted into the query string instead (it is a query parameter there, so it is never echoed into the body). Giggy.ai keeps its typed `text` and `voice` values canonical and passes provider-specific `mode`, `output_format`, and optional `model_id` from `providerOptions` into its JSON body.
 
 ## Key resolution
 
@@ -264,7 +283,11 @@ Identical to every other module — the G1 precedence chain: `deps.keyProvider` 
 import { createClient } from '@deuz-sdk/core';
 
 const client = createClient({
-  apiKeys: { openai: process.env.OPENAI_API_KEY!, elevenlabs: process.env.ELEVENLABS_API_KEY! },
+  apiKeys: {
+    openai: process.env.OPENAI_API_KEY!,
+    elevenlabs: process.env.ELEVENLABS_API_KEY!,
+    giggy: process.env.GIGGY_API_KEY!,
+  },
 });
 ```
 
@@ -288,7 +311,7 @@ Stated up front so you do not discover it mid-integration:
 - **No voice discovery.** There is no `listVoices()`. Voice ids come from your provider's console or its own REST endpoint (`GET /v1/voices` on ElevenLabs), and nothing validates the string you pass.
 - **No transcoding, no concatenation, no SSML.** One text in, one file out. Splitting a long document across calls, joining the results, and inserting pauses are all yours.
 - **No per-model capability matrix.** `SpeechModel` is not a `LanguageModel`, so [`getModelCapabilities`](/docs/advanced/model-registry) does not apply and an unknown slug produces no warning — an unsupported model is simply a `404` → `ModelNotFoundError` from the provider.
-- **No provider beyond these two wires.** A third TTS vendor needs a new `SpeechAdapter`; the only extension point available today is pointing `baseURL` at a relay that mimics one of them.
+- **No provider beyond these wires.** A third TTS vendor needs a new `SpeechAdapter`; the only extension point available today is pointing `baseURL` at a relay that mimics one of them.
 
 ## Observability
 
