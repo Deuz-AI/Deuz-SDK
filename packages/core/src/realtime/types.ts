@@ -81,6 +81,8 @@ export interface RealtimeWebSocketInit {
    * Node >= 22, Deno, Bun and the `ws` package can.
    */
   headers?: Record<string, string>;
+  /** Prevent redirect following in Node `ws` implementations that support this option. */
+  followRedirects?: false;
 }
 
 /**

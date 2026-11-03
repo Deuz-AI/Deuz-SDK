@@ -15,8 +15,14 @@ export interface SSEEvent {
   id?: string;
 }
 
-export async function* parseSSE(body: ReadableStream<Uint8Array>): AsyncGenerator<SSEEvent> {
+export async function* parseSSE(
+  body: ReadableStream<Uint8Array>,
+  signal?: AbortSignal,
+): AsyncGenerator<SSEEvent> {
   const reader = body.getReader();
+  const cancelReader = () => void reader.cancel().catch(() => undefined);
+  if (signal?.aborted) cancelReader();
+  else signal?.addEventListener('abort', cancelReader, { once: true });
   const decoder = new TextDecoder('utf-8');
   let buffer = '';
   let eventName: string | undefined;
@@ -105,6 +111,7 @@ export async function* parseSSE(body: ReadableStream<Uint8Array>): AsyncGenerato
     const tail = takeEvent();
     if (tail) yield tail;
   } finally {
+    signal?.removeEventListener('abort', cancelReader);
     try {
       await reader.cancel();
     } catch {

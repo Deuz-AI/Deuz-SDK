@@ -351,9 +351,9 @@ Text to speech.
 
 Speech to text.
 
-**Values** (3): createDeepgram, createOpenAITranscription, transcribe
+**Values** (6): createDeepgram, createGiggyLiveTranscriptionSession, createGiggyTranscription, createOpenAITranscription, streamTranscription, transcribe
 
-**Types** (10): TranscribeOptions, TranscribeResult, TranscriptionInput, TranscriptionModel, TranscriptionProvider, TranscriptionProviderSettings, TranscriptionSegment, TranscriptionSurface, TranscriptionUsage, TranscriptionWord
+**Types** (15): CreateGiggyLiveTranscriptionSessionOptions, GiggyLiveTranscriptionEvent, GiggyLiveTranscriptionSession, GiggyTranscriptionEvent, StreamTranscriptionOptions, TranscribeOptions, TranscribeResult, TranscriptionInput, TranscriptionModel, TranscriptionProvider, TranscriptionProviderSettings, TranscriptionSegment, TranscriptionSurface, TranscriptionUsage, TranscriptionWord
 
 ## `@deuz-sdk/core/realtime`
 
@@ -753,6 +753,8 @@ Reverse lookup for "which subpath do I import this from?". Root exports are omit
 - `createGeminiCache` — `google/extras`
 - `createGeminiLive` — `realtime`
 - `createGiggy` — `speech`
+- `createGiggyLiveTranscriptionSession` — `transcription`
+- `createGiggyTranscription` — `transcription`
 - `createGLM` — `providers`
 - `createGoal` — `goal`
 - `createGoalEvent` — `goal`
@@ -1093,6 +1095,7 @@ Reverse lookup for "which subpath do I import this from?". Root exports are omit
 - `staticSkillSource` — `skills`
 - `streamAgent` — `agent`
 - `streamSpeech` — `speech`
+- `streamTranscription` — `transcription`
 - `submitAction` — `midjourney`
 - `submitBlend` — `midjourney`
 - `submitDescribe` — `midjourney`

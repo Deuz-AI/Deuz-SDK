@@ -257,7 +257,11 @@ export async function streamSpeech(options: StreamSpeechOptions): Promise<Stream
     instructions: options.instructions,
     providerOptions: options.providerOptions,
   });
-  const response = await fetchImpl(url, { ...init, signal: options.signal });
+  const response = await fetchImpl(url, {
+    ...init,
+    signal: options.signal,
+    ...(options.model.surface === 'giggy-speech' ? { redirect: 'error' as const } : {}),
+  });
   if (!response.ok) {
     throw adapter.mapError(response.status, await readErrorBody(response), response.headers);
   }
