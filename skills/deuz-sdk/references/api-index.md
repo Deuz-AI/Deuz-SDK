@@ -1,7 +1,7 @@
 <!-- GENERATED FILE — do not hand-edit.
      regenerate: node packages/core/tooling/skills/generate-api-index.mjs --date YYYY-MM-DD
      source: packages/core/{package.json exports, tsup.config.ts} + src walk (export * followed)
-     verified: 2026-10-16 against @deuz-sdk/core@2.4.0 · api-contract sha256:da3643f44edc -->
+     verified: 2026-11-02 against @deuz-sdk/core@2.4.0 · api-contract sha256:da3643f44edc -->
 
 # API index — every subpath, every export
 
@@ -343,17 +343,17 @@ Synchronous image generation.
 
 Text to speech.
 
-**Values** (3): createElevenLabs, createOpenAISpeech, generateSpeech
+**Values** (5): createElevenLabs, createGiggy, createOpenAISpeech, generateSpeech, streamSpeech
 
-**Types** (7): GenerateSpeechOptions, GenerateSpeechResult, SpeechAudioFormat, SpeechModel, SpeechModelSurface, SpeechProvider, SpeechProviderSettings
+**Types** (9): GenerateSpeechOptions, GenerateSpeechResult, SpeechAudioFormat, SpeechModel, SpeechModelSurface, SpeechProvider, SpeechProviderSettings, StreamSpeechOptions, StreamSpeechResult
 
 ## `@deuz-sdk/core/transcription`
 
 Speech to text.
 
-**Values** (3): createDeepgram, createOpenAITranscription, transcribe
+**Values** (6): createDeepgram, createGiggyLiveTranscriptionSession, createGiggyTranscription, createOpenAITranscription, streamTranscription, transcribe
 
-**Types** (10): TranscribeOptions, TranscribeResult, TranscriptionInput, TranscriptionModel, TranscriptionProvider, TranscriptionProviderSettings, TranscriptionSegment, TranscriptionSurface, TranscriptionUsage, TranscriptionWord
+**Types** (15): CreateGiggyLiveTranscriptionSessionOptions, GiggyLiveTranscriptionEvent, GiggyLiveTranscriptionSession, GiggyTranscriptionEvent, StreamTranscriptionOptions, TranscribeOptions, TranscribeResult, TranscriptionInput, TranscriptionModel, TranscriptionProvider, TranscriptionProviderSettings, TranscriptionSegment, TranscriptionSurface, TranscriptionUsage, TranscriptionWord
 
 ## `@deuz-sdk/core/realtime`
 
@@ -752,6 +752,9 @@ Reverse lookup for "which subpath do I import this from?". Root exports are omit
 - `createGeminiAuthToken` — `realtime`
 - `createGeminiCache` — `google/extras`
 - `createGeminiLive` — `realtime`
+- `createGiggy` — `speech`
+- `createGiggyLiveTranscriptionSession` — `transcription`
+- `createGiggyTranscription` — `transcription`
 - `createGLM` — `providers`
 - `createGoal` — `goal`
 - `createGoalEvent` — `goal`
@@ -1091,6 +1094,8 @@ Reverse lookup for "which subpath do I import this from?". Root exports are omit
 - `sseResponse` — `testing`
 - `staticSkillSource` — `skills`
 - `streamAgent` — `agent`
+- `streamSpeech` — `speech`
+- `streamTranscription` — `transcription`
 - `submitAction` — `midjourney`
 - `submitBlend` — `midjourney`
 - `submitDescribe` — `midjourney`

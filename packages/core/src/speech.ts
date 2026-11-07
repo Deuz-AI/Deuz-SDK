@@ -23,10 +23,10 @@ import { resolveDependencies } from './internal/resolve-deps';
 import { observeOperation } from './internal/observe-runtime';
 import { readErrorBody } from './internal/media-http';
 import { getSpeechAdapter } from './adapters/speech';
-import { AuthenticationError } from './errors';
+import { AuthenticationError, APICallError, UnsupportedCapabilityError } from './errors';
 
 /** Which TTS wire a descriptor speaks — the key `getSpeechAdapter` switches on. */
-export type SpeechModelSurface = 'openai-speech' | 'elevenlabs-speech';
+export type SpeechModelSurface = 'openai-speech' | 'elevenlabs-speech' | 'giggy-speech';
 
 /** A speech model descriptor — a separate kind from chat `LanguageModel`. */
 export interface SpeechModel {
@@ -89,10 +89,22 @@ export interface GenerateSpeechResult {
   usage: { characters: number };
 }
 
+/** Options for native audio streaming. Currently supported by Giggy.ai only. */
+export type StreamSpeechOptions = Omit<GenerateSpeechOptions, 'format'>;
+
+/** Progressive speech result; `audio` yields PCM16LE mono chunks at 24 kHz. */
+export interface StreamSpeechResult {
+  audio: ReadableStream<Uint8Array>;
+  mediaType: 'audio/pcm';
+  format: 'pcm';
+  usage: { characters: number };
+}
+
 /** Wire defaults, applied only when neither the factory nor `createClient` set one. */
 const DEFAULT_BASE_URLS: Record<SpeechModelSurface, string> = {
   'openai-speech': 'https://api.openai.com/v1',
   'elevenlabs-speech': 'https://api.elevenlabs.io/v1',
+  'giggy-speech': 'https://api.giggy.ai/v1',
 };
 
 const DEFAULT_FORMAT: SpeechAudioFormat = 'mp3';
@@ -132,6 +144,11 @@ export function createOpenAISpeech(settings: SpeechProviderSettings = {}): Speec
  */
 export function createElevenLabs(settings: SpeechProviderSettings = {}): SpeechProvider {
   return createSpeechProvider('elevenlabs-speech', 'elevenlabs', settings);
+}
+
+/** Giggy.ai text-to-speech. Pass the voice UUID with `voice`; Giggy requests always use progressive PCM streaming. */
+export function createGiggy(settings: SpeechProviderSettings = {}): SpeechProvider {
+  return createSpeechProvider('giggy-speech', 'giggy', settings);
 }
 
 /**
@@ -194,10 +211,111 @@ export async function generateSpeech(
   );
 }
 
+/**
+ * Stream native speech audio from a provider that supports incremental output.
+ * Giggy.ai is the only native TTS streaming wire currently supported. Its
+ * endpoint progressively returns raw PCM; no full-audio buffer is assembled.
+ */
+export async function streamSpeech(options: StreamSpeechOptions): Promise<StreamSpeechResult> {
+  if (options.model.surface !== 'giggy-speech') {
+    throw new UnsupportedCapabilityError({
+      provider: options.model.provider,
+      modelId: options.model.modelId,
+      capability: 'native speech streaming',
+      message: `Speech streaming is not supported by '${options.model.provider}'.`,
+    });
+  }
+
+  const adapter = getSpeechAdapter(options.model.surface);
+  if (!adapter.buildStreamRequest) {
+    throw new UnsupportedCapabilityError({
+      provider: options.model.provider,
+      modelId: options.model.modelId,
+      capability: 'native speech streaming',
+    });
+  }
+  const deps = resolveDependencies(options.deps);
+  const clientContext = readClientContext(options);
+  const {
+    apiKey,
+    baseURL,
+    headers,
+    fetch: fetchImpl,
+  } = await resolveSpeechCall(options.model, deps, options.headers, clientContext);
+  const { url, init } = adapter.buildStreamRequest({
+    call: {
+      provider: options.model.provider,
+      modelId: options.model.modelId,
+      apiKey,
+      baseURL,
+      headers,
+    },
+    text: options.text,
+    voice: options.voice,
+    format: 'pcm',
+    speed: options.speed,
+    instructions: options.instructions,
+    providerOptions: options.providerOptions,
+  });
+  const response = await fetchImpl(url, {
+    ...init,
+    signal: options.signal,
+    ...(options.model.surface === 'giggy-speech' ? { redirect: 'error' as const } : {}),
+  });
+  if (!response.ok) {
+    throw adapter.mapError(response.status, await readErrorBody(response), response.headers);
+  }
+  if (!response.body) {
+    throw new APICallError({
+      message: 'Giggy.ai speech response did not include an audio stream.',
+      provider: options.model.provider,
+      statusCode: response.status,
+      isRetryable: false,
+    });
+  }
+  return {
+    audio: response.body,
+    mediaType: 'audio/pcm',
+    format: 'pcm',
+    usage: { characters: options.text.length },
+  };
+}
+
 async function generateSpeechCore(
   options: GenerateSpeechOptions,
   deps: ResolvedDependencies,
 ): Promise<GenerateSpeechResult> {
+  if (options.model.surface === 'giggy-speech') {
+    // `generateSpeech` remains a buffered compatibility API, but Giggy itself
+    // is always called through its native progressive PCM endpoint.
+    const streamed = await streamSpeech({ ...options, deps });
+    const reader = streamed.audio.getReader();
+    const chunks: Uint8Array[] = [];
+    let byteLength = 0;
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+        byteLength += value.byteLength;
+      }
+    } finally {
+      reader.releaseLock();
+    }
+    const audio = new Uint8Array(byteLength);
+    let offset = 0;
+    for (const chunk of chunks) {
+      audio.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return {
+      audio,
+      mediaType: streamed.mediaType,
+      format: 'pcm',
+      usage: streamed.usage,
+    };
+  }
+
   const adapter = getSpeechAdapter(options.model.surface);
   const clientContext = readClientContext(options);
   const {

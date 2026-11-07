@@ -1,8 +1,10 @@
 import { describe, it, expect } from 'vitest';
 import {
   generateSpeech,
+  streamSpeech,
   createOpenAISpeech,
   createElevenLabs,
+  createGiggy,
   type SpeechModel,
 } from '../src/speech';
 import { getSpeechAdapter } from '../src/adapters/speech';
@@ -214,6 +216,126 @@ describe('generateSpeech — ElevenLabs wire (POST /text-to-speech/{voice})', ()
       model_id: 'eleven_flash_v2_5',
       voice_settings: { stability: 0.4 },
     });
+  });
+});
+
+describe('generateSpeech — Giggy.ai wire (POST /text-to-speech)', () => {
+  it('uses the native progressive PCM request under the buffered generateSpeech API', async () => {
+    const { fetch, calls } = audioFetch([1, 2, 3], { 'content-type': 'audio/pcm' });
+    const model = createGiggy({ apiKey: 'giggy-key', fetch })('giggyspeech');
+
+    const result = await generateSpeech({
+      model,
+      text: 'Hello Giggy',
+      voice: '123e4567-e89b-12d3-a456-426614174000',
+    });
+
+    expect(calls[0]!.url).toBe('https://api.giggy.ai/v1/text-to-speech');
+    expect(headersOf(calls[0]!)['xi-api-key']).toBe('giggy-key');
+    expect(headersOf(calls[0]!).authorization).toBeUndefined();
+    expect(bodyOf(calls[0]!)).toEqual({
+      text: 'Hello Giggy',
+      voice_id: '123e4567-e89b-12d3-a456-426614174000',
+      mode: 'streaming',
+      output_format: 'pcm_24000',
+    });
+    expect([...result.audio]).toEqual([1, 2, 3]);
+    expect(result.mediaType).toBe('audio/pcm');
+    expect(result.format).toBe('pcm');
+  });
+
+  it('keeps Giggy streaming enabled when provider options request buffered delivery', async () => {
+    const { fetch, calls } = audioFetch();
+    const model = createGiggy({ apiKey: 'k', fetch, baseURL: 'https://proxy.example/v1/' })(
+      'giggyspeech',
+    );
+
+    await generateSpeech({
+      model,
+      text: 'Batch me',
+      voice: 'voice-uuid',
+      providerOptions: { mode: 'batch', output_format: 'mp3_24000_160', model_id: 'giggyspeech' },
+    });
+
+    expect(calls[0]!.url).toBe('https://proxy.example/v1/text-to-speech');
+    expect(bodyOf(calls[0]!)).toEqual({
+      text: 'Batch me',
+      voice_id: 'voice-uuid',
+      mode: 'streaming',
+      output_format: 'pcm_24000',
+      model_id: 'giggyspeech',
+    });
+  });
+
+  it('rejects a missing voice before fetching and ignores mode overrides', async () => {
+    const { fetch, calls } = audioFetch();
+    const model = createGiggy({ apiKey: 'k', fetch })('giggyspeech');
+
+    await expect(generateSpeech({ model, text: 'hi' })).rejects.toBeInstanceOf(InvalidRequestError);
+    await expect(
+      generateSpeech({ model, text: 'hi', voice: 'v', providerOptions: { mode: 'fast' } }),
+    ).resolves.toMatchObject({ mediaType: 'audio/pcm', format: 'pcm' });
+    expect(calls).toHaveLength(1);
+  });
+
+  it('maps Giggy error messages through the shared error hierarchy', async () => {
+    const { fetch } = errorFetch(401, { message: 'Invalid Giggy key.' });
+    const model = createGiggy({ apiKey: 'bad', fetch })('giggyspeech');
+    await expect(generateSpeech({ model, text: 'hi', voice: 'v' })).rejects.toMatchObject({
+      name: 'AuthenticationError',
+      message: 'Invalid Giggy key.',
+      provider: 'giggy',
+    });
+  });
+});
+
+describe('streamSpeech — Giggy.ai native PCM stream', () => {
+  it('forces native streaming options and exposes progressive PCM chunks', async () => {
+    const calls: { url: string; init?: RequestInit }[] = [];
+    const source = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new Uint8Array([1, 2]));
+        controller.enqueue(new Uint8Array([3, 4]));
+        controller.close();
+      },
+    });
+    const fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ url: String(input), init });
+      return new Response(source, { headers: { 'content-type': 'audio/pcm' } });
+    }) as typeof globalThis.fetch;
+    const model = createGiggy({ apiKey: 'giggy-key', fetch })('giggyspeech');
+    const result = await streamSpeech({
+      model,
+      text: 'Hello Giggy',
+      voice: '123e4567-e89b-12d3-a456-426614174000',
+      providerOptions: { mode: 'fast', output_format: 'mp3_24000_160', seed: 42 },
+    });
+
+    expect(calls[0]!.url).toBe('https://api.giggy.ai/v1/text-to-speech');
+    expect(headersOf(calls[0]!)['xi-api-key']).toBe('giggy-key');
+    expect(bodyOf(calls[0]!)).toEqual({
+      seed: 42,
+      text: 'Hello Giggy',
+      voice_id: '123e4567-e89b-12d3-a456-426614174000',
+      mode: 'streaming',
+      output_format: 'pcm_24000',
+    });
+    expect(result.mediaType).toBe('audio/pcm');
+    expect(result.format).toBe('pcm');
+    expect(result.usage.characters).toBe('Hello Giggy'.length);
+    const reader = result.audio.getReader();
+    expect([...(await reader.read()).value!]).toEqual([1, 2]);
+    expect([...(await reader.read()).value!]).toEqual([3, 4]);
+    expect((await reader.read()).done).toBe(true);
+  });
+
+  it('rejects providers without native streaming', async () => {
+    const { fetch, calls } = audioFetch();
+    const model = createOpenAISpeech({ apiKey: 'k', fetch })('tts-1');
+    await expect(streamSpeech({ model, text: 'hi' })).rejects.toBeInstanceOf(
+      UnsupportedCapabilityError,
+    );
+    expect(calls).toHaveLength(0);
   });
 });
 

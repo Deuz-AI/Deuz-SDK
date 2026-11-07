@@ -1,9 +1,9 @@
 ---
 title: Transcription (STT)
-description: transcribe — audio in, text (and timings) out, over the OpenAI and Deepgram speech-to-text wires.
+description: transcribe audio or stream Giggy uploaded-recording transcript revisions over SSE.
 ---
 
-`transcribe` is the other half of [generateSpeech](/docs/modules/speech): audio goes in, text comes out. Like every media module it is one request and one answer — **no streaming**, no loop.
+`transcribe` is the other half of [generateSpeech](/docs/modules/speech): audio goes in, text comes out. OpenAI and Deepgram return one finished transcript. Giggy's uploaded-recording endpoint can instead stream cumulative transcript revisions through `streamTranscription`.
 
 Two wires ship in 2.0, and they are far less alike than the two TTS wires:
 
@@ -11,15 +11,16 @@ Two wires ship in 2.0, and they are far less alike than the two TTS wires:
 | --- | --- | --- |
 | OpenAI (and OpenAI-compatible relays) | `createOpenAITranscription` | `POST {baseURL}/audio/transcriptions`, `multipart/form-data`, `Authorization: Bearer` |
 | Deepgram | `createDeepgram` | `POST {baseURL}/listen?model=…`, **raw audio as the body**, `Authorization: Token` |
+| Giggy.ai | `createGiggyTranscription` | `POST {baseURL}/audio/transcriptions?mode=streaming`, raw WAV body, `xi-api-key`, SSE events |
 
-Transcription models are a **separate kind** from chat `LanguageModel` (`surface: 'openai-transcription' | 'deepgram-transcription'`) — they cannot be passed to [streamChat](/docs/core/stream-chat) or [generateText](/docs/core/generate-text). The module is pure and edge-safe: HTTP goes through `deps.fetch` and the API key is resolved from the factory, `createClient`, or a `deps.keyProvider`, never from the environment.
+Transcription models are a **separate kind** from chat `LanguageModel` — they cannot be passed to [streamChat](/docs/core/stream-chat) or [generateText](/docs/core/generate-text). The module is pure and edge-safe: HTTP goes through `deps.fetch` and the API key is resolved from the factory, `createClient`, or a `deps.keyProvider`, never from the environment.
 
 <Callout type="info" title="Audio input to a chat model is a file part">
 This page is about a dedicated STT endpoint. Audio you want a **chat** model to hear travels as `filePart({ mediaType: 'audio/…' })`, exactly like a PDF or an image — the `Part` union stayed at five members in 2.0.
 </Callout>
 
 <Callout type="warn" title="Verified against mocks, not yet against a live API">
-Everything on this page is pinned by unit tests (`test/transcription.test.ts`) that drive both adapters through an injected `deps.fetch` and assert the exact URL, query string, auth scheme, multipart fields, and response parsing. That proves the SDK **sends and reads what this page says it does**. It does not prove OpenAI and Deepgram accept it — this module has no live-API test; `test/live/` covers DeepSeek, Google, and xAI only.
+Everything on this page is pinned by unit tests (`test/transcription.test.ts`) that drive the adapters through an injected `deps.fetch` and assert request shape, auth, multipart/raw bodies, SSE event revisions, and response parsing. That proves the SDK **sends and reads what this page says it does**. It does not prove providers accept it; no live-API test is included in this module.
 
 The wire details below come from the providers' documentation. Run one real file through it before you ship, and correct anything that turns out wrong with [`providerOptions`](#provideroptions) rather than waiting for an SDK release.
 </Callout>
@@ -37,7 +38,7 @@ The two providers are not interchangeable, and the differences show up in the fi
 | Want a vocabulary hint (names, jargon) | `createOpenAITranscription` | `prompt` is OpenAI-only. Deepgram's equivalent is `keyterm` via `providerOptions`. |
 | Are transcribing to feed a chat model, not a human | Either | The extra fields cost nothing if you ignore them. |
 
-And when **not** to use this module at all: if you want a chat model to reason about *how* something was said (tone, background, overlapping speakers), a transcript throws that away — send the audio to a model whose registry row sets `audio: true` as a [`filePart`](/docs/core/files) instead. If you want live captions, see [what this does not do](#what-transcribe-does-not-do): there is no streaming path here.
+And when **not** to use this module at all: if you want a chat model to reason about *how* something was said (tone, background, overlapping speakers), a transcript throws that away — send the audio to a model whose registry row sets `audio: true` as a [`filePart`](/docs/core/files) instead. `streamTranscription` is for a completed uploaded recording; it does not stream microphone input.
 
 ## transcribe
 
@@ -68,14 +69,14 @@ console.log(usage.inputTokens); // token-billed on this model
 
 | Option | Type | Default | Notes |
 | --- | --- | --- | --- |
-| `model` | `TranscriptionModel` | — | From `createOpenAITranscription` / `createDeepgram`. Required. |
+| `model` | `TranscriptionModel` | — | From `createOpenAITranscription`, `createDeepgram`, or `createGiggyTranscription`. Required. |
 | `audio` | `Uint8Array \| ArrayBuffer \| Blob \| { url }` | — | Required. `{ url }` is **Deepgram-only** — see below. |
 | `mediaType` | `string` | from a `Blob`'s own `type` | e.g. `'audio/mpeg'`. Strongly recommended — see [Media types and filenames](#media-types-and-filenames). |
 | `filename` | `string` | derived from `mediaType` | Overrides the multipart filename (OpenAI only). |
 | `language` | `string` | provider auto-detect | ISO-639-1 hint, e.g. `'tr'`. |
 | `prompt` | `string` | unset | Vocabulary/style hint (OpenAI only). |
 | `timestamps` | `boolean` | `false` | Ask for `segments` + `words` — see [Timestamps](#timestamps). |
-| `providerOptions` | `{ openai?, deepgram? }` | unset | Extra form fields / query params. Canonical fields always win. |
+| `providerOptions` | `{ openai?, deepgram?, giggy? }` | unset | Extra form fields / query params. Giggy's `mode` is fixed to `streaming`. |
 | `signal` | `AbortSignal` | unset | Aborts the underlying fetch. |
 | `headers` | `Record<string, string>` | unset | Per-call headers, merged over factory headers. |
 | `deps` | `Dependencies` | resolved defaults | Inject `fetch`, `keyProvider`, `observer`, … |
@@ -95,6 +96,71 @@ interface TranscribeResult {
 ```
 
 Every optional field is **absent, not `undefined`**, when the wire did not produce it — a plain `json` OpenAI response yields exactly `{ text, usage, raw }`. `raw` always carries the provider's own JSON, so a field this module does not model is never lost.
+
+## Giggy uploaded-recording streaming
+
+Giggy's Streaming STT mode accepts a completed WAV recording as raw request bytes. The WAV must contain PCM16 mono audio at 16 kHz. The SDK posts it to `/audio/transcriptions?mode=streaming` and returns the response as a `ReadableStream<GiggyTranscriptionEvent>`; no transcript buffer is accumulated.
+
+```ts
+import { createGiggyTranscription, streamTranscription } from '@deuz-sdk/core/transcription';
+
+const giggy = createGiggyTranscription({ apiKey: process.env.GIGGY_API_KEY! });
+const events = await streamTranscription({
+  model: giggy('giggy-stt'),
+  audio: wavBytes,
+  mediaType: 'audio/wav',
+});
+
+let transcript = '';
+for await (const event of events) {
+  if (event.type === 'transcript_chunk' && event.replace) {
+    transcript = event.text ?? ''; // cumulative revisions replace the previous draft
+  } else if (event.type === 'error') {
+    throw new Error(String((event.data as { message?: unknown }).message ?? 'Transcription failed'));
+  }
+}
+console.log(transcript);
+```
+
+Events such as `generation_created` and `generation_updated` retain their provider payload in `data`. Transcript chunks are cumulative and may revise earlier words; replace the displayed draft with `event.text` rather than appending it. The terminal status event is marked `terminal: true`. An SSE `error` event is emitted to the caller and then closes the stream. HTTP errors reject `streamTranscription`; transport errors error the returned stream. Pass `signal` or cancel the reader to close the local connection. Giggy documents that closing uploaded-recording SSE does not cancel the admitted transcription job.
+
+`transcribe()` on a Giggy model is a buffered compatibility wrapper over this same streaming endpoint. It returns the last cumulative transcript revision after the stream completes. It does not select Fast or Batch modes.
+
+This endpoint streams an **uploaded recording**, not a live microphone. Use `createGiggyLiveTranscriptionSession` below for Giggy's separate one-socket live protocol.
+
+## Giggy live microphone (WebSocket)
+
+`createGiggyLiveTranscriptionSession` opens Giggy's authenticated WebSocket at `/audio/transcriptions`. It sends `start`, admits the UUID from `generation_created`, then waits for `ready` with the matching UUID and positive attempt before allowing audio. It accepts headerless PCM16LE mono frames and sends `stop()` when the caller reaches the end of the utterance. The default input rate is 16 kHz; 8 kHz is also accepted. Transcript revisions must match the admitted UUID and attempt. `input_complete` matches the UUID and has a sequence; its attempt is optional. Transcript and input-complete sequences must increase; duplicate sequences and late frames are dropped. This API needs a server runtime that can authenticate the WebSocket handshake. Keep the key on the server.
+
+```ts
+import {
+  createGiggyTranscription,
+  createGiggyLiveTranscriptionSession,
+} from '@deuz-sdk/core/transcription';
+
+const giggy = createGiggyTranscription({ apiKey: process.env.GIGGY_API_KEY! });
+const session = createGiggyLiveTranscriptionSession({
+  model: giggy('giggy-stt'),
+  sampleRateHz: 16000,
+});
+const events = session.events();
+await session.connect();
+
+const readingEvents = (async () => {
+  for await (const event of events) {
+    if (event.type === 'transcript') {
+      renderTranscript(event.text); // cumulative revisions replace the displayed draft
+    }
+  }
+})();
+
+for await (const pcmFrame of microphoneFrames()) session.sendAudio(pcmFrame);
+await session.stop(); // resolves after canonical final-result validation
+await session.close();
+await readingEvents;
+```
+
+Giggy's `transcription` events carry cumulative text in `alternatives[0].transcript`, plus `is_final`, `sequence`, generation UUID, and attempt. The SDK emits them as `transcript` events with `replace: true` and `source: 'websocket'`. `input-complete` marks the final input acknowledgement, and `generation-updated` exposes provider status. After `input_complete` and terminal `generation_updated` status `completed`, the SDK fetches `/v1/generations/{uuid}` to validate identity and status, then downloads its signed HTTPS result without forwarding the API key. It checks the canonical text against any WebSocket final transcript and verifies `audio_duration_ms` against the submitted PCM. If no `is_final: true` transcript arrived, the SDK emits the verified canonical text as one final replacement with `source: 'canonical-result'`. `stop()` resolves only after this canonical validation. Connection readiness and stop completion each have a 15-second default timeout; `connectTimeoutMs` and `stopTimeoutMs` can tune each from 100 ms to 120 seconds. `signal` aborts the session and closes its socket; `close()` also closes it. This live WebSocket stream and uploaded-recording SSE stream are separate APIs with different input and lifecycle rules.
 
 ## Timestamps
 
@@ -228,7 +294,7 @@ Notes on the shape, all of them things that bite once:
 
 - **`segments` is optional and this code treats it as such.** On Deepgram it exists only when `smart_format` produced paragraphs (it is on by default); on OpenAI it exists only for `whisper-1` with `timestamps: true`. `segments ?? []` with a fall back to plain `text` is not defensive noise — it is the actual contract.
 - **Diarization does not reach the canonical shape.** `TranscriptionSegment` is `{ start, end, text }` — no speaker field. Deepgram's speaker labels are in `raw`, which is exactly what `raw` is for: read `result.raw` when you need a field this module does not model.
-- **A long recording is a long wait.** There is no streaming and no progress signal; the promise resolves when the provider is done. Put this behind a queue, not an HTTP request handler.
+- **For OpenAI and Deepgram, a long recording is a long wait.** Their `transcribe()` calls return after the provider is done. Giggy supports progressive revisions for uploaded WAV through [`streamTranscription`](#giggy-uploaded-recording-streaming); put long jobs behind a queue if your request handler cannot stay open.
 - **The transcript is untrusted input.** It came from a microphone someone else controlled. If it flows into a tool-calling agent rather than a summary, treat it the way you would a user message — see [request validation](/docs/modules/request-validation) and [guardrails](/docs/agents/guardrails).
 
 ## usage — two meters, one shape

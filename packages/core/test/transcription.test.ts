@@ -8,8 +8,11 @@
 import { describe, it, expect } from 'vitest';
 import {
   transcribe,
+  streamTranscription,
+  createGiggyLiveTranscriptionSession,
   createOpenAITranscription,
   createDeepgram,
+  createGiggyTranscription,
   type TranscribeResult,
 } from '../src/transcription';
 import { createMemoryObserver } from '../src/observe';
@@ -38,6 +41,64 @@ function jsonFetch(
     });
   }) as typeof fetch;
   return { fetch: fn, calls };
+}
+
+function sseFetch(frames: string[]) {
+  const calls: { url: string; init?: RequestInit }[] = [];
+  const fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    calls.push({ url: String(input), init });
+    const encoder = new TextEncoder();
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (const frame of frames) controller.enqueue(encoder.encode(frame));
+        controller.close();
+      },
+    });
+    return new Response(body, { headers: { 'content-type': 'text/event-stream' } });
+  }) as typeof globalThis.fetch;
+  return { fetch, calls };
+}
+
+function uploadedCanonicalFetch(
+  frames: string[],
+  artifact: unknown = { text: 'canonical text' },
+  canonicalUuid = '123e4567-e89b-42d3-a456-426614174000',
+  canonicalStatus = 'completed',
+) {
+  const calls: { url: string; init?: RequestInit }[] = [];
+  const fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    calls.push({ url, init });
+    if (url.includes('/audio/transcriptions?')) {
+      const encoder = new TextEncoder();
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          for (const frame of frames) controller.enqueue(encoder.encode(frame));
+          controller.close();
+        },
+      });
+      return new Response(body, { headers: { 'content-type': 'text/event-stream' } });
+    }
+    if (url.endsWith('/generations/123e4567-e89b-42d3-a456-426614174000')) {
+      return new Response(
+        JSON.stringify({
+          generation: {
+            generation_uuid: canonicalUuid,
+            status: canonicalStatus,
+            result: { url: 'https://artifacts.giggy.ai/transcripts/result.json' },
+          },
+        }),
+        { headers: { 'content-type': 'application/json' } },
+      );
+    }
+    if (url === 'https://artifacts.giggy.ai/transcripts/result.json') {
+      return new Response(JSON.stringify(artifact), {
+        headers: { 'content-type': 'application/json' },
+      });
+    }
+    throw new Error(`Unexpected fetch URL: ${url}`);
+  }) as typeof globalThis.fetch;
+  return { fetch, calls };
 }
 
 function formOf(init: RequestInit | undefined): FormData {
@@ -505,5 +566,739 @@ describe('transcribe (shared behavior)', () => {
     const model = createOpenAITranscription({ apiKey: 'k', fetch })('whisper-1');
     const res: TranscribeResult = await transcribe({ model, audio: AUDIO });
     expect(Object.keys(res).sort()).toEqual(['raw', 'text', 'usage']);
+  });
+});
+
+describe('Giggy uploaded-recording transcription stream', () => {
+  const model = (fetch: typeof globalThis.fetch) =>
+    createGiggyTranscription({ apiKey: 'giggy-key', fetch })('giggy-stt');
+
+  it('posts raw WAV to native streaming mode and emits SSE events incrementally', async () => {
+    const calls: { url: string; init?: RequestInit }[] = [];
+    let upstream!: ReadableStreamDefaultController<Uint8Array>;
+    const fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ url: String(input), init });
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          upstream = controller;
+          controller.enqueue(
+            new TextEncoder().encode(
+              'event: generation_created\ndata: {"generation_uuid":"g-1"}\n\n',
+            ),
+          );
+        },
+      });
+      return new Response(body, { headers: { 'content-type': 'text/event-stream' } });
+    }) as typeof globalThis.fetch;
+    const wav = new Uint8Array([82, 73, 70, 70, 1, 2]);
+    const output = await streamTranscription({
+      model: model(fetch),
+      audio: wav,
+      language: 'English',
+      providerOptions: { giggy: { mode: 'fast', client_request_id: 'request-1' } },
+    });
+    const reader = output.getReader();
+
+    const first = await reader.read();
+    expect(first.value).toMatchObject({
+      type: 'generation_created',
+      data: { generation_uuid: 'g-1' },
+    });
+    expect(calls[0]!.url).toContain(
+      '/audio/transcriptions?client_request_id=request-1&mode=streaming&language=English',
+    );
+    expect(calls[0]!.init!.method).toBe('POST');
+    expect((calls[0]!.init!.headers as Record<string, string>)['content-type']).toBe('audio/wav');
+    expect((calls[0]!.init!.headers as Record<string, string>)['xi-api-key']).toBe('giggy-key');
+    expect(calls[0]!.init!.body).toBeInstanceOf(Uint8Array);
+    expect([...(calls[0]!.init!.body as Uint8Array)]).toEqual([...wav]);
+
+    upstream.enqueue(
+      new TextEncoder().encode(
+        'event: transcript_chunk\ndata: {"text":"Hello","replace":true}\n\n',
+      ),
+    );
+    const second = await reader.read();
+    expect(second.value).toMatchObject({ type: 'transcript_chunk', text: 'Hello', replace: true });
+    await reader.cancel();
+  });
+
+  it('accepts draft-only SSE EOF and returns the completed keyless canonical artifact', async () => {
+    const frames = [
+      'event: generation_created\ndata: {"generation_uuid":"123e4567-e89b-42d3-a456-426614174000"}\n\n',
+      'event: transcript_chunk\ndata: {"text":"draft","replace":true}\n\n',
+    ];
+    const { fetch, calls } = uploadedCanonicalFetch(frames);
+    const events = await streamTranscription({
+      model: model(fetch),
+      audio: AUDIO,
+      mediaType: 'audio/wav',
+    });
+    const reader = events.getReader();
+    const received = [];
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      received.push(value!);
+    }
+    expect(received.filter((e) => e.type === 'transcript_chunk').map((e) => e.text)).toEqual([
+      'draft',
+    ]);
+    expect(received.at(-1)).toMatchObject({ type: 'transcript_chunk', text: 'draft' });
+
+    const result = await transcribe({ model: model(fetch), audio: AUDIO, mediaType: 'audio/wav' });
+    expect(result).toMatchObject({
+      text: 'canonical text',
+      raw: { text: 'canonical text' },
+      usage: {},
+    });
+    expect(result).not.toHaveProperty('durationSeconds');
+    expect(calls).toHaveLength(4);
+    expect(calls[2]!.url).toContain('/generations/123e4567-e89b-42d3-a456-426614174000');
+    expect((calls[2]!.init!.headers as Record<string, string>)['xi-api-key']).toBe('giggy-key');
+    expect(calls[2]!.init!.redirect).toBe('error');
+    expect(calls[3]!.url).toBe('https://artifacts.giggy.ai/transcripts/result.json');
+    expect(calls[3]!.init!.headers).toBeUndefined();
+    expect(calls[3]!.init!.redirect).toBe('error');
+  });
+
+  it('cancels the keyless artifact request when the public transcribe signal aborts', async () => {
+    let artifactStarted!: () => void;
+    const artifactRequestStarted = new Promise<void>((resolve) => {
+      artifactStarted = resolve;
+    });
+    const generationUuid = '123e4567-e89b-42d3-a456-426614174000';
+    const fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes('/audio/transcriptions?')) {
+        const frames = [
+          `event: generation_created\ndata: {"generation_uuid":"${generationUuid}"}\n\n`,
+          'event: generation_updated\ndata: {"status":"completed"}\n\n',
+        ];
+        const encoder = new TextEncoder();
+        return new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              for (const frame of frames) controller.enqueue(encoder.encode(frame));
+              controller.close();
+            },
+          }),
+          { headers: { 'content-type': 'text/event-stream' } },
+        );
+      }
+      if (url.includes('/generations/')) {
+        return new Response(
+          JSON.stringify({
+            generation: {
+              generation_uuid: generationUuid,
+              status: 'completed',
+              result: { url: 'https://artifacts.giggy.ai/transcripts/result.json' },
+            },
+          }),
+          { headers: { 'content-type': 'application/json' } },
+        );
+      }
+      artifactStarted();
+      return await new Promise<Response>((_resolve, reject) => {
+        if (init?.signal?.aborted) {
+          reject(new DOMException('The operation was aborted.', 'AbortError'));
+          return;
+        }
+        init?.signal?.addEventListener(
+          'abort',
+          () => reject(new DOMException('The operation was aborted.', 'AbortError')),
+          { once: true },
+        );
+      });
+    }) as typeof globalThis.fetch;
+    const controller = new AbortController();
+    const pending = transcribe({
+      model: model(fetch),
+      audio: AUDIO,
+      mediaType: 'audio/wav',
+      signal: controller.signal,
+    });
+    await artifactRequestStarted;
+    controller.abort();
+    await expect(pending).rejects.toMatchObject({ name: 'AbortError' });
+  });
+
+  it('rejects a mismatched canonical identity before fetching the signed artifact', async () => {
+    const frames = [
+      'event: generation_created\ndata: {"generation_uuid":"123e4567-e89b-42d3-a456-426614174000"}\n\n',
+    ];
+    const { fetch, calls } = uploadedCanonicalFetch(
+      frames,
+      { text: 'must not be fetched' },
+      '123e4567-e89b-42d3-a456-426614174001',
+    );
+    await expect(
+      transcribe({ model: model(fetch), audio: AUDIO, mediaType: 'audio/wav' }),
+    ).rejects.toMatchObject({
+      name: 'APICallError',
+      message: expect.stringContaining('identity or completed status did not match'),
+    });
+    expect(calls).toHaveLength(2);
+  });
+
+  it('rejects an explicit failed upload status without fetching canonical results', async () => {
+    const { fetch, calls } = uploadedCanonicalFetch([
+      'event: generation_created\ndata: {"generation_uuid":"123e4567-e89b-42d3-a456-426614174000"}\n\n',
+      'event: generation_updated\ndata: {"status":"failed"}\n\n',
+    ]);
+    await expect(
+      transcribe({ model: model(fetch), audio: AUDIO, mediaType: 'audio/wav' }),
+    ).rejects.toMatchObject({ name: 'APICallError' });
+    expect(calls).toHaveLength(1);
+  });
+
+  it('surfaces a provider error event and maps it to an error for buffered transcribe', async () => {
+    const { fetch } = sseFetch(['event: error\ndata: {"message":"Recording rejected"}\n\n']);
+    const events = await streamTranscription({ model: model(fetch), audio: AUDIO });
+    const reader = events.getReader();
+    expect(await reader.read()).toMatchObject({
+      done: false,
+      value: { type: 'error', data: { message: 'Recording rejected' } },
+    });
+    expect((await reader.read()).done).toBe(true);
+    await expect(transcribe({ model: model(fetch), audio: AUDIO })).rejects.toMatchObject({
+      name: 'APICallError',
+      message: 'Recording rejected',
+    });
+  });
+
+  it('cancels the underlying SSE body when the caller cancels its reader', async () => {
+    let canceled = false;
+    const fetch = (async () => {
+      const body = new ReadableStream<Uint8Array>({
+        cancel() {
+          canceled = true;
+        },
+      });
+      return new Response(body, { headers: { 'content-type': 'text/event-stream' } });
+    }) as typeof globalThis.fetch;
+    const events = await streamTranscription({ model: model(fetch), audio: AUDIO });
+    const reader = events.getReader();
+    await reader.cancel();
+    expect(canceled).toBe(true);
+  });
+});
+
+describe('Giggy live transcription WebSocket session', () => {
+  function canonicalFetch(generationUuid: string, text: string, audioDurationMs: number) {
+    return jsonFetch((url) =>
+      url.includes('/generations/')
+        ? {
+            body: {
+              generation_uuid: generationUuid,
+              status: 'completed',
+              result: { url: 'https://signed.example.test/result.json?sig=redacted' },
+            },
+          }
+        : { body: { text, audio_duration_ms: audioDurationMs } },
+    );
+  }
+
+  it('waits for ready, sends binary PCM, and validates canonical completion after input_complete', async () => {
+    const resultFetch = canonicalFetch('live-1', 'final text', 1);
+    const model = createGiggyTranscription({ apiKey: 'giggy-key', fetch: resultFetch.fetch })(
+      'giggy-stt',
+    );
+    const listeners = new Map<string, (event: unknown) => void>();
+    const sent: unknown[] = [];
+    const socket = {
+      readyState: 0,
+      binaryType: 'blob',
+      send(data: string) {
+        sent.push(data);
+      },
+      close() {},
+      addEventListener(type: string, listener: (event: unknown) => void) {
+        listeners.set(type, listener);
+      },
+      removeEventListener() {},
+    };
+    let socketUrl = '';
+    let authHeader = '';
+    let followRedirects: false | undefined;
+    const session = createGiggyLiveTranscriptionSession({
+      model,
+      language: 'English',
+      deps: {
+        webSocket(url, init) {
+          socketUrl = url;
+          authHeader = init.headers?.['xi-api-key'] ?? '';
+          followRedirects = init.followRedirects;
+          return socket;
+        },
+      },
+    });
+    const events = session.events();
+    const connected = session.connect();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(socketUrl).toBe('wss://api.giggy.ai/v1/audio/transcriptions');
+    expect(authHeader).toBe('giggy-key');
+    expect(followRedirects).toBe(false);
+    listeners.get('open')?.({});
+    expect(JSON.parse(sent[0] as string)).toEqual({
+      type: 'start',
+      format: 'raw',
+      encoding: 'LINEAR16',
+      sampleRateHz: 16000,
+      interimResults: true,
+      language: 'English',
+      options: { endpointing: 'external' },
+    });
+    listeners.get('message')?.({
+      data: JSON.stringify({ type: 'generation_created', generation: { uuid: 'live-1' } }),
+    });
+    listeners.get('message')?.({
+      data: JSON.stringify({ type: 'ready', generation_uuid: 'live-1', attempt: 2 }),
+    });
+    await connected;
+    expect((await events.next()).value).toEqual({
+      type: 'session-ready',
+      generationUuid: 'live-1',
+      attempt: 2,
+    });
+
+    session.sendAudio(new Uint8Array([9, 8, 7]).subarray(1));
+    expect(sent[1]).toBeInstanceOf(ArrayBuffer);
+    expect([...new Uint8Array(sent[1] as ArrayBuffer)]).toEqual([8, 7]);
+    const stopped = session.stop();
+    expect(sent[2]).toBe(JSON.stringify({ type: 'stop' }));
+    listeners.get('message')?.({
+      data: JSON.stringify({
+        type: 'transcription',
+        generation_uuid: 'live-1',
+        attempt: 2,
+        sequence: 1,
+        alternatives: [{ transcript: 'draft' }],
+        is_final: false,
+      }),
+    });
+    // Replayed frames from another generation/attempt and nonmonotonic frames are fenced out.
+    listeners.get('message')?.({
+      data: JSON.stringify({
+        type: 'transcription',
+        generation_uuid: 'old-generation',
+        attempt: 2,
+        sequence: 9,
+        text: 'stale',
+        is_final: false,
+      }),
+    });
+    listeners.get('message')?.({
+      data: JSON.stringify({
+        type: 'transcription',
+        generation_uuid: 'live-1',
+        attempt: 2,
+        sequence: 1,
+        text: 'replayed',
+        is_final: false,
+      }),
+    });
+    listeners.get('message')?.({
+      data: JSON.stringify({
+        type: 'transcription',
+        generation_uuid: 'live-1',
+        attempt: 2,
+        sequence: 2,
+        alternatives: [{ transcript: 'final text' }],
+        is_final: true,
+      }),
+    });
+    listeners.get('message')?.({
+      // ACK sequence counts binary frames, not transcript revisions (two
+      // transcript revisions have already arrived, but only one PCM frame was sent).
+      data: JSON.stringify({ type: 'input_complete', generation_uuid: 'live-1', sequence: 1 }),
+    });
+    listeners.get('message')?.({
+      data: JSON.stringify({
+        type: 'generation_updated',
+        generation: { generation_uuid: 'live-1', status: 'completed' },
+      }),
+    });
+    await stopped;
+    expect(session.status).toBe('completed');
+    expect(session.transcript).toBe('final text');
+    expect((await events.next()).value).toMatchObject({
+      type: 'transcript',
+      text: 'draft',
+      replace: true,
+    });
+    expect((await events.next()).value).toMatchObject({
+      type: 'transcript',
+      text: 'final text',
+      isFinal: true,
+    });
+    expect((await events.next()).value).toMatchObject({
+      type: 'input-complete',
+      generationUuid: 'live-1',
+    });
+    expect((await events.next()).value).toMatchObject({
+      type: 'generation-updated',
+      status: 'completed',
+    });
+    expect(resultFetch.calls).toHaveLength(2);
+    expect((resultFetch.calls[0]!.init?.headers as Record<string, string>)['xi-api-key']).toBe(
+      'giggy-key',
+    );
+    expect(resultFetch.calls[1]!.init?.headers).toBeUndefined();
+  });
+
+  it('rejects input_complete when its sequence does not equal sent binary frame count', async () => {
+    const resultFetch = canonicalFetch('g-ack', 'must not complete', 1);
+    const model = createGiggyTranscription({ apiKey: 'k', fetch: resultFetch.fetch })('giggy-stt');
+    const listeners = new Map<string, (event: unknown) => void>();
+    const socket = {
+      readyState: 0,
+      send() {},
+      close() {},
+      addEventListener(type: string, listener: (event: unknown) => void) {
+        listeners.set(type, listener);
+      },
+    };
+    const session = createGiggyLiveTranscriptionSession({
+      model,
+      deps: { webSocket: () => socket },
+    });
+    const connected = session.connect();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    listeners.get('open')?.({});
+    const send = (payload: unknown) =>
+      listeners.get('message')?.({ data: JSON.stringify(payload) });
+    send({ type: 'generation_created', generation_uuid: 'g-ack' });
+    send({ type: 'ready', generation_uuid: 'g-ack', attempt: 1 });
+    await connected;
+    session.sendAudio(new Uint8Array(32_000));
+    const stopped = session.stop();
+    send({ type: 'input_complete', generation_uuid: 'g-ack', sequence: 2 });
+
+    await expect(stopped).rejects.toBeInstanceOf(APICallError);
+    expect(session.status).toBe('failed');
+    expect(resultFetch.calls).toHaveLength(0);
+  });
+
+  it('closes the socket and ends the event iterator on abort', async () => {
+    const model = createGiggyTranscription({ apiKey: 'k' })('giggy-stt');
+    const listeners = new Map<string, (event: unknown) => void>();
+    let closed = false;
+    const controller = new AbortController();
+    const session = createGiggyLiveTranscriptionSession({
+      model,
+      signal: controller.signal,
+      deps: {
+        webSocket: () => ({
+          readyState: 0,
+          send() {},
+          close() {
+            closed = true;
+          },
+          addEventListener(type, listener) {
+            listeners.set(type, listener);
+          },
+        }),
+      },
+    });
+    const events = session.events();
+    const connected = session.connect();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    listeners.get('open')?.({});
+    controller.abort();
+    await expect(connected).rejects.toBeTruthy();
+    expect(closed).toBe(true);
+    expect((await events.next()).value).toMatchObject({ type: 'error' });
+  });
+
+  it('waits for both final transcript and input_complete, in either order', async () => {
+    const resultFetch = canonicalFetch('g-final', 'final', 1000);
+    const model = createGiggyTranscription({ apiKey: 'k', fetch: resultFetch.fetch })('giggy-stt');
+    const listeners = new Map<string, (event: unknown) => void>();
+    const socket = {
+      readyState: 0,
+      send() {},
+      close() {},
+      addEventListener(type: string, listener: (event: unknown) => void) {
+        listeners.set(type, listener);
+      },
+    };
+    const session = createGiggyLiveTranscriptionSession({
+      model,
+      deps: { webSocket: () => socket },
+    });
+    const connected = session.connect();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    listeners.get('open')?.({});
+    const send = (payload: unknown) =>
+      listeners.get('message')?.({ data: JSON.stringify(payload) });
+    send({ type: 'generation_created', generation_uuid: 'g-final' });
+    send({ type: 'ready', generation_uuid: 'g-final', attempt: 1 });
+    await connected;
+    session.sendAudio(new Uint8Array(32_000));
+    const stopped = session.stop();
+    let settled = false;
+    void stopped.then(() => {
+      settled = true;
+    });
+    send({ type: 'input_complete', generation_uuid: 'g-final', sequence: 1 });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    send({
+      type: 'transcription',
+      generation_uuid: 'g-final',
+      attempt: 1,
+      sequence: 2,
+      alternatives: [{ transcript: 'final' }],
+      is_final: true,
+    });
+    send({ type: 'generation_updated', generation_uuid: 'g-final', status: 'completed' });
+    await stopped;
+    expect(settled).toBe(true);
+  });
+
+  it('uses the canonical completed result as final when the socket sends no final marker', async () => {
+    const calls: { url: string; init?: RequestInit }[] = [];
+    let releaseArtifact!: () => void;
+    const artifactGate = new Promise<void>((resolve) => {
+      releaseArtifact = resolve;
+    });
+    const fetchResult = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      calls.push({ url, init });
+      if (url.includes('/generations/')) {
+        return new Response(
+          JSON.stringify({
+            generation_uuid: 'g-canonical',
+            status: 'completed',
+            result: { url: 'https://signed.example.test/result.json?sig=redacted' },
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
+      }
+      await artifactGate;
+      return new Response(JSON.stringify({ text: 'authoritative text', audio_duration_ms: 1000 }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }) as typeof fetch;
+    const model = createGiggyTranscription({ apiKey: 'k', fetch: fetchResult })('giggy-stt');
+    const listeners = new Map<string, (event: unknown) => void>();
+    const socket = {
+      readyState: 0,
+      send() {},
+      close() {},
+      addEventListener(type: string, listener: (event: unknown) => void) {
+        listeners.set(type, listener);
+      },
+    };
+    const session = createGiggyLiveTranscriptionSession({
+      model,
+      deps: { webSocket: () => socket },
+    });
+    const events = session.events();
+    const connected = session.connect();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    listeners.get('open')?.({});
+    const send = (payload: unknown) =>
+      listeners.get('message')?.({ data: JSON.stringify(payload) });
+    send({ type: 'generation_created', generation_uuid: 'g-canonical' });
+    send({ type: 'ready', generation_uuid: 'g-canonical', attempt: 1 });
+    await connected;
+    session.sendAudio(new Uint8Array(32_000));
+    const stopped = session.stop();
+    send({
+      type: 'transcription',
+      generation_uuid: 'g-canonical',
+      attempt: 1,
+      sequence: 1,
+      alternatives: [{ transcript: 'provisional text' }],
+      replace: true,
+      is_final: false,
+    });
+    send({ type: 'input_complete', generation_uuid: 'g-canonical', sequence: 1 });
+    send({
+      type: 'generation_updated',
+      generation: { generation_uuid: 'g-canonical', status: 'completed' },
+    });
+    listeners.get('close')?.({ code: 1000, reason: 'completed' });
+    let settled = false;
+    void stopped.then(() => {
+      settled = true;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(session.status).toBe('stopping');
+    expect(settled).toBe(false);
+    expect(calls).toHaveLength(2);
+    releaseArtifact();
+    await stopped;
+
+    expect(session.status).toBe('completed');
+    expect(session.transcript).toBe('authoritative text');
+    const received = [];
+    for (;;) {
+      const next = await events.next();
+      if (next.done) break;
+      received.push(next.value);
+    }
+    expect(received.filter((event) => event.type === 'transcript')).toEqual([
+      expect.objectContaining({ text: 'provisional text', isFinal: false, source: 'websocket' }),
+      expect.objectContaining({
+        text: 'authoritative text',
+        replace: true,
+        isFinal: true,
+        source: 'canonical-result',
+      }),
+    ]);
+    expect(calls).toHaveLength(2);
+    expect((calls[0]!.init?.headers as Record<string, string>)['xi-api-key']).toBe('k');
+    expect(calls[1]!.init?.headers).toBeUndefined();
+  });
+
+  it('rejects stale generation status and failed signed artifact fetches', async () => {
+    const run = async (
+      fetchHandler: ReturnType<typeof jsonFetch>['fetch'],
+      expectedMessage: string,
+    ) => {
+      const model = createGiggyTranscription({ apiKey: 'k', fetch: fetchHandler })('giggy-stt');
+      const listeners = new Map<string, (event: unknown) => void>();
+      const session = createGiggyLiveTranscriptionSession({
+        model,
+        deps: {
+          webSocket: () => ({
+            readyState: 0,
+            send() {},
+            close() {},
+            addEventListener(type: string, listener: (event: unknown) => void) {
+              listeners.set(type, listener);
+            },
+          }),
+        },
+      });
+      const connected = session.connect();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      listeners.get('open')?.({});
+      const send = (payload: unknown) =>
+        listeners.get('message')?.({ data: JSON.stringify(payload) });
+      send({ type: 'generation_created', generation_uuid: 'g-error' });
+      send({ type: 'ready', generation_uuid: 'g-error', attempt: 1 });
+      await connected;
+      session.sendAudio(new Uint8Array(32_000));
+      const stopped = session.stop();
+      send({ type: 'input_complete', generation_uuid: 'g-error', sequence: 1 });
+      send({ type: 'generation_updated', generation_uuid: 'g-error', status: 'completed' });
+      await expect(stopped).rejects.toMatchObject({
+        name: 'APICallError',
+        message: expect.stringContaining(expectedMessage),
+      });
+    };
+
+    await run(
+      jsonFetch((url) => ({
+        body: url.includes('/generations/')
+          ? {
+              generation_uuid: 'stale-id',
+              status: 'completed',
+              result: { url: 'https://signed.example.test/result' },
+            }
+          : { text: 'ignored', audio_duration_ms: 1000 },
+      })).fetch,
+      'identity or status did not match',
+    );
+    await run(
+      jsonFetch((url) =>
+        url.includes('/generations/')
+          ? {
+              body: {
+                generation_uuid: 'g-error',
+                status: 'completed',
+                result: { url: 'https://signed.example.test/result' },
+              },
+            }
+          : { status: 403, body: { error: 'expired' } },
+      ).fetch,
+      'download failed with HTTP 403',
+    );
+  });
+
+  it('rejects a ready event for a different generation and bounds readiness/stop waits', async () => {
+    const model = createGiggyTranscription({ apiKey: 'k' })('giggy-stt');
+    const listeners = new Map<string, (event: unknown) => void>();
+    const socket = {
+      readyState: 0,
+      send() {},
+      close() {},
+      addEventListener(type: string, listener: (event: unknown) => void) {
+        listeners.set(type, listener);
+      },
+    };
+    const mismatch = createGiggyLiveTranscriptionSession({
+      model,
+      connectTimeoutMs: 500,
+      deps: { webSocket: () => socket },
+    });
+    const connecting = mismatch.connect();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    listeners.get('open')?.({});
+    const send = (payload: unknown) =>
+      listeners.get('message')?.({ data: JSON.stringify(payload) });
+    send({ type: 'generation_created', generation_uuid: 'admitted' });
+    send({ type: 'ready', generation_uuid: 'another', attempt: 1 });
+    await expect(connecting).rejects.toMatchObject({
+      name: 'APICallError',
+      message: expect.stringContaining('did not match'),
+    });
+
+    const waitingForReady = createGiggyLiveTranscriptionSession({
+      model,
+      connectTimeoutMs: 100,
+      deps: {
+        webSocket: () => ({
+          ...socket,
+          addEventListener(type: string, listener: (event: unknown) => void) {
+            listeners.set(type, listener);
+          },
+        }),
+      },
+    });
+    await expect(waitingForReady.connect()).rejects.toMatchObject({
+      name: 'APICallError',
+      message: expect.stringContaining('did not become ready'),
+    });
+
+    const stopping = createGiggyLiveTranscriptionSession({
+      model,
+      stopTimeoutMs: 100,
+      deps: {
+        webSocket: () => ({
+          ...socket,
+          addEventListener(type: string, listener: (event: unknown) => void) {
+            listeners.set(type, listener);
+          },
+        }),
+      },
+    });
+    const stopped = stopping.connect();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    listeners.get('open')?.({});
+    send({ type: 'generation_created', generation_uuid: 'timeout' });
+    send({ type: 'ready', generation_uuid: 'timeout', attempt: 1 });
+    await stopped;
+    await expect(stopping.stop()).rejects.toMatchObject({
+      name: 'APICallError',
+      message: expect.stringContaining('did not deliver'),
+    });
+  });
+
+  it('rejects an undocumented [DONE] SSE sentinel instead of treating it as terminal', async () => {
+    const { fetch } = sseFetch(['data: [DONE]\n\n']);
+    const events = await streamTranscription({
+      model: createGiggyTranscription({ apiKey: 'k', fetch })('giggy-stt'),
+      audio: AUDIO,
+    });
+    await expect(events.getReader().read()).rejects.toMatchObject({
+      name: 'APICallError',
+      message: expect.stringContaining('undocumented [DONE]'),
+    });
   });
 });
