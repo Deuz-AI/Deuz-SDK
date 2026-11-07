@@ -354,14 +354,9 @@ export async function streamTranscription(
             );
             return;
           }
-          controller.error(
-            new APICallError({
-              message: 'Giggy.ai transcription stream ended before a terminal status event.',
-              provider: options.model.provider,
-              statusCode: 200,
-              isRetryable: true,
-            }),
-          );
+          // Uploaded SSE chunks are previews. A clean EOF is valid; buffered
+          // transcribe() verifies completion from the canonical generation GET.
+          controller.close();
           return;
         }
         if (next.value.data === '[DONE]') {
@@ -392,7 +387,9 @@ export async function streamTranscription(
           'message';
         const terminalStatus =
           type === 'generation_updated' &&
-          ['completed', 'failed', 'cancelled', 'stopped'].includes(String(payload?.status));
+          ['completed', 'failed', 'cancelled', 'stopped', 'error'].includes(
+            String(payload?.status),
+          );
         const terminalEvent =
           ['error', 'completed', 'failed', 'cancelled', 'stopped', 'generation_completed'].includes(
             type,
@@ -432,6 +429,168 @@ export async function streamTranscription(
   });
 }
 
+async function fetchCanonicalUploadedResult(
+  options: TranscribeOptions,
+  deps: ResolvedDependencies,
+  generationUuid: string,
+): Promise<{ text: string; language?: string; durationSeconds?: number; raw: unknown }> {
+  if (
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+      generationUuid,
+    )
+  ) {
+    throw new APICallError({
+      message: 'Giggy uploaded transcription did not include a valid generation UUID.',
+      provider: options.model.provider,
+      statusCode: 200,
+      isRetryable: false,
+    });
+  }
+  const clientContext = readClientContext(options);
+  const {
+    apiKey,
+    baseURL,
+    headers,
+    fetch: fetchImpl,
+  } = await resolveTranscriptionCall(options.model, deps, options.headers, clientContext);
+  const generationResponse = await fetchImpl(
+    `${baseURL}/generations/${encodeURIComponent(generationUuid)}`,
+    {
+      method: 'GET',
+      headers: { ...headers, 'xi-api-key': apiKey },
+      signal: options.signal,
+      redirect: 'error',
+    },
+  );
+  if (!generationResponse.ok) {
+    throw mapMediaError(
+      options.model.provider,
+      generationResponse.status,
+      await readErrorBody(generationResponse),
+      generationResponse.headers,
+      `Giggy canonical generation lookup failed with HTTP ${generationResponse.status}.`,
+    );
+  }
+  let generationPayload: unknown;
+  try {
+    generationPayload = await generationResponse.json();
+  } catch {
+    throw new APICallError({
+      message: 'Giggy returned invalid canonical generation JSON.',
+      provider: options.model.provider,
+      statusCode: generationResponse.status,
+      isRetryable: false,
+    });
+  }
+  const envelope = generationPayload as {
+    generation_uuid?: unknown;
+    uuid?: unknown;
+    status?: unknown;
+    result?: { url?: unknown };
+    generation?: {
+      generation_uuid?: unknown;
+      uuid?: unknown;
+      status?: unknown;
+      result?: { url?: unknown };
+      generation?: { generation_uuid?: unknown; uuid?: unknown; status?: unknown };
+    };
+  } | null;
+  const generation = envelope?.generation ?? envelope;
+  const nestedGeneration = generation?.generation;
+  const canonicalUuid =
+    generation?.generation_uuid ??
+    generation?.uuid ??
+    nestedGeneration?.generation_uuid ??
+    nestedGeneration?.uuid;
+  const canonicalStatus = generation?.status ?? nestedGeneration?.status;
+  if (canonicalUuid !== generationUuid || canonicalStatus !== 'completed') {
+    throw new APICallError({
+      message: 'Giggy canonical generation identity or completed status did not match the upload.',
+      provider: options.model.provider,
+      statusCode: generationResponse.status,
+      isRetryable: false,
+    });
+  }
+  if (typeof generation?.result?.url !== 'string') {
+    throw new APICallError({
+      message: 'Giggy completed upload did not include a canonical result URL.',
+      provider: options.model.provider,
+      statusCode: generationResponse.status,
+      isRetryable: false,
+    });
+  }
+  let artifactUrl: URL;
+  try {
+    artifactUrl = new URL(generation.result.url);
+  } catch {
+    throw new APICallError({
+      message: 'Giggy canonical transcript URL was invalid.',
+      provider: options.model.provider,
+      statusCode: generationResponse.status,
+      isRetryable: false,
+    });
+  }
+  if (artifactUrl.protocol !== 'https:' || artifactUrl.username || artifactUrl.password) {
+    throw new APICallError({
+      message: 'Giggy canonical transcript URL must be credential-free HTTPS.',
+      provider: options.model.provider,
+      statusCode: generationResponse.status,
+      isRetryable: false,
+    });
+  }
+  const artifactResponse = await fetchImpl(artifactUrl, {
+    method: 'GET',
+    signal: options.signal,
+    redirect: 'error',
+  });
+  if (!artifactResponse.ok) {
+    throw mapMediaError(
+      options.model.provider,
+      artifactResponse.status,
+      await readErrorBody(artifactResponse),
+      artifactResponse.headers,
+      `Giggy canonical transcript download failed with HTTP ${artifactResponse.status}.`,
+    );
+  }
+  let artifact: unknown;
+  try {
+    artifact = await artifactResponse.json();
+  } catch {
+    throw new APICallError({
+      message: 'Giggy returned invalid canonical transcript JSON.',
+      provider: options.model.provider,
+      statusCode: artifactResponse.status,
+      isRetryable: false,
+    });
+  }
+  const transcript = artifact as {
+    text?: unknown;
+    language?: unknown;
+    duration?: unknown;
+    duration_seconds?: unknown;
+  } | null;
+  if (!transcript || typeof transcript.text !== 'string') {
+    throw new APICallError({
+      message: 'Giggy canonical transcript artifact must include text.',
+      provider: options.model.provider,
+      statusCode: artifactResponse.status,
+      isRetryable: false,
+    });
+  }
+  const durationSeconds =
+    typeof transcript.duration === 'number'
+      ? transcript.duration
+      : typeof transcript.duration_seconds === 'number'
+        ? transcript.duration_seconds
+        : undefined;
+  return {
+    text: transcript.text,
+    ...(typeof transcript.language === 'string' ? { language: transcript.language } : {}),
+    ...(durationSeconds !== undefined ? { durationSeconds } : {}),
+    raw: artifact,
+  };
+}
+
 /**
  * Open Giggy's native live-microphone STT session. Unlike
  * `streamTranscription`, this sends binary microphone PCM over one WebSocket;
@@ -468,6 +627,7 @@ export function createGiggyLiveTranscriptionSession(
   let canonicalResultStarted = false;
   let canonicalTranscript: string | undefined;
   let sentPcmBytes = 0;
+  let sentFrameCount = 0;
   let resultApiKey: string | undefined;
   let resultBaseUrl: string | undefined;
   let resultHeaders: Record<string, string> = {};
@@ -748,9 +908,20 @@ export function createGiggyLiveTranscriptionSession(
         failProtocol('Giggy input_complete must include an integer sequence.');
         return;
       }
-      if (sequence <= lastSequence) return;
-      lastSequence = sequence;
-      if (sawInputComplete) return;
+      if (status !== 'stopping') {
+        failProtocol('Giggy input_complete arrived before the client stopped sending audio.');
+        return;
+      }
+      if (sequence !== sentFrameCount) {
+        failProtocol(
+          'Giggy input_complete sequence did not match the number of binary audio frames sent.',
+        );
+        return;
+      }
+      if (sawInputComplete) {
+        failProtocol('Giggy sent input_complete more than once.');
+        return;
+      }
       sawInputComplete = true;
       emit({ type: 'input-complete', generationUuid, attempt: admittedAttempt!, raw: payload });
       maybeFetchCanonicalResult();
@@ -1162,6 +1333,7 @@ export function createGiggyLiveTranscriptionSession(
       const copy = bytes.slice().buffer;
       (socket as RealtimeWebSocket & { send(data: ArrayBuffer): void }).send(copy);
       sentPcmBytes += bytes.byteLength;
+      sentFrameCount += 1;
     },
     stop() {
       if (status === 'completed') return Promise.resolve();
@@ -1313,15 +1485,11 @@ async function transcribeCore(
       deps,
     });
     const reader = stream.getReader();
-    let text = '';
-    let raw: unknown;
-    let language: string | undefined;
-    let durationSeconds: number | undefined;
+    let generationUuid: string | undefined;
     try {
       for (;;) {
         const { done, value } = await reader.read();
         if (done) break;
-        raw = value.data;
         if (value.type === 'error') {
           const payload = value.data as {
             message?: unknown;
@@ -1344,12 +1512,28 @@ async function transcribeCore(
             isRetryable: false,
           });
         }
-        const payloadStatus = (value.data as { status?: unknown } | null)?.status;
+        const payload = value.data as {
+          generation_uuid?: unknown;
+          generationUuid?: unknown;
+          generation?: { generation_uuid?: unknown; uuid?: unknown; status?: unknown };
+          status?: unknown;
+        } | null;
+        if (value.type === 'generation_created') {
+          const admitted =
+            payload?.generation_uuid ??
+            payload?.generationUuid ??
+            payload?.generation?.generation_uuid ??
+            payload?.generation?.uuid;
+          if (typeof admitted === 'string') generationUuid = admitted;
+        }
+        const payloadStatus = payload?.status ?? payload?.generation?.status;
         if (
           value.terminal &&
           (value.type === 'failed' ||
             value.type === 'stopped' ||
             value.type === 'cancelled' ||
+            value.type === 'error' ||
+            payloadStatus === 'error' ||
             payloadStatus === 'failed' ||
             payloadStatus === 'stopped' ||
             payloadStatus === 'cancelled')
@@ -1361,31 +1545,27 @@ async function transcribeCore(
             isRetryable: false,
           });
         }
-        if (value.type === 'transcript_chunk' && value.text !== undefined) text = value.text;
-        const payload = value.data as {
-          language?: unknown;
-          duration?: unknown;
-          duration_seconds?: unknown;
-          result?: { text?: unknown; language?: unknown; duration?: unknown };
-        } | null;
-        if (typeof payload?.language === 'string') language = payload.language;
-        if (typeof payload?.duration === 'number') durationSeconds = payload.duration;
-        if (typeof payload?.duration_seconds === 'number')
-          durationSeconds = payload.duration_seconds;
-        if (typeof payload?.result?.text === 'string') text = payload.result.text;
-        if (typeof payload?.result?.language === 'string') language = payload.result.language;
-        if (typeof payload?.result?.duration === 'number')
-          durationSeconds = payload.result.duration;
       }
     } finally {
       reader.releaseLock();
     }
+    if (!generationUuid) {
+      throw new APICallError({
+        message: 'Giggy upload stream ended without an admitted generation UUID.',
+        provider: options.model.provider,
+        statusCode: 200,
+        isRetryable: false,
+      });
+    }
+    const canonical = await fetchCanonicalUploadedResult(options, deps, generationUuid);
     return {
-      text,
-      ...(language !== undefined ? { language } : {}),
-      ...(durationSeconds !== undefined ? { durationSeconds } : {}),
-      usage: durationSeconds !== undefined ? { seconds: durationSeconds } : {},
-      raw,
+      text: canonical.text,
+      ...(canonical.language !== undefined ? { language: canonical.language } : {}),
+      ...(canonical.durationSeconds !== undefined
+        ? { durationSeconds: canonical.durationSeconds }
+        : {}),
+      usage: canonical.durationSeconds !== undefined ? { seconds: canonical.durationSeconds } : {},
+      raw: canonical.raw,
     };
   }
 
