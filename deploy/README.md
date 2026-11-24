@@ -5,16 +5,22 @@ CloudFront in front. Everything here is checked in so the stack can be rebuilt f
 
 ## Current state
 
+Checked on the live server on 2026-11-24.
+
 | | |
 |---|---|
-| AWS account | `672850355747`, CLI profile `deuz` |
 | Region | `eu-central-1` (Frankfurt) |
-| Instance | `i-0a61709c172e30e60` — t4g.small (2 vCPU ARM Graviton, 2 GB + 2 GB swap) |
-| Elastic IP | `3.77.16.98` |
-| Security group | `sg-05c0e3628c7475a00` |
-| App directory | `/opt/deuz/current`, systemd unit `deuz-docs` |
-| SSH | `ssh -i ~/.ssh/deuz-docs.pem ec2-user@3.77.16.98` |
-| CloudFront | **not created yet** — the account is pending Support verification |
+| Instance | `i-01e6a3a3d56a037a4` (`deuz-docs`), t4g.medium (ARM Graviton, 4 GB) |
+| Public IP | `18.199.24.25`; `deuz-sdk.tech` resolves to it |
+| Security group | `sg-0077849369698a6c8`: 80 and 443 open, 22 from one admin IP only |
+| App directory | `/opt/deuz/current`, systemd unit `deuz-docs` (Next.js on `127.0.0.1:3000`) |
+| Front | Caddy on 80 and 443 terminates TLS and proxies to the app; plain HTTP is redirected (308) |
+| SSH | `ssh -i ~/.ssh/deuz-docs.pem ec2-user@18.199.24.25`, from the admin IP |
+| CloudFront | not in front of the site: responses come `Via: Caddy` |
+
+`user-data.sh`, `dist.json`, `normalize.js` and the `cp-*.json` policies describe the first
+server (Next.js on port 80, CloudFront planned). The live server was set up by hand after
+that, with Caddy in front; its Caddy configuration is not in this directory.
 
 ## Deploying
 
@@ -23,19 +29,42 @@ There is no local wrapper script: a deploy is three commands from the repository
 
 ```sh
 tar --exclude=node_modules --exclude=.next --exclude=.source -czf deuz-docs.tar.gz -C docs .
-scp -i ~/.ssh/deuz-docs.pem deuz-docs.tar.gz deploy/redeploy.sh ec2-user@3.77.16.98:/tmp/
-ssh -i ~/.ssh/deuz-docs.pem ec2-user@3.77.16.98 bash /tmp/redeploy.sh
+scp -i ~/.ssh/deuz-docs.pem deuz-docs.tar.gz deploy/redeploy.sh ec2-user@18.199.24.25:/tmp/
+ssh -i ~/.ssh/deuz-docs.pem ec2-user@18.199.24.25 bash /tmp/redeploy.sh
 ```
 
 `redeploy.sh` expects the tarball at `/tmp/deuz-docs.tar.gz`, with the contents of
 `docs/` at its root. It extracts it to a staging directory, reuses `node_modules` when
-`package-lock.json` is unchanged, builds, swaps directories and health-checks `/docs`. If
-the health check fails it restores the previous directory and exits non-zero, so a broken
-build never stays live.
+`package-lock.json` is unchanged, builds, swaps directories and health-checks `/docs`, first
+on the app's own port (`127.0.0.1:3000`), then on port 80. If the health check fails it
+restores the previous directory and exits non-zero, so a broken build never stays live.
 
 The server never clones the repository: it builds whatever `docs/` you upload. Deploy from
 a checkout of the `main` branch. The redesign branch the site was first deployed from is
 merged into it, so `main` is where the current docs live.
+
+## Deploying without the SSH key
+
+Port 22 is open to one admin IP only. From anywhere else, use EC2 Instance Connect in the
+AWS console:
+
+1. Add a temporary inbound rule to the security group: TCP 22 from the prefix list
+   `com.amazonaws.eu-central-1.ec2-instance-connect`.
+2. Open the instance, choose Connect, then EC2 Instance Connect (user `ec2-user`).
+3. In the browser terminal, build the tarball from `main` on the server and run the script:
+
+   ```sh
+   cd /tmp && curl -fsSL https://github.com/Deuz-AI/Deuz-SDK/archive/refs/heads/main.tar.gz -o repo.tar.gz
+   mkdir deuz-src && tar -xzf repo.tar.gz -C deuz-src --strip-components=1
+   tar -czf /tmp/deuz-docs.tar.gz -C deuz-src/docs .
+   nohup bash deuz-src/deploy/redeploy.sh > /tmp/redeploy.log 2>&1 &
+   tail -f /tmp/redeploy.log
+   ```
+
+   `nohup` keeps the deploy running if the browser session drops. The build takes about
+   four minutes on this instance.
+4. Remove `/tmp/deuz-src`, `/tmp/repo.tar.gz` and `/tmp/deuz-docs.tar.gz`, then delete the
+   temporary rule.
 
 ## CloudFront
 

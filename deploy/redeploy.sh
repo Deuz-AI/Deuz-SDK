@@ -39,10 +39,22 @@ mv "$APP" "$OLD"
 mv "$STAGE" "$APP"
 sudo systemctl start deuz-docs
 
+# Uygulama canli sunucuda 127.0.0.1:3000'de dinler; 80'i Caddy tutar ve HTTPS'e
+# yonlendirir (308). user-data.sh ile kurulan sunucuda ise uygulama dogrudan
+# 80'dedir. Ikisinden biri 200 donerse saglikli say.
+healthy() {
+  for url in http://127.0.0.1:3000/docs http://localhost/docs; do
+    code=$(curl -s -o /dev/null -m 5 -w '%{http_code}' "$url" || true)
+    if [ "$code" = "200" ]; then
+      echo ">> saglikli ($url, HTTP $code)"
+      return 0
+    fi
+  done
+  return 1
+}
+
 for i in $(seq 1 30); do
-  code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost/docs || true)
-  if [ "$code" = "200" ]; then
-    echo ">> saglikli (HTTP $code)"
+  if healthy; then
     rm -rf "$OLD"
     exit 0
   fi
