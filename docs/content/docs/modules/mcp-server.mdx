@@ -457,8 +457,9 @@ capabilities, the SDK default, as 2.4 already advertised for tools.
 
 A long-running served tool or agent can answer `tools/call` with a **task
 handle** instead of its result (2.5). The run continues in the background; the
-client polls for it, reads the result later, and can cancel it. Opt in per
-name with `tasks.tools`, or with `task: true` on an agent:
+client polls for it, reads the result later, and can cancel it. Tasks are a
+preview: their options can still change in 2.6. Opt in per name with
+`tasks.tools`, or with `task: true` on an agent:
 
 ```ts
 import { createMcpServer } from '@deuz-sdk/core/mcp/server';

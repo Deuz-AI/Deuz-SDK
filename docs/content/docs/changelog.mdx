@@ -33,8 +33,9 @@ in a real editor.
   `CLAUDE_CODE_USE_*` provider switch would route around the meter.
   → [CLI](/docs/modules/cli)
 - **Harness runner** (`/harness`, `/harness/node`, preview) — `runHarness` and
-  `harnessTool` run Claude Code, Codex, Gemini CLI or OpenCode over ACP behind
-  a meter, decide their permission requests by policy on real paths
+  `harnessTool` run Claude Code, Codex or OpenCode over ACP behind a meter
+  (Gemini CLI too, with a declared cost only and no ceiling), decide their
+  permission requests by policy on real paths
   (symlinks, junctions and 8.3 names resolved), and compare measured with
   declared cost. The Claude Code preset is verified live and switches each
   session to the mode where Claude Code asks before its tool calls.
