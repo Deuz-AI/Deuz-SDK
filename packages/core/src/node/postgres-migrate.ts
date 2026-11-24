@@ -19,6 +19,14 @@
  * store's upgrade steps, in order, inside the same locked statement, then the
  * `create` statements and the version bump; a failure anywhere leaves the
  * schema as it was. A newer version, written by a newer build, is refused.
+ *
+ * Retries wait (2.5). `retryPostgres` waits before each retry, never before
+ * the first attempt: a random time (full jitter) of up to 10 ms, then up to
+ * 20, 40 and 80 ms (`postgresRetryDelay`), so at most 150 ms over the four
+ * retries of five attempts. Writers that failed together, such as those queued
+ * on one row under REPEATABLE READ, then retry apart instead of colliding
+ * again, and a rival whose commit is still being flushed to disk has time to
+ * become visible. `withPgTransaction` (`pg-tx.ts`) waits the same way.
  * Node-only.
  */
 import type { PgClientLike } from './store-postgres';
@@ -103,16 +111,42 @@ export function postgresSchemaStatement(spec: PostgresSchemaSpec): string {
 /** How many times a store sends one statement before it gives up. */
 const ATTEMPTS = 5;
 
+/** The longest wait before the first retry, in milliseconds; each later retry may wait twice as long. */
+const RETRY_BASE_MS = 10;
+/** The longest wait before any one retry, in milliseconds. */
+const RETRY_CAP_MS = 80;
+
+/**
+ * How long to wait before retry `retry` (1 before the second attempt), in
+ * milliseconds: full jitter, a random time from 0 up to
+ * `min(80, 10 * 2^(retry - 1))`. The four retries of five attempts wait at
+ * most 10, 20, 40 and 80 ms, 150 ms in all and 75 ms on average. A ceiling of
+ * 10 ms covers a typical commit flush; growing it covers a slow disk, and the
+ * jitter keeps writers that failed together from retrying in step.
+ */
+export function postgresRetryDelay(retry: number): number {
+  return Math.random() * Math.min(RETRY_CAP_MS, RETRY_BASE_MS * 2 ** (retry - 1));
+}
+
+/** Resolves after `postgresRetryDelay(retry)` milliseconds. */
+export function waitBeforePostgresRetry(retry: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, postgresRetryDelay(retry)));
+}
+
 /**
  * Runs `statement`, and again (five attempts in all) while it fails with one of
  * the SQLSTATEs in `codes`, read from the driver error's `code` as `pg`, PGlite
- * and postgres.js report it. Only for statements that are safe to repeat.
+ * and postgres.js report it. Each retry first waits a random, growing time
+ * (`postgresRetryDelay`: up to 10, 20, 40, then 80 ms); the first attempt runs
+ * at once. The last attempt's error is thrown. Only for statements that are
+ * safe to repeat.
  */
 export async function retryPostgres<T>(
   codes: readonly string[],
   statement: () => Promise<T>,
 ): Promise<T> {
   for (let attempt = 1; ; attempt++) {
+    if (attempt > 1) await waitBeforePostgresRetry(attempt - 1);
     try {
       return await statement();
     } catch (error) {

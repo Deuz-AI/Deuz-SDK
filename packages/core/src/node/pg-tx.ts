@@ -15,12 +15,25 @@
  * retry a statement. The callback must therefore be safe to run again, and
  * keep its side effects inside the transaction.
  *
+ * Each retry waits first (2.5); the first attempt never does. The wait is a
+ * random time (full jitter) of up to 10 ms, then up to 20, 40 and 80 ms, so
+ * 150 ms at most in all (`postgresRetryDelay`), and the failed attempt's
+ * connection is already back in the pool. Without the wait a loser could
+ * spend every attempt on one rival: under SERIALIZABLE the rival passes its
+ * conflict check before its commit is flushed to disk, and until that commit
+ * is visible each new snapshot of the loser still overlaps it and fails the
+ * same way.
+ *
  * `ensurePgSchema` is the schema-meta rule of `sqlite-handle.ts` for Postgres:
  * each store keeps its version in `<schema>.<name>_schema`, never in another
  * store's table. Node-only.
  */
 import type { PgClientLike } from './store-postgres';
-import { SCHEMA_RACE_CODES, SERIALIZATION_CODES } from './postgres-migrate';
+import {
+  SCHEMA_RACE_CODES,
+  SERIALIZATION_CODES,
+  waitBeforePostgresRetry,
+} from './postgres-migrate';
 import {
   assertStoredSchemaVersion,
   planSchemaMeta,
@@ -73,7 +86,7 @@ export interface PgTransactionOptions {
   isolation?: PgIsolationLevel;
   /** SQLSTATEs that run the transaction again. Default 40001 and 40P01. */
   retryOn?: readonly string[];
-  /** Attempts in all, the first included. Default 5. */
+  /** Attempts in all, the first included; each retry waits first. Default 5. */
   attempts?: number;
 }
 
@@ -87,9 +100,11 @@ const ENDED =
  * Runs `fn` in one transaction on one connection from `pool`: BEGIN, `fn`,
  * COMMIT. A throw rolls back and is rethrown. A serialization failure or a
  * deadlock, in `fn` or at COMMIT, runs the whole transaction again on a fresh
- * connection, up to `attempts`. The connection always goes back to the pool;
- * one whose ROLLBACK failed is destroyed instead, since its state is unknown.
- * `tx` refuses statements once the transaction ended.
+ * connection, up to `attempts`, after a random wait that grows with each
+ * retry (`postgresRetryDelay`: up to 10, 20, 40, then 80 ms; none before the
+ * first attempt). The last attempt's error is thrown. The connection always
+ * goes back to the pool; one whose ROLLBACK failed is destroyed instead, since
+ * its state is unknown. `tx` refuses statements once the transaction ended.
  */
 export async function withPgTransaction<T>(
   pool: PgPoolLike,
@@ -100,6 +115,8 @@ export async function withPgTransaction<T>(
   const attempts = options.attempts ?? ATTEMPTS;
   const begin = options.isolation ? BEGIN[options.isolation] : 'BEGIN';
   for (let attempt = 1; ; attempt++) {
+    // The failed attempt's connection went back in `finally`: none is held while waiting.
+    if (attempt > 1) await waitBeforePostgresRetry(attempt - 1);
     const connection = await pool.connect();
     if (typeof connection?.query !== 'function' || typeof connection.release !== 'function')
       throw new TypeError(
