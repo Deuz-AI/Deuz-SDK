@@ -4,17 +4,23 @@ import Link from 'next/link';
 import {
   ArrowRight,
   AudioLines,
+  Bot,
   Database,
+  Gauge,
   Globe,
+  Plug,
+  ScrollText,
+  Search,
   Server,
   Sparkles,
+  SquareCode,
   Waves,
   Workflow,
 } from 'lucide-react';
 import { HeroMascot } from '@/components/home/hero-mascot';
 import { ProviderGrid } from '@/components/home/provider-grid';
 import { i18n, isLocale, localeNames, type Locale } from '@/lib/i18n';
-import { homeCopy, type HomeFeatureKey } from '@/lib/home-copy';
+import { homeCopy, type HomeFeatureKey, type HomeReleaseKey } from '@/lib/home-copy';
 import { localePath } from '@/lib/layout.shared';
 import { gitConfig } from '@/lib/shared';
 
@@ -25,6 +31,20 @@ const featureOrder: { key: HomeFeatureKey; icon: typeof Waves }[] = [
   { key: 'mcp', icon: Server },
   { key: 'edge', icon: Globe },
   { key: 'media', icon: AudioLines },
+];
+
+/**
+ * The 2.5 additions, each linked to its module page. `preview` follows the
+ * stability table of the 2.5 notes: ACP and the harness runner can still
+ * change in 2.6 (so can the CLI, which the meter card names in its text).
+ */
+const releaseOrder: { key: HomeReleaseKey; icon: typeof Waves; href: string; preview?: true }[] = [
+  { key: 'meter', icon: Gauge, href: '/docs/modules/meter' },
+  { key: 'harness', icon: Bot, href: '/docs/modules/harness', preview: true },
+  { key: 'acp', icon: SquareCode, href: '/docs/modules/acp', preview: true },
+  { key: 'toolSearch', icon: Search, href: '/docs/modules/tool-search' },
+  { key: 'aiSdk', icon: Plug, href: '/docs/modules/ai-sdk-provider' },
+  { key: 'ledger', icon: ScrollText, href: '/docs/modules/mcp-ledger' },
 ];
 
 /** The Blender export lands here (see docs/MASCOT-MODEL.md). Until it does, the hero shows the built-in rig. */
@@ -106,6 +126,58 @@ export default async function HomePage(props: PageProps<'/[lang]'>) {
 
       <section className="border-t">
         <div className="mx-auto w-full max-w-6xl px-4 py-16">
+          <div className="grid items-end gap-8 lg:grid-cols-[3fr_2fr]">
+            <div>
+              <p className="text-sm text-fd-muted-foreground">{t.release.tag}</p>
+              <h2 className={`mt-3 ${sectionTitle}`}>{t.release.title}</h2>
+              <p className="mt-4 max-w-2xl text-fd-muted-foreground text-pretty">
+                {t.release.body}
+              </p>
+            </div>
+            <pre className="overflow-x-auto rounded-lg bg-fd-foreground p-4 text-sm text-fd-background">
+              <code>
+                <span className="text-fd-background/45">$ </span>
+                npx @deuz-sdk/cli meter --budget-usd 5 -- claude
+              </code>
+            </pre>
+          </div>
+          <div className="mt-10 grid border-t border-l sm:grid-cols-2 lg:grid-cols-3">
+            {releaseOrder.map(({ key, icon: Icon, href, preview }) => {
+              const item = t.release.items[key];
+              return (
+                <Link
+                  key={key}
+                  href={localePath(locale, href)}
+                  className={`border-r border-b p-6 transition-colors hover:bg-fd-accent motion-reduce:transition-none ${focusRing}`}
+                >
+                  <span className="flex h-6 items-center justify-between gap-3">
+                    <Icon className="size-5" aria-hidden="true" />
+                    {preview ? (
+                      <span className="rounded-full border px-2 py-0.5 text-xs text-fd-muted-foreground">
+                        {t.release.preview}
+                      </span>
+                    ) : null}
+                  </span>
+                  <h3 className="mt-4 font-medium">{item.title}</h3>
+                  <p className="mt-1.5 text-sm leading-relaxed text-fd-muted-foreground">
+                    {item.body}
+                  </p>
+                </Link>
+              );
+            })}
+          </div>
+          <Link
+            href={localePath(locale, '/docs/reference/whats-new-2-5')}
+            className={`mt-8 ${inlineLink}`}
+          >
+            {t.release.cta}
+            <ArrowRight className="size-4" />
+          </Link>
+        </div>
+      </section>
+
+      <section className="border-t">
+        <div className="mx-auto w-full max-w-6xl px-4 py-16">
           <h2 className={sectionTitle}>{t.worksWith}</h2>
           <div className="mt-8">
             <ProviderGrid locale={locale} />
@@ -157,7 +229,7 @@ export default async function HomePage(props: PageProps<'/[lang]'>) {
               {'({ apiKey });\n'}
               const res = streamChat
               {'({\n  model: anthropic('}
-              <span className="text-fd-background/70">'claude-opus-4-8'</span>
+              <span className="text-fd-background/70">'claude-opus-5-5'</span>
               {'),\n  messages: [{ role: '}
               <span className="text-fd-background/70">'user'</span>
               {', content: '}

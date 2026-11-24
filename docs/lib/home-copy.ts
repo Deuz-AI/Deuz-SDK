@@ -2,6 +2,8 @@ import type { Locale } from './i18n';
 
 export type HomeFeatureKey = 'stream' | 'agents' | 'stores' | 'mcp' | 'edge' | 'media';
 
+export type HomeReleaseKey = 'meter' | 'harness' | 'acp' | 'toolSearch' | 'aiSdk' | 'ledger';
+
 export type HomeCopy = {
   badge: string;
   titleA: string;
@@ -21,6 +23,15 @@ export type HomeCopy = {
   skillsBody: string;
   skillsCta: string;
   skillsList: { name: string; body: string }[];
+  /** The "New in 2.5" section of the home page. */
+  release: {
+    tag: string;
+    title: string;
+    body: string;
+    preview: string;
+    cta: string;
+    items: Record<HomeReleaseKey, { title: string; body: string }>;
+  };
   languagesLabel: string;
   footerDocs: string;
   footerChangelog: string;
@@ -91,6 +102,39 @@ export const homeCopy: Record<Locale, HomeCopy> = {
         body: 'The verified name-by-name port from ai and @ai-sdk packages.',
       },
     ],
+    release: {
+      tag: 'New in 2.5',
+      title: 'Budgets, receipts and approvals for the tools you already use',
+      body: '2.5 applies them outside your own code: to coding agents such as Claude Code and Codex, to ACP editors, to Vercel AI SDK code and to MCP clients.',
+      preview: 'preview',
+      cta: 'Read the 2.5 notes',
+      items: {
+        meter: {
+          title: 'Budget meter',
+          body: 'A local proxy charges the model requests of Claude Code or Codex to a budget and answers 402 at the ceiling. The deuz CLI (preview) starts it with one command.',
+        },
+        harness: {
+          title: 'Harness runner',
+          body: 'runHarness runs Claude Code, Codex or OpenCode as a sub-agent under a budget and applies your policy to its permission requests.',
+        },
+        acp: {
+          title: 'ACP for editors',
+          body: 'Serve a Deuz agent to ACP editors such as Zed and JetBrains IDEs, with signed approvals and a budget, or drive any ACP agent from code.',
+        },
+        toolSearch: {
+          title: 'Tool search',
+          body: 'A large tool catalog behind one search tool. A search never returns a tool the run’s policy refuses.',
+        },
+        aiSdk: {
+          title: 'AI SDK provider',
+          body: 'Wrap a Vercel AI SDK 7 model in one line, and existing AI SDK code runs under a Deuz budget.',
+        },
+        ledger: {
+          title: 'MCP ledger',
+          body: 'A ready-made MCP server for any MCP client: versioned memory, an advisory spend record and a hash-chained receipt log.',
+        },
+      },
+    },
     languagesLabel: 'Documentation UI',
     footerDocs: 'Documentation',
     footerChangelog: 'Changelog',
@@ -159,6 +203,39 @@ export const homeCopy: Record<Locale, HomeCopy> = {
         body: 'Die geprüfte Migration Name für Name von ai und den @ai-sdk-Paketen.',
       },
     ],
+    release: {
+      tag: 'Neu in 2.5',
+      title: 'Budgets, Belege und Freigaben für die Werkzeuge, die du schon nutzt',
+      body: '2.5 wendet sie außerhalb deines eigenen Codes an: auf Coding-Agenten wie Claude Code und Codex, auf ACP-Editoren, auf Vercel-AI-SDK-Code und auf MCP-Clients.',
+      preview: 'Preview',
+      cta: 'Die Notizen zu 2.5 lesen',
+      items: {
+        meter: {
+          title: 'Budget-Meter',
+          body: 'Ein lokaler Proxy bucht die Modellanfragen von Claude Code oder Codex auf ein Budget und antwortet an der Obergrenze mit 402. Die deuz-CLI (Preview) startet ihn mit einem Befehl.',
+        },
+        harness: {
+          title: 'Harness-Runner',
+          body: 'runHarness führt Claude Code, Codex oder OpenCode als Sub-Agent unter einem Budget aus und wendet deine Policy auf dessen Berechtigungsanfragen an.',
+        },
+        acp: {
+          title: 'ACP für Editoren',
+          body: 'Stelle einen Deuz-Agenten für ACP-Editoren wie Zed und die JetBrains-IDEs bereit, mit signierten Freigaben und einem Budget, oder steuere jeden ACP-Agenten aus dem Code.',
+        },
+        toolSearch: {
+          title: 'Tool-Suche',
+          body: 'Ein großer Tool-Katalog hinter einem einzigen Such-Tool. Eine Suche liefert nie ein Tool, das die Policy des Laufs ablehnt.',
+        },
+        aiSdk: {
+          title: 'AI-SDK-Provider',
+          body: 'Umschließe ein Modell des Vercel AI SDK 7 in einer Zeile, und bestehender AI-SDK-Code läuft unter einem Deuz-Budget.',
+        },
+        ledger: {
+          title: 'MCP-Ledger',
+          body: 'Ein fertiger MCP-Server für jeden MCP-Client: versioniertes Gedächtnis, eine unverbindliche Ausgabenübersicht und ein hash-verkettetes Belegprotokoll.',
+        },
+      },
+    },
     languagesLabel: 'Dokumentations-UI',
     footerDocs: 'Dokumentation',
     footerChangelog: 'Changelog',
@@ -227,6 +304,39 @@ export const homeCopy: Record<Locale, HomeCopy> = {
         body: 'ai ve @ai-sdk paketlerinden isim isim doğrulanmış geçiş.',
       },
     ],
+    release: {
+      tag: '2.5 ile gelenler',
+      title: 'Zaten kullandığın araçlar için bütçe, makbuz ve onay',
+      body: '2.5 bunları kendi kodunun dışına taşıyor: Claude Code ve Codex gibi kodlama ajanlarına, ACP editörlerine, Vercel AI SDK koduna ve MCP istemcilerine.',
+      preview: 'önizleme',
+      cta: '2.5 notlarını oku',
+      items: {
+        meter: {
+          title: 'Bütçe ölçer',
+          body: 'Yerel bir proxy, Claude Code ya da Codex’in model isteklerini bir bütçeye yazar ve tavanda 402 döner. deuz CLI (önizleme) onu tek komutla başlatır.',
+        },
+        harness: {
+          title: 'Harness çalıştırıcı',
+          body: 'runHarness; Claude Code, Codex ya da OpenCode’u bütçe altında bir alt ajan olarak çalıştırır ve izin isteklerine senin politikanı uygular.',
+        },
+        acp: {
+          title: 'Editörler için ACP',
+          body: 'Bir Deuz ajanını Zed ve JetBrains IDE’leri gibi ACP editörlerine imzalı onaylar ve bir bütçeyle sun, ya da herhangi bir ACP ajanını koddan yönet.',
+        },
+        toolSearch: {
+          title: 'Araç arama',
+          body: 'Büyük bir araç kataloğu tek bir arama aracının arkasında. Arama, çalıştırmanın politikasının reddettiği bir aracı asla döndürmez.',
+        },
+        aiSdk: {
+          title: 'AI SDK sağlayıcısı',
+          body: 'Bir Vercel AI SDK 7 modelini tek satırda sar; mevcut AI SDK kodu bir Deuz bütçesi altında çalışsın.',
+        },
+        ledger: {
+          title: 'MCP defteri',
+          body: 'Her MCP istemcisi için hazır bir MCP sunucusu: sürümlü bellek, bağlayıcı olmayan bir harcama kaydı ve hash zincirli bir makbuz günlüğü.',
+        },
+      },
+    },
     languagesLabel: 'Dokümantasyon arayüzü',
     footerDocs: 'Dokümantasyon',
     footerChangelog: 'Sürüm notları',
@@ -295,6 +405,39 @@ export const homeCopy: Record<Locale, HomeCopy> = {
         body: 'Le portage vérifié, nom par nom, depuis ai et les paquets @ai-sdk.',
       },
     ],
+    release: {
+      tag: 'Nouveau dans la 2.5',
+      title: 'Budgets, reçus et approbations pour les outils que vous utilisez déjà',
+      body: 'La 2.5 les applique en dehors de votre propre code : aux agents de programmation comme Claude Code et Codex, aux éditeurs ACP, au code du Vercel AI SDK et aux clients MCP.',
+      preview: 'aperçu',
+      cta: 'Lire les notes de la 2.5',
+      items: {
+        meter: {
+          title: 'Compteur de budget',
+          body: 'Un proxy local impute les requêtes de modèle de Claude Code ou de Codex à un budget et répond 402 au plafond. La CLI deuz (aperçu) le lance en une commande.',
+        },
+        harness: {
+          title: 'Exécuteur de harness',
+          body: 'runHarness exécute Claude Code, Codex ou OpenCode comme sous-agent sous un budget et applique votre politique à ses demandes d’autorisation.',
+        },
+        acp: {
+          title: 'ACP pour les éditeurs',
+          body: 'Servez un agent Deuz aux éditeurs ACP comme Zed et les IDE JetBrains, avec des approbations signées et un budget, ou pilotez n’importe quel agent ACP depuis le code.',
+        },
+        toolSearch: {
+          title: 'Recherche d’outils',
+          body: 'Un grand catalogue d’outils derrière un seul outil de recherche. Une recherche ne renvoie jamais un outil que la politique de l’exécution refuse.',
+        },
+        aiSdk: {
+          title: 'Fournisseur AI SDK',
+          body: 'Enveloppez un modèle du Vercel AI SDK 7 en une ligne, et le code AI SDK existant s’exécute sous un budget Deuz.',
+        },
+        ledger: {
+          title: 'Registre MCP',
+          body: 'Un serveur MCP prêt à l’emploi pour tout client MCP : mémoire versionnée, relevé de dépenses indicatif et journal de reçus chaîné par hachage.',
+        },
+      },
+    },
     languagesLabel: 'Interface de la documentation',
     footerDocs: 'Documentation',
     footerChangelog: 'Journal des modifications',
@@ -363,6 +506,39 @@ export const homeCopy: Record<Locale, HomeCopy> = {
         body: 'La migrazione verificata, nome per nome, da ai e dai pacchetti @ai-sdk.',
       },
     ],
+    release: {
+      tag: 'Novità della 2.5',
+      title: 'Budget, ricevute e approvazioni per gli strumenti che usi già',
+      body: 'La 2.5 li applica fuori dal tuo codice: agli agenti di programmazione come Claude Code e Codex, agli editor ACP, al codice del Vercel AI SDK e ai client MCP.',
+      preview: 'anteprima',
+      cta: 'Leggi le note della 2.5',
+      items: {
+        meter: {
+          title: 'Contatore di budget',
+          body: 'Un proxy locale addebita a un budget le richieste al modello di Claude Code o Codex e risponde 402 al tetto. La CLI deuz (anteprima) lo avvia con un comando.',
+        },
+        harness: {
+          title: 'Esecutore di harness',
+          body: 'runHarness esegue Claude Code, Codex o OpenCode come sotto-agente entro un budget e applica la tua policy alle sue richieste di autorizzazione.',
+        },
+        acp: {
+          title: 'ACP per gli editor',
+          body: 'Servi un agente Deuz agli editor ACP come Zed e gli IDE JetBrains, con approvazioni firmate e un budget, oppure guida qualsiasi agente ACP dal codice.',
+        },
+        toolSearch: {
+          title: 'Ricerca di strumenti',
+          body: 'Un grande catalogo di strumenti dietro un solo strumento di ricerca. Una ricerca non restituisce mai uno strumento che la policy dell’esecuzione rifiuta.',
+        },
+        aiSdk: {
+          title: 'Provider AI SDK',
+          body: 'Avvolgi un modello del Vercel AI SDK 7 in una riga, e il codice AI SDK esistente gira entro un budget Deuz.',
+        },
+        ledger: {
+          title: 'Registro MCP',
+          body: 'Un server MCP pronto all’uso per qualsiasi client MCP: memoria versionata, un registro di spesa indicativo e un log di ricevute concatenato da hash.',
+        },
+      },
+    },
     languagesLabel: 'Interfaccia della documentazione',
     footerDocs: 'Documentazione',
     footerChangelog: 'Changelog',
@@ -431,6 +607,39 @@ export const homeCopy: Record<Locale, HomeCopy> = {
         body: 'La migración verificada, nombre por nombre, desde ai y los paquetes @ai-sdk.',
       },
     ],
+    release: {
+      tag: 'Novedades de la 2.5',
+      title: 'Presupuestos, recibos y aprobaciones para las herramientas que ya usas',
+      body: 'La 2.5 los aplica fuera de tu propio código: a agentes de programación como Claude Code y Codex, a editores ACP, al código del Vercel AI SDK y a clientes MCP.',
+      preview: 'vista previa',
+      cta: 'Leer las notas de la 2.5',
+      items: {
+        meter: {
+          title: 'Medidor de presupuesto',
+          body: 'Un proxy local carga a un presupuesto las peticiones al modelo de Claude Code o Codex y responde 402 al llegar al tope. La CLI deuz (vista previa) lo inicia con un comando.',
+        },
+        harness: {
+          title: 'Ejecutor de harness',
+          body: 'runHarness ejecuta Claude Code, Codex u OpenCode como subagente bajo un presupuesto y aplica tu política a sus solicitudes de permiso.',
+        },
+        acp: {
+          title: 'ACP para editores',
+          body: 'Sirve un agente Deuz a editores ACP como Zed y los IDE de JetBrains, con aprobaciones firmadas y un presupuesto, o dirige cualquier agente ACP desde el código.',
+        },
+        toolSearch: {
+          title: 'Búsqueda de herramientas',
+          body: 'Un catálogo grande de herramientas detrás de una sola herramienta de búsqueda. Una búsqueda nunca devuelve una herramienta que la política de la ejecución rechaza.',
+        },
+        aiSdk: {
+          title: 'Proveedor AI SDK',
+          body: 'Envuelve un modelo del Vercel AI SDK 7 en una línea, y el código AI SDK existente se ejecuta bajo un presupuesto Deuz.',
+        },
+        ledger: {
+          title: 'Registro MCP',
+          body: 'Un servidor MCP listo para cualquier cliente MCP: memoria versionada, un registro de gasto orientativo y un registro de recibos encadenado por hash.',
+        },
+      },
+    },
     languagesLabel: 'Interfaz de la documentación',
     footerDocs: 'Documentación',
     footerChangelog: 'Registro de cambios',
@@ -499,6 +708,39 @@ export const homeCopy: Record<Locale, HomeCopy> = {
         body: 'Проверенный перенос имя в имя из ai и пакетов @ai-sdk.',
       },
     ],
+    release: {
+      tag: 'Новое в 2.5',
+      title: 'Бюджеты, квитанции и подтверждения для инструментов, которыми вы уже пользуетесь',
+      body: '2.5 применяет их за пределами вашего кода: к агентам-программистам, таким как Claude Code и Codex, к редакторам с ACP, к коду на Vercel AI SDK и к MCP-клиентам.',
+      preview: 'превью',
+      cta: 'Читать заметки о 2.5',
+      items: {
+        meter: {
+          title: 'Счётчик бюджета',
+          body: 'Локальный прокси списывает запросы Claude Code или Codex к модели с бюджета и отвечает 402 на пределе. CLI deuz (превью) запускает его одной командой.',
+        },
+        harness: {
+          title: 'Запуск harness',
+          body: 'runHarness запускает Claude Code, Codex или OpenCode как суб-агента в рамках бюджета и применяет вашу политику к его запросам разрешений.',
+        },
+        acp: {
+          title: 'ACP для редакторов',
+          body: 'Подключите агента Deuz к редакторам с ACP, таким как Zed и IDE от JetBrains, с подписанными подтверждениями и бюджетом, или управляйте любым ACP-агентом из кода.',
+        },
+        toolSearch: {
+          title: 'Поиск инструментов',
+          body: 'Большой каталог инструментов за одним инструментом поиска. Поиск никогда не возвращает инструмент, который политика запуска запрещает.',
+        },
+        aiSdk: {
+          title: 'Провайдер для AI SDK',
+          body: 'Оберните модель Vercel AI SDK 7 одной строкой, и существующий код на AI SDK будет работать в рамках бюджета Deuz.',
+        },
+        ledger: {
+          title: 'MCP-журнал',
+          body: 'Готовый MCP-сервер для любого MCP-клиента: версионируемая память, справочный учёт расходов и журнал квитанций, связанный хешами.',
+        },
+      },
+    },
     languagesLabel: 'Интерфейс документации',
     footerDocs: 'Документация',
     footerChangelog: 'История изменений',
@@ -567,6 +809,39 @@ export const homeCopy: Record<Locale, HomeCopy> = {
         body: 'ai および @ai-sdk パッケージからの、名前単位で検証された移行。',
       },
     ],
+    release: {
+      tag: '2.5 の新機能',
+      title: 'いつものツールに、予算・レシート・承認を',
+      body: '2.5 はこれらを自分のコードの外にも適用します。Claude Code や Codex などのコーディングエージェント、ACP 対応エディタ、Vercel AI SDK のコード、MCP クライアントが対象です。',
+      preview: 'プレビュー',
+      cta: '2.5 のノートを読む',
+      items: {
+        meter: {
+          title: '予算メーター',
+          body: 'ローカルプロキシが Claude Code や Codex のモデルリクエストを予算に計上し、上限では 402 を返します。deuz CLI (プレビュー) なら 1 コマンドで起動できます。',
+        },
+        harness: {
+          title: 'ハーネスランナー',
+          body: 'runHarness は Claude Code、Codex、OpenCode を予算の範囲内でサブエージェントとして実行し、その権限リクエストにポリシーを適用します。',
+        },
+        acp: {
+          title: 'エディタ向け ACP',
+          body: 'Deuz エージェントを Zed や JetBrains IDE などの ACP 対応エディタに、署名付き承認と予算つきで提供できます。任意の ACP エージェントをコードから操作することもできます。',
+        },
+        toolSearch: {
+          title: 'ツール検索',
+          body: '大きなツールカタログを 1 つの検索ツールの背後に置きます。実行のポリシーが拒否するツールは検索結果に決して含まれません。',
+        },
+        aiSdk: {
+          title: 'AI SDK プロバイダー',
+          body: 'Vercel AI SDK 7 のモデルを 1 行でラップすれば、既存の AI SDK コードが Deuz の予算のもとで動きます。',
+        },
+        ledger: {
+          title: 'MCP レジャー',
+          body: 'あらゆる MCP クライアント向けの、すぐ使える MCP サーバー。バージョン管理されたメモリ、参考用の支出記録、ハッシュチェーンのレシートログを備えます。',
+        },
+      },
+    },
     languagesLabel: 'ドキュメント UI',
     footerDocs: 'ドキュメント',
     footerChangelog: '変更履歴',
@@ -634,6 +909,39 @@ export const homeCopy: Record<Locale, HomeCopy> = {
         body: 'ai 및 @ai-sdk 패키지에서의 이름 단위 검증 마이그레이션.',
       },
     ],
+    release: {
+      tag: '2.5의 새로운 기능',
+      title: '이미 쓰고 있는 도구에 예산, 영수증, 승인을',
+      body: '2.5는 이를 내 코드 밖에도 적용합니다. Claude Code와 Codex 같은 코딩 에이전트, ACP 에디터, Vercel AI SDK 코드, MCP 클라이언트가 대상입니다.',
+      preview: '프리뷰',
+      cta: '2.5 노트 읽기',
+      items: {
+        meter: {
+          title: '예산 미터',
+          body: '로컬 프록시가 Claude Code나 Codex의 모델 요청을 예산에 기록하고, 한도에 이르면 402로 응답합니다. deuz CLI(프리뷰)는 명령 하나로 이를 시작합니다.',
+        },
+        harness: {
+          title: '하니스 러너',
+          body: 'runHarness는 Claude Code, Codex, OpenCode를 예산 안에서 서브 에이전트로 실행하고, 그 권한 요청에 정책을 적용합니다.',
+        },
+        acp: {
+          title: '에디터용 ACP',
+          body: 'Deuz 에이전트를 Zed와 JetBrains IDE 같은 ACP 에디터에 서명된 승인과 예산과 함께 제공하거나, 어떤 ACP 에이전트든 코드에서 구동할 수 있습니다.',
+        },
+        toolSearch: {
+          title: '도구 검색',
+          body: '큰 도구 카탈로그를 검색 도구 하나 뒤에 둡니다. 실행의 정책이 거부하는 도구는 검색 결과에 절대 나오지 않습니다.',
+        },
+        aiSdk: {
+          title: 'AI SDK 프로바이더',
+          body: 'Vercel AI SDK 7 모델을 한 줄로 감싸면, 기존 AI SDK 코드가 Deuz 예산 아래에서 실행됩니다.',
+        },
+        ledger: {
+          title: 'MCP 레저',
+          body: '모든 MCP 클라이언트를 위한 바로 쓸 수 있는 MCP 서버입니다. 버전 관리되는 메모리, 참고용 지출 기록, 해시 체인 영수증 로그를 제공합니다.',
+        },
+      },
+    },
     languagesLabel: '문서 UI',
     footerDocs: '문서',
     footerChangelog: '변경 이력',
@@ -698,6 +1006,39 @@ export const homeCopy: Record<Locale, HomeCopy> = {
       },
       { name: 'migrate-from-ai-sdk', body: '从 ai 与 @ai-sdk 系列包逐个名称验证过的迁移路径。' },
     ],
+    release: {
+      tag: '2.5 新增内容',
+      title: '为你已经在用的工具带来预算、回执和审批',
+      body: '2.5 把它们用到你自己的代码之外：Claude Code、Codex 这样的编码智能体，ACP 编辑器，Vercel AI SDK 代码，以及 MCP 客户端。',
+      preview: '预览',
+      cta: '阅读 2.5 说明',
+      items: {
+        meter: {
+          title: '预算计量器',
+          body: '本地代理把 Claude Code 或 Codex 的模型请求记入预算，到达上限时返回 402。deuz CLI（预览）用一条命令启动它。',
+        },
+        harness: {
+          title: 'Harness 运行器',
+          body: 'runHarness 在预算内把 Claude Code、Codex 或 OpenCode 作为子智能体运行，并把你的策略应用到它的权限请求上。',
+        },
+        acp: {
+          title: '面向编辑器的 ACP',
+          body: '把 Deuz 智能体提供给 Zed、JetBrains IDE 等 ACP 编辑器，带有签名审批和预算；也可以从代码驱动任意 ACP 智能体。',
+        },
+        toolSearch: {
+          title: '工具搜索',
+          body: '把庞大的工具目录放在一个搜索工具之后。搜索绝不会返回运行策略拒绝的工具。',
+        },
+        aiSdk: {
+          title: 'AI SDK 提供方',
+          body: '用一行代码包装 Vercel AI SDK 7 的模型，现有的 AI SDK 代码就能在 Deuz 预算下运行。',
+        },
+        ledger: {
+          title: 'MCP 账本',
+          body: '面向任意 MCP 客户端的现成 MCP 服务器：版本化记忆、仅供参考的支出记录，以及哈希链回执日志。',
+        },
+      },
+    },
     languagesLabel: '文档界面',
     footerDocs: '文档',
     footerChangelog: '更新日志',
