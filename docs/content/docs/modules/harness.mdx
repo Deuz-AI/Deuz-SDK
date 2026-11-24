@@ -22,6 +22,8 @@ sub-agent under Deuz's guarantees. One call:
 `harnessTool` wraps the same run as a `{ prompt }` tool, so a Deuz agent can
 delegate a coding task to a harness under a budget.
 
+The harness runner is a preview: its API can still change in 2.6.
+
 | Subpath | Exports | Runtime |
 | --- | --- | --- |
 | `@deuz-sdk/core/harness` | `runAcpHarness`, `createHarnessReceiptCollector`, `compareHarnessCost`, `evaluateHarnessPolicy`, `matchHarnessPath`, `normalizeHarnessPath`, `HARNESS_PRESETS`, `claudeCodeHarness`, `codexHarness`, `geminiCliHarness`, `opencodeHarness`, `defaultHarnessEnv`, `CLAUDE_CODE_PROVIDER_SWITCHES` and the `Harness*` types | Edge-safe (the ACP connection is injected) |

@@ -25,9 +25,11 @@ developers already work:
   catalog behind one search tool that respects the run's budget and policy.
 
 2.5 is additive. Every change to the public API of `@deuz-sdk/core` is new
-surface, so 2.4 code compiles against 2.5 unchanged. Nothing new runs until you
-import it, and the provider requests of existing calls are unchanged. Two
-behaviours of the MCP server change on purpose; read
+surface, so 2.4 code that calls the API compiles against 2.5 unchanged; a class
+that implements `DeuzMcpServer` itself needs the new
+[`catalog` member](#new-members). Nothing new runs until you import it, and the
+provider requests of existing calls are unchanged. Two behaviours of the MCP
+server change on purpose; read
 [Upgrading from 2.4](#upgrading-from-24) if you serve tools over MCP.
 
 <Callout type="info" title="What was verified live">
@@ -93,7 +95,7 @@ needs out of core:
 | Package | What it is | Needs |
 | --- | --- | --- |
 | [`@deuz-sdk/cli`](/docs/modules/cli) | The `deuz` command: `deuz meter` and `deuz acp` | Node 22; Node 22.13 for `--store` |
-| [`@deuz-sdk/ai-sdk-provider`](/docs/modules/ai-sdk-provider) | `deuz(model, options)` and `deuzMiddleware(options)` for Vercel AI SDK 7 | `ai@7`, `@ai-sdk/provider@4`, Node 22 |
+| [`@deuz-sdk/ai-sdk-provider`](/docs/modules/ai-sdk-provider) | `deuz(model, options)` and `deuzMiddleware(options)` for Vercel AI SDK 7 | `@ai-sdk/provider@4` (a peer), Node 22; works with the `ai@7` your app installs |
 | [`@deuz-sdk/mcp-ledger`](/docs/modules/mcp-ledger) | `npx @deuz-sdk/mcp-ledger`: memory, an advisory budget and receipts over MCP | Node 22.13 (`node:sqlite`) |
 
 ## Stability

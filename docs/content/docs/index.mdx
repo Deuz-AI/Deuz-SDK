@@ -4,7 +4,7 @@ description: A pure, web-first, multi-provider TypeScript AI SDK with zero runti
 icon: BookOpen
 ---
 
-`@deuz-sdk/core` is a from-scratch TypeScript AI SDK that talks to Anthropic, OpenAI, xAI Grok, Google Gemini, Vertex AI, Azure, Bedrock and Yunwu through **one canonical streaming protocol**. It depends on no other AI SDK, ships **zero runtime dependencies**, and runs anywhere `fetch` runs — Node, Deno, Bun, and Vercel/Cloudflare Edge.
+`@deuz-sdk/core` is a from-scratch TypeScript AI SDK that talks to Anthropic, OpenAI, xAI Grok, Google Gemini, Vertex AI, Azure, Bedrock and Yunwu through **one canonical streaming protocol**. It depends on no other AI SDK, ships **zero runtime dependencies**, and its core uses Web APIs only, so it targets anywhere `fetch` runs — Node, Deno, Bun, and Vercel/Cloudflare Edge. CI tests it on Node 22 and 24 on Linux and Node 22 on Windows; for the other runtimes, a browser-platform bundle build checks that the core reaches no Node API, and no test runs on them ([Edge & Runtimes](/docs/advanced/edge)).
 
 Reach for it when you want full control over the wire, deterministic and replayable behaviour in tests, and no vendor lock-in at the streaming or UI layer. Reach for something else if you want a hosted agent platform, a prompt IDE, or a batteries-included RAG-as-a-service — this is a library, and everything stateful is a seam you fill. [Known gaps](/docs/reference/known-gaps) lists where Deuz is behind and what to use there instead.
 
@@ -117,7 +117,7 @@ const { text } = await generateText({
 });
 ```
 
-That one seam is why `Date.now()`, `Math.random()`, `process.env` and `console.*` are **lint errors** inside the core. It is also why the same build runs unchanged on Cloudflare Workers: there is nothing ambient left to be missing. See [Dependencies & clients](/docs/core/dependencies).
+That one seam is why `Date.now()`, `Math.random()`, `process.env` and `console.*` are **lint errors** inside the core. It is also why the same build needs no changes for Cloudflare Workers: there is nothing ambient left to be missing (a browser bundle build checks this; no test runs on Workers). See [Dependencies & clients](/docs/core/dependencies).
 
 ### 3. `streamChat` returns synchronously and never throws (the "G2" rule)
 
@@ -175,10 +175,14 @@ Everything is additive, and nothing runs until you import it.
   → [AI SDK provider](/docs/modules/ai-sdk-provider) ·
   [MCP ledger](/docs/modules/mcp-ledger)
 
-Nothing in 2.5 was run against a live provider, a real harness or a real
-editor. Start with [What is new in 2.5](/docs/reference/whats-new-2-5) for the
-upgrade notes and known limits, and see [Known gaps](/docs/reference/known-gaps)
-for where Deuz is behind and what to use instead.
+On 2026-11-24 the meter, the CLI and the Claude Code harness preset ran
+against real Claude Code, Codex reached the meter through a custom model
+provider, and ACP passed a conformance run against the official ACP SDK. The
+other 2.5 modules were not run against a live provider, and nothing in 2.5 was
+run in a real editor. Start with
+[What is new in 2.5](/docs/reference/whats-new-2-5) for the upgrade notes and
+known limits, and see [Known gaps](/docs/reference/known-gaps) for where Deuz
+is behind and what to use instead.
 
 ## New in 2.4
 

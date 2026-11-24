@@ -6,7 +6,7 @@ license: MIT
 
 # Building with @deuz-sdk/core
 
-A pure, web-first, multi-provider AI runtime. Zero runtime dependencies, ESM+CJS, Node >= 22. The root and web-safe subpaths run on Edge/Workers; Node adapters have separate entry points. 88 code subpaths (89 package export keys including `package.json`), 270 root exports, 29 provider ids across four wire surfaces; three companion packages (`@deuz-sdk/cli`, `@deuz-sdk/ai-sdk-provider`, `@deuz-sdk/mcp-ledger`) keep their dependencies out of core. Everything a provider sends is normalized to one canonical `StreamPart` delta stream before anything else touches it.
+A pure, web-first, multi-provider AI runtime. Zero runtime dependencies, ESM+CJS, Node >= 22. The root and web-safe subpaths target Edge/Workers (checked by a browser-platform bundle build; CI tests Node only); Node adapters have separate entry points. 88 code subpaths (89 package export keys including `package.json`), 270 root exports, 29 provider ids across four wire surfaces; three companion packages (`@deuz-sdk/cli`, `@deuz-sdk/ai-sdk-provider`, `@deuz-sdk/mcp-ledger`) keep their dependencies out of core. Everything a provider sends is normalized to one canonical `StreamPart` delta stream before anything else touches it.
 
 ## Before you `npm install` anything else
 
@@ -127,7 +127,7 @@ Every peer is optional; install one only when you use it: `zod` + `@standard-com
 
 ## New in 2.5
 
-A distribution release: it takes Deuz's persistent budget, receipts and signed approvals to where developers already work. 2.5 is additive: every public API change to `@deuz-sdk/core` is new surface, so 2.4 code compiles unchanged; nothing new runs until you import it, existing calls send the same provider requests, and `@deuz-sdk/react` gains nothing. Stability labels: tool search, the MCP server's resources, prompts and catalog, the meter (handler, proxy and receipt shape), the AI SDK provider and the MCP ledger are **stable**; ACP, the harness runner and the CLI are **preview** (their API can still change in 2.6). All of it is in `references/distribution.md`, the MCP server parts in `references/interop.md`.
+A distribution release: it takes Deuz's persistent budget, receipts and signed approvals to where developers already work. 2.5 is additive: every public API change to `@deuz-sdk/core` is new surface, so 2.4 code that calls the API compiles unchanged (a class that implements `DeuzMcpServer` itself needs the new `catalog` member); nothing new runs until you import it, existing calls send the same provider requests, and `@deuz-sdk/react` gains nothing. Stability labels: tool search, the MCP server's resources, prompts and catalog, the meter (handler, proxy and receipt shape), the AI SDK provider and the MCP ledger are **stable**; ACP, the harness runner and the CLI are **preview** (their API can still change in 2.6). All of it is in `references/distribution.md`, the MCP server parts in `references/interop.md`.
 
 - **Coding harnesses.** `/meter` charges Claude Code's or Codex's own model traffic to a persistent `BudgetStore` and answers 402 at the ceiling; `deuz meter -- claude` starts it in one line; `runHarness` / `harnessTool` (`/harness/node`) run a harness as a budgeted sub-agent whose permission requests a Deuz policy decides, with measured and declared cost side by side.
 - **Editors.** ACP version 1 on both sides: `serveAcpAgent` serves a native run to Zed or a JetBrains IDE (`deuz acp` from the command line), `connectAcpAgent` / `spawnAcpAgent` drive any ACP agent.

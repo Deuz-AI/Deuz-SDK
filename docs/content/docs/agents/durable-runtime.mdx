@@ -234,7 +234,7 @@ Anything else — **forged, missing, expired, or bound to another run** — flip
 
 ## Edge safety
 
-The whole module is Web-API-only (`crypto.subtle`, `btoa`/`atob`, JSON) and is re-exported from [`@deuz-sdk/core/edge`](/docs/advanced/edge). Node-specific reference stores (file/SQLite) are deliberately **not** in this module — they will live behind a `/node` subpath like `rag/node` and `skills/node` when the CLI ships.
+The whole module is Web-API-only (`crypto.subtle`, `btoa`/`atob`, JSON) and is re-exported from [`@deuz-sdk/core/edge`](/docs/advanced/edge). Node-specific stores are deliberately **not** in this module — the SQLite, Redis and Postgres `SessionStore` implementations live in the [store packs](/docs/modules/stores) (`@deuz-sdk/core/stores/sqlite`, `/stores/redis` and `/stores/postgres`, since 2.0).
 
 ## vs. AI SDK's `WorkflowAgent`
 

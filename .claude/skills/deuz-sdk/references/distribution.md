@@ -138,13 +138,23 @@ deuz meter --port 8787 --openai-upstream https://chatgpt.com/backend-api/codex -
 ```ts no-verify
 // agent.ts — `defineAcpAgent` only types the export
 import { defineAcpAgent } from '@deuz-sdk/cli';
-import { anthropic } from '@deuz-sdk/core/anthropic';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+
+// Core never reads process.env: pass the key to the factory yourself.
+const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
 
 export default defineAcpAgent({
   info: { name: 'my-agent', version: '1.0.0' },
-  run: { model: anthropic('claude-opus-5-5'), instructions: 'You are a careful coding agent.', maxSteps: 20 },
+  run: {
+    model: anthropic('claude-opus-5-5'),
+    instructions: 'You are a careful coding agent.',
+    maxSteps: 20,
+    maxOutputTokens: 4_000, // each call reserves its prompt plus this cap
+  },
 });
 ```
+
+`--budget-usd` prices calls with Deuz's bundled table unless the module sets `deps.priceProvider` (a module that sets `budget` itself must set it, or its USD limit counts $0). Without `maxOutputTokens` each call reserves the model's full output cap, so a small budget refuses every turn.
 
 In code, `runCli` from `@deuz-sdk/cli` runs the CLI in process and resolves the exit code (`DeuzCliError` codes: `usage`, `budget_conflict`, `store_unavailable`, `module_*`). Zed (`agent_servers` in `settings.json`) and JetBrains (`~/.jetbrains/acp.json`, full path to `npx`) registrations follow those editors' docs and have not been tried.
 

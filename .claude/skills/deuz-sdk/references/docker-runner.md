@@ -7,7 +7,7 @@
 
 **Load when:** model-written code must run isolated (not as a child of your host, which `createNodeSandbox` is), or a long process must survive your host restarting — reconnect instead of starting twice, cancel reliably, read its output and files after it stopped. Also when upgrading `createNodeSandbox` users: its 2.4 behaviour changes are at the end.
 
-`@deuz-sdk/core/compute/docker` is Node-only and preview (the API may change in 2.5; the stored record is versioned). It drives the Docker CLI as a child process with `shell: false` and targets Linux containers; it was verified with Docker Desktop on Windows 11 and a Linux engine in CI. It never mounts a host directory or the Docker socket and never pulls an image. Docs: [/docs/modules/docker](/docs/modules/docker) (2.4).
+`@deuz-sdk/core/compute/docker` is Node-only and preview (the API may change in a later release; the stored record is versioned). It drives the Docker CLI as a child process with `shell: false` and targets Linux containers; it was verified with Docker Desktop on Windows 11 and a Linux engine in CI. It never mounts a host directory or the Docker socket and never pulls an image. Docs: [/docs/modules/docker](/docs/modules/docker) (2.4).
 
 | Piece | What it is |
 | --- | --- |

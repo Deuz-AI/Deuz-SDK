@@ -65,7 +65,7 @@ const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
 const model = anthropic('claude-opus-4-8');
 ```
 
-Everything ambient goes through one `Dependencies` seam — `fetch`, `clock`, `logger`, `tracer`, `keyProvider`, `priceProvider`, `generateId`, `observer`. There is no `console.*`, no `Date.now()` and no `Math.random()` anywhere in core. See [Dependencies](/docs/core/dependencies).
+Everything ambient goes through one `Dependencies` seam — `fetch`, `clock`, `logger`, `tracer`, `keyProvider`, `priceProvider`, `generateId`, `observer`. `console.*`, `Date.now()` and `Math.random()` are lint errors in ordinary core code; the few exceptions are documented defaults, such as `Date.now()` for the clock and `crypto.randomUUID()` for ids when you inject none. See [Dependencies](/docs/core/dependencies).
 
 ### 2. `streamChat` returns synchronously and never throws
 
@@ -435,8 +435,8 @@ The previous version of this page ended with "everything else has a direct equiv
 
 | AI SDK feature | Status in Deuz |
 | --- | --- |
-| `transcribe`, `generateSpeech` (audio in/out) | **Absent.** No transcription or speech function exists. Some models report an `audio` capability in the registry (audio *tokens* are metered), but there is no audio entry point. |
-| Video generation (`experimental_generateVideo`) | **Absent** as a function. `@deuz-sdk/core/yunwu` carries a pinned `YUNWU_VIDEO_MODELS` catalog only. |
+| `transcribe`, `generateSpeech` (audio in/out) | **[`transcribe`](/docs/modules/transcription) and [`generateSpeech`](/docs/modules/speech)** (`@deuz-sdk/core/transcription`, `@deuz-sdk/core/speech`, 2.0) over the OpenAI, Deepgram and ElevenLabs wires. Not streamed: speech returns one finished file and transcription is batch only, so there is no equivalent of `experimental_streamSpeech` or `experimental_streamTranscribe`. |
+| Video generation (`experimental_generateVideo`) | **[`generateVideo`](/docs/modules/video-generation)** (`@deuz-sdk/core/video`, 2.0), with `submitVideo`, `waitForVideo` and `downloadVideo`, over the OpenAI Videos shape that relays such as Yunwu serve. It works only through such a relay. |
 | `useCompletion` | **Absent.** Use `useChat` against a single-turn route, or drive `readDeuzStream` yourself. |
 | Svelte / Vue / Angular bindings | **Absent.** Only `@deuz-sdk/react` ships. The wire is plain SSE, so a binding is writable in an afternoon. |
 | DevTools (`@ai-sdk/devtools`, a local web UI on a port) | **No server, but there is a viewer.** `renderRunReport(events)` (`@deuz-sdk/core/observe`) turns the same `ObserveEvent` protocol into one self-contained HTML document — inline CSS/JS, no external fetch, opens from `file://` — and `writeRunReport({ from: 'runs.jsonl', to: 'run.html' })` (`@deuz-sdk/core/observe/node`) does it straight from a `createJsonlObserver` file. Nothing listens on a port and nothing records by default. |
@@ -504,7 +504,7 @@ Not a competition — just the parts of a port where you get to *delete* code:
 - **`verifyStep`** — a verifier hook at every natural completion that can reject an answer and re-drive the loop with feedback.
 - **Memory and RAG in the box** — mem0-style extract/reconcile over a vector store or a markdown vault; hybrid dense + BM25 retrieval with RRF fusion.
 - **A structural request validator** (`validateChatRequest`) for the exact body a chat route receives.
-- **Zero runtime dependencies**, an edge-safety lint gate, and injected clock/randomness — so tests are deterministic and the same build runs on Workers.
+- **Zero runtime dependencies**, an edge-safety lint gate, and injected clock/randomness — so tests are deterministic and the same build needs no changes for Workers (checked by a browser bundle build; no test runs on Workers).
 
 ## See also
 

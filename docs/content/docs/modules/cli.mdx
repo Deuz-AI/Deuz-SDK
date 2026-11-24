@@ -3,7 +3,8 @@ title: CLI
 description: The deuz command line — `deuz meter` puts an enforced token/USD budget in front of Claude Code, Codex or any Anthropic or OpenAI client, and `deuz acp` serves a Deuz agent to Zed or a JetBrains IDE over ACP (2.5).
 ---
 
-`@deuz-sdk/cli` (2.5) is the `deuz` command. It has two commands:
+`@deuz-sdk/cli` (2.5) is the `deuz` command. The CLI is a preview: its
+commands, flags and API can still change in 2.6. It has two commands:
 
 - **`deuz meter`** runs the [meter](/docs/modules/meter) as a local proxy in
   front of a coding harness such as Claude Code or Codex, or any Anthropic or
@@ -201,7 +202,10 @@ options of `serveAcpAgentStdio` without `stdin` and `stdout`, or a function
 
 ```ts title="agent.ts"
 import { defineAcpAgent } from '@deuz-sdk/cli';
-import { anthropic } from '@deuz-sdk/core/anthropic';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+
+// Core never reads process.env: pass the key to the factory yourself.
+const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
 
 export default defineAcpAgent({
   info: { name: 'my-agent', version: '1.0.0' },
@@ -209,6 +213,7 @@ export default defineAcpAgent({
     model: anthropic('claude-opus-5-5'),
     instructions: 'You are a careful coding agent.',
     maxSteps: 20,
+    maxOutputTokens: 4_000, // each call reserves its prompt plus this cap
   },
 });
 ```
@@ -233,6 +238,16 @@ missing export, the message lists the exports the module has.
 | `-h`, `--help` | Show help. |
 
 The budget flags are refused when the module sets `budget` itself.
+
+`--budget-usd` prices each call with Deuz's bundled price table
+(`createPriceProvider()` from `@deuz-sdk/core/pricing`) unless the module sets
+its own `deps.priceProvider`. A model the table does not know is recorded as
+unpriced: its tokens count, its dollars do not, and the footer says "some
+calls unpriced". A module that sets `budget` itself gets no default: set
+`deps.priceProvider` there, or its USD limit counts $0. Set `maxOutputTokens`
+as well. Without it, each call reserves the model's full output cap (128,000
+tokens for `claude-opus-5-5`), so a small budget refuses every turn before it
+is sent.
 
 ### Register it in an editor
 

@@ -107,11 +107,21 @@ describe('deuz: help, version and usage errors', () => {
     const help = fakeIo();
     expect(await runCli(['--help'], help.io)).toBe(0);
     expect(help.stdout()).toContain('Usage: deuz <command>');
+    // A receipt file is written only with --receipts.
+    expect(help.stdout()).toContain('--receipts <file> keeps a receipt per request');
 
     const meterHelp = fakeIo();
     expect(await runCli(['meter', '--help'], meterHelp.io)).toBe(0);
     expect(meterHelp.stdout()).toContain('--budget-usd');
     expect(meterHelp.stdout()).toContain('--store');
+    // Codex on a ChatGPT login ignores OPENAI_BASE_URL: no `-- codex` example.
+    expect(meterHelp.stdout()).not.toMatch(/^ {2}deuz meter .* -- codex$/m);
+    expect(meterHelp.stdout()).toContain('Codex on a ChatGPT login ignores OPENAI_BASE_URL');
+
+    const acpHelp = fakeIo();
+    expect(await runCli(['acp', '--help'], acpHelp.io)).toBe(0);
+    expect(acpHelp.stdout()).toContain("priced by Deuz's bundled table");
+    expect(acpHelp.stdout()).toContain('module sets deps.priceProvider');
   });
 
   it('exits 2 with a one-line hint for an unknown command, an unknown flag and a bad value', async () => {
@@ -357,7 +367,7 @@ describe('deuz acp', () => {
       [['acp', './nope/agent.js'], /no such file: .*agent\.js/],
       [
         ['acp', FIXTURE, '--export', 'agent'],
-        /has no export 'agent' \(it exports: broken, default, factory\); pass --export <name>/,
+        /has no export 'agent' \(it exports: broken, default, factory, priced\); pass --export <name>/,
       ],
       [['acp', FIXTURE, '--export', 'broken'], /export 'broken' of .* has no 'run'/],
     ];
@@ -394,6 +404,34 @@ describe('deuz acp', () => {
     expect(stderr.text()).toMatch(
       /deuz acp: serving fixture-agent from .*agent\.mjs over stdio; budget \$5\.00/,
     );
+  });
+
+  it('prices a turn under --budget-usd when the module names no price provider', async () => {
+    const toAgent = new PassThrough();
+    const fromAgent = new PassThrough();
+    const running = runCli(
+      ['acp', FIXTURE, '--export', 'priced', '--budget-usd', '5', '--footer'],
+      {
+        stdin: toAgent,
+        stdout: fromAgent,
+        stderr: new PassThrough(),
+        cwd: tmp,
+        env: process.env,
+        signals: { on: () => {}, off: () => {} },
+      },
+    );
+    const client = await connectAcpAgent({
+      transport: nodeStreamsToAcpTransport(fromAgent, toAgent, { endOnClose: true }),
+    });
+    const session = await client.newSession({ cwd: tmp });
+    const result = await session.prompt('hi').result;
+    expect(result.text).toContain('priced reply');
+    // 1,000 input tokens at $4/M plus 500 output at $20/M: the ceiling counts real dollars.
+    expect(result.text).toContain('turn $0.0140');
+    expect(result.text).toContain('remaining $4.99');
+    expect(result.text).not.toContain('unpriced');
+    await client.close();
+    expect(await running).toBe(0);
   });
 
   it('calls a factory export with the arguments after --', async () => {

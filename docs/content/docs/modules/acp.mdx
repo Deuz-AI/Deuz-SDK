@@ -17,7 +17,8 @@ the JSON-RPC protocol editors use to run coding agents. It works on both sides:
   a typed result. `spawnAcpAgent` starts the agent as a child process first.
 
 The JSON-RPC layer is written by hand, with no dependencies, against ACP
-protocol version 1 (schema release 1.34.1), not the v2 beta.
+protocol version 1 (schema release 1.34.1), not the v2 beta. ACP support is a
+preview: its API can still change in 2.6.
 
 | Subpath | Exports | Runtime |
 | --- | --- | --- |
@@ -118,6 +119,7 @@ import {
 } from '@deuz-sdk/core/agent';
 import { serveAcpAgentStdio } from '@deuz-sdk/core/acp/stdio';
 import { createApprovalSigner } from '@deuz-sdk/core/durable';
+import { createPriceProvider } from '@deuz-sdk/core/pricing';
 import { tools } from './tools.mjs'; // your ToolSet; mark risky tools needsApproval
 
 const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
@@ -128,7 +130,14 @@ if (!approvalSecret) throw new Error('APPROVAL_SECRET is not set: it signs tool 
 await serveAcpAgentStdio({
   agent: { streamAgent, resumeStreamAgent },
   store: createInMemoryAgentRunStore(),
-  run: { model: anthropic('claude-sonnet-5-5'), instructions: 'A careful coding agent.', tools, maxSteps: 20 },
+  run: {
+    model: anthropic('claude-sonnet-5-5'),
+    instructions: 'A careful coding agent.',
+    tools,
+    maxSteps: 20,
+    maxOutputTokens: 4_000, // each call reserves its prompt plus this cap
+    deps: { priceProvider: createPriceProvider() }, // without it, the USD limit counts $0
+  },
   approvalSigner: createApprovalSigner({ secret: approvalSecret }),
   budget: { store: createInMemoryBudgetStore(), scopes: [{ key: 'user:me', limits: { usd: 5 } }] },
   budgetFooter: true,

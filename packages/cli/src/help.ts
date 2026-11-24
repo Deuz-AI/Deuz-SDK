@@ -11,7 +11,7 @@ Usage: deuz <command> [options]
 Commands:
   meter    Put a token/USD budget in front of a coding harness (Claude Code,
            Codex, any Anthropic or OpenAI client): a local proxy that answers
-           402 at the ceiling and writes a receipt per request.
+           402 at the ceiling. --receipts <file> keeps a receipt per request.
   acp      Serve a Deuz agent to an editor (Zed, JetBrains) over the Agent
            Client Protocol on stdio.
 
@@ -61,8 +61,12 @@ Proxy:
 
 Examples:
   deuz meter --budget-usd 5 -- claude
-  deuz meter --budget-usd 20 --window day --store ~/.deuz/budget.sqlite -- codex
+  deuz meter --budget-usd 20 --window day --store ~/.deuz/budget.sqlite -- claude
   deuz meter --budget-usd 5 --receipts meter.jsonl
+
+Codex on a ChatGPT login ignores OPENAI_BASE_URL, so 'deuz meter -- codex'
+meters nothing there. A custom Codex model provider reaches the meter: see
+https://deuz-sdk.tech/docs/modules/meter#codex-with-a-chatgpt-login
 `;
 
 /** `deuz acp --help`. */
@@ -79,7 +83,9 @@ every log line goes to stderr.
 Options:
   --export <name>           The export to use (default: default)
   --footer                  Append a plain-text budget line to each reply
-  --budget-usd <n>          USD ceiling for every turn (alias --budget)
+  --budget-usd <n>          USD ceiling for every turn (alias --budget). Calls
+                            are priced by Deuz's bundled table unless the
+                            module sets deps.priceProvider
   --budget-tokens <n>       Token ceiling
   --window <spec>           lifetime (default), day, week, month, 12h, 7d...
   --key <name>              Budget key (default deuz:acp, deuz:acp:<window>)

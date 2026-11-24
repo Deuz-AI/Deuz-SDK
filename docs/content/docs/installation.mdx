@@ -25,9 +25,9 @@ previews). Existing generation APIs remain available. See
 Three companion packages ship next to it in 2.5, each installed on its own:
 
 ```bash
-npx @deuz-sdk/cli meter --budget-usd 5 -- claude        # the deuz CLI (preview)
-npm install @deuz-sdk/ai-sdk-provider @ai-sdk/provider ai  # a Deuz budget under AI SDK 7 models
-npx -y @deuz-sdk/mcp-ledger                              # an MCP server for Claude Desktop, Cursor…
+npx @deuz-sdk/cli meter --budget-usd 5 -- claude                          # the deuz CLI (preview)
+npm install @deuz-sdk/ai-sdk-provider @deuz-sdk/core @ai-sdk/provider ai  # a Deuz budget under AI SDK 7 models
+npx -y @deuz-sdk/mcp-ledger                                               # an MCP server for Claude Desktop, Cursor…
 ```
 
 See [CLI](/docs/modules/cli), [AI SDK provider](/docs/modules/ai-sdk-provider)
@@ -53,7 +53,7 @@ bun add @deuz-sdk/core
 
 ## Runtime requirements
 
-The core is **pure and web-first**: it touches only Web APIs (`fetch`, Web Streams, `TextDecoder`, WebCrypto, `atob`/`btoa`). Anything stateful or non-deterministic — HTTP, clock, logging, metering, circuit-breaker, API keys, id generation — is injected through a single `Dependencies` seam, with no-op/in-memory defaults applied for you. As a result the same build runs unchanged on any runtime that has `fetch` plus Web Streams.
+The core is **pure and web-first**: it touches only Web APIs (`fetch`, Web Streams, `TextDecoder`, WebCrypto, `atob`/`btoa`). Anything stateful or non-deterministic — HTTP, clock, logging, metering, circuit-breaker, API keys, id generation — is injected through a single `Dependencies` seam, with no-op/in-memory defaults applied for you. As a result the same build needs no changes on any runtime that has `fetch` plus Web Streams. CI runs the tests on Node only (22 and 24 on Linux, 22 on Windows); the other rows below rest on that Web-API-only design and a browser-platform bundle check, and no test runs on Deno, Bun, Cloudflare Workers or Vercel Edge.
 
 | Runtime                | Core + tool loop | Node-only subpaths               | Notes                                                                                                                                                                                                 |
 | ---------------------- | ---------------- | -------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |

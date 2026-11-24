@@ -48,15 +48,41 @@ export type DeuzAcpAgentModule =
  * ```ts
  * // agent.ts
  * import { defineAcpAgent } from '@deuz-sdk/cli';
- * import { anthropic } from '@deuz-sdk/core/anthropic';
+ * import { createAnthropic } from '@deuz-sdk/core/anthropic';
+ * const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
  * export default defineAcpAgent({
  *   info: { name: 'my-agent', version: '1.0.0' },
- *   run: { model: anthropic('claude-sonnet-4-5'), instructions: 'A careful coding agent.', maxSteps: 20 },
+ *   run: { model: anthropic('claude-sonnet-5-5'), instructions: 'A careful coding agent.', maxSteps: 20 },
  * });
  * ```
  */
 export function defineAcpAgent<T extends DeuzAcpAgentModule>(agent: T): T {
   return agent;
+}
+
+/**
+ * Gives a run that names no price provider Deuz's bundled price table
+ * (`createPriceProvider()` from `@deuz-sdk/core/pricing`), as `deuz meter` and
+ * the AI SDK wrapper price by default. `deuz acp` applies it under
+ * `--budget-usd`: core prices nothing by itself, so without a price provider a
+ * USD ceiling counts $0 and never refuses. A run that sets
+ * `deps.priceProvider` keeps its own. A model the table does not know is still
+ * recorded as unpriced, and the reply's budget footer says so.
+ */
+export async function withDefaultPrices(run: DeuzAcpAgent['run']): Promise<DeuzAcpAgent['run']> {
+  const { createPriceProvider } = await import('@deuz-sdk/core/pricing');
+  const priceProvider = createPriceProvider();
+  const priced = <T>(value: T): T => {
+    // Anything but run options goes through as it is: the server reports it.
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) return value;
+    const deps: unknown = (value as { deps?: unknown }).deps;
+    if (deps !== undefined && (typeof deps !== 'object' || deps === null)) return value;
+    if ((deps as { priceProvider?: unknown } | undefined)?.priceProvider !== undefined)
+      return value;
+    return { ...value, deps: { ...(deps as object | undefined), priceProvider } };
+  };
+  if (typeof run !== 'function') return priced(run);
+  return async (context) => priced(await run(context));
 }
 
 /** `deuz acp` after its flags are parsed. */
@@ -128,8 +154,12 @@ export async function runAcp(command: AcpCommand, io: CliIo): Promise<number> {
     try {
       const { serveAcpAgentStdio } = await import('@deuz-sdk/core/acp/stdio');
       const userOnError = options.onError;
+      // A USD ceiling from the flags only bites on priced calls.
+      const run =
+        command.budget?.usd !== undefined ? await withDefaultPrices(options.run) : options.run;
       const connection = await serveAcpAgentStdio({
         ...options,
+        run,
         agent,
         store,
         ...(budget ? { budget: { store: budget.store, scopes: budget.scopes } } : {}),

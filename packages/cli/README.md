@@ -1,6 +1,6 @@
 # @deuz-sdk/cli
 
-The `deuz` command line for the [Deuz SDK](https://github.com/Deuz-AI/Deuz-SDK). It has two commands:
+The `deuz` command line for the [Deuz SDK](https://github.com/Deuz-AI/Deuz-SDK). The CLI is a preview: its commands, flags and API can still change in 2.6. It has two commands:
 
 - **`deuz meter`** puts an enforced token/USD budget in front of a coding harness such as Claude Code or Codex, or in front of any Anthropic or OpenAI client. It runs a local proxy that charges each request to a persistent budget, refuses requests with `402` once the ceiling is reached, and can write a receipt for every request.
 - **`deuz acp`** serves a Deuz agent to an editor (Zed, JetBrains IDEs) over the [Agent Client Protocol](https://agentclientprotocol.com) on stdio.
@@ -142,7 +142,10 @@ The options take these fields:
 ```ts
 // agent.ts
 import { defineAcpAgent } from '@deuz-sdk/cli';
-import { anthropic } from '@deuz-sdk/core/anthropic';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+
+// Core never reads process.env: pass the key to the factory yourself.
+const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
 
 export default defineAcpAgent({
   info: { name: 'my-agent', version: '1.0.0' },
@@ -150,6 +153,7 @@ export default defineAcpAgent({
     model: anthropic('claude-sonnet-4-5'),
     instructions: 'You are a careful coding agent.',
     maxSteps: 20,
+    maxOutputTokens: 4_000, // each call reserves its prompt plus this cap
   },
 });
 ```
@@ -172,6 +176,8 @@ If the module cannot be found, fails to load, lacks the export, or exports the w
 | `-h`, `--help` | Show help. |
 
 The budget flags cannot be combined with a module that sets `budget` itself.
+
+`--budget-usd` prices each call with Deuz's bundled price table (`createPriceProvider()` from `@deuz-sdk/core/pricing`) unless the module sets its own `deps.priceProvider`. A model the table does not know is recorded as unpriced: its tokens count, its dollars do not, and the footer says "some calls unpriced". A module that sets `budget` itself gets no default: set `deps.priceProvider` there, or its USD limit counts $0. Set `maxOutputTokens` as well. Without it, each call reserves the model's full output cap, so a small budget refuses every turn before it is sent.
 
 ### Register it in Zed
 
