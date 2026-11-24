@@ -191,7 +191,7 @@ describe.runIf(DOCKER)('Docker process runner (live)', () => {
     expect(info.Config.Labels).toMatchObject({
       'deuz.operation-id': 'isolation',
       'deuz.scope': SCOPE,
-      'deuz.sdk-version': '2.4.0',
+      'deuz.sdk-version': '2.5.0',
       'deuz.kind': 'process',
     });
     expect(info.HostConfig).toMatchObject({

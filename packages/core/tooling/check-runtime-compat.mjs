@@ -124,6 +124,33 @@ const consumers = [
     source: `export { createInMemoryDurableStreamStateStore, parseDeuzCapabilities,
       formatDeuzCapabilities } from '@deuz-sdk/core/ui';`,
   },
+  // 2.5 edge-safe entries.
+  {
+    name: 'tool-search',
+    source: `export { createToolSearch, searchTools, createToolIndex, tokenizeForSearch, withSearchMeta,
+      searchMetaOf, remainingFromExecution, remainingFromBudgetStore, ToolSearchError }
+      from '@deuz-sdk/core/tool-search';`,
+  },
+  {
+    name: 'meter',
+    source: `export { createMeterHandler, declaredReceipt, estimatePromptTokens, MeterError }
+      from '@deuz-sdk/core/meter';`,
+  },
+  {
+    name: 'acp',
+    source: `export { serveAcpAgent, connectAcpAgent, createAcpPeer, createNdjsonTransport,
+      createInMemoryAcpTransportPair, createInMemoryAcpSessionStore, AcpError }
+      from '@deuz-sdk/core/acp';`,
+  },
+  {
+    name: 'harness',
+    source: `export { runAcpHarness, createHarnessReceiptCollector, compareHarnessCost,
+      evaluateHarnessPolicy, HARNESS_PRESETS, defaultHarnessEnv } from '@deuz-sdk/core/harness';`,
+  },
+  {
+    name: 'errors',
+    source: "export { DeuzError, BreakerOpenError, isDeuzError } from '@deuz-sdk/core/errors';",
+  },
 ];
 
 function browserBundle(consumer) {
@@ -151,7 +178,7 @@ function nodeOnlyReferences(result) {
   const output = result.outputFiles?.map((file) => file.text).join('\n') ?? '';
   if (forbiddenBuiltins.test(output)) issues.push('bundled output references a node: builtin');
   const nodeOnlyInput = Object.keys(result.metafile?.inputs ?? {}).find((input) =>
-    /(?:rag-node|memory-markdown|skills[\\/]node|mcp[\\/](?:server[\\/])?stdio|swarm[\\/](?:sqlite|postgres|redis)|ops[\\/](?:sqlite|postgres|redis)|evolve[\\/]sqlite|node[\\/](?:observe|chat-store|workspace|compute|browser|runtime|vertex-auth|mcp|store-sqlite|store-redis|store-postgres|swarm-sqlite|swarm-postgres|swarm-redis|ops-sqlite|ops-postgres|ops-redis|budget-sqlite|budget-postgres|redis-budget|redis-scripts|evolve-sqlite|headless|store-connection|vmem-sqlite|vmem-postgres|goal-runtime-sqlite|goal-runtime-postgres|process-ops-sqlite|chat-conditional-sqlite|chat-conditional-postgres|stream-state-sqlite|stream-state-postgres|stream-state-redis|runs-v3-sqlite|runs-v3-postgres)|compute[\\/]docker|memory[\\/]versioned[\\/](?:sqlite|postgres)|goal[\\/]runtime[\\/](?:sqlite|postgres))/.test(
+    /(?:rag-node|memory-markdown|skills[\\/]node|mcp[\\/](?:server[\\/])?stdio|swarm[\\/](?:sqlite|postgres|redis)|ops[\\/](?:sqlite|postgres|redis)|evolve[\\/]sqlite|node[\\/](?:observe|chat-store|workspace|compute|browser|runtime|vertex-auth|mcp|store-sqlite|store-redis|store-postgres|swarm-sqlite|swarm-postgres|swarm-redis|ops-sqlite|ops-postgres|ops-redis|budget-sqlite|budget-postgres|redis-budget|redis-scripts|evolve-sqlite|headless|store-connection|vmem-sqlite|vmem-postgres|goal-runtime-sqlite|goal-runtime-postgres|process-ops-sqlite|chat-conditional-sqlite|chat-conditional-postgres|stream-state-sqlite|stream-state-postgres|stream-state-redis|runs-v3-sqlite|runs-v3-postgres)|compute[\\/]docker|memory[\\/]versioned[\\/](?:sqlite|postgres)|goal[\\/]runtime[\\/](?:sqlite|postgres)|meter[\\/]node|acp[\\/]stdio|harness[\\/]node|node[\\/](?:meter|acp-stdio|harness))/.test(
       input,
     ),
   );
@@ -192,6 +219,10 @@ const nodeOnlyEntries = [
   ['goal/runtime/sqlite', 'createSqliteGoalRuntimeStore'],
   ['goal/runtime/postgres', 'createPostgresGoalRuntimeStore'],
   ['compute/docker', 'createDockerSandbox, createDockerProcessRunner'],
+  // 2.5 Node-only entries.
+  ['meter/node', 'createMeterProxy, createJsonlReceiptSink'],
+  ['acp/stdio', 'serveAcpAgentStdio, spawnAcpAgent, nodeStreamsToAcpTransport'],
+  ['harness/node', 'runHarness, harnessTool'],
 ];
 for (const [subpath, names] of nodeOnlyEntries) {
   try {
@@ -228,6 +259,11 @@ for (const entry of [
   'dist/context.js',
   'dist/goal/runtime.js',
   'dist/skills/learning.js',
+  'dist/tool-search.js',
+  'dist/meter.js',
+  'dist/acp.js',
+  'dist/harness.js',
+  'dist/errors.js',
 ]) {
   const source = readFileSync(resolve(root, entry), 'utf8');
   if (forbiddenBuiltins.test(source)) failures.push(`${entry}: directly imports a node: builtin`);

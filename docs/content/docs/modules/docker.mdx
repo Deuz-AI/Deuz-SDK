@@ -20,11 +20,12 @@ and never mounts the host workspace or the Docker socket.
 | `DEFAULT_DOCKER_SANDBOX` | The isolation and size defaults |
 | `DockerSandboxError`, `OperationConflictError` | An infrastructure failure (with a `code`); an operation id reused for another request |
 
-Preview means the API may still change in 2.5; the stored record format is
-versioned. The first release targets Linux containers. It is tested in Linux
-CI with a real Docker engine and was verified on Windows 11 with Docker
-Desktop 29.8 (Linux containers, containerd image store). Only the Docker CLI is
-tested; `dockerPath` can name another binary, at your own risk.
+Preview means the API may still change in a later release (2.5 left it
+unchanged); the stored record format is versioned. The first release targets
+Linux containers. It is tested in Linux CI with a real Docker engine and was
+verified on Windows 11 with Docker Desktop 29.8 (Linux containers, containerd
+image store). Only the Docker CLI is tested; `dockerPath` can name another
+binary, at your own risk.
 
 [`examples/23-docker-runner`](https://github.com/Deuz-AI/Deuz-SDK/tree/main/examples/23-docker-runner)
 runs both parts on a pinned alpine image without a key: sandbox runs under the
@@ -332,7 +333,7 @@ No output or other content goes into a span.
 
 ## Limits
 
-- Preview: the API may change in 2.5.
+- Preview: the API may change in a later release.
 - Linux containers only. On Windows and macOS, Docker Desktop runs them in a
   VM; Windows containers are not supported.
 - The image is never pulled. Pull and pin it yourself (an image id or digest

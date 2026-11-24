@@ -17,7 +17,7 @@ import {
 } from './fixtures/durable-stream-store-conformance';
 import { estimateClockSkew } from './fixtures/clock-skew';
 import { pglitePool } from './fixtures/pg-pool';
-import { postgresUrl } from './fixtures/services';
+import { PG_REPEATABLE_READ_OPTIONS, postgresUrl } from './fixtures/services';
 import { SLOW_HOOK_TIMEOUT_MS, SLOW_TEST_TIMEOUT_MS } from './fixtures/timeouts';
 
 const wait = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -111,12 +111,7 @@ describe.skipIf(!url)('createPostgresDurableStreamStateStore on a live server', 
   };
 
   beforeAll(async () => {
-    pool = new pg.Pool({ connectionString: url, max: 8 });
-    pool.on('connect', (connection) => {
-      void connection.query(
-        'SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL REPEATABLE READ',
-      );
-    });
+    pool = new pg.Pool({ connectionString: url, max: 8, options: PG_REPEATABLE_READ_OPTIONS });
     ({ skew } = await estimateClockSkew(async () => {
       const { rows } = await pool.query(
         'SELECT (extract(epoch from clock_timestamp()) * 1000)::bigint AS now',

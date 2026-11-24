@@ -3,6 +3,7 @@
   "icon": "BookOpenCheck",
   "defaultOpen": true,
   "pages": [
+    "whats-new-2-5",
     "whats-new-2-4",
     "whats-new-2-3",
     "whats-new-2-2",
@@ -12,6 +13,7 @@
     "agent-skills",
     "compatibility",
     "support-matrix",
+    "known-gaps",
     "stream-protocol",
     "provider-conformance",
     "release-process",

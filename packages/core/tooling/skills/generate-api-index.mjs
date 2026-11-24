@@ -169,8 +169,30 @@ export const SUBPATH_DESCRIPTIONS = {
   '@deuz-sdk/core/chat':
     'The pure chat state engine plus validateChatRequest — the gate in front of client history; conditional chat stores and the transcript index (2.4).',
   '@deuz-sdk/core/chat/node': 'File-backed chat store (Node only).',
+  '@deuz-sdk/core/tool-search':
+    'Budget- and policy-aware tool search (2.5): a BM25 tool index and a search tool that surfaces deferred tools through prepareStep.',
+  '@deuz-sdk/core/meter':
+    'Budget proxy for harness traffic (2.5): a fetch-style handler for Anthropic and OpenAI wires, 402 at the ceiling, measured and declared receipts.',
+  '@deuz-sdk/core/meter/node':
+    'The meter as a loopback node:http proxy, and a JSONL receipt sink (Node only, 2.5).',
+  '@deuz-sdk/core/acp':
+    'Agent Client Protocol (2.5): serve a native run as an ACP agent for editors, or drive an ACP agent as a client.',
+  '@deuz-sdk/core/acp/stdio':
+    'ACP over stdio: serve an agent on the process streams, or spawn an ACP agent process (Node only, 2.5).',
+  '@deuz-sdk/core/harness':
+    'Coding-harness runs over ACP (2.5): presets, a path and tool-kind permission policy, signed decisions, measured versus declared cost.',
+  '@deuz-sdk/core/harness/node':
+    'runHarness and harnessTool: spawn a coding harness behind a budget meter (Node only, 2.5).',
+  '@deuz-sdk/core/errors':
+    'The error taxonomy on its own (2.5): DeuzError, BreakerOpenError and the other error classes, without loading the root entry.',
   '@deuz-sdk/react':
     'React hooks and components: useChat, useObject, approval card, cost badge, chat snapshots (2.4).',
+  '@deuz-sdk/ai-sdk-provider':
+    'Vercel AI SDK 7 models under a Deuz budget (2.5): deuz(model, options) and deuzMiddleware, with fail-over, a breaker and receipts.',
+  '@deuz-sdk/mcp-ledger':
+    'A ready-made MCP server for memory, budget and receipts (2.5): createMcpLedger, or npx @deuz-sdk/mcp-ledger.',
+  '@deuz-sdk/cli':
+    'The deuz command (2.5): deuz meter wraps a harness in a budget proxy, deuz acp serves an agent module to editors; runCli runs it in-process.',
 };
 
 /** The curated re-export subset would list half the package again; the reverse lookup skips it. */
@@ -215,7 +237,14 @@ export function renderApiIndex(
 ) {
   assertDate(date);
   const byName = (a, b) => compareNames(a, b, locale);
-  const core = table.modules.filter((module) => module.specifier !== '@deuz-sdk/react');
+  const core = table.modules.filter(
+    (module) => module.specifier === '@deuz-sdk/core' || module.specifier.startsWith('@deuz-sdk/core/'),
+  );
+  const others = table.modules.filter((module) => !core.includes(module)).map((m) => code(m.specifier));
+  const othersText =
+    others.length <= 1
+      ? `${others[0] ?? code('@deuz-sdk/react')} ships one`
+      : `${others.slice(0, -1).join(', ')} and ${others.at(-1)} ship one each`;
   const lines = [
     '<!-- GENERATED FILE — do not hand-edit.',
     `     regenerate: ${REGENERATE_COMMAND}`,
@@ -226,7 +255,7 @@ export function renderApiIndex(
     '',
     '**Load when:** checking whether a name exists, finding which subpath exports it, or exploring an unfamiliar module.',
     '',
-    `${code(`@deuz-sdk/core@${table.version}`)} ships **${core.length} subpaths**; ${code('@deuz-sdk/react')} ships one. Names marked under **Types** are type-only — import them with ${code('import type')}, or a bundler-free runtime will crash looking for a value that was erased at compile time.`,
+    `${code(`@deuz-sdk/core@${table.version}`)} ships **${core.length} subpaths**; ${othersText}. Names marked under **Types** are type-only — import them with ${code('import type')}, or a bundler-free runtime will crash looking for a value that was erased at compile time.`,
     '',
     `If anything here disagrees with ${code('packages/core/package.json')} ${code('exports')} or ${code('tooling/api-contract.json')}, those win — and this file is stale; regenerate it.`,
   ];

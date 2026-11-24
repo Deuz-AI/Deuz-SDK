@@ -25,7 +25,7 @@ import { agentRunStoreV3Contracts, withBlobs } from './fixtures/agent-run-store-
 import { contextPackage, envelopeV3 } from './fixtures/agent-run-v3';
 import { manualClock } from './fixtures/manual-clock';
 import { pglitePool } from './fixtures/pg-pool';
-import { postgresUrl } from './fixtures/services';
+import { PG_REPEATABLE_READ_OPTIONS, postgresUrl } from './fixtures/services';
 import { SLOW_HOOK_TIMEOUT_MS, SLOW_TEST_TIMEOUT_MS } from './fixtures/timeouts';
 
 /** Disk and database stores: a loaded machine makes their I/O slow. */
@@ -261,13 +261,8 @@ describe.skipIf(!liveUrl)('Postgres V3 run store (live server)', () => {
   };
 
   beforeAll(() => {
-    pool = new pg.Pool({ connectionString: liveUrl, max: 8 });
     // As in postgres-live: pooled connections default to REPEATABLE READ.
-    pool.on('connect', (connection) => {
-      void connection.query(
-        'SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL REPEATABLE READ',
-      );
-    });
+    pool = new pg.Pool({ connectionString: liveUrl, max: 8, options: PG_REPEATABLE_READ_OPTIONS });
   });
   afterAll(async () => {
     try {

@@ -14,7 +14,7 @@ A release is publishable only when the same `npm run release:verify` command pas
 
 ## Versioning with Changesets
 
-Every user-visible change lands with a Changeset. The core and React packages are a fixed version group, so versioning either package keeps both package versions aligned.
+Every user-visible change lands with a Changeset. Since 2.5 the five packages (`@deuz-sdk/core`, `@deuz-sdk/react`, `@deuz-sdk/ai-sdk-provider`, `@deuz-sdk/mcp-ledger` and `@deuz-sdk/cli`) are one fixed version group, so versioning any of them keeps all five versions aligned.
 
 1. Add and review a patch/minor Changeset with `npm run changeset`.
 2. When the release is ready, run `npm run version` once, then `npm install --package-lock-only` to synchronize the workspace lockfile. Review the package versions, generated package changelogs, and lockfile together.
@@ -26,7 +26,7 @@ Bundle thresholds live in `packages/core/tooling/bundle-size-budgets.json`; publ
 
 ## Tag-driven publishing
 
-The release workflow runs only for a `v*` tag. It requires the tag to match the core package version, installs the repository's pinned npm version, re-runs every release gate, publishes all unpublished workspace packages with provenance, and creates the GitHub release. A normal push to `main` cannot publish.
+The release workflow runs only for a `v*` tag. It requires the tag to match the version of every package in the group, installs the repository's pinned npm version, re-runs every release gate, publishes all unpublished workspace packages with provenance, and creates the GitHub release. A normal push to `main` cannot publish.
 
 ```bash
 # Replace <version> with the version already written by Changesets.
@@ -37,7 +37,7 @@ git push origin v<version>
 Trusted publishing (OIDC) is the primary authentication path. Keep all of these values aligned:
 
 - The job runs on a GitHub-hosted runner with Node `>=22.14.0`, npm `11.18.0`, and `permissions.id-token: write`.
-- npm Trusted Publisher is configured separately for both `@deuz-sdk/core` and `@deuz-sdk/react`.
+- npm Trusted Publisher is configured separately for each of the five packages. npm can configure one only for a package that already exists, so the first publish of `@deuz-sdk/ai-sdk-provider`, `@deuz-sdk/mcp-ledger` and `@deuz-sdk/cli` (2.5.0) needs `NPM_TOKEN` in the `npm` environment, or a one-time manual publish; configure their trusted publishers afterwards.
 - Each npm publisher record uses organization/user `Deuz-AI`, repository `Deuz-SDK`, workflow filename `release.yml`, and environment `npm`.
 - The GitHub `npm` environment may hold `NPM_TOKEN` as a fallback. When that secret is absent, the workflow removes setup-node's empty auth-token entry so npm can mint OIDC credentials.
 

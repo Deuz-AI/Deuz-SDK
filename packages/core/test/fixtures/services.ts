@@ -69,6 +69,16 @@ export function postgresUrl(env: TestEnv = process.env): string | undefined {
   return serverUrl('postgres', env);
 }
 
+/**
+ * Startup options that make every connection of a `pg.Pool` default to
+ * REPEATABLE READ (`new pg.Pool({ connectionString, options })`). The server
+ * applies them while it opens the session, so no statement can run first. A
+ * `pool.on('connect')` handler that sends the SET races the first query the
+ * pool hands the connection: pg 8 queues it with a DeprecationWarning, and
+ * pg 9 refuses a query while another is running.
+ */
+export const PG_REPEATABLE_READ_OPTIONS = '-c default_transaction_isolation=repeatable\\ read';
+
 /** DEUZ_TEST_REDIS_URL, or `undefined` to skip. Throws when Redis is required and unset. */
 export function redisUrl(env: TestEnv = process.env): string | undefined {
   return serverUrl('redis', env);

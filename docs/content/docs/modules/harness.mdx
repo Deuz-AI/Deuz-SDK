@@ -1,0 +1,563 @@
+---
+title: Harness
+description: Run Claude Code, Codex or OpenCode as a budgeted Deuz sub-agent over ACP — its model traffic charged to a persistent budget through the meter, its permission requests decided by a Deuz policy, and its measured and declared cost side by side. Gemini CLI runs with a declared cost only (2.5).
+---
+
+`@deuz-sdk/core/harness` (2.5) runs an external coding harness (Claude Code,
+Codex, Gemini CLI, OpenCode or any other [ACP](/docs/modules/acp) agent) as a
+sub-agent under Deuz's guarantees. One call:
+
+1. starts a [meter](/docs/modules/meter) on `127.0.0.1`, bound to a persistent
+   [`BudgetStore`](/docs/modules/budgets), and points the harness's base URL
+   variables at it, so the harness's own model traffic is charged to the budget
+   and refused with 402 at the ceiling;
+2. spawns the harness as an ACP agent, opens one session in `cwd` and sends
+   the prompt;
+3. decides every permission request the harness sends: a policy by tool kind
+   and path, then a callback, then an approver, then deny;
+4. cancels the turn at the first 402 for a budget ceiling;
+5. reports the cost the meter **measured** next to the cost the harness
+   **declared** about itself, and flags when they diverge.
+
+`harnessTool` wraps the same run as a `{ prompt }` tool, so a Deuz agent can
+delegate a coding task to a harness under a budget.
+
+The harness runner is a preview: its API can still change in 2.6.
+
+| Subpath | Exports | Runtime |
+| --- | --- | --- |
+| `@deuz-sdk/core/harness` | `runAcpHarness`, `createHarnessReceiptCollector`, `compareHarnessCost`, `evaluateHarnessPolicy`, `matchHarnessPath`, `normalizeHarnessPath`, `HARNESS_PRESETS`, `claudeCodeHarness`, `codexHarness`, `geminiCliHarness`, `opencodeHarness`, `defaultHarnessEnv`, `CLAUDE_CODE_PROVIDER_SWITCHES` and the `Harness*` types | Edge-safe (the ACP connection is injected) |
+| `@deuz-sdk/core/harness/node` | `runHarness`, `harnessTool` and the same types | Node-only (`node:child_process`, `node:http`) |
+
+<Callout type="warn" title="Deuz decides only what the harness asks about">
+A harness runs its own tools on your machine and sends
+`session/request_permission` only when **it** chooses to. Deuz decides what it
+is asked and sees what it is told. A harness configured to skip prompts (an
+auto-accept or "yolo" mode) asks nothing, and a tool call it never reports is
+invisible to Deuz. `result.toolCalls` keeps the two apart: `decided` counts the
+calls that went through a Deuz decision, `observedOnly` the calls Deuz only saw
+reported. The budget is the hard limit here; the permission policy is as strong
+as the harness's own prompting. The `claude-code` preset switches each session
+to Claude Code's `default` mode, where it asks before every tool call (see
+[Session mode](#session-mode)); the other presets leave the harness in the mode
+its own settings choose.
+</Callout>
+
+<Callout type="warn" title="What was run against the real harness">
+Claude Code and Codex were run live on 2026-11-24 (Windows 11, Node 26.13.0).
+Gemini CLI and OpenCode were not; their presets rest on documentation read on
+2026-11-23 (`verification.verifiedLive: false`).
+
+- **Claude Code** (`verifiedLive: true`; Claude Code 2.1.331,
+  `@agentclientprotocol/claude-agent-acp` 0.110.1 with Claude Agent SDK
+  0.3.330, claude.ai subscription login, model `haiku`): the adapter starts
+  through `npx` on Windows, picks up the subscription login, and all its model
+  traffic goes through the meter. Measured and declared cost agreed within
+  $0.000001, and a budget refusal ended the turn as `cancelled` after one
+  request. Before the session-mode fix, the adapter started in the mode of the
+  user's Claude Code settings and asked nothing, so a deny-writes policy did not
+  stop a write. The preset now opens the session with
+  `allowDangerouslySkipPermissions: false` and switches it to `default`.
+  `runHarness('claude-code')` with that preset was re-run live on 2026-11-24:
+  `result.sessionMode` was `'default'`, the edit permission request arrived, a
+  deny-writes policy refused it and the file was not written (`toolCalls`:
+  observed 1, decided 1, denied 1, observedOnly 0). Measured $0.011074 against
+  declared $0.01107382, comparison `consistent`.
+- **Codex** (`verifiedLive: false`; `@agentclientprotocol/codex-acp` 2.10.0
+  with Codex 0.171.0, ChatGPT login, model `gpt-5.6-luna`): `runHarness` with
+  the preset and the ChatGPT upstream (see [Presets](#presets)) routed the turn
+  through the meter and ended with the model's answer, but the meter then
+  charged its estimate instead of measuring, because ChatGPT's Codex backend
+  sends no `content-type`. The meter now reads such a streamed reply as
+  server-sent events and measures it; that fix is covered by a unit test and
+  has not been run live. API-key mode was not tried.
+
+The tests spawn a real child process, a scripted ACP agent that calls a fake
+Anthropic upstream through the meter on `127.0.0.1`. Try a small budget first.
+</Callout>
+
+## Run a harness under a budget
+
+```ts title="harness.ts"
+import { runHarness } from '@deuz-sdk/core/harness/node';
+import { createSqliteBudgetStore } from '@deuz-sdk/core/ops/sqlite';
+
+const result = await runHarness({
+  harness: 'claude-code',
+  prompt: 'Run the tests and fix what fails.',
+  cwd: '/work/repo',
+  budget: {
+    store: createSqliteBudgetStore({ path: '.deuz/budget.sqlite' }),
+    scopes: [{ key: 'harness:ci', limits: { usd: 2 } }],
+  },
+  policy: {
+    rules: [
+      { decision: 'deny', paths: ['**/.env', '**/.env.*'], name: 'no-secrets' },
+      { decision: 'allow', kinds: ['read', 'search', 'edit'], paths: ['**'] },
+    ],
+  },
+});
+
+console.log(result.stopReason, result.text);
+console.log(result.cost.measured?.usd, result.cost.declared?.usd, result.cost.comparison.status);
+console.log(result.toolCalls); // { observed, decided, allowed, denied, observedOnly }
+```
+
+The child inherits this process's environment, so its API key reaches it as
+usual. `env` adds variables on top. The base URL variables the run sets to
+point at the meter are applied last and override the same names in `env`, so
+the meter cannot be bypassed by accident. The harness and the meter are shut
+down before `runHarness` resolves.
+
+`runHarness` rejects with an `AcpError` when the harness cannot start, exits
+before the ACP handshake, dies mid-turn, or refuses the preset's session mode.
+It throws a `TypeError` for an unknown preset name, for a `budget` combined
+with a shared meter or `meter: false`, for a `budget` on a harness the meter
+cannot measure (see [Gemini CLI](#presets)), and for a `budget` while one of the
+harness's provider switches is set (see [Provider switches](#provider-switches)).
+
+## Presets
+
+| Name | Launch | Model traffic the meter measures | Variables the preset sets | Base URL claim |
+| --- | --- | --- | --- | --- |
+| `claude-code` | `npx -y @agentclientprotocol/claude-agent-acp` | Anthropic Messages | `ANTHROPIC_BASE_URL`; session mode `default` | documented, verified live |
+| `codex` | `npx -y @agentclientprotocol/codex-acp` | OpenAI Responses over HTTP | `CODEX_CONFIG` (a `deuz-meter` model provider, below) and `OPENAI_BASE_URL` | partial |
+| `gemini-cli` | `gemini --acp` | none | none | unsupported |
+| `opencode` | `opencode acp` | Anthropic and OpenAI providers | `OPENCODE_CONFIG_CONTENT` with `provider.{anthropic,openai}.options.baseURL` | partial |
+
+Each preset's `verification` records what was confirmed and where:
+`acpEntryPoint` is `'documented'` for all four; `baseUrl` is `'documented'`
+for `claude-code`, `'partial'` for `codex` and `opencode` and `'unsupported'`
+for `gemini-cli`; `verifiedLive` is `true` for `claude-code` only; `checkedAt`
+is `'2026-11-24'` for `claude-code` and `codex` and `'2026-11-23'` for the
+other two; `sources` and `notes` cite the pages read and, for the two run live,
+what was observed and with which versions. "Partial" means part of the claim is
+documented and the rest is inferred or unconfirmed:
+
+- **claude-code.** `ANTHROPIC_BASE_URL` is documented for Claude Code itself,
+  and on 2026-11-24 it reached the Claude Code the adapter starts. Under a
+  claude.ai subscription login (no `ANTHROPIC_API_KEY`), Claude Code sent its
+  OAuth bearer to the meter, which forwarded it unchanged, measured the usage
+  and priced it at API rates, although the subscription is not billed per
+  token. The receipts held no credentials. Claude Code called only
+  `HEAD /api/hello` and `POST /v1/messages` on the base URL. The preset also
+  sets `sessionMode: 'default'`, `sessionMeta` (see
+  [Session mode](#session-mode)) and `unmeteredEnv:
+  CLAUDE_CODE_PROVIDER_SWITCHES` (see [Provider switches](#provider-switches)).
+- **codex.** A ChatGPT login ignores `OPENAI_BASE_URL`, and Codex's built-in
+  provider sends each turn over a Responses WebSocket, which the meter cannot
+  carry. So the preset defines its own Codex model provider in the adapter's
+  `CODEX_CONFIG` and selects it: `model_provider: 'deuz-meter'` with
+  `base_url: '<meter>/v1'`, `wire_api: 'responses'`,
+  `requires_openai_auth: true` (Codex's own login is used) and
+  `supports_websockets: false`. Codex then sends `POST <meter>/v1/responses`
+  over HTTP with server-sent events. `OPENAI_BASE_URL` is still set for older
+  adapters. Where the meter forwards depends on the login, which the preset
+  cannot see: an API key needs the default OpenAI upstream, a ChatGPT login
+  needs ChatGPT's Codex backend mounted at `/v1`:
+
+  ```ts
+  meter: {
+    upstreams: [
+      { provider: 'openai', kind: 'openai', baseUrl: 'https://chatgpt.com/backend-api/codex', mount: '/v1' },
+    ],
+  },
+  ```
+
+  With that upstream a ChatGPT-login run completed on 2026-11-24. The backend
+  answers `/responses` with no `content-type`; in that run the meter read the
+  stream as JSON, found no usage and charged its estimate (about 21 times the
+  measured cost). The meter now treats a 2xx reply to a `stream: true` request
+  as server-sent events unless its `content-type` says JSON, so this traffic is
+  measured. The fix is covered by a unit test, not yet by a live run.
+  ChatGPT-plan traffic is priced at API rates.
+  The adapter sends no declared cost (`comparison: 'undeclared'`). API-key mode
+  was not tried.
+- **gemini-cli.** Older Gemini CLI releases used `--experimental-acp`. Gemini
+  CLI talks to Google's Gemini API, which the meter does not speak, so the
+  preset sets nothing: a Gemini run has **declared cost only, no measured cost
+  and no ceiling**. `runHarness` therefore refuses a `budget` for it unless you
+  pass `allowUnmetered: true`, and with that flag the budget is not applied.
+- **opencode.** `provider.<id>.options.baseURL` is OpenCode's v1 config schema
+  (v2 moved it to `providers.<id>.settings.baseURL`), and the format of
+  `OPENCODE_CONFIG_CONTENT` is not spelled out in its docs. The preset
+  **replaces** any `OPENCODE_CONFIG_CONTENT` already in your environment.
+  Providers other than Anthropic and OpenAI are not rerouted.
+
+All four presets set `windowsShell: true`, because their commands are usually
+npm `.cmd` launchers on Windows. There `runHarness` starts them through a
+shell, passing the command and its arguments as one command line (arguments
+are not escaped), and stopping the harness ends the whole process tree with
+`taskkill /T /F`.
+
+### Your own harness
+
+Any ACP agent works as a `HarnessSpec`:
+
+```ts
+await runHarness({
+  harness: { name: 'my-agent', command: 'my-agent', args: ['--acp'] },
+  prompt: 'Update the changelog.',
+  budget,
+});
+```
+
+Without its own `env(meterUrl)`, a spec gets `defaultHarnessEnv`:
+`ANTHROPIC_BASE_URL=<meter>` and `OPENAI_BASE_URL=<meter>/v1`. Whether your
+harness honours them is for you to check. A spec may also set `sessionMode`,
+`sessionMeta` and `unmeteredEnv`; without `unmeteredEnv` it is checked against
+Claude Code's provider switches, so pass `unmeteredEnv: []` to opt out.
+
+### Session mode
+
+A preset or spec with `sessionMode` has every session switched to that ACP
+mode (`session/set_mode`) before the prompt is sent, and `sessionMeta` is sent
+as `_meta` on `session/new`. If the harness refuses the switch, the run rejects
+with an `AcpError` and no prompt is sent. `result.sessionMode` is the mode at
+the end of the turn; a value other than the one requested means the harness
+switched modes during the turn. The `sessionMode` and `sessionMeta` options of
+`runHarness` override the preset's.
+
+The Claude Code adapter starts each session in the permission mode of the
+user's Claude Code settings (`permissions.defaultMode`), or in `auto` when none
+is set, and in `bypassPermissions` or `auto` it sends no permission requests.
+The `claude-code` preset therefore opens each session with
+`sessionMeta: { claudeCode: { options: { allowDangerouslySkipPermissions: false } } }`
+and switches it to `default`, where Claude Code asks before each tool call.
+
+### Provider switches
+
+Some environment variables send a harness's model traffic to another provider,
+around the meter. With a `budget`, `runHarness` refuses to start while one of
+the harness's `unmeteredEnv` variables is on in this process's environment or
+in `env`, unless `allowUnmetered: true`. The `TypeError` names the variables,
+never their values. A value counts as on unless it is empty, `0`, `false`,
+`no` or `off`; on Windows names match without regard to case. Set the variable
+to `undefined` in `env` to clear it for the child.
+
+For `claude-code` (and, by default, for your own specs) the list is
+`CLAUDE_CODE_PROVIDER_SWITCHES`, from Claude Code's environment-variable
+reference read on 2026-11-24: `CLAUDE_CODE_USE_BEDROCK`,
+`CLAUDE_CODE_USE_MANTLE`, `CLAUDE_CODE_USE_VERTEX`, `CLAUDE_CODE_USE_FOUNDRY`,
+`CLAUDE_CODE_USE_ANTHROPIC_AWS` and `CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD`.
+Claude Code's settings files can set the same variables (their `env` key), and
+those are not read.
+
+## Permissions
+
+Each `session/request_permission` is decided in this order, and the first one
+that decides wins:
+
+1. **`policy`**: rules by tool kind and path, tried in order.
+2. **`onPermission(request, { signal })`**: return `'allow'`, `'deny'`,
+   `{ decision, reason }`, or `undefined` to pass it on.
+3. **`approveToolCall(call, { messages })`**: the shape of a run's server-mode
+   approver, so a parent run's approver can be passed straight in. The call is
+   named `<harness>.<kind>` (for example `claude-code.edit`) with
+   `args: { title, kind, paths, rawInput }`. True allows.
+4. **`fallback`**: `'deny'` by default.
+
+A callback or approver that throws denies, with the error's message as the
+reason.
+
+```ts
+policy: {
+  default: 'ask', // the default: hand unmatched requests to onPermission, then the approver
+  rules: [
+    { decision: 'deny', paths: ['/etc/**'] },
+    { decision: 'deny', kinds: ['delete', 'execute'], name: 'no-destructive' },
+    { decision: 'allow', kinds: ['read', 'search'], paths: ['**'] },
+  ],
+}
+```
+
+- A rule matches when its `kinds` (if any) include the call's kind, which is
+  `'other'` when the harness sent none, and its `paths` (if any) match the
+  call's locations.
+- An **allow** rule needs **every** location to match one of its globs, and at
+  least one location. A **deny** rule needs **any** location to match. A call
+  that reports no location therefore never matches an allow rule with `paths`.
+- **Real paths.** `runHarness` resolves each location to its real path before
+  the policy sees it (`fs.realpath.native`): symlinks, junctions and Windows
+  8.3 short names are resolved, a path that does not exist yet is resolved
+  through its nearest existing ancestor, and a dangling link through its
+  target. The policy is evaluated on both forms: a deny on either denies, and
+  an allow needs the real paths to be allowed; relative globs match the real
+  paths against the real `cwd`. A path that cannot be resolved never satisfies
+  an allow. `resolvePath: false` turns this off, a function replaces the
+  resolver, and each record in `result.decisions` carries `resolvedPaths`.
+  `runAcpHarness` resolves nothing unless you pass `resolvePath`.
+- A relative glob is resolved against the session's `cwd`, so `'**'` means
+  "inside the workspace". `**` matches any depth, `*` one segment, `?` one
+  character. `\` is read as `/`, `.` and `..` are resolved first, and Windows
+  drive paths match without regard to case. On a drive path, an NTFS stream
+  suffix (`.env::$DATA`), trailing dots and spaces and a `\\?\` or `\\.\`
+  prefix are dropped first, so another spelling of the same file meets the
+  same rules. A drive-relative path (`D:file`) is never joined to `cwd`, so it
+  matches no workspace glob.
+- **Deny** rules match without regard to case on every path (`.ENV` against
+  `**/.env`), since macOS and network shares are often case-insensitive. Allow
+  rules and `matchHarnessPath` keep the platform's case rule.
+- `default: 'allow'` or `'deny'` decides unmatched requests without asking
+  anyone. `evaluateHarnessPolicy(policy, { kind, paths }, cwd)` evaluates a
+  policy on its own, and `matchHarnessPath(path, glob, cwd)` one glob.
+
+Deuz answers with a `*_once` option, so the harness asks again next time. It
+falls back to `allow_always` / `reject_always` only when the harness offers no
+`*_once` option; after an "always" answer the harness stops asking about that
+tool. When no option fits, the request is answered `cancelled`.
+
+Every request ends up in `result.decisions` with the decision, who made it
+(`'policy'`, `'callback'`, `'approver'`, `'fallback'` or `'cancelled'`), the
+rule name, the reason and the option sent. With `signer` (an
+[`ApprovalSigner`](/docs/agents/durable-runtime#hmac-signed-approvals)), each record also carries an
+HMAC token: `signer.verify(token)` returns the decision as a
+`ToolApprovalRequest` bound to `runId`. It attests that this host made the
+decision. It is not a resumable approval.
+
+## Measured and declared cost
+
+| | Measured | Declared |
+| --- | --- | --- |
+| Source | The meter, from the usage the provider reported for each request | The harness's own `usage_update.cost` over ACP: its growth over the turn |
+| In the result | `cost.measured`: `usd`, `chargedUsd`, `tokens`, `requests`, `refused`, `exhaustedKeys`, `receipts`, `exact` | `cost.declared`: `amount`, `currency`, and `usd` when the currency is USD |
+| Receipt | One `source: 'measured'` meter receipt per request | One `source: 'declared'` receipt with `settlement: 'none'` |
+| Charged to the budget | Yes | No |
+
+`cost.comparison.status` is `'consistent'` or `'diverged'` when both exist,
+`'undeclared'` when the harness reported no USD cost, `'unmeasured'` when no
+meter measured it, and `'unavailable'` when neither. The two diverge when
+`|measured - declared|` exceeds both `absoluteUsd` (default $0.001) and
+`relative` (default 10%) of the larger one; set your own with
+`divergence: { relative, absoluteUsd }`. `compareHarnessCost(measuredUsd,
+declaredUsd, thresholds)` is the same check on its own.
+
+`result.receipts` holds the measured receipts, then the declared one. Pass
+`receipts` (a sink or a list of sinks, for example
+[`createJsonlReceiptSink`](/docs/modules/meter#receipts)) to get every receipt
+as it lands.
+
+## The ceiling
+
+- **One meter per run, by default.** Each run starts its own meter on
+  `127.0.0.1`, port 0, bound to `budget`, and closes it after the run. Pass
+  meter options as `meter` (`upstreams`, `estimate`, `priceProvider`,
+  `unknownPrice` and the rest; see [Meter](/docs/modules/meter#options)).
+  Without `budget`, the meter only measures.
+- **Cancel at the ceiling.** At the first 402 for a budget ceiling the run
+  sends `session/cancel` (`onBudgetExhausted: 'cancel'`, the default), so the
+  harness stops instead of retrying. `'continue'` leaves the turn to the
+  harness. After a cancel (budget or `signal`) the harness has 10 seconds to
+  end its turn; then the connection is closed, a spawned harness is killed and
+  the run rejects with an `AcpError` of kind `'cancelled'`. `result.budget` has `exhausted`, `refused` and `exhaustedKeys`.
+- **Upstreams.** The meter forwards to `api.anthropic.com` and `api.openai.com`
+  unless you configure `meter.upstreams`. A gateway URL already set in this
+  process's environment (`ANTHROPIC_BASE_URL`, say) is **not** followed: the
+  run overrides it to point at the meter. Route the meter itself to the
+  gateway instead.
+- **A shared meter.** Pass a listening `MeterProxy` as `meter` to share one
+  meter across runs. The totals are then the difference of its stats over the
+  run (`measured.exact: false`): they include any other traffic it carried
+  meanwhile, there are no per-run receipts, `exhaustedKeys` is empty, and the
+  run cannot cancel live at the ceiling. Configure the budget on the shared
+  meter; `budget` is refused here.
+- **No meter.** `meter: false` measures and caps nothing.
+- **Share the parent's ceiling.** The harness's spend is enforced by the meter
+  only, at the HTTP layer. It is not reported back to a parent run's usage, so
+  it is never counted twice. To keep a harness inside a parent run's ceiling,
+  pass the same store and scope keys as `budget`.
+
+## As a tool
+
+`harnessTool` is the same run as a tool: `{ prompt }` in, a summary out. Each
+call spawns a fresh harness and session, cancelled by the call's `signal`.
+
+```ts title="delegate.ts"
+import { generateText } from '@deuz-sdk/core';
+import { createApprovalSigner } from '@deuz-sdk/core/durable';
+import { harnessTool } from '@deuz-sdk/core/harness/node';
+
+const result = await generateText({
+  model,
+  prompt: 'CI is red on main. Get it green.',
+  tools: {
+    coder: harnessTool({
+      harness: 'codex',
+      cwd: repo,
+      budget: { store, scopes: [{ key: 'harness:codex', limits: { usd: 3 } }] },
+      policy: { rules: [{ decision: 'allow', kinds: ['read', 'search'], paths: ['**'] }] },
+      onResult: (run) => {
+        audit.push(run); // the full HarnessResult
+      },
+    }),
+  },
+  // Decides the harness's permission requests the policy left open.
+  approveToolCall: async (call) => call.toolName === 'codex.edit',
+  // Signs each of those decisions.
+  approvalSigner: createApprovalSigner({ secret: process.env.APPROVAL_SECRET! }),
+  maxSteps: 4,
+});
+```
+
+The model sees `HarnessToolOutput`: `text`, `stopReason`, `measuredUsd`,
+`declaredUsd`, `costStatus`, `budgetExhausted` and `toolCalls`. `onResult`
+receives the full `HarnessResult`.
+
+What the parent's approval machinery carries, and what it cannot:
+
+- **The delegation itself** can use the parent's full signed approval flow:
+  give the tool `needsApproval`, and the parent suspends before the harness
+  starts and resumes with a signed verdict, as for any tool.
+- **Permission requests in the middle of a turn** cannot. The child process
+  holds an open ACP request, so the parent cannot suspend and resume around it
+  (possibly in another process). They are decided synchronously: `policy`,
+  `onPermission`, then the parent's server-mode `approveToolCall`, then deny.
+  `generateText`, `streamText` and `agentTool` hand their `approveToolCall`
+  down to tools. **Native `runAgent` tools get no approver**, so there only the
+  policy and the callback decide. `useParentApprover: false` stops using the
+  parent's approver.
+- **Signing.** With the parent's `approvalSigner`, each decision record is
+  HMAC-signed (`signDecisions`, default true). That is an audit attestation,
+  not a resumable approval.
+
+## Over any ACP connection
+
+`runAcpHarness`, on the edge-safe subpath, is the run without the spawning: you
+open the connection. Pass the `hooks` it gives you into `connectAcpAgent` or
+`spawnAcpAgent`; without them, Deuz never sees the permission requests or the
+updates.
+
+```ts
+import { connectAcpAgent } from '@deuz-sdk/core/acp';
+import { runAcpHarness } from '@deuz-sdk/core/harness';
+
+const result = await runAcpHarness({
+  name: 'remote-agent',
+  cwd: '/work/repo',
+  prompt: 'List the TODOs in src/.',
+  connect: (hooks) => connectAcpAgent({ transport, ...hooks }),
+  policy: { default: 'deny', rules: [{ decision: 'allow', kinds: ['read', 'search'], paths: ['**'] }] },
+});
+```
+
+It sees the paths as the agent sent them, so a link to a denied file can be
+allowed; pass `resolvePath` (an async `(path) => realPath | null`) to evaluate
+real paths as `runHarness` does. `sessionMode` and `sessionMeta` work as in
+[Session mode](#session-mode).
+
+The run closes the connection when it ends, unless `keepOpen: true`. To measure
+it, give it a `meter` link: `createHarnessReceiptCollector({ flush })` returns a
+`sink` to put among a meter's `receipts` and a `link` to pass as `meter`.
+
+```ts
+import { createMeterHandler } from '@deuz-sdk/core/meter';
+
+const collector = createHarnessReceiptCollector({ flush: () => meter.flush() });
+const meter = createMeterHandler({ budget, receipts: [collector.sink] });
+// … route the agent's provider traffic through meter.fetch, then:
+await runAcpHarness({ ...options, meter: collector.link });
+```
+
+## The result
+
+| Field | What it holds |
+| --- | --- |
+| `harness`, `sessionId` | The harness name and the ACP session. |
+| `sessionMode` | The session's mode at the end of the turn, when the run set one or the harness reported one. |
+| `stopReason` | `'end_turn'`, `'max_tokens'`, `'max_turn_requests'`, `'refusal'` or `'cancelled'`. |
+| `text`, `thought`, `plan` | The agent's reply, its reasoning, and its plan when it sent one. |
+| `cost` | `measured`, `declared` and `comparison` (see [above](#measured-and-declared-cost)). |
+| `receipts` | Measured receipts, then the declared one. |
+| `budget` | `exhausted`, `refused`, `exhaustedKeys`. |
+| `toolCalls` | `observed`, `decided`, `allowed`, `denied`, `observedOnly`. |
+| `decisions` | One record per permission request, signed when a `signer` is given. |
+| `calls` | Every tool call of the turn as the harness reported it. |
+| `startedAt`, `durationMs` | Timing, from the injected clock. |
+
+## Options
+
+`runHarness` takes:
+
+| Option | Default | Notes |
+| --- | --- | --- |
+| `harness` | — | A preset name, a `HarnessPreset` or a `HarnessSpec`. |
+| `prompt` | — | A string or ACP content blocks. |
+| `cwd` | this process's | The session's working directory and the child's; relative policy globs resolve against it. |
+| `budget` | — | `{ store, scopes }`, as for the meter. |
+| `meter` | a meter of this run | Meter options, a listening `MeterProxy` (shared), or `false`. |
+| `allowUnmetered` | `false` | Run with a `budget` although the meter cannot measure the harness (Gemini CLI; the budget is then not applied) or one of its provider switches is set (that traffic is neither measured nor capped). |
+| `resolvePath` | a Node real-path resolver | `false` evaluates the paths as sent; a function replaces the resolver. See [Permissions](#permissions). |
+| `sessionMode`, `sessionMeta` | the preset's | See [Session mode](#session-mode). |
+| `policy`, `onPermission`, `approveToolCall`, `fallback` | `fallback: 'deny'` | See [Permissions](#permissions). |
+| `signer`, `runId` | — | Sign each decision record, bound to `runId`. |
+| `onBudgetExhausted` | `'cancel'` | Or `'continue'`. |
+| `divergence` | `{ relative: 0.1, absoluteUsd: 0.001 }` | See [Measured and declared cost](#measured-and-declared-cost). |
+| `receipts` | — | Sinks for every receipt, measured and declared. |
+| `env` | — | Added to this process's environment for the child. |
+| `shell` | the preset's `windowsShell` on win32 | Arguments are not escaped. |
+| `stderr` | `'inherit'` | `'ignore'` or a line callback. |
+| `killTimeoutMs` | 2000 | How long `close` waits before killing the child. |
+| `mcpServers`, `signal`, `onUpdate`, `deps` | — | MCP servers for the session, cancellation, every ACP update, and `{ clock, generateId, priceProvider }`. |
+
+`harnessTool` takes the same options without `prompt` and `signal`, plus
+`description`, `needsApproval`, `useParentApprover` (default true),
+`signDecisions` (default true) and `onResult`.
+
+## Limits
+
+- **Deuz decides only what the harness asks.** Calls the harness runs without
+  asking, including every call in an auto-accept mode, are not gated; calls it
+  never reports are not even counted. Read `toolCalls.decided` against
+  `toolCalls.observedOnly`.
+- **"Always" answers.** Deuz picks `*_once` options where the harness offers
+  them. A harness that offers only "always" options stops asking about that
+  tool after the first answer.
+- **Mid-turn permissions are not resumable approvals.** They are decided
+  synchronously in this process. Signed decision records attest the decision;
+  they cannot be resumed elsewhere. Native `runAgent` tools pass no approver to
+  `harnessTool`.
+- **Only Claude Code is verified live.** It was verified on Windows 11 with a
+  subscription login and model `haiku`; other platforms, logins and models were
+  not run. Gemini CLI and OpenCode were not run live: OpenCode's
+  `OPENCODE_CONFIG_CONTENT` format and its v2 config schema still need a trial.
+- **Codex with a ChatGPT login needs the upstream recipe, and its measurement
+  is not verified live.** It needs the `meter.upstreams` recipe in
+  [Presets](#presets). The meter's handling of the backend's reply without a
+  `content-type` is covered by a unit test only; the live run predates it.
+  Codex API-key mode was not tried.
+- **Subscription traffic is priced at API rates.** A Claude Code subscription
+  login and a ChatGPT plan are not billed per token; the meter's figure is what
+  the same tokens would cost on the API. Gemini CLI is never metered: declared
+  cost only, no ceiling.
+- **The ceiling inherits the meter's limits.** Admission is by estimate, so
+  one request in flight can overshoot the ceiling, and the default estimate is
+  pessimistic, so the last part of a small budget can be refused early. See
+  [Meter limits](/docs/modules/meter#limits).
+- **A shared meter is approximate.** Its totals include concurrent traffic,
+  and it gives no per-run receipts and no live cancel.
+- **A gateway in your environment is not followed.** Configure
+  `meter.upstreams` instead.
+- **Settings files are not read.** `runHarness` refuses a budgeted run while a
+  provider switch is set in the environment, but Claude Code's settings files
+  (`env` in user, project, local or managed settings) can set the same
+  switches, or `ANTHROPIC_BASE_URL`, and route around the meter.
+- **Path resolution needs a file system.** `runHarness` resolves real paths;
+  `runAcpHarness` does not unless you pass `resolvePath`. A link swapped in
+  between the decision and the harness's own write is not checked again.
+- **Declared cost is a claim.** It is recorded, compared and never charged. A
+  cost in another currency keeps its amount but has no `usd`, and is not
+  compared.
+- **Each `harnessTool` call is a fresh harness.** No session carries over
+  between calls.
+- **Windows.** Shell launches do not escape arguments. The process-tree kill
+  through `taskkill /T /F` is typechecked but has no automated test: it needs a
+  Windows `.cmd` launcher. The file-symlink test needs Developer Mode or admin
+  rights and skips without them; junctions and 8.3 short names are tested.
+
+## See also
+
+- [Meter](/docs/modules/meter) — the budget proxy a harness run starts, and its receipts.
+- [ACP](/docs/modules/acp) — the protocol underneath, both sides.
+- [CLI](/docs/modules/cli) — `deuz meter -- claude` puts the same meter in front of a harness from the terminal.
+- [Budgets](/docs/modules/budgets) — scopes, windows and the durable stores.
+- [Known gaps](/docs/reference/known-gaps) — where Deuz is behind, and what to use instead.

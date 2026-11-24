@@ -370,7 +370,41 @@
     "  memory-versioned-postgres 48615 / 15374 -> 53500 / 16950",
     "  goal-runtime-sqlite       52257 / 14490 -> 57500 / 15950",
     "  goal-runtime-postgres     54225 / 15420 -> 59650 / 17000",
-    "  compute-docker            65585 / 22391 -> 72150 / 24650"
+    "  compute-docker            65585 / 22391 -> 72150 / 24650",
+    "",
+    "RAISED FOR 2.5 (integration): mcp-server serves resources, resource templates, prompts and a mutable",
+    "catalog with list_changed and resources/updated notifications (all on ./mcp/server). That is real eager",
+    "growth of the served surface, +5% headroom:",
+    "  mcp-server: 18250 / 6570 -> 30650 / 10700 (measured 29153 / 10162)",
+    "",
+    "ADDED FOR 2.5 (integration): the eight new subpaths, measured through this pipeline, ~10% headroom.",
+    "Edge-safe (browser platform):",
+    "  tool-search        13651 /  5257 -> 15050 /  5800",
+    "  meter              29142 /  9489 -> 32100 / 10450",
+    "  acp                38939 / 13195 -> 42850 / 14550",
+    "  acp (lazy)        252672 / 80028 -> 278000 / 88050  (durable, execution-policy and the model registry, loaded by import() only when a run needs them)",
+    "  harness            13814 /  5557 -> 15200 /  6150",
+    "  errors              1143 /   634 ->  1300 /   700",
+    "Node-only (platform node, like the 2.4 stores):",
+    "  meter-node         31033 / 10356 -> 34150 / 11400",
+    "  acp-stdio          41932 / 14338 -> 46150 / 15800",
+    "  acp-stdio (lazy)  252672 / 80028 -> 278000 / 88050",
+    "  harness-node      112870 / 34778 -> 124200 / 38300",
+    "  harness-node (lazy) 204422 / 67315 -> 224900 / 74050",
+    "",
+    "RAISED FOR 2.5 (live-trial hardening): runAcpHarness evaluates the policy on the given and the",
+    "resolved paths, switches the session mode (sessionMode/sessionMeta) and tracks mode updates; the",
+    "presets gained unmeteredEnv, CLAUDE_CODE_PROVIDER_SWITCHES, Codex's CODEX_CONFIG model provider",
+    "and the verification notes of the 2026-11-24 live trials, all reachable from HARNESS_PRESETS.",
+    "Real surface, ~10% headroom:",
+    "  harness: 15200 / 6150 -> 20100 / 8100 (measured 18249 / 7355)",
+    "",
+    "RAISED FOR 2.5 (live-trial hardening): mcp-server gained MCP tasks (the 2026-07-28 Tasks extension and",
+    "2025-11-25 core tasks: the task runtime, the in-memory store and the tasks/* handlers in mcp/tasks.ts),",
+    "per-subscriber identity checks on resources/updated (an SSE frame filter on listen streams) and RFC 6570",
+    "template-variable decoding. All of it is reachable from createMcpServer, tasks included although they are",
+    "opt-in (a lazy import() of mcp/tasks.ts would move most of it out of the eager chunk). +5% headroom:",
+    "  mcp-server: 30650 / 10700 -> 44550 / 15550 (measured 42413 / 14798)"
   ],
   "bundles": {
     "core": {
@@ -779,8 +813,8 @@
     "mcp-server": {
       "from": "@deuz-sdk/core/mcp/server",
       "exports": ["createMcpServer"],
-      "maxRawBytes": 18250,
-      "maxGzipBytes": 6570,
+      "maxRawBytes": 44550,
+      "maxGzipBytes": 15550,
       "maxLazyRawBytes": 361500,
       "maxLazyGzipBytes": 117050
     },
@@ -960,6 +994,73 @@
       "platform": "node",
       "maxRawBytes": 72150,
       "maxGzipBytes": 24650
+    },
+    "tool-search": {
+      "from": "@deuz-sdk/core/tool-search",
+      "exports": ["createToolSearch", "searchTools", "withSearchMeta", "remainingFromBudgetStore"],
+      "maxRawBytes": 15050,
+      "maxGzipBytes": 5800
+    },
+    "meter": {
+      "from": "@deuz-sdk/core/meter",
+      "exports": ["createMeterHandler", "declaredReceipt"],
+      "maxRawBytes": 32100,
+      "maxGzipBytes": 10450
+    },
+    "acp": {
+      "from": "@deuz-sdk/core/acp",
+      "exports": [
+        "serveAcpAgent",
+        "connectAcpAgent",
+        "createNdjsonTransport",
+        "createInMemoryAcpSessionStore"
+      ],
+      "maxRawBytes": 42850,
+      "maxGzipBytes": 14550,
+      "maxLazyRawBytes": 278000,
+      "maxLazyGzipBytes": 88050
+    },
+    "harness": {
+      "from": "@deuz-sdk/core/harness",
+      "exports": [
+        "runAcpHarness",
+        "createHarnessReceiptCollector",
+        "evaluateHarnessPolicy",
+        "HARNESS_PRESETS"
+      ],
+      "maxRawBytes": 20100,
+      "maxGzipBytes": 8100
+    },
+    "errors": {
+      "from": "@deuz-sdk/core/errors",
+      "exports": ["DeuzError", "BreakerOpenError", "isDeuzError"],
+      "maxRawBytes": 1300,
+      "maxGzipBytes": 700
+    },
+    "meter-node": {
+      "from": "@deuz-sdk/core/meter/node",
+      "exports": ["createMeterProxy", "createJsonlReceiptSink"],
+      "platform": "node",
+      "maxRawBytes": 34150,
+      "maxGzipBytes": 11400
+    },
+    "acp-stdio": {
+      "from": "@deuz-sdk/core/acp/stdio",
+      "exports": ["serveAcpAgentStdio", "spawnAcpAgent"],
+      "platform": "node",
+      "maxRawBytes": 46150,
+      "maxGzipBytes": 15800,
+      "maxLazyRawBytes": 278000,
+      "maxLazyGzipBytes": 88050
+    },
+    "harness-node": {
+      "from": "@deuz-sdk/core/harness/node",
+      "exports": ["runHarness", "harnessTool"],
+      "platform": "node",
+      "maxRawBytes": 124200,
+      "maxGzipBytes": 38300,
+      "maxLazyRawBytes": 224900,
+      "maxLazyGzipBytes": 74050
     }
   }
 }

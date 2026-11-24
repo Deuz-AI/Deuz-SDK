@@ -1,0 +1,431 @@
+---
+title: Meter
+description: A local budget proxy for coding harnesses — point Claude Code or Codex at it and every request is charged to a persistent Deuz budget, refused with HTTP 402 at the ceiling, and recorded as one receipt (2.5).
+---
+
+`@deuz-sdk/core/meter` (2.5) is a budget proxy for traffic you do not write
+yourself. Claude Code, Codex and most other coding harnesses let you change
+their API base URL. Point it at the meter and every request is:
+
+1. **admitted** against a persistent [`BudgetStore`](/docs/modules/budgets)
+   before it is forwarded, on a conservative estimate;
+2. **forwarded** to the real provider, with the response streamed back chunk by
+   chunk, byte for byte, with no read-ahead;
+3. **settled** with the usage the provider reported, priced by the same
+   `PriceProvider` and usage mapping a Deuz call uses;
+4. **recorded** as one receipt that carries no prompt, no response and no
+   credential.
+
+At the ceiling the meter answers **402** in the provider's own error JSON, and
+the request never reaches the provider. Nothing in the harness changes.
+
+| Subpath | Exports | Runtime |
+| --- | --- | --- |
+| `@deuz-sdk/core/meter` | `createMeterHandler`, `declaredReceipt`, `DEFAULT_METER_UPSTREAMS`, `estimatePromptTokens`, `DEFAULT_METER_CHARS_PER_TOKEN`, `DEFAULT_METER_MAX_OUTPUT_TOKENS`, `MeterError` | Edge-safe (fetch-style handler) |
+| `@deuz-sdk/core/meter/node` | `createMeterProxy`, `createJsonlReceiptSink` | Node-only (`node:http`, `node:fs`) |
+
+It routes **Anthropic Messages**, **OpenAI Chat Completions** and **OpenAI
+Responses**, and any OpenAI-compatible base URL you configure as an upstream.
+
+<Callout title="Verified live with Claude Code; Codex partly">
+On 2026-11-24 (Windows 11, Node 26.13.0) the meter ran in front of real
+harnesses:
+
+- **Claude Code 2.1.331** under a claude.ai subscription login (no API key,
+  model `haiku`): Claude Code honours `ANTHROPIC_BASE_URL` under that login and
+  sends its OAuth bearer through the meter, which forwards it unchanged. The
+  meter measured and priced the usage at API rates, and the receipt held no
+  credentials. On the base URL Claude Code called only `HEAD /api/hello` and
+  `POST /v1/messages` (no `count_tokens`, model listing or telemetry), in
+  `claude -p` mode; interactive mode was not tried. At a ceiling below one
+  request's estimate, Claude Code showed `API Error: 402 deuz meter: …` and
+  exited with code 1 after one request, without retrying.
+- **Codex** under a ChatGPT login: see
+  [Codex with a ChatGPT login](#codex-with-a-chatgpt-login). Its requests reach
+  the meter only through a custom Codex model provider. In the live run the
+  meter charged their estimate instead of measuring them; it now measures them,
+  which a unit test covers but no live run has confirmed. A 402 is retried five
+  times (six requests, none forwarded) before Codex exits 1 with the meter's
+  message. API-key mode was not tried.
+
+The test suite runs offline against a fake upstream on a 127.0.0.1 port, with
+real SSE streams. Try a small budget before you rely on a large one.
+</Callout>
+
+## Run it in front of a harness
+
+```ts title="meter.ts"
+import { createJsonlReceiptSink, createMeterProxy } from '@deuz-sdk/core/meter/node';
+import { createSqliteBudgetStore } from '@deuz-sdk/core/ops/sqlite';
+
+const proxy = createMeterProxy({
+  budget: {
+    store: createSqliteBudgetStore({ path: '.deuz/budget.sqlite' }),
+    // $20 in any rolling 24 hours.
+    scopes: [{ key: 'dev:me', limits: { usd: 20 }, window: { ms: 86_400_000 } }],
+  },
+  receipts: createJsonlReceiptSink({ path: '.deuz/meter.jsonl' }),
+  onWarning: (warning) => console.error('meter:', warning),
+});
+
+const { url } = await proxy.listen({ port: 8787 });
+console.error(`meter listening on ${url}`);
+```
+
+Then start the harness with its base URL pointed at the meter:
+
+```bash
+ANTHROPIC_BASE_URL=http://127.0.0.1:8787 claude
+OPENAI_BASE_URL=http://127.0.0.1:8787/v1 codex   # API-key mode only; not verified live
+```
+
+Your API key, or a subscription's OAuth bearer, still travels in the harness's
+own headers. The meter passes `x-api-key` and `authorization` through untouched
+and never logs them or puts them in a receipt. Codex signed in with ChatGPT
+ignores `OPENAI_BASE_URL`; see [below](#codex-with-a-chatgpt-login).
+
+`proxy.close()` stops accepting connections, lets requests in flight finish
+(`close({ force: true })` cuts them, settling their holds fail-closed), then
+waits for every settlement and receipt. It is idempotent. `proxy.stats()`
+returns running totals: requests, refusals, upstream errors, tokens, USD and a
+per-model breakdown.
+
+The `deuz meter` command of the `deuz` CLI starts the same meter from the
+command line, and can wrap the harness command itself; see
+[CLI](/docs/modules/cli#deuz-meter).
+
+## The handler on its own
+
+`createMeterHandler` is the same meter as a fetch-style handler, for any host
+with the Fetch API. This complete example runs without a key or a network: a
+stand-in for `api.anthropic.com` is injected through `deps.fetch`.
+
+```ts title="meter-handler.ts"
+import { createInMemoryBudgetStore } from '@deuz-sdk/core/agent';
+import { createMeterHandler } from '@deuz-sdk/core/meter';
+
+const store = createInMemoryBudgetStore();
+const meter = createMeterHandler({
+  budget: { store, scopes: [{ key: 'dev:me', limits: { usd: 1 } }] },
+  receipts: (receipt) => console.log(receipt.outcome, receipt.settlement, receipt.usage),
+  deps: {
+    // Stand-in upstream: a non-streaming Messages response with its usage.
+    fetch: async () =>
+      Response.json({ id: 'msg_1', type: 'message', content: [], usage: { input_tokens: 50, output_tokens: 10 } }),
+  },
+});
+
+const response = await meter.fetch(
+  new Request('http://127.0.0.1:8787/v1/messages', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'anthropic-version': '2023-06-01' },
+    body: JSON.stringify({
+      model: 'claude-opus-5-5',
+      max_tokens: 1000,
+      messages: [{ role: 'user', content: 'hi' }],
+    }),
+  }),
+);
+await response.json();
+await meter.flush(); // every settlement and receipt is done
+
+// 'completed' 'measured' { inputTokens: 50, outputTokens: 10, totalTokens: 60, … }
+console.log(await store.usage('dev:me')); // { tokens: 60, usd: … } priced from the registry
+```
+
+`fetch` never rejects: every failure comes back as a provider-shaped error
+response. `flush()` resolves once every started request is settled and every
+receipt is delivered.
+
+## Options
+
+| Option | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `upstreams` | `MeterUpstream[]` | `DEFAULT_METER_UPSTREAMS` | Anthropic at `https://api.anthropic.com` and OpenAI at `https://api.openai.com`, both at mount `''`. |
+| `budget` | `{ store, scopes }` | — | `scopes` is a list, or a function of the request that picks them. An empty list meters that request with no budget. |
+| `priceProvider` | `PriceProvider` | `createPriceProvider()` | From `@deuz-sdk/core/pricing`. |
+| `unknownPrice` | `'warn' \| 'reject'` | `'warn'` | See [Unpriced models](#unpriced-models). |
+| `estimate` | `MeterEstimateOptions` or a function | — | `{ charsPerToken?, defaultMaxOutputTokens?, promptRate? }`, or your own estimator. |
+| `injectStreamUsage` | `boolean` | `true` | Ask streaming Chat Completions for a final usage chunk. |
+| `unmeteredRoutes` | `'reject' \| 'forward'` | `'reject'` | What to do with a billable POST the meter does not know. |
+| `receipts` | sink or sinks | — | `(receipt) => void \| Promise<void>`. |
+| `onWarning` | `(warning) => void` | — | `unpriced-model`, `usage-missing`. |
+| `onError` | `(error, { stage, requestId? }) => void` | — | Failures the meter swallowed: `reserve`, `settle`, `release`, `receipt`, `upstream`. |
+| `maxRequestBytes` | `number` | 32 MiB | Larger bodies get 413. |
+| `maxResponseCopyBytes` | `number` | 16 MiB | Cap on the copy of a JSON body read for usage. |
+| `deps` | `{ fetch?, clock?, generateId? }` | host | Injected, as everywhere in Deuz. |
+
+`createMeterProxy` takes the same options plus `host` (default `127.0.0.1`) and
+`port` (default `0`, a free port). `listen()` resolves `{ host, port, url }`
+and rejects with `MeterError('listen_failed')`. Bad options throw
+`MeterError('invalid_options')`.
+
+<Callout type="warn" title="Keep the proxy on loopback">
+The meter forwards the caller's own credentials. Binding `0.0.0.0` offers that
+relay to everyone on your network. The default is `127.0.0.1`.
+</Callout>
+
+## Choosing scopes per request
+
+`scopes` can be a function of the request. It receives the route, model,
+protocol, whether it streams, the output cap and the headers, with anything
+that looks like a credential (authorization, api-key, cookie, token, secret,
+session, signature) removed:
+
+```ts
+createMeterProxy({
+  budget: {
+    store,
+    scopes: (request) => [
+      { key: `harness:${request.headers['x-harness'] ?? 'unknown'}`, limits: { usd: 5 } },
+      { key: 'dev:me', limits: { usd: 20 }, window: { ms: 86_400_000 } },
+    ],
+  },
+});
+```
+
+Admission is all-or-none across the scopes, as in every `BudgetStore`.
+
+## How a request is charged
+
+The meter reserves an estimate before it forwards a request, and settles the
+hold when the response ends:
+
+| How the response ends | Settlement | What the budget is charged |
+| --- | --- | --- |
+| Final usage arrived | `'measured'` | The measured usage, priced. |
+| The upstream answered non-2xx, or sent an error event before any usage | `'released'` | Nothing; the hold is dropped. |
+| No final usage: client disconnect, broken stream, Chat streaming without usage, a JSON body over 16 MiB | `'estimate'` | The estimate, or the partial usage when that is higher (fail-closed). A `usage-missing` warning is raised. |
+| The client disconnected after the request was sent but before the upstream's headers arrived | `'estimate'` | The estimate (outcome `'aborted'`): the provider may still bill the request. A `usage-missing` warning is raised. |
+| The upstream could not be reached | `'released'` | Nothing; the hold is dropped (`'held'` if the release itself failed). The client gets 502. |
+| The store failed to settle three times | `'held'` | The estimate stays held; `onError` is called and `BudgetStore.sweep` reconciles it later. |
+| No budget took part | `'none'` | — |
+
+Settlement is awaited before the client sees the stream close.
+
+Usage is read from:
+
+- **Anthropic**: `message_start` usage plus the cumulative `message_delta`
+  usage, including cache reads, 5-minute and 1-hour cache writes and
+  iterations; or the JSON body.
+- **OpenAI Chat Completions**: the `usage` field, or the final usage chunk when
+  streaming.
+- **OpenAI Responses**: `response.completed`, `response.incomplete` or
+  `response.failed`, or the JSON `usage`.
+
+The mapping reuses the adapters' own Anthropic, Chat and Responses usage
+mappers, so the meter bills exactly as a Deuz call to the same model would.
+
+### The default estimate
+
+- **Tokens**: the request body's characters / 3, plus the output cap. The cap
+  is `max_tokens`, `max_completion_tokens` or `max_output_tokens`, or 32 000 when
+  the request sets none. A Chat Completions request with an integer `n` above 1
+  multiplies that cap by `n`, since every choice is billed. Base64 runs of
+  1 024 characters or more count as one token per 32 characters.
+- **USD**: the prompt is priced at the model's dearest prompt rate (the 1-hour
+  cache write) unless `estimate.promptRate: 'input'`.
+
+It is deliberately pessimistic. With Claude Code-sized prompts, the last part
+of a small budget can be refused early. Tune it with `estimate` options
+(`charsPerToken`, `defaultMaxOutputTokens`, `promptRate`) or pass your own
+estimator function. `estimatePromptTokens(body, charsPerToken)` is the default
+prompt estimate.
+
+### `injectStreamUsage`
+
+On by default: a streaming Chat Completions request without
+`stream_options.include_usage` gets it added, so the final usage arrives. The
+client then receives one extra final chunk with empty `choices`. The OpenAI
+SDKs handle it; a naive client that reads `choices[0]` without a guard may not.
+Turn it off for such clients, or for compatible hosts that reject
+`stream_options`. Those requests are then charged their estimate.
+
+## Routing
+
+- A request goes to the upstream with the longest matching `mount`.
+- On an `anthropic` upstream, POST paths ending in `/messages` are metered. On
+  an `openai` upstream, POST paths ending in `/chat/completions` or
+  `/responses` are metered (Azure-style paths work).
+- `/messages/count_tokens`, `/responses/input_tokens` and every non-POST
+  request pass through unmetered and without a receipt; they count in
+  `stats().passthrough`.
+- Any other POST (batches, embeddings, `/responses/compact` and so on) is
+  refused with a 404 in the provider's shape by default, so no spend bypasses
+  the budget. With `unmeteredRoutes: 'forward'` it is sent on uncharged, with a
+  receipt.
+- When Anthropic and OpenAI share a mount (the default), metered paths decide.
+  Any other request goes to Anthropic if it carries any `anthropic-*` header or
+  its path is under `/api/` (Claude Code's `HEAD /api/hello`), otherwise to
+  OpenAI.
+
+An OpenAI-compatible provider is one more upstream:
+
+```ts
+import { DEFAULT_METER_UPSTREAMS } from '@deuz-sdk/core/meter';
+
+createMeterProxy({
+  upstreams: [
+    ...DEFAULT_METER_UPSTREAMS,
+    { provider: 'openrouter', kind: 'openai', baseUrl: 'https://openrouter.ai/api', mount: '/openrouter' },
+  ],
+});
+// OPENAI_BASE_URL=http://127.0.0.1:8787/openrouter/v1
+```
+
+## Responses the meter makes
+
+| Status | When |
+| --- | --- |
+| 402 | The budget is exhausted, or an unpriced model under `'reject'`. |
+| 404 | An unmetered billable route under `unmeteredRoutes: 'reject'`. |
+| 413 | The body is larger than `maxRequestBytes`. |
+| 400 | The body is not a JSON object. |
+| 502 | The upstream is unreachable. |
+| 503 | The store or a custom estimator failed. |
+
+A 402 looks like the provider's own error. For Anthropic:
+`{ "type": "error", "error": { "type": "billing_error", "message": "deuz meter: budget <key> is exhausted: …" } }`.
+For OpenAI: `{ "error": { "type": "insufficient_quota", "code": "insufficient_quota", … } }`.
+The message says `budget <key> is exhausted: …` once the committed spend has
+reached the limit, and `budget <key> cannot cover this request: …` when the
+request's estimate alone does not fit; both go on with the committed amount,
+the limit and the estimate, and end with `The request was not sent.`
+
+The `expect` request header (`Expect: 100-continue`) is not forwarded
+upstream, along with the hop-by-hop headers.
+
+Every response the meter makes itself carries `x-deuz-meter: <reason>`.
+Responses relayed from the upstream carry `x-deuz-meter-id`, the receipt id.
+
+## Codex with a ChatGPT login
+
+Codex signed in with ChatGPT ignores `OPENAI_BASE_URL`, and its built-in
+provider sends each turn over a Responses WebSocket to ChatGPT's Codex backend
+(`https://chatgpt.com/backend-api/codex`), which the meter cannot carry. What
+worked live on 2026-11-24 (Codex CLI 0.166.0, model `gpt-5.6-luna`) is a custom
+Codex model provider that keeps the ChatGPT login and uses HTTP, with the
+meter's OpenAI upstream set to the Codex backend:
+
+```bash
+deuz meter --port 8787 --openai-upstream https://chatgpt.com/backend-api/codex -- \
+  codex exec -c model_provider="deuzmeter" \
+  -c 'model_providers.deuzmeter={name="deuz meter",base_url="http://127.0.0.1:8787",wire_api="responses",requires_openai_auth=true,supports_websockets=false}' \
+  "reply with the single word OK"
+```
+
+Codex then sends `POST /responses` over HTTP with server-sent events, and the
+meter forwards it with the ChatGPT bearer. The [harness](/docs/modules/harness#presets)
+`codex` preset sets the same provider (with a `base_url` ending in `/v1`, so
+there the upstream is mounted at `/v1`).
+
+**The backend sends no `content-type`.** It answers `/responses` with none, so
+in the live trial the meter read the stream as JSON, found no usage and settled
+on the estimate (outcome `aborted`, about 21 times the measured cost). The meter
+now reads a 2xx reply to a `stream: true` request as server-sent events unless
+its `content-type` says JSON, so this traffic is measured. A unit test covers
+that case; it has not been re-run live. With `text/event-stream` forced in a
+test harness, the meter measured exactly the tokens Codex reported.
+ChatGPT-plan traffic is priced at API rates; it is not billed per token. Do not run Codex with
+`RUST_LOG` debug output while metering: that output carried a credential.
+
+## Unpriced models
+
+Under `unknownPrice: 'warn'` (the default) a model with no price is admitted
+with a USD hold of 0 and charged tokens only. Its receipt has `priced: false`,
+and an `unpriced-model` warning fires once per model. Under `'reject'`, or a
+scope's own `limits.unknownPrice: 'reject'`, it is refused with 402 when a scope
+bounds USD. See [Models without a price](/docs/modules/budgets#models-without-a-price).
+
+## Receipts
+
+Each metered request produces one receipt:
+
+```ts
+{
+  version: 1, id: '…', requestId: 'meter:…', source: 'measured',
+  startedAt, endedAt, durationMs, upstreamMs,
+  provider: 'anthropic', protocol: 'anthropic-messages', model: 'claude-opus-5-5',
+  route: '/v1/messages',            // path only, never the query string
+  method: 'POST', status: 200,
+  outcome: 'completed',             // 'refused' | 'upstream_error' | 'aborted' | 'failed'
+  stream: true, usage: { … }, usageComplete: true, usd: 0.00775,
+  estimate: { tokens, usd },
+  settlement: 'measured',           // 'estimate' | 'released' | 'held' | 'none'
+  charged: { tokens, usd }, budgetKeys: ['dev:me'],
+  refusal: undefined,               // { reason: 'budget_exceeded', key, dimension, limit, committed } on a 402
+  upstreamRequestId: 'req_…', priced: true,
+}
+```
+
+A receipt never carries an API key, an auth header, a query string or a request
+or response body. `createJsonlReceiptSink({ path })` appends one JSON line per
+receipt, in order, creates the parent directories, and creates the file with
+mode 0600. A failed write is reported to `onError`; later receipts are still
+written.
+
+### Declared receipts
+
+`declaredReceipt(input, { priceProvider?, clock?, generateId? })` builds a
+receipt in the same shape with `source: 'declared'`: a cost an agent reported
+about itself (for example over [ACP](/docs/modules/acp)) that nothing on the
+wire confirmed. It prices `usage` when `usd` is omitted and a `priceProvider` is
+given. It only builds the record: it charges no budget, and its `settlement`
+defaults to `'none'`. Keep the `source` label, so reports can tell a measured
+cost from a declared one.
+
+## How it fits with the rest of Deuz
+
+- **Budgets.** The meter is one more client of the `BudgetStore`. Point it at
+  the same store and scopes as your app, your [AI SDK models](/docs/modules/ai-sdk-provider)
+  and your native agents, and they share one ceiling across processes. Holds,
+  windows, `sweep` and `prune` behave as on the [budgets page](/docs/modules/budgets).
+- **Receipts.** A meter receipt records a model call, not a tool's effect. The
+  [MCP ledger](/docs/modules/mcp-ledger) records what a model reports doing; the
+  meter records what it actually spent.
+- **Approvals.** The meter sees provider traffic only; it does not see or gate
+  the harness's tool calls.
+
+## Limits
+
+- **The ceiling can be overshot by up to one request.** Streaming usage is
+  final only when the response ends, and admission checks
+  `committed + estimate <= limit`. A request whose measured cost exceeds its own
+  estimate can push past the limit; the next request is then refused. With
+  several requests in flight at the ceiling, each can overshoot by its own
+  error; sequential harness traffic overshoots by at most one request.
+  `settle` records actual amounts even above the limit.
+- **Only the prompt estimate can be low when the output is capped.** Anthropic
+  requests always send `max_tokens`, and a Chat Completions `n` multiplies the
+  cap. CJK-heavy prompts, hidden provider framing
+  and large inline images or PDFs can exceed the character estimate.
+- **The estimate is pessimistic by design**, so the last part of a small budget
+  can be refused early. There is no calibration from settled usage yet. For
+  Claude Code traffic on 2026-11-24 it was 4 to 130 times the measured cost
+  (for example $0.0717 estimated against $0.0085 measured with `haiku`), so
+  roughly the last $0.07 of a budget is refused early.
+- **Codex with a ChatGPT login is measured, but not verified live.** It
+  reaches the meter only through a custom Codex model provider. Its replies
+  carry no `content-type`; the meter reads them as server-sent events, which a
+  unit test covers but no live run has confirmed; see
+  [Codex with a ChatGPT login](#codex-with-a-chatgpt-login). Codex API-key mode
+  was not tried live.
+- **Codex retries a 402.** Codex sent each refused request six times in all
+  before exiting; none was forwarded or charged. Claude Code does not retry a
+  402.
+- **Unknown billable routes are refused by default.** A harness that calls a
+  billable endpoint the meter does not know (for example `/v1/responses/compact`)
+  gets a 404 that names `unmeteredRoutes`. Use `'forward'` to send it on
+  uncharged.
+- **No retries.** The meter does not retry; a harness's retry is a new request.
+- **Bodies are decoded.** Responses are decoded by `fetch`, so
+  `content-encoding` and `content-length` are not relayed.
+- **Declared receipts charge nothing.** A caller that wants a declared cost in
+  the budget reserves and settles it itself.
+
+## See also
+
+- [Budgets](/docs/modules/budgets) — scopes, windows, holds and the durable stores.
+- [AI SDK provider](/docs/modules/ai-sdk-provider) — the same budget for Vercel AI SDK code.
+- [MCP ledger](/docs/modules/mcp-ledger) — an advisory budget, memory and receipts for MCP clients.
+- [Pricing](/docs/modules/pricing) — the price table the meter settles with.

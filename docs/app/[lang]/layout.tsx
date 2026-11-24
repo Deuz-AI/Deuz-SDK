@@ -40,44 +40,44 @@ const siteDescriptions: Record<Locale, string> = {
 
 const bannerCopy: Record<Locale, { text: string; link: string }> = {
   en: {
-    text: 'Deuz SDK 2.4 is out — versioned memory and a context compiler, a goal supervisor and durable scheduler, a local Docker runner and durable chat streams.',
-    link: 'What is new in 2.4',
+    text: 'Deuz SDK 2.5 is out — a budget meter for coding harnesses and the deuz CLI, harnesses as budgeted sub-agents, ACP for editors, tool search, and MCP resources and prompts.',
+    link: 'What is new in 2.5',
   },
   de: {
-    text: 'Deuz SDK 2.4 ist da — versioniertes Gedächtnis und ein Kontext-Compiler, ein Goal-Supervisor und dauerhafter Scheduler, ein lokaler Docker-Runner und dauerhafte Chat-Streams.',
-    link: 'Neu in 2.4',
+    text: 'Deuz SDK 2.5 ist da — ein Budget-Meter für Coding-Harnesses und die deuz-CLI, Harnesses als budgetierte Sub-Agenten, ACP für Editoren, Tool-Suche sowie MCP-Ressourcen und -Prompts.',
+    link: 'Neu in 2.5',
   },
   tr: {
-    text: 'Deuz SDK 2.4 çıktı — sürümlü bellek ve bağlam derleyicisi, hedef denetleyicisi ve kalıcı zamanlayıcı, yerel Docker çalıştırıcısı ve kalıcı sohbet akışları.',
-    link: '2.4’te neler yeni',
+    text: 'Deuz SDK 2.5 çıktı — kodlama araçları için bütçe ölçer ve deuz CLI, bütçeli alt ajan olarak kodlama araçları, editörler için ACP, araç arama, MCP kaynakları ve prompt’ları.',
+    link: '2.5’te neler yeni',
   },
   fr: {
-    text: 'Deuz SDK 2.4 est sorti — mémoire versionnée et compilateur de contexte, superviseur d’objectifs et planificateur durable, exécuteur Docker local et flux de chat durables.',
-    link: 'Nouveautés de la 2.4',
+    text: 'Deuz SDK 2.5 est sorti — un compteur de budget pour les agents de code et la CLI deuz, ces agents en sous-agents budgétés, ACP pour les éditeurs, la recherche d’outils, et les ressources et prompts MCP.',
+    link: 'Nouveautés de la 2.5',
   },
   it: {
-    text: 'Deuz SDK 2.4 è uscito — memoria versionata e compilatore di contesto, supervisore degli obiettivi e scheduler durevole, runner Docker locale e stream di chat durevoli.',
-    link: 'Novità della 2.4',
+    text: 'Deuz SDK 2.5 è uscito — un contatore di budget per gli agenti di coding e la CLI deuz, gli agenti di coding come sotto-agenti con budget, ACP per gli editor, la ricerca degli strumenti, e risorse e prompt MCP.',
+    link: 'Novità della 2.5',
   },
   es: {
-    text: 'Deuz SDK 2.4 ya está aquí — memoria versionada y compilador de contexto, supervisor de objetivos y planificador duradero, ejecutor Docker local y streams de chat duraderos.',
-    link: 'Novedades de 2.4',
+    text: 'Deuz SDK 2.5 ya está aquí — un medidor de presupuesto para agentes de código y la CLI deuz, esos agentes como subagentes con presupuesto, ACP para editores, búsqueda de herramientas, y recursos y prompts MCP.',
+    link: 'Novedades de 2.5',
   },
   ru: {
-    text: 'Вышел Deuz SDK 2.4 — версионируемая память и компилятор контекста, супервизор целей и надёжный планировщик, локальный Docker-раннер и надёжные потоки чата.',
-    link: 'Что нового в 2.4',
+    text: 'Вышел Deuz SDK 2.5 — счётчик бюджета для агентов программирования и CLI deuz, такие агенты как суб-агенты с бюджетом, ACP для редакторов, поиск инструментов, а также ресурсы и промпты MCP.',
+    link: 'Что нового в 2.5',
   },
   ja: {
-    text: 'Deuz SDK 2.4 リリース — バージョン管理されたメモリとコンテキストコンパイラ、ゴールスーパーバイザーと永続スケジューラ、ローカル Docker ランナー、永続チャットストリーム。',
-    link: '2.4 の新機能',
+    text: 'Deuz SDK 2.5 リリース — コーディングエージェント向け予算メーターと deuz CLI、予算付きサブエージェントとしてのコーディングエージェント、エディター向け ACP、ツール検索、MCP リソースとプロンプト。',
+    link: '2.5 の新機能',
   },
   ko: {
-    text: 'Deuz SDK 2.4 출시 — 버전 관리 메모리와 컨텍스트 컴파일러, 목표 감독자와 영속 스케줄러, 로컬 Docker 러너, 영속 채팅 스트림.',
-    link: '2.4의 새로운 점',
+    text: 'Deuz SDK 2.5 출시 — 코딩 에이전트용 예산 미터와 deuz CLI, 예산이 걸린 서브 에이전트로서의 코딩 에이전트, 에디터용 ACP, 도구 검색, MCP 리소스와 프롬프트.',
+    link: '2.5의 새로운 점',
   },
   zh: {
-    text: 'Deuz SDK 2.4 已发布 — 版本化记忆与上下文编译器、目标监督器与持久调度器、本地 Docker 运行器以及持久聊天流。',
-    link: '2.4 新特性',
+    text: 'Deuz SDK 2.5 已发布 — 面向编码代理的预算计量器与 deuz CLI、作为受预算约束子代理的编码代理、面向编辑器的 ACP、工具搜索，以及 MCP 资源与提示词。',
+    link: '2.5 新特性',
   },
 };
 
@@ -112,10 +112,10 @@ export default async function Layout({ params, children }: LayoutProps<'/[lang]'
     >
       <body className="flex min-h-screen flex-col">
         <RootProvider i18n={i18nProvider(translations, lang)}>
-          <Banner id="deuz-sdk-2-4">
+          <Banner id="deuz-sdk-2-5">
             {banner.text}{' '}
             <Link
-              href={localePath(locale, '/docs/reference/whats-new-2-4')}
+              href={localePath(locale, '/docs/reference/whats-new-2-5')}
               className="font-medium underline underline-offset-4"
             >
               {banner.link}

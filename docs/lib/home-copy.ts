@@ -30,22 +30,22 @@ export type HomeCopy = {
 export const homeCopy: Record<Locale, HomeCopy> = {
   en: {
     badge:
-      'v2.4.0 — versioned memory, a context compiler, a goal supervisor, a Docker runner & durable streams',
+      'v2.5.0 — a budget meter for coding harnesses, the deuz CLI, ACP, tool search & MCP resources and prompts',
     titleA: 'One canonical wire for',
     titleB: 'every AI provider',
     lead: 'Pure · Web-first · Multi-provider AI SDK for TypeScript',
     description:
-      '29 providers behind one StreamPart delta stream. Zero runtime dependencies — SQLite, Redis and Postgres packs, guardrails and handoffs in the loop, MCP that connects itself. Runs anywhere fetch runs.',
+      '29 providers behind one StreamPart delta stream. Zero runtime dependencies — SQLite, Redis and Postgres packs, guardrails and handoffs in the loop, MCP that connects itself. A Web-API-only core, built for anywhere fetch runs.',
     ctaDocs: 'Get started',
-    ctaWhatsNew: 'What is new in 2.4',
+    ctaWhatsNew: 'What is new in 2.5',
     worksWith: 'One API surface across',
     providersMore:
       'Each mark opens its guide. Any other OpenAI-compatible host works through createOpenAICompatible.',
     stats: [
       { value: '29', label: 'provider ids' },
-      { value: '80', label: 'subpaths' },
+      { value: '88', label: 'subpaths' },
       { value: '3', label: 'database packs' },
-      { value: '2.3 → 2.4', label: 'mostly additive' },
+      { value: '2.4 → 2.5', label: 'mostly additive' },
     ],
     features: {
       stream: {
@@ -66,7 +66,7 @@ export const homeCopy: Record<Locale, HomeCopy> = {
       },
       edge: {
         title: 'Edge-safe core',
-        body: 'Web APIs only — no node:*, no Buffer, no ambient state. Node, Deno, Bun, Vercel Edge and Cloudflare Workers.',
+        body: 'Web APIs only — no node:*, no Buffer, no ambient state. Tested on Node; a browser-platform bundle build keeps Node-only code out.',
       },
       media: {
         title: 'Speech, transcription, video',
@@ -84,7 +84,7 @@ export const homeCopy: Record<Locale, HomeCopy> = {
     skillsList: [
       {
         name: 'deuz-sdk',
-        body: 'The whole surface: the invariants, a task-to-file router, and twenty-five reference files loaded only when a task needs them.',
+        body: 'The whole surface: the invariants, a task-to-file router, and twenty-six reference files loaded only when a task needs them.',
       },
       {
         name: 'migrate-from-ai-sdk',
@@ -94,26 +94,26 @@ export const homeCopy: Record<Locale, HomeCopy> = {
     languagesLabel: 'Documentation UI',
     footerDocs: 'Documentation',
     footerChangelog: 'Changelog',
-    footerWhatsNew: 'What is new in 2.4',
+    footerWhatsNew: 'What is new in 2.5',
   },
   de: {
     badge:
-      'v2.4.0 — versioniertes Gedächtnis, Kontext-Compiler, Goal-Supervisor, Docker-Runner und dauerhafte Streams',
+      'v2.5.0 — Budget-Meter für Coding-Harnesses, die deuz-CLI, ACP, Tool-Suche sowie MCP-Ressourcen und -Prompts',
     titleA: 'Ein kanonisches Protokoll für',
     titleB: 'jeden KI-Provider',
     lead: 'Pures · Web-first · Multi-Provider AI SDK für TypeScript',
     description:
-      '29 Provider hinter einem StreamPart-Delta-Stream. Keine Runtime-Abhängigkeiten — SQLite-, Redis- und Postgres-Packs, Guardrails und Handoffs im Loop, MCP das sich selbst verbindet. Läuft überall, wo fetch läuft.',
+      '29 Provider hinter einem StreamPart-Delta-Stream. Keine Runtime-Abhängigkeiten — SQLite-, Redis- und Postgres-Packs, Guardrails und Handoffs im Loop, MCP das sich selbst verbindet. Ein Kern nur aus Web-APIs, gebaut für jede Umgebung mit fetch.',
     ctaDocs: 'Loslegen',
-    ctaWhatsNew: 'Neu in 2.4',
+    ctaWhatsNew: 'Neu in 2.5',
     worksWith: 'Eine API-Oberfläche für',
     providersMore:
       'Jedes Zeichen öffnet seine Anleitung. Jeder andere OpenAI-kompatible Host läuft über createOpenAICompatible.',
     stats: [
       { value: '29', label: 'Provider-IDs' },
-      { value: '80', label: 'Subpfade' },
+      { value: '88', label: 'Subpfade' },
       { value: '3', label: 'Datenbank-Packs' },
-      { value: '2.3 → 2.4', label: 'größtenteils additiv' },
+      { value: '2.4 → 2.5', label: 'größtenteils additiv' },
     ],
     features: {
       stream: {
@@ -134,7 +134,7 @@ export const homeCopy: Record<Locale, HomeCopy> = {
       },
       edge: {
         title: 'Edge-sicherer Kern',
-        body: 'Nur Web-APIs — kein node:*, kein Buffer, kein Umgebungszustand. Node, Deno, Bun, Vercel Edge und Cloudflare Workers.',
+        body: 'Nur Web-APIs — kein node:*, kein Buffer, kein Umgebungszustand. Getestet auf Node; ein Bundle-Build für die Browser-Plattform hält Node-only-Code fern.',
       },
       media: {
         title: 'Sprache, Transkription, Video',
@@ -162,26 +162,26 @@ export const homeCopy: Record<Locale, HomeCopy> = {
     languagesLabel: 'Dokumentations-UI',
     footerDocs: 'Dokumentation',
     footerChangelog: 'Changelog',
-    footerWhatsNew: 'Neu in 2.4',
+    footerWhatsNew: 'Neu in 2.5',
   },
   tr: {
     badge:
-      'v2.4.0 — sürümlü bellek, bağlam derleyicisi, hedef denetleyicisi, Docker çalıştırıcısı ve kalıcı akışlar',
+      'v2.5.0 — kodlama araçları için bütçe ölçer, deuz CLI, ACP, araç arama ve MCP kaynakları ile prompt’ları',
     titleA: 'Tüm yapay zeka sağlayıcıları için',
     titleB: 'tek kanonik protokol',
     lead: 'Saf · Web öncelikli · Çok sağlayıcılı TypeScript AI SDK',
     description:
-      '29 sağlayıcı, tek bir StreamPart delta akışının arkasında. Sıfır çalışma zamanı bağımlılığı — SQLite, Redis ve Postgres paketleri, döngüde guardrail ve handoff, kendini bağlayan MCP. fetch’in çalıştığı her yerde çalışır.',
+      '29 sağlayıcı, tek bir StreamPart delta akışının arkasında. Sıfır çalışma zamanı bağımlılığı — SQLite, Redis ve Postgres paketleri, döngüde guardrail ve handoff, kendini bağlayan MCP. Yalnızca Web API’leri kullanan, fetch’in olduğu her ortam için tasarlanmış bir çekirdek.',
     ctaDocs: 'Başla',
-    ctaWhatsNew: '2.4’te neler yeni',
+    ctaWhatsNew: '2.5’te neler yeni',
     worksWith: 'Tek API yüzeyi:',
     providersMore:
       'Her işaret kendi rehberini açar. Diğer OpenAI uyumlu her sunucu createOpenAICompatible ile çalışır.',
     stats: [
       { value: '29', label: 'sağlayıcı kimliği' },
-      { value: '80', label: 'alt yol' },
+      { value: '88', label: 'alt yol' },
       { value: '3', label: 'veritabanı paketi' },
-      { value: '2.3 → 2.4', label: 'çoğunlukla eklemeli' },
+      { value: '2.4 → 2.5', label: 'çoğunlukla eklemeli' },
     ],
     features: {
       stream: {
@@ -202,7 +202,7 @@ export const homeCopy: Record<Locale, HomeCopy> = {
       },
       edge: {
         title: 'Edge-güvenli çekirdek',
-        body: 'Yalnızca Web API’leri — node:* yok, Buffer yok, ortam durumu yok. Node, Deno, Bun, Vercel Edge ve Cloudflare Workers.',
+        body: 'Yalnızca Web API’leri — node:* yok, Buffer yok, ortam durumu yok. Node üzerinde test edilir; tarayıcı platformu için bir paket derlemesi yalnızca Node’a özgü kodu dışarıda tutar.',
       },
       media: {
         title: 'Konuşma, transkripsiyon, video',
@@ -230,26 +230,26 @@ export const homeCopy: Record<Locale, HomeCopy> = {
     languagesLabel: 'Dokümantasyon arayüzü',
     footerDocs: 'Dokümantasyon',
     footerChangelog: 'Sürüm notları',
-    footerWhatsNew: '2.4’te neler yeni',
+    footerWhatsNew: '2.5’te neler yeni',
   },
   fr: {
     badge:
-      'v2.4.0 — Mémoire versionnée, compilateur de contexte, superviseur d’objectifs, exécuteur Docker et flux durables',
+      'v2.5.0 — Compteur de budget pour les agents de code, CLI deuz, ACP, recherche d’outils, ressources et prompts MCP',
     titleA: 'Un protocole canonique pour',
     titleB: 'chaque fournisseur d’IA',
     lead: 'SDK IA TypeScript pur · web-first · multi-fournisseur',
     description:
-      '29 fournisseurs derrière un seul flux delta StreamPart. Zéro dépendance runtime — packs SQLite, Redis et Postgres, guardrails et handoffs dans la boucle, MCP qui se connecte tout seul. Fonctionne partout où fetch fonctionne.',
+      '29 fournisseurs derrière un seul flux delta StreamPart. Zéro dépendance runtime — packs SQLite, Redis et Postgres, guardrails et handoffs dans la boucle, MCP qui se connecte tout seul. Un cœur uniquement en API Web, conçu pour tout environnement doté de fetch.',
     ctaDocs: 'Commencer',
-    ctaWhatsNew: 'Nouveautés de la 2.4',
+    ctaWhatsNew: 'Nouveautés de la 2.5',
     worksWith: 'Une seule surface d’API pour',
     providersMore:
       'Chaque marque ouvre son guide. Tout autre hôte compatible OpenAI passe par createOpenAICompatible.',
     stats: [
       { value: '29', label: 'ids de fournisseur' },
-      { value: '80', label: 'sous-chemins' },
+      { value: '88', label: 'sous-chemins' },
       { value: '3', label: 'packs base de données' },
-      { value: '2.3 → 2.4', label: 'surtout additif' },
+      { value: '2.4 → 2.5', label: 'surtout additif' },
     ],
     features: {
       stream: {
@@ -270,7 +270,7 @@ export const homeCopy: Record<Locale, HomeCopy> = {
       },
       edge: {
         title: 'Cœur edge-safe',
-        body: 'API Web uniquement — pas de node:*, pas de Buffer, pas d’état ambiant. Node, Deno, Bun, Vercel Edge et Cloudflare Workers.',
+        body: 'API Web uniquement — pas de node:*, pas de Buffer, pas d’état ambiant. Testé sur Node, et un build de bundle pour la plateforme navigateur écarte le code propre à Node.',
       },
       media: {
         title: 'Parole, transcription, vidéo',
@@ -298,26 +298,26 @@ export const homeCopy: Record<Locale, HomeCopy> = {
     languagesLabel: 'Interface de la documentation',
     footerDocs: 'Documentation',
     footerChangelog: 'Journal des modifications',
-    footerWhatsNew: 'Nouveautés de la 2.4',
+    footerWhatsNew: 'Nouveautés de la 2.5',
   },
   it: {
     badge:
-      'v2.4.0 — Memoria versionata, compilatore di contesto, supervisore degli obiettivi, runner Docker e stream durevoli',
+      'v2.5.0 — Contatore di budget per gli agenti di coding, CLI deuz, ACP, ricerca degli strumenti, risorse e prompt MCP',
     titleA: 'Un protocollo canonico per',
     titleB: 'ogni provider di IA',
     lead: 'SDK IA TypeScript puro · web-first · multi-provider',
     description:
-      '29 provider dietro un unico stream delta StreamPart. Zero dipendenze runtime — pack SQLite, Redis e Postgres, guardrail e handoff nel loop, MCP che si connette da solo. Funziona ovunque funzioni fetch.',
+      '29 provider dietro un unico stream delta StreamPart. Zero dipendenze runtime — pack SQLite, Redis e Postgres, guardrail e handoff nel loop, MCP che si connette da solo. Un core solo Web API, pensato per ogni ambiente con fetch.',
     ctaDocs: 'Inizia',
-    ctaWhatsNew: 'Novità della 2.4',
+    ctaWhatsNew: 'Novità della 2.5',
     worksWith: 'Un’unica superficie API per',
     providersMore:
       'Ogni marchio apre la sua guida. Qualsiasi altro host compatibile con OpenAI passa da createOpenAICompatible.',
     stats: [
       { value: '29', label: 'id provider' },
-      { value: '80', label: 'sottopath' },
+      { value: '88', label: 'sottopath' },
       { value: '3', label: 'pack database' },
-      { value: '2.3 → 2.4', label: 'per lo più additivo' },
+      { value: '2.4 → 2.5', label: 'per lo più additivo' },
     ],
     features: {
       stream: {
@@ -338,7 +338,7 @@ export const homeCopy: Record<Locale, HomeCopy> = {
       },
       edge: {
         title: 'Core edge-safe',
-        body: 'Solo Web API — niente node:*, niente Buffer, nessuno stato ambientale. Node, Deno, Bun, Vercel Edge e Cloudflare Workers.',
+        body: 'Solo Web API — niente node:*, niente Buffer, nessuno stato ambientale. Testato su Node; una build del bundle per la piattaforma browser tiene fuori il codice solo-Node.',
       },
       media: {
         title: 'Speech, trascrizione, video',
@@ -366,26 +366,26 @@ export const homeCopy: Record<Locale, HomeCopy> = {
     languagesLabel: 'Interfaccia della documentazione',
     footerDocs: 'Documentazione',
     footerChangelog: 'Changelog',
-    footerWhatsNew: 'Novità della 2.4',
+    footerWhatsNew: 'Novità della 2.5',
   },
   es: {
     badge:
-      'v2.4.0 — Memoria versionada, compilador de contexto, supervisor de objetivos, ejecutor Docker y streams duraderos',
+      'v2.5.0 — Medidor de presupuesto para agentes de código, CLI deuz, ACP, búsqueda de herramientas, recursos y prompts MCP',
     titleA: 'Un protocolo canónico para',
     titleB: 'cada proveedor de IA',
     lead: 'SDK de IA para TypeScript puro · web-first · multiproveedor',
     description:
-      '29 proveedores detrás de un único stream delta StreamPart. Cero dependencias en tiempo de ejecución — packs SQLite, Redis y Postgres, guardrails y handoffs en el bucle, MCP que se conecta solo. Funciona dondequiera que funcione fetch.',
+      '29 proveedores detrás de un único stream delta StreamPart. Cero dependencias en tiempo de ejecución — packs SQLite, Redis y Postgres, guardrails y handoffs en el bucle, MCP que se conecta solo. Un núcleo solo con Web APIs, pensado para cualquier entorno con fetch.',
     ctaDocs: 'Empezar',
-    ctaWhatsNew: 'Novedades de 2.4',
+    ctaWhatsNew: 'Novedades de 2.5',
     worksWith: 'Una sola superficie de API para',
     providersMore:
       'Cada marca abre su guía. Cualquier otro host compatible con OpenAI funciona mediante createOpenAICompatible.',
     stats: [
       { value: '29', label: 'ids de proveedor' },
-      { value: '80', label: 'subrutas' },
+      { value: '88', label: 'subrutas' },
       { value: '3', label: 'packs de base de datos' },
-      { value: '2.3 → 2.4', label: 'casi todo aditivo' },
+      { value: '2.4 → 2.5', label: 'casi todo aditivo' },
     ],
     features: {
       stream: {
@@ -406,7 +406,7 @@ export const homeCopy: Record<Locale, HomeCopy> = {
       },
       edge: {
         title: 'Núcleo edge-safe',
-        body: 'Solo Web APIs — sin node:*, sin Buffer, sin estado ambiental. Node, Deno, Bun, Vercel Edge y Cloudflare Workers.',
+        body: 'Solo Web APIs — sin node:*, sin Buffer, sin estado ambiental. Probado en Node; una compilación del bundle para la plataforma navegador deja fuera el código exclusivo de Node.',
       },
       media: {
         title: 'Voz, transcripción, vídeo',
@@ -434,26 +434,26 @@ export const homeCopy: Record<Locale, HomeCopy> = {
     languagesLabel: 'Interfaz de la documentación',
     footerDocs: 'Documentación',
     footerChangelog: 'Registro de cambios',
-    footerWhatsNew: 'Novedades de 2.4',
+    footerWhatsNew: 'Novedades de 2.5',
   },
   ru: {
     badge:
-      'v2.4.0 — версионируемая память, компилятор контекста, супервизор целей, Docker-раннер и надёжные потоки',
+      'v2.5.0 — счётчик бюджета для агентов программирования, CLI deuz, ACP, поиск инструментов, ресурсы и промпты MCP',
     titleA: 'Один канонический протокол для',
     titleB: 'каждого ИИ-провайдера',
     lead: 'Чистый · web-first · мультипровайдерный TypeScript AI SDK',
     description:
-      '29 провайдеров за одним дельта-потоком StreamPart. Ноль runtime-зависимостей — пакеты SQLite, Redis и Postgres, guardrail и handoff в цикле, MCP, который подключается сам. Работает везде, где работает fetch.',
+      '29 провайдеров за одним дельта-потоком StreamPart. Ноль runtime-зависимостей — пакеты SQLite, Redis и Postgres, guardrail и handoff в цикле, MCP, который подключается сам. Ядро только на Web API, рассчитанное на любую среду с fetch.',
     ctaDocs: 'Начать',
-    ctaWhatsNew: 'Что нового в 2.4',
+    ctaWhatsNew: 'Что нового в 2.5',
     worksWith: 'Единая поверхность API для',
     providersMore:
       'Каждый знак открывает своё руководство. Любой другой OpenAI-совместимый хост работает через createOpenAICompatible.',
     stats: [
       { value: '29', label: 'id провайдеров' },
-      { value: '80', label: 'подпутей' },
+      { value: '88', label: 'подпутей' },
       { value: '3', label: 'пакета БД' },
-      { value: '2.3 → 2.4', label: 'в основном аддитивно' },
+      { value: '2.4 → 2.5', label: 'в основном аддитивно' },
     ],
     features: {
       stream: {
@@ -474,7 +474,7 @@ export const homeCopy: Record<Locale, HomeCopy> = {
       },
       edge: {
         title: 'Edge-безопасное ядро',
-        body: 'Только Web API — без node:*, без Buffer, без внешнего состояния. Node, Deno, Bun, Vercel Edge и Cloudflare Workers.',
+        body: 'Только Web API — без node:*, без Buffer, без внешнего состояния. Тестируется на Node; сборка бандла под браузерную платформу не пропускает код только для Node.',
       },
       media: {
         title: 'Речь, транскрипция, видео',
@@ -502,26 +502,26 @@ export const homeCopy: Record<Locale, HomeCopy> = {
     languagesLabel: 'Интерфейс документации',
     footerDocs: 'Документация',
     footerChangelog: 'История изменений',
-    footerWhatsNew: 'Что нового в 2.4',
+    footerWhatsNew: 'Что нового в 2.5',
   },
   ja: {
     badge:
-      'v2.4.0 — バージョン管理メモリ、コンテキストコンパイラ、ゴールスーパーバイザー、Docker ランナー、永続ストリーム',
+      'v2.5.0 — コーディングエージェント向け予算メーター、deuz CLI、ACP、ツール検索、MCP リソースとプロンプト',
     titleA: 'すべての AI プロバイダーを',
     titleB: 'ひとつの正規プロトコルで',
     lead: 'ピュア · ウェブファースト · マルチプロバイダー TypeScript AI SDK',
     description:
-      '29 のプロバイダーを単一の StreamPart デルタストリームの背後に統合。ランタイム依存ゼロ — SQLite / Redis / Postgres パック、ループ内のガードレールとハンドオフ、自分で接続する MCP。fetch が動くところならどこでも動きます。',
+      '29 のプロバイダーを単一の StreamPart デルタストリームの背後に統合。ランタイム依存ゼロ — SQLite / Redis / Postgres パック、ループ内のガードレールとハンドオフ、自分で接続する MCP。Web API のみのコアで、fetch のある環境を対象に設計されています。',
     ctaDocs: 'はじめる',
-    ctaWhatsNew: '2.4 の新機能',
+    ctaWhatsNew: '2.5 の新機能',
     worksWith: '単一の API サーフェスで',
     providersMore:
       '各マークをクリックするとガイドが開きます。その他の OpenAI 互換ホストは createOpenAICompatible で利用できます。',
     stats: [
       { value: '29', label: 'プロバイダー ID' },
-      { value: '80', label: 'サブパス' },
+      { value: '88', label: 'サブパス' },
       { value: '3', label: 'データベースパック' },
-      { value: '2.3 → 2.4', label: 'ほぼ加算的' },
+      { value: '2.4 → 2.5', label: 'ほぼ加算的' },
     ],
     features: {
       stream: {
@@ -542,7 +542,7 @@ export const homeCopy: Record<Locale, HomeCopy> = {
       },
       edge: {
         title: 'エッジセーフなコア',
-        body: 'Web API のみ — node:* なし、Buffer なし、環境状態なし。Node、Deno、Bun、Vercel Edge、Cloudflare Workers で動作。',
+        body: 'Web API のみ — node:* なし、Buffer なし、環境状態なし。Node でテスト済み。ブラウザープラットフォーム向けのバンドルビルドが Node 専用コードの混入を防ぎます。',
       },
       media: {
         title: '音声・文字起こし・動画',
@@ -560,7 +560,7 @@ export const homeCopy: Record<Locale, HomeCopy> = {
     skillsList: [
       {
         name: 'deuz-sdk',
-        body: '表面のすべて: 不変条件、タスクからファイルへのルーター、必要なときだけ読み込まれる 25 個のリファレンス。',
+        body: '表面のすべて: 不変条件、タスクからファイルへのルーター、必要なときだけ読み込まれる 26 個のリファレンス。',
       },
       {
         name: 'migrate-from-ai-sdk',
@@ -570,25 +570,25 @@ export const homeCopy: Record<Locale, HomeCopy> = {
     languagesLabel: 'ドキュメント UI',
     footerDocs: 'ドキュメント',
     footerChangelog: '変更履歴',
-    footerWhatsNew: '2.4 の新機能',
+    footerWhatsNew: '2.5 の新機能',
   },
   ko: {
-    badge: 'v2.4.0 — 버전 관리 메모리, 컨텍스트 컴파일러, 목표 감독자, Docker 러너, 영속 스트림',
+    badge: 'v2.5.0 — 코딩 에이전트용 예산 미터, deuz CLI, ACP, 도구 검색, MCP 리소스와 프롬프트',
     titleA: '모든 AI 프로바이더를 위한',
     titleB: '단 하나의 정규 프로토콜',
     lead: '순수 · 웹 우선 · 멀티 프로바이더 TypeScript AI SDK',
     description:
-      '29개 프로바이더를 하나의 StreamPart 델타 스트림 뒤에 둡니다. 런타임 의존성 제로 — SQLite, Redis, Postgres 팩, 루프 안의 가드레일과 핸드오프, 스스로 연결하는 MCP. fetch가 동작하는 곳이라면 어디서든 실행됩니다.',
+      '29개 프로바이더를 하나의 StreamPart 델타 스트림 뒤에 둡니다. 런타임 의존성 제로 — SQLite, Redis, Postgres 팩, 루프 안의 가드레일과 핸드오프, 스스로 연결하는 MCP. Web API만 쓰는 코어로, fetch가 있는 환경을 대상으로 설계되었습니다.',
     ctaDocs: '시작하기',
-    ctaWhatsNew: '2.4의 새로운 점',
+    ctaWhatsNew: '2.5의 새로운 점',
     worksWith: '단일 API 표면:',
     providersMore:
       '각 마크를 누르면 안내 문서가 열립니다. 그 밖의 OpenAI 호환 호스트는 createOpenAICompatible로 사용할 수 있습니다.',
     stats: [
       { value: '29', label: '프로바이더 id' },
-      { value: '80', label: '서브패스' },
+      { value: '88', label: '서브패스' },
       { value: '3', label: '데이터베이스 팩' },
-      { value: '2.3 → 2.4', label: '대부분 가산적' },
+      { value: '2.4 → 2.5', label: '대부분 가산적' },
     ],
     features: {
       stream: {
@@ -609,7 +609,7 @@ export const homeCopy: Record<Locale, HomeCopy> = {
       },
       edge: {
         title: '엣지 안전 코어',
-        body: 'Web API만 사용 — node:* 없음, Buffer 없음, 환경 상태 없음. Node, Deno, Bun, Vercel Edge, Cloudflare Workers.',
+        body: 'Web API만 사용 — node:* 없음, Buffer 없음, 환경 상태 없음. Node에서 테스트합니다. 브라우저 플랫폼용 번들 빌드가 Node 전용 코드의 유입을 막습니다.',
       },
       media: {
         title: '음성, 전사, 비디오',
@@ -627,7 +627,7 @@ export const homeCopy: Record<Locale, HomeCopy> = {
     skillsList: [
       {
         name: 'deuz-sdk',
-        body: '표면 전체: 불변 조건, 작업에서 파일로 가는 라우터, 필요할 때만 로드되는 25개의 레퍼런스 파일.',
+        body: '표면 전체: 불변 조건, 작업에서 파일로 가는 라우터, 필요할 때만 로드되는 26개의 레퍼런스 파일.',
       },
       {
         name: 'migrate-from-ai-sdk',
@@ -637,25 +637,25 @@ export const homeCopy: Record<Locale, HomeCopy> = {
     languagesLabel: '문서 UI',
     footerDocs: '문서',
     footerChangelog: '변경 이력',
-    footerWhatsNew: '2.4의 새로운 점',
+    footerWhatsNew: '2.5의 새로운 점',
   },
   zh: {
-    badge: 'v2.4.0 — 版本化记忆、上下文编译器、目标监督器、Docker 运行器与持久流',
+    badge: 'v2.5.0 — 面向编码代理的预算计量器、deuz CLI、ACP、工具搜索以及 MCP 资源与提示词',
     titleA: '为每一个 AI 提供商',
     titleB: '提供同一条规范协议',
     lead: '纯净 · Web 优先 · 多提供商 TypeScript AI SDK',
     description:
-      '29 个提供商统一在同一条 StreamPart 增量流之后。零运行时依赖 — SQLite、Redis、Postgres 包，循环内的护栏与交接，会自己连接的 MCP。fetch 能运行的地方就能运行。',
+      '29 个提供商统一在同一条 StreamPart 增量流之后。零运行时依赖 — SQLite、Redis、Postgres 包，循环内的护栏与交接，会自己连接的 MCP。核心仅使用 Web API，面向任何提供 fetch 的环境。',
     ctaDocs: '快速开始',
-    ctaWhatsNew: '2.4 新特性',
+    ctaWhatsNew: '2.5 新特性',
     worksWith: '同一套 API 表面覆盖',
     providersMore:
       '点击任一标识即可打开对应指南。其他 OpenAI 兼容主机可通过 createOpenAICompatible 使用。',
     stats: [
       { value: '29', label: '提供商 id' },
-      { value: '80', label: '子路径' },
+      { value: '88', label: '子路径' },
       { value: '3', label: '数据库包' },
-      { value: '2.3 → 2.4', label: '几乎全部是加法' },
+      { value: '2.4 → 2.5', label: '几乎全部是加法' },
     ],
     features: {
       stream: {
@@ -676,7 +676,7 @@ export const homeCopy: Record<Locale, HomeCopy> = {
       },
       edge: {
         title: '边缘安全内核',
-        body: '仅使用 Web API — 没有 node:*、没有 Buffer、没有环境状态。Node、Deno、Bun、Vercel Edge 和 Cloudflare Workers 均可运行。',
+        body: '仅使用 Web API — 没有 node:*、没有 Buffer、没有环境状态。在 Node 上测试；面向浏览器平台的打包构建会把仅限 Node 的代码挡在外面。',
       },
       media: {
         title: '语音、转写、视频',
@@ -701,6 +701,6 @@ export const homeCopy: Record<Locale, HomeCopy> = {
     languagesLabel: '文档界面',
     footerDocs: '文档',
     footerChangelog: '更新日志',
-    footerWhatsNew: '2.4 新特性',
+    footerWhatsNew: '2.5 新特性',
   },
 };

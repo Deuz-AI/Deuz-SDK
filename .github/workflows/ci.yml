@@ -22,6 +22,11 @@ jobs:
     # + verify:size + verify:api. It is the same gate release:verify (and
     # therefore release.yml) runs, so this job needs no extra steps: anything
     # added to the root `check` script is picked up here automatically.
+    # It covers all five published packages: the root `build` builds them in
+    # dependency order (core first; react, ai-sdk-provider, mcp-ledger and cli
+    # import its dist), and the other root scripts run in every workspace that
+    # defines them. verify:package of mcp-ledger and cli also runs each built bin
+    # with --version.
     #
     # verify:docs-refs (packages/core/tooling/verify-docs.mjs) is the cheap
     # static lint over docs/ + skills/ + README.md — leaked tool-call debris,

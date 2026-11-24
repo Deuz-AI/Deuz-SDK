@@ -9,6 +9,8 @@ Provider, transport, and orchestration failures use the typed `DeuzError` contra
 import { DeuzError, isDeuzError, RateLimitError, AuthenticationError } from '@deuz-sdk/core';
 ```
 
+Since 2.5, `@deuz-sdk/core/errors` exports the same classes without loading the root entry (for a library or a small edge bundle that only needs to recognise them), plus the core error classes the root leaves to their subpaths: `ContextBudgetExceededError`, `RevisionConflictError`, `OperationConflictError`, `EmbeddingMismatchError` and `UnsupportedStoreError`. They are the same class objects every other entry exports, so `instanceof` agrees across entries. The module-specific errors (`McpLedgerError`, `MeterError`, `AcpError`, `ToolSearchError` and the like) stay on their own subpaths and packages.
+
 <Callout title="Prefer `isDeuzError` over `instanceof` at package boundaries">
 `instanceof` breaks across duplicate package copies and across realms (a worker, a bundled dependency that pinned its own version). `isDeuzError(value)` checks a `Symbol.for`-branded field instead, so it stays reliable. Use `instanceof` for the *specific* subclasses when you need their fields, and `isDeuzError` for the "is this one of ours?" question.
 </Callout>

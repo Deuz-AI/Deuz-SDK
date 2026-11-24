@@ -247,7 +247,7 @@ scenario(
         labels: {
           'deuz.operation-id': 'iso',
           'deuz.scope': backend.scope,
-          'deuz.sdk-version': '2.4.0',
+          'deuz.sdk-version': '2.5.0',
           'deuz.kind': 'process',
         },
       });

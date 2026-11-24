@@ -1,0 +1,355 @@
+---
+title: Tool search
+description: Keep a large tool catalog out of the model's context behind one search tool that knows the run's budget and execution policy — lexical BM25, no dependencies, legacy loop and native runs (2.5).
+---
+
+`@deuz-sdk/core/tool-search` (2.5) puts a large catalog behind one search tool.
+The model sees the search tool and a few always-loaded tools. It calls the
+search with a query, the result lists the matching tools, and those tools are
+callable from the next step on. A catalog of 200 tools no longer costs 200 tool
+definitions on every request.
+
+What sets it apart from a plain tool search is that it is also a policy layer:
+
+- a tool the [execution policy](/docs/modules/native-agents) would refuse is
+  never returned; only a count of withheld tools is;
+- a tool whose estimated cost does not fit the remaining
+  [budget](/docs/modules/budgets) is left out, or labelled, as you choose;
+- approval-gated and expensive tools are labelled, so the model chooses with
+  the run's limits in view.
+
+There is no parallel mechanism. `apply()` uses the seam the loops already have:
+a `prepareStep` that returns `activeTools`. `generateText`, `streamChat` and a
+native `runAgent` decide each step's tool set exactly as they would for a
+`prepareStep` you wrote yourself. The module is edge-safe: no clock, no I/O and
+no ambient state.
+
+| Export | What it is |
+| --- | --- |
+| `createToolSearch(options)` | A search over one catalog: `apply`, `search`, `tools`, `prepareStep`, `guardrail` |
+| `searchTools(query, options)` | A one-shot search without a model |
+| `withSearchMeta(tool, meta)` / `searchMetaOf(tool)` | Attach or read cost and keyword metadata |
+| `remainingFromBudgetStore(store, scopes, now?)` | The budget persistent scopes have left |
+| `remainingFromExecution(execution)` | The budget an execution context has left |
+| `createToolIndex(entries)` / `tokenizeForSearch(text)` | The bare BM25 index and its tokenizer |
+| `TOOL_SEARCH_NAME`, `ToolSearchError` | `'tool_search'`; the error with code `invalid_options` or `invalid_query` |
+
+## Search, then call
+
+This complete example uses a deterministic model, so it needs no API key. The
+model searches first, then calls the tool the search surfaced.
+
+```ts title="tool-search.ts"
+import { generateText } from '@deuz-sdk/core';
+import type { ToolSet } from '@deuz-sdk/core';
+import { createToolSearch } from '@deuz-sdk/core/tool-search';
+import { createMockModel } from '@deuz-sdk/core/testing';
+
+const object = (properties: Record<string, unknown>) => ({ type: 'object', properties });
+
+const catalog: ToolSet = {
+  send_email: {
+    description: 'Send an email message to a recipient.',
+    parameters: object({ to: { type: 'string', description: 'Recipient address' } }),
+    execute: async () => 'sent',
+  },
+  render_video: {
+    description: 'Render a video clip from a script.',
+    parameters: object({ script: { type: 'string' } }),
+    execute: async () => 'video.mp4',
+  },
+  get_time: { description: 'Current time.', parameters: object({}), execute: async () => 'noon' },
+  // ...hundreds more
+};
+
+const search = createToolSearch({ tools: catalog, alwaysLoaded: ['get_time'] });
+
+const model = createMockModel({
+  responses: [
+    { toolCalls: [{ toolName: 'tool_search', args: { query: 'send an email' } }] },
+    { toolCalls: [{ toolName: 'send_email', args: { to: 'bob@example.com' } }] },
+    { text: 'Mail sent.' },
+  ],
+});
+
+const result = await generateText(search.apply({ model, prompt: 'Mail Bob.', maxSteps: 5 }));
+console.log(result.text); // 'Mail sent.'
+```
+
+The first request offers only `tool_search` and `get_time`. The second also
+offers `send_email`, because the search returned it; `render_video` is never
+sent. A native run takes the same one-liner:
+`await runAgent(search.apply({ model, prompt, maxSteps: 5 }))`.
+
+The model's search result, as it enters the history, looks like this:
+
+```json
+{
+  "query": "send an email",
+  "tools": [{ "name": "send_email", "description": "Send an email message to a recipient." }],
+  "note": "…"
+}
+```
+
+A tool that is gated, costly or over budget carries `requiresApproval`,
+`estimatedCost`, `expensive` or `overBudget`; a label appears only when it
+applies. `withheld: { budget, policy }` counts the matching tools that were left
+out. The query `select:send_email,get_time` loads tools by exact name; the
+policy and budget filters still apply to it.
+
+## What `apply()` changes
+
+`search.apply(callOptions)` returns your call options with three changes:
+
+- **`tools`** becomes your own tools, plus the catalog, plus the search tool.
+  Your own tools that are not in the catalog stay always loaded.
+- **`prepareStep`** runs your `prepareStep` first, then sets `activeTools` to
+  the search tool, the `alwaysLoaded` tools, the tools surfaced in the history
+  and your extras. Your static `activeTools` and any per-step `activeTools`
+  can only narrow that set. When nothing is left, the step is sent with only
+  the search tool and `toolChoice: 'none'`, so the loop never falls back to
+  offering every tool.
+- **`guardrails.onToolCall`** gets a guardrail of its own first, named
+  `'tool-search'`, when `enforce` is on (the default). It judges catalog tools
+  as `search.guardrail` does, and also refuses any tool the step never offered:
+  only the search tool, the `alwaysLoaded` tools and your own `tools` pass
+  besides catalog tools. See [Enforcement](#enforcement).
+
+It throws `ToolSearchError('invalid_options')` when your own `tools` already
+hold a different tool under the search tool's name.
+
+Its signature is
+`apply<O extends object>(options: O & ToolSearchCallOptions): ToolSearchApplied<O, T>`.
+The result keeps every other field of your options with its own type, so a
+literal such as `checkpointVersion: 3` still selects the matching `runAgent`
+overload, and `tools`, `prepareStep` (always the composed one) and
+`guardrails` are retyped. Because the search tool's name is configurable,
+`applied.tools.tool_search` is `ToolSearchTool | undefined` under
+`noUncheckedIndexedAccess`. One check is loose: a wrong return type of your own
+`prepareStep` (for example `() => 42`) is not reported; wrong `activeTools` and
+`guardrails` shapes are.
+
+If you prefer to wire it yourself, the pieces are public: `search.tools`,
+`search.prepareStep`, `search.guardrail`, `search.activeTools(messages)` and
+`search.surfaced(messages)`.
+
+## Options
+
+| Option | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `tools` | `ToolSet` or `AgentToolSet` | — | The full catalog. Every tool not in `alwaysLoaded` is deferred. |
+| `alwaysLoaded` | `string[]` | `[]` | Offered on every step without a search. A name outside `tools` is passed through unchanged. |
+| `name` | `string` | `'tool_search'` | The search tool's name. Must not name a catalog tool. |
+| `description` | `string` | built in | Replaces the search tool's description. |
+| `maxResults` | `number` | `5` | Most tools one search returns, and the cap on the model's `limit`. |
+| `meta` | `Record<string, ToolSearchMeta>` | — | `{ cost?: { usd?, tokens? }, keywords? }` per tool name. Wins over `withSearchMeta`. |
+| `budget` | `ToolSearchBudgetOptions` | — | `remaining`, `overBudget`, `expensive`; see below. |
+| `policy` | `ExecutionPolicy` | — | Intersected with the run's own execution policy. |
+| `enforce` | `boolean` | `true` | Refuse a deferred tool the history never surfaced, and any tool the step never offered. |
+
+`createToolSearch` throws `ToolSearchError('invalid_options')` for a search
+name that names a catalog tool, a `maxResults` that is not a positive integer,
+or invalid metadata, and `ExecutionPolicyError` for an invalid `policy`.
+
+### Metadata
+
+A tool's cost and extra search words live outside the `Tool` type, so no wire
+and no loop ever reads them. Give them by name in `meta`, or attach them to the
+tool:
+
+```ts
+import { withSearchMeta } from '@deuz-sdk/core/tool-search';
+
+const renderVideo = withSearchMeta(catalog.render_video!, {
+  cost: { usd: 0.4 },            // estimated per call, beyond the model call that issues it
+  keywords: ['clip', 'movie'],   // indexed with the tool's name
+});
+```
+
+`withSearchMeta` returns a shallow copy; the original tool is unchanged.
+
+## Budgets
+
+The search compares each tool's estimated cost with the budget that remains.
+It reads that budget from two sources, and the tighter one wins per dimension:
+
+- `budget.remaining`: a fixed value, or a function called on every search;
+- the call's execution context, automatically. A native run always has one;
+  a legacy call has one when you pass `execution`. `remainingFromExecution`
+  computes it: for each scope on the context's path, its limit minus what its
+  ledger has committed, never below 0.
+
+To read a persistent [`BudgetStore`](/docs/modules/budgets), use
+`remainingFromBudgetStore`:
+
+```ts
+import { createInMemoryBudgetStore } from '@deuz-sdk/core/agent';
+import { createToolSearch, remainingFromBudgetStore } from '@deuz-sdk/core/tool-search';
+
+const store = createInMemoryBudgetStore();
+const scopes = [{ key: 'user:42', limits: { usd: 5 }, window: { ms: 86_400_000 } }];
+
+const search = createToolSearch({
+  tools: catalog,
+  meta: { render_video: { cost: { usd: 0.4 } } },
+  budget: {
+    // A windowed scope needs the current time; without `now` it throws.
+    remaining: () => remainingFromBudgetStore(store, scopes, Date.now()),
+    overBudget: 'exclude',          // or 'label'
+    expensive: { usd: 0.25 },       // label tools at or above $0.25 per call
+  },
+});
+```
+
+- **`overBudget`**: `'exclude'` (the default) leaves a tool that does not fit
+  out of the results, so it is never loaded, and counts it under
+  `withheld.budget`. `'label'` returns it marked `overBudget: true`.
+- **`expensive`**: a fitting tool is labelled `expensive` when its estimate
+  reaches `usd` or `tokens`, or `share` (default 0.5) of the remaining budget
+  in either dimension. Pass `share: 1` or more to label on absolute thresholds
+  only.
+- A tool with no cost estimate is never excluded.
+
+The search filters on the budget when it runs. With `enforce` on and
+`overBudget: 'exclude'`, the guardrail also checks a surfaced tool's cost
+estimate against `budget.remaining` again when the model calls it, and refuses
+the call when the tool no longer fits or that source throws. That call-time
+check reads `budget.remaining` only: a budget that comes only from the
+execution context's ledger is not re-checked there. The loop's own budget and
+ledger still stop spending at step boundaries.
+
+## Approval and policy
+
+- `needsApproval: true` is labelled `requiresApproval: true`. A function
+  `needsApproval` is labelled `'conditional'`. `policy.requireApproval` labels
+  every tool. The labels are information for the model only: the loop's own
+  [approval gate](/docs/agents/tool-loop#approval-gates) still decides, and
+  signed approvals work as they always do.
+- A tool outside `allowedTools` is never returned. The allowed set is the
+  static `policy` intersected with the execution context's policy.
+- When an execution policy has `allowedTools`, list the search tool's name
+  (`'tool_search'`) in it too, or the loop refuses the search call itself.
+
+### Enforcement
+
+With `enforce` on, a deferred tool that the model calls before any search
+surfaced it is refused by an `onToolCall` guardrail named `'tool-search'`. The
+call becomes a `permission-denied` result that tells the model to search
+first. The guardrail runs before the approval gate, so a guessed tool name
+cannot get past the search's own policy and budget filters. A tool that the
+model calls in the same turn as the search that finds it is refused too: the
+model has not seen its schema yet.
+
+The guardrail that `apply()` installs also refuses a call to any tool the
+step never offered: anything that is not the search tool, an `alwaysLoaded`
+tool, one of the call's own `tools` or a catalog tool. That covers the MCP
+tools the loop merges in from the call's `mcp` entries (reason
+`Tool '<name>' is not offered on this step.`). It lets two kinds of call
+through, because the loop then legitimately offers tools the search cannot see:
+
+- **a sub-agent's calls** (the call's `agentPath` is set), since sub-agents
+  inherit the parent's guardrails but run their own tools;
+- **every call after a handoff**, once the history holds a call of one of the
+  call's own `transfer_to_*` tools, since the loop then offers the target's
+  whole tool set.
+
+The standalone `search.guardrail` judges catalog tools only.
+
+The surfaced set is read from the history, which a client can forge. A name
+outside the static `policy`'s `allowedTools` never counts as surfaced, and a
+search result is read only from the result that answers the search call's own
+id, so another tool's result that reuses that id is not taken for one.
+
+## Searching without a model
+
+`search.search(query, { limit?, context? })` runs the same search on the host
+and returns `{ query, hits, withheld, remaining? }`. Each hit has `name`,
+`description`, `score`, `requiresApproval`, `estimatedCost`, `expensive`,
+`overBudget` and `alwaysLoaded`. `searchTools(query, options)` does the same
+once, building the index for that call.
+
+```ts
+const { hits } = await search.search('send email', { limit: 3 });
+console.log(hits.map((hit) => hit.name)); // ['send_email']
+```
+
+## The index
+
+The index is BM25 (k1 1.2, b 0.75) over each tool's name (weighted ×3), its
+keywords (×2), its description and its parameter names and descriptions. The
+tokenizer splits camelCase, snake_case and kebab-case, folds case, drops a short
+English stop-word list (which includes "tool" and "tools") and folds plurals.
+`createToolIndex` and `tokenizeForSearch` expose both pieces.
+
+Standard Schema parameters (zod and others) are converted for indexing through
+the optional `@standard-community/standard-json` peer. Without it, those tools
+are indexed by name, description and keywords only, with no error.
+
+## History, compaction and durable runs
+
+The set of surfaced tools is read from the search results in the history every
+step, never kept in memory. One `createToolSearch` instance can therefore serve
+concurrent requests, and a surfaced tool stays loaded for the rest of the run.
+
+- When [compaction](/docs/core/compaction)'s `prune-tool-results` has replaced a
+  search result with `[pruned N chars]`, the result is recomputed from the
+  recorded query against the catalog and the static policy, **without the
+  budget filter**. A tool that would now be over budget can then stay loaded.
+- After a `summarize` compaction the old results are gone, and the model has
+  to search again.
+- A native durable run's resume binding covers the full `tools` set (catalog
+  plus search tool), which never changes; only the per-step narrowing changes,
+  and it is recomputed from the checkpointed history. A resumed run should
+  therefore offer the same tools. This follows from the binding code; it has
+  **not** been tested with a real suspend and resume.
+
+## MCP tools
+
+Tools that the loop adds by itself from the call's `mcp` entries are invisible
+to the index. Under search they are hidden unless you name them in
+`alwaysLoaded`. To make MCP tools searchable, list them from an
+[MCP client](/docs/modules/mcp) yourself and include them in `tools`. The
+catalog is fixed when the search is created: after an MCP catalog change, create
+a new search.
+
+With `enforce` on, a hidden `mcp` tool is also refused: a model that guesses
+its name gets a `permission-denied` result (`not offered on this step`). Name
+the tool in `alwaysLoaded` to keep it visible and callable. With
+`enforce: false`, or under a sub-agent or after a handoff (see
+[Enforcement](#enforcement)), a hidden `mcp` tool can still be called; an
+execution policy's `allowedTools`, which the loop enforces itself, blocks it
+there too.
+
+## Limits
+
+- **Lexical only.** BM25 with no embeddings and no prefix or fuzzy matching:
+  "weath" does not find "weather", and a synonym the tool's text does not
+  contain does not match. Add `keywords` for the words your users say.
+- **Not evaluated against a real model.** The tests drive the loop with a
+  deterministic model. Whether a given model finds the right tool through
+  search as reliably as with the full catalog loaded has not been measured.
+  Try it on your own catalog before you rely on it.
+- **Budget filtering happens at search time.** A surfaced tool stays loaded for
+  the run, and a result pruned by compaction is recomputed without the budget
+  filter. With `enforce` and `overBudget: 'exclude'`, a call is re-checked
+  against `budget.remaining` only, not against the execution context's ledger.
+- **Labels are advisory.** `requiresApproval`, `expensive` and `overBudget`
+  inform the model; the loop's approval gate, guardrails and budgets enforce.
+- **MCP tools from `mcp` entries are not indexed**, and the catalog is fixed at
+  creation.
+- **Two pass-throughs in enforcement.** A sub-agent's calls, and every call
+  after the history holds a handoff, are not checked against what the step
+  offered (catalog tools still are). Inside a sub-agent, a tool of its own that
+  shares a name with a deferred catalog tool is refused.
+- **Handoff detection needs one copy of core.** Handoff tools are recognised by
+  a marker that is not shared across a CommonJS and an ES module copy of the
+  package; if both load, calls after a handoff are refused instead of let
+  through.
+- **Durable resume is reasoned, not tested.** See above.
+
+## See also
+
+- [Budgets](/docs/modules/budgets) — persistent scopes and the `BudgetStore` the search reads.
+- [Native agents](/docs/modules/native-agents) — execution contexts, policies and `runAgent`.
+- [Tool loop](/docs/agents/tool-loop) — `prepareStep`, `activeTools` and the approval gate.
+- [Guardrails](/docs/agents/guardrails) — where the enforcement guardrail runs.

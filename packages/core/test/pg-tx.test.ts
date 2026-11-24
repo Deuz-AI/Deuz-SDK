@@ -22,7 +22,7 @@ import {
 } from '../src/node/pg-tx';
 import type { PgClientLike } from '../src/node/store-postgres';
 import { pglitePool } from './fixtures/pg-pool';
-import { postgresUrl } from './fixtures/services';
+import { PG_REPEATABLE_READ_OPTIONS, postgresUrl } from './fixtures/services';
 import { SLOW_HOOK_TIMEOUT_MS, SLOW_TEST_TIMEOUT_MS } from './fixtures/timeouts';
 
 const pgError = (code: string, message = `pg error ${code}`) =>
@@ -130,6 +130,53 @@ describe('withPgTransaction', () => {
     const two = scriptedPool();
     await expect(withPgTransaction(two.pool, always, { attempts: 2 })).rejects.toThrow();
     expect(two.connections()).toBe(2);
+  });
+
+  it('waits a growing time before each retry, never before the first, and keeps the attempt count', async () => {
+    // Math.random() at the top of its range: each wait takes its whole
+    // ceiling, 10, 20, 40, then 80 ms. Real timers: the pool is scripted.
+    const random = vi.spyOn(Math, 'random').mockReturnValue(1);
+    try {
+      const run = async (failures: number, attempts?: number) => {
+        const rolledBack: number[] = [];
+        const begun: { at: number; released: number }[] = [];
+        const scripted = scriptedPool((sql) => {
+          if (sql === 'BEGIN')
+            begun.push({ at: performance.now(), released: scripted.releases.length });
+          if (sql === 'ROLLBACK') rolledBack.push(performance.now());
+          if (sql === 'COMMIT' && failures-- > 0) throw pgError('40001', 'could not serialize');
+        });
+        const pending = withPgTransaction(scripted.pool, async () => 'committed', { attempts });
+        // The first attempt has its connection before any timer could run.
+        expect(scripted.connections()).toBe(1);
+        const outcome = await pending.catch((error: unknown) => error);
+        const waits = rolledBack
+          .slice(0, begun.length - 1)
+          .map((at, retry) => begun[retry + 1]!.at - at);
+        // Each failed attempt's connection is back in the pool before its wait.
+        expect(begun.map((attempt) => attempt.released)).toEqual(begun.map((_, i) => i));
+        return { outcome, waits, tries: scripted.connections() };
+      };
+
+      // Four failures: the fifth and last default attempt commits.
+      const recovered = await run(4);
+      expect(recovered.outcome).toBe('committed');
+      expect(recovered.tries).toBe(5);
+      expect(recovered.waits).toHaveLength(4);
+      // A timer can fire slightly early on the event loop's cached millisecond clock.
+      recovered.waits.forEach((wait, i) =>
+        expect(wait).toBeGreaterThanOrEqual([10, 20, 40, 80][i]! - 2),
+      );
+
+      // Never committing: exactly the attempts asked for, then the last error.
+      const exhausted = await run(Infinity, 3);
+      expect(exhausted.outcome).toMatchObject({ code: '40001', message: 'could not serialize' });
+      expect(exhausted.tries).toBe(3);
+      expect(exhausted.waits).toHaveLength(2);
+      exhausted.waits.forEach((wait, i) => expect(wait).toBeGreaterThanOrEqual([10, 20][i]! - 2));
+    } finally {
+      random.mockRestore();
+    }
   });
 
   it('never runs again after any other error, or one outside the codes asked for', async () => {
@@ -265,10 +312,17 @@ function spec(schema: string, version: 1 | 2 | 3, extra: Partial<PgSchemaSpec> =
 }
 
 describe('ensurePgSchema (PGlite)', () => {
-  const db = new PGlite();
-  const pool = pglitePool(db);
-  // Start-up is slow under load; keep it out of the first test's time budget.
-  beforeAll(() => db.waitReady, SLOW_HOOK_TIMEOUT_MS);
+  // PGlite starts in the hook, not while the file is collected. Its start-up
+  // blocks the event loop, for seconds on a loaded machine, and a database
+  // created at collection time started up underneath the scripted retry tests
+  // above: one of them, waiting on a 10 ms timer, then ran into its timeout.
+  let db: PGlite;
+  let pool: ReturnType<typeof pglitePool>;
+  beforeAll(async () => {
+    db = new PGlite();
+    pool = pglitePool(db);
+    await db.waitReady;
+  }, SLOW_HOOK_TIMEOUT_MS);
   afterAll(() => db.close());
 
   let schemas = 0;
@@ -413,14 +467,9 @@ describe.skipIf(!url)('withPgTransaction on a live server (REPEATABLE READ, pool
   };
 
   beforeAll(() => {
-    pool = new pg.Pool({ connectionString: url, max: 8 });
     // As in postgres-live: every pooled connection defaults to REPEATABLE READ,
     // so a concurrent write fails with 40001 instead of waiting.
-    pool.on('connect', (connection) => {
-      void connection.query(
-        'SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL REPEATABLE READ',
-      );
-    });
+    pool = new pg.Pool({ connectionString: url, max: 8, options: PG_REPEATABLE_READ_OPTIONS });
   });
 
   afterAll(async () => {

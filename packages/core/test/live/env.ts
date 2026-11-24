@@ -63,7 +63,6 @@ export async function skipOnQuota(
     const code = (error as { code?: string } | undefined)?.code;
     const status = (error as { statusCode?: number } | undefined)?.statusCode;
     if (code === 'rate_limit' || status === 429) {
-      // eslint-disable-next-line no-console
       console.warn('[live] skipped: provider returned 429 (quota), not an SDK failure');
       ctx.skip();
       return;

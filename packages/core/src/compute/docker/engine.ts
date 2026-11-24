@@ -27,7 +27,7 @@ import type { DockerSandboxOptions, ProcessOutput } from './types';
  * The value of the `deuz.sdk-version` label: the SDK release that created the
  * container. A test keeps it in step with the package version.
  */
-export const DOCKER_LABEL_SDK_VERSION = '2.4.0';
+export const DOCKER_LABEL_SDK_VERSION = '2.5.0';
 
 /** The labels every container carries; a host cannot set or override them. */
 export const DEUZ_LABEL = {

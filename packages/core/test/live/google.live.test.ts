@@ -47,7 +47,6 @@ describe.skipIf(!apiKey)(`google native — live (${MODEL})`, () => {
     expect(result.usage.totalTokens).toBeGreaterThanOrEqual(
       result.usage.inputTokens + result.usage.outputTokens,
     );
-    // eslint-disable-next-line no-console
     console.log(
       `[gemini-native ${fingerprint(apiKey!)}] text=${JSON.stringify(result.text)} ` +
         `in=${result.usage.inputTokens} out=${result.usage.outputTokens} ` +
@@ -95,7 +94,6 @@ describe.skipIf(!apiKey)(`google native — live (${MODEL})`, () => {
     // stopped at one and returned the tool call as the final answer.
     expect(result.steps?.length ?? 0).toBeGreaterThan(1);
     expect(result.text).toMatch(/31|clear/i);
-    // eslint-disable-next-line no-console
     console.log(
       `[gemini-native] tool arg=${JSON.stringify(observed)} steps=${result.steps?.length ?? 0}`,
     );
@@ -129,7 +127,6 @@ describe.skipIf(!apiKey)(`google compat — live (${MODEL})`, () => {
 
     expect(result.text.toLowerCase()).toContain('pong');
     expect(result.usage.inputTokens).toBeGreaterThan(0);
-    // eslint-disable-next-line no-console
     console.log(
       `[gemini-compat] text=${JSON.stringify(result.text)} ` +
         `in=${result.usage.inputTokens} out=${result.usage.outputTokens}`,

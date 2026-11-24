@@ -1,0 +1,77 @@
+{
+  "name": "@deuz-sdk/mcp-ledger",
+  "version": "2.5.0",
+  "description": "Ready-made MCP server for Deuz budgets, versioned memory and receipts — npx @deuz-sdk/mcp-ledger.",
+  "license": "MIT",
+  "author": "Umutcan Edizaslan (U-C4N)",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Deuz-AI/Deuz-SDK.git",
+    "directory": "packages/mcp-ledger"
+  },
+  "homepage": "https://github.com/Deuz-AI/Deuz-SDK#readme",
+  "bugs": "https://github.com/Deuz-AI/Deuz-SDK/issues",
+  "type": "module",
+  "sideEffects": false,
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "files": [
+    "dist"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      }
+    },
+    "./package.json": "./package.json"
+  },
+  "bin": {
+    "deuz-mcp-ledger": "./dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsup",
+    "test": "vitest run",
+    "lint": "eslint .",
+    "typecheck": "tsc --noEmit",
+    "verify:package": "publint --strict && attw --pack . && node dist/cli.js --version",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "ai",
+    "mcp",
+    "model-context-protocol",
+    "budget",
+    "memory",
+    "receipts",
+    "deuz"
+  ],
+  "dependencies": {
+    "@deuz-sdk/core": "^2.5.0",
+    "@modelcontextprotocol/server": "^2.3.1"
+  },
+  "devDependencies": {
+    "@arethetypeswrong/cli": "^0.18.0",
+    "@modelcontextprotocol/client": "^2.3.1",
+    "@types/node": "^22.10.0",
+    "eslint": "^9.18.0",
+    "eslint-config-prettier": "^9.1.0",
+    "publint": "^0.3.0",
+    "tsup": "^8.5.0",
+    "typescript": "^5.7.0",
+    "typescript-eslint": "^8.20.0",
+    "vitest": "^4.0.0"
+  }
+}

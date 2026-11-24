@@ -35,7 +35,6 @@ describe.skipIf(!apiKey)(`xai — live (${MODEL})`, () => {
 
     expect(result.text.toLowerCase()).toContain('pong');
     expect(result.usage.inputTokens).toBeGreaterThan(0);
-    // eslint-disable-next-line no-console
     console.log(
       `[xai ${fingerprint(apiKey!)}] text=${JSON.stringify(result.text)} ` +
         `in=${result.usage.inputTokens} out=${result.usage.outputTokens} ` +

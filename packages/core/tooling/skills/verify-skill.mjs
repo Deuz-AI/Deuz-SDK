@@ -9,9 +9,12 @@
  * `package.json` exports, `export *` followed through src — the table
  * `tooling/verify-docs.mjs` builds), it checks SKILL.md and references/*.md:
  *
- *   1. names: every `import { … } from '@deuz-sdk/…'` resolves name by name;
+ *   1. names: every `import { … } from '@deuz-sdk/…'`, and every destructured
+ *      `const { … } = require('@deuz-sdk/…')` (or `await import(…)`), resolves
+ *      name by name;
  *      every quoted or backticked `@deuz-sdk/<package>[/<subpath>]` exists, so
- *      a package other than core and react, or a dynamic `import('…')` of
+ *      a package other than core, react and the single-entry packages of
+ *      export-table.mjs, or a dynamic `import('…')` of
  *      one, fails too; every name the prose attributes to a subpath (`name`
  *      from|on `@deuz-sdk/…`) is exported there. A bare backticked word is not
  *      taken for an API name: options, fields, methods and other libraries'
@@ -34,7 +37,7 @@
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { join, relative, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { loadExportTable } from './export-table.mjs';
+import { SINGLE_ENTRY_PACKAGES, loadExportTable } from './export-table.mjs';
 import { maskNoVerify } from './fences.mjs';
 import { REGENERATE_COMMAND, renderApiIndex } from './generate-api-index.mjs';
 import { MIRROR_DIR, SKILL_DIR, diffSkillCopies } from './sync-skill-copy.mjs';
@@ -42,14 +45,20 @@ import { MIRROR_DIR, SKILL_DIR, diffSkillCopies } from './sync-skill-copy.mjs';
 const SYNC_COMMAND = 'node packages/core/tooling/skills/sync-skill-copy.mjs --write';
 const STAMP = /@deuz-sdk\/core@([^\s·`]+)\s*·\s*api-contract sha256:([0-9a-f]+)/g;
 const STAMP_SHAPE = '"@deuz-sdk/core@<version> · api-contract sha256:<12 hex>"';
-const IMPORT = /\b(?:import|export)\s+(?:type\s+)?\{([^}]*)\}\s*from\s*['"](@deuz-sdk\/[^'"]+)['"]/g;
+const IMPORT =
+  /\b(?:import|export)\s+(?:type\s+)?\{([^}]*)\}\s*from\s*['"](@deuz-sdk\/[^'"]+)['"]/g;
+/** `const { a, b: c } = require('@deuz-sdk/…')`, or the same with `await import(…)`. */
+const REQUIRE =
+  /\b(?:const|let|var)\s+\{([^}]*)\}\s*=\s*(?:require|await\s+import)\s*\(\s*['"](@deuz-sdk\/[^'"]+)['"]\s*\)/g;
 /** Any package of the scope; a version (`@deuz-sdk/core@2.3.0`) never matches. */
 const MENTION = /(['"`])(@deuz-sdk\/[\w.-]+(?:\/[\w./-]+)?)\1/g;
 /** The specifiers MENTION reads, whole. */
 const SPECIFIER = /^@deuz-sdk\/[\w.-]+(?:\/[\w./-]+)?$/;
 const ATTRIBUTION = /`([A-Za-z_$][\w$]*)(?:\([^`]*\))?`\s+\(?(?:from|on)\s+`(@deuz-sdk\/[^`\s]+)`/g;
 /** Specifiers the package serves that are not modules. */
-const NON_MODULES = new Set(['@deuz-sdk/core/package.json', '@deuz-sdk/react/package.json']);
+const NON_MODULES = new Set(
+  ['core', 'react', ...SINGLE_ENTRY_PACKAGES].map((name) => `@deuz-sdk/${name}/package.json`),
+);
 
 const lineAt = (text, index) => text.slice(0, index).split('\n').length;
 
@@ -86,6 +95,22 @@ function checkNames(source, table, stats, report) {
       if (!name) continue;
       stats.names++;
       if (!names.has(name)) report(line, `"${name}" is not exported by ${specifier}`);
+    }
+  }
+
+  // A destructured require or dynamic import names what it takes the same way.
+  // An unknown specifier is left to MENTION below, which reports it.
+  for (const m of text.matchAll(REQUIRE)) {
+    const names = modules.get(m[2]);
+    if (!names) continue;
+    stats.imports++;
+    const line = lineAt(text, m.index);
+    const list = m[1].replace(/\/\/[^\n]*/g, '').replace(/\/\*[\s\S]*?\*\//g, '');
+    for (const raw of list.split(',')) {
+      const name = raw.split(/[:=]/)[0]?.trim();
+      if (!name || name.startsWith('...')) continue;
+      stats.names++;
+      if (!names.has(name)) report(line, `"${name}" is not exported by ${m[2]}`);
     }
   }
 

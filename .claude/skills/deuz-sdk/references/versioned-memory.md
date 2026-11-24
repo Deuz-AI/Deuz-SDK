@@ -1,4 +1,4 @@
-<!-- verified: 2026-10-16 against @deuz-sdk/core@2.4.0 · api-contract sha256:da3643f44edc
+<!-- verified: 2026-11-24 against @deuz-sdk/core@2.5.0 · api-contract sha256:cd3d4f48e5a3
      sources: packages/core/src/memory/versioned/{index,types,session,store,tools,import,policy,accounting}.ts,
      packages/core/src/node/{vmem-sqlite,vmem-postgres,store-connection}.ts, packages/core/src/types/accounting.ts,
      packages/core/src/internal/accounting.ts, packages/core/src/memory.ts, packages/core/src/errors.ts,

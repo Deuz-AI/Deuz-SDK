@@ -1,4 +1,4 @@
-<!-- verified: 2026-10-16 against @deuz-sdk/core@2.4.0 · api-contract sha256:da3643f44edc
+<!-- verified: 2026-11-24 against @deuz-sdk/core@2.5.0 · api-contract sha256:cd3d4f48e5a3
      sources: packages/core/src/mcp/index.ts, packages/core/src/mcp/shared.ts, packages/core/src/mcp/resolve.ts,
      packages/core/src/mcp/auth.ts, packages/core/src/mcp/stdio.ts, packages/core/src/mcp/sdk-line.ts,
      packages/core/src/mcp/sdk-v2.ts, packages/core/src/node/mcp.ts, packages/core/src/inference/loop-shared.ts,
@@ -8,7 +8,7 @@
 
 # MCP: external tool servers
 
-**Load when:** giving a run tools that live on a Model Context Protocol server — a hosted `https://…/mcp` endpoint, a legacy SSE server, or a local `npx` process — choosing the SDK line and protocol revision (MCP 2026-07-28, 2.3), or dealing with MCP OAuth, sampling, roots, elicitation, reconnects, a catalog that changes mid-run, or a connection pool in a server process. To *serve* your own tools or agents over MCP, read `references/interop.md`; MCP tools inside a native run are in `references/native-execution.md`.
+**Load when:** giving a run tools that live on a Model Context Protocol server — a hosted `https://…/mcp` endpoint, a legacy SSE server, or a local `npx` process — choosing the SDK line and protocol revision (MCP 2026-07-28, 2.3), or dealing with MCP OAuth, sampling, roots, elicitation, reconnects, a catalog that changes mid-run, or a connection pool in a server process. To *serve* your own tools, agents, resources, prompts or MCP tasks over MCP (2.5), read `references/interop.md`; MCP tools inside a native run are in `references/native-execution.md`; hiding a server's many tools behind tool search (2.5) is in `references/distribution.md`. The client has no MCP tasks in 2.5; only the server serves them.
 
 Do not wire `@modelcontextprotocol/client` or `@modelcontextprotocol/sdk` by hand. The `mcp:` call option and `createMcpClient` already own the handshake, the tool mapping, the namespacing, the refresh and the teardown.
 

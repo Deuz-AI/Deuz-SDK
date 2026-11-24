@@ -82,6 +82,16 @@ export default defineConfig({
     ui: 'src/ui.ts',
     chat: 'src/chat.ts',
     'chat/node': 'src/node/chat-store.ts',
+    'tool-search': 'src/tool-search.ts',
+    meter: 'src/meter/index.ts',
+    'meter/node': 'src/node/meter.ts',
+    acp: 'src/acp/index.ts',
+    'acp/stdio': 'src/node/acp-stdio.ts',
+    harness: 'src/harness/index.ts',
+    'harness/node': 'src/node/harness.ts',
+    // The error taxonomy alone (type-only imports), for packages that need a
+    // class such as BreakerOpenError without loading the root entry.
+    errors: 'src/errors.ts',
   },
   format: ['esm', 'cjs'],
   dts: true,

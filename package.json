@@ -1,7 +1,7 @@
 {
   "name": "deuz-sdk",
   "private": true,
-  "description": "Deuz SDK monorepo — @deuz-sdk/core (pure, web-first, multi-provider AI SDK) + @deuz-sdk/react.",
+  "description": "Deuz SDK monorepo — @deuz-sdk/core (pure, web-first, multi-provider AI SDK), @deuz-sdk/react, @deuz-sdk/ai-sdk-provider, @deuz-sdk/mcp-ledger and @deuz-sdk/cli.",
   "license": "MIT",
   "author": "Umutcan Edizaslan (U-C4N)",
   "repository": {
@@ -18,7 +18,7 @@
     "examples/*"
   ],
   "scripts": {
-    "build": "npm run build -w @deuz-sdk/core && npm run build -w @deuz-sdk/react",
+    "build": "npm run build -w @deuz-sdk/core && npm run build -w @deuz-sdk/react && npm run build -w @deuz-sdk/ai-sdk-provider && npm run build -w @deuz-sdk/mcp-ledger && npm run build -w @deuz-sdk/cli",
     "dev": "npm run dev -w @deuz-sdk/core",
     "example": "npm run dev -w",
     "example:setup": "npm run build",

@@ -456,18 +456,25 @@ describe('verify-skill: grading answers', () => {
     writeTree(answers, {
       'mention.md': 'Install `@deuz-sdk/headless` and run it.\n',
       'dynamic.ts': "const cli = await import('@deuz-sdk/headless');\n",
-      'require.cjs': "const { runHeadless } = require('@deuz-sdk/cli');\n",
-      'attribution.md': 'Use `runHeadless` from `@deuz-sdk/cli`.\n',
+      'require.cjs': "const { runHeadless } = require('@deuz-sdk/runner');\n",
+      // A real package: each destructured name must be one it exports.
+      'require-name.cjs':
+        "const { generateText, runHeadles: run } = require('@deuz-sdk/core');\n" +
+        "const { tool, ...rest } = await import('@deuz-sdk/core');\n" +
+        "const { runHeadless } = require('@deuz-sdk/cli');\n",
+      'attribution.md': 'Use `runHeadless` from `@deuz-sdk/runner`.\n',
       'control.md':
         'See `@deuz-sdk/core/headles`, or `runHeadless` from `@deuz-sdk/core/headless`.\n',
       'versions.md': 'Pin `@deuz-sdk/core@2.3.0` and `@deuz-sdk/react@2.3.0`.\n',
     });
     expect(verify.verifyAnswers(answers, { table }).failures).toEqual([
-      'attribution.md:1  mentions unknown subpath "@deuz-sdk/cli"',
+      'attribution.md:1  mentions unknown subpath "@deuz-sdk/runner"',
       'control.md:1  mentions unknown subpath "@deuz-sdk/core/headles"',
       'dynamic.ts:1  mentions unknown subpath "@deuz-sdk/headless"',
       'mention.md:1  mentions unknown subpath "@deuz-sdk/headless"',
-      'require.cjs:1  mentions unknown subpath "@deuz-sdk/cli"',
+      'require-name.cjs:1  "runHeadles" is not exported by @deuz-sdk/core',
+      'require-name.cjs:3  "runHeadless" is not exported by @deuz-sdk/cli',
+      'require.cjs:1  mentions unknown subpath "@deuz-sdk/runner"',
     ]);
   });
 });

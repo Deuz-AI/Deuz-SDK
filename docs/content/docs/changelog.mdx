@@ -6,6 +6,72 @@ icon: History
 
 All notable changes to `@deuz-sdk/core`. The package follows semver: minor versions are additive, the locked 1.0 type surface only changes in a major.
 
+## 2.5.0
+
+**Deuz's budgets, receipts and approvals where developers already work.** A
+budget meter for coding harnesses, the `deuz` CLI, harnesses run as budgeted
+sub-agents, the Agent Client Protocol on both sides, budget- and policy-aware
+tool search, MCP resources and prompts, and three new packages: the CLI, a
+Vercel AI SDK provider and a ready-made MCP ledger. Eight new core subpaths, `/errors` among them (every core error class, without the root entry).
+Every change to core's public API is additive; two MCP server behaviours change
+on purpose. Upgrade notes and known limits are on
+[What is new in 2.5](/docs/reference/whats-new-2-5). The meter, the CLI and
+the harness runner were run against real Claude Code and Codex on 2026-11-24,
+and ACP passed a conformance run against the official ACP SDK; nothing was run
+in a real editor.
+
+- **Meter** (`/meter`, `/meter/node`) — a budget proxy for Anthropic Messages
+  and OpenAI Chat Completions and Responses traffic: admission on an estimate,
+  settlement on reported usage, 402 at the ceiling in the provider's own error
+  shape, one content-free receipt per request. Verified live in front of Claude
+  Code on a subscription login. A streamed reply with no `content-type`
+  (ChatGPT's Codex backend) is read as SSE and measured; that is unit-tested,
+  not run live. → [Meter](/docs/modules/meter)
+- **CLI** (`@deuz-sdk/cli`, preview) — `deuz meter [-- command]` and
+  `deuz acp <module>`, with USD and token ceilings, rolling windows and a
+  SQLite store. `deuz meter -- <command>` refuses to start while a
+  `CLAUDE_CODE_USE_*` provider switch would route around the meter.
+  → [CLI](/docs/modules/cli)
+- **Harness runner** (`/harness`, `/harness/node`, preview) — `runHarness` and
+  `harnessTool` run Claude Code, Codex or OpenCode over ACP behind a meter
+  (Gemini CLI too, with a declared cost only and no ceiling), decide their
+  permission requests by policy on real paths
+  (symlinks, junctions and 8.3 names resolved), and compare measured with
+  declared cost. The Claude Code preset is verified live and switches each
+  session to the mode where Claude Code asks before its tool calls.
+  → [Harness](/docs/modules/harness)
+- **ACP** (`/acp`, `/acp/stdio`, preview) — serve a native agent to an editor
+  with signed approvals and a persistent budget, or drive any ACP agent from
+  code or as a child process. Conformance-checked in both directions against
+  the official ACP SDK. → [ACP](/docs/modules/acp)
+- **Tool search** (`/tool-search`) — a BM25 search tool over a large catalog
+  that withholds tools the policy refuses or the budget cannot pay for, through
+  the loops' `prepareStep` seam, and refuses calls to tools the step never
+  offered. → [Tool search](/docs/modules/tool-search)
+- **MCP server** — static and URI-template resources (variables decoded and
+  checked per RFC 6570 operator), prompts, a mutable `server.catalog` with
+  `list_changed` and identity-checked `resources/updated` notifications, MCP
+  tasks for opted-in tools and agents (the Tasks extension on 2026-07-28, core
+  tasks on 2025-11-25), and the `tasks`, `eventBus`, `maxSubscriptions` and
+  `generateId` options. → [MCP server](/docs/modules/mcp-server)
+- **AI SDK provider** (`@deuz-sdk/ai-sdk-provider`) — `deuz(model, options)`
+  and `deuzMiddleware` put a Deuz budget, fail-over and the circuit breaker
+  under AI SDK 7 models. → [AI SDK provider](/docs/modules/ai-sdk-provider)
+- **MCP ledger** (`@deuz-sdk/mcp-ledger`) — `npx @deuz-sdk/mcp-ledger`:
+  memory, an advisory spend ledger and a hash-chained receipt log in local
+  SQLite files. → [MCP ledger](/docs/modules/mcp-ledger)
+
+Fixed: a served MCP tool call's `toolCallId` is now `mcp-<unit>-<JSON-RPC id>`
+with a fresh unit per HTTP request or stdio connection, so tools that derive
+operation ids from it (the versioned memory tools among them) no longer collide
+across connections.
+
+Changed: an MCP server with zero tools answers `tools/list` with `[]` instead of
+method-not-found.
+
+[Known gaps](/docs/reference/known-gaps) is new: where Deuz is behind, and what
+to use instead.
+
 ## 2.4.0
 
 Released 2026-10-16.

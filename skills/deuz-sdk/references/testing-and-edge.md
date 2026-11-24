@@ -1,4 +1,4 @@
-<!-- verified: 2026-10-16 against @deuz-sdk/core@2.4.0 · api-contract sha256:da3643f44edc
+<!-- verified: 2026-11-24 against @deuz-sdk/core@2.5.0 · api-contract sha256:cd3d4f48e5a3
      sources: packages/core/src/testing.ts, src/internal/eval-suite.ts, src/types/{config,deps,methods,stream,tool}.ts,
      src/internal/resolve-call.ts, src/core/resilience.ts, src/inference/tool-loop.ts, src/{openai,anthropic,edge}.ts,
      tooling/check-runtime-compat.mjs, packages/core/package.json (exports), packages/core/test/{testing,tool-loop}.test.ts,
@@ -350,7 +350,7 @@ The repository ships a baseline of offline tasks and fault-injection scenarios (
 
 ### What "edge-safe" buys you
 
-The core touches only APIs that exist in every modern JS runtime: `fetch`, Web Streams, `TextEncoder`/`TextDecoder`, WebCrypto, timers, `atob`/`btoa`. There are no `node:*` imports, no `Buffer`, no `process` — including no `process.env`. Everything stateful is a `Dependencies` seam with a Web-API default: `deps.clock` instead of ambient `Date.now`/`setTimeout`, `deps.generateId` instead of `crypto.randomUUID`, `deps.logger` instead of `console`. The same build ships to Node 22+, Cloudflare Workers, Vercel Edge, Deno, Bun and the browser; every release bundles root, `/edge`, provider, native `/agent`, `/swarm`, `/ops`, `/evolve` and `/schedule` consumers, and since 2.3 `/goal`, `/mcp/server`, `/realtime`, `/batch`, `/a2a` and `/testing`, with esbuild's browser platform and fails if the graph reaches a Node-only module.
+The core touches only APIs that exist in every modern JS runtime: `fetch`, Web Streams, `TextEncoder`/`TextDecoder`, WebCrypto, timers, `atob`/`btoa`. There are no `node:*` imports, no `Buffer`, no `process` — including no `process.env`. Everything stateful is a `Dependencies` seam with a Web-API default: `deps.clock` instead of ambient `Date.now`/`setTimeout`, `deps.generateId` instead of `crypto.randomUUID`, `deps.logger` instead of `console`. The same build targets Node 22+, Cloudflare Workers, Vercel Edge, Deno, Bun and the browser, but CI runs the tests on Node only (22 and 24 on Linux, 22 on Windows); every release bundles root, `/edge`, provider, native `/agent`, `/swarm`, `/ops`, `/evolve` and `/schedule` consumers, and since 2.3 `/goal`, `/mcp/server`, `/realtime`, `/batch`, `/a2a` and `/testing`, with esbuild's browser platform and fails if the graph reaches a Node-only module.
 
 Consequence you must design for: **you read the key, core never does.** Pass it to the factory (`createAnthropic({ apiKey })`), to `createClient({ apiKeys })`, or resolve it per call with `deps.keyProvider` (async and refreshing — the Vertex OAuth case).
 

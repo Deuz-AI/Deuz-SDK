@@ -126,7 +126,7 @@ export async function resolveCall(input: ResolveCallInput): Promise<ResolvedCall
       apiKey = NO_KEY_SENTINEL;
     } else {
       throw new AuthenticationError({
-        message: `No API key for provider '${provider}'. Pass it to the factory (e.g. create${provider}({ apiKey })), via ClientConfig.apiKeys, or a deps.keyProvider.`,
+        message: `No API key for provider '${provider}'. Pass it to the provider's factory as { apiKey }, via ClientConfig.apiKeys, or a deps.keyProvider.`,
         provider,
       });
     }

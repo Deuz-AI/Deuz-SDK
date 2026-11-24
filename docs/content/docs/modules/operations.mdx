@@ -365,7 +365,10 @@ The stores are built for `READ COMMITTED`, Postgres's default, and also run
 under a `REPEATABLE READ` or `SERIALIZABLE` session default. There a contended
 write can fail with a serialization failure (40001), and any write can be
 chosen as a deadlock victim (40P01). Postgres rolls such a statement back
-whole, so since 2.3 every store sends it again, up to five attempts in all:
+whole, so since 2.3 every store sends it again, up to five attempts in all.
+Since 2.5 each retry first waits a random time of up to 10, 20, 40, then 80 ms
+(150 ms at most in all), so writers that failed together do not collide again
+and a rival still committing has time to finish. These writes run again:
 
 | Store | Writes that run again |
 | --- | --- |

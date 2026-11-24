@@ -71,7 +71,7 @@ describe('createDockerSandbox', () => {
       expect.arrayContaining([
         expect.stringMatching(/^deuz\.operation-id=.+/),
         'deuz.scope=default',
-        'deuz.sdk-version=2.4.0',
+        'deuz.sdk-version=2.5.0',
         'deuz.kind=sandbox',
       ]),
     );

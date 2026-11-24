@@ -1,9 +1,11 @@
 ---
 title: MCP server
-description: Publish Deuz tools, native agent tools and whole agents over MCP — one definition served over fetch-native Streamable HTTP and stdio, MCP 2026-07-28 with a 2025-11-25 fallback.
+description: Publish Deuz tools, native agent tools, whole agents, resources and prompts over MCP — one definition served over fetch-native Streamable HTTP and stdio, MCP 2026-07-28 with a 2025-11-25 fallback, and a catalog you can change at runtime (2.5).
 ---
 
 `createMcpServer` (2.3) turns the tools you already wrote for the loop into a [Model Context Protocol](https://modelcontextprotocol.io) server. One definition publishes a `ToolSet`, a native `AgentToolSet` and whole agents (`runAgent` behind a tool), and serves them two ways: `server.fetch` is a fetch-native Streamable HTTP handler (`Request` in, `Response` out — Workers, Deno, Bun, route handlers), and `serveMcpStdio(server)` serves the **same handle** over stdin/stdout for clients that launch the server as a child process.
+
+2.5 adds the rest of what a server publishes: [resources](#resources) (static and RFC 6570 URI templates), [prompts](#prompts), and a [mutable catalog](#the-mutable-catalog) — `server.catalog` adds, replaces and removes tools, agents, resources and prompts at runtime and announces each change with the matching `list_changed` notification. A resource read and a prompt `get` see the same per-request identity a tool call sees. Opted-in tools and agents can also run as [MCP tasks](#tasks): the call answers a task handle and the run continues in the background. A tools-only server advertises exactly what it did in 2.4.
 
 The server speaks **MCP 2026-07-28** to a client that negotiates it and, by default, serves 2025-era clients (MCP 2025-11-25) through a stateless fallback — so the Deuz client on either SDK line, the official SDK clients and most hosted agents can all call it.
 
@@ -17,7 +19,7 @@ The v2 SDK needs Node ≥ 20 (or a fetch-native edge runtime) and brings its own
 
 | Subpath | Exports | Runtime |
 | --- | --- | --- |
-| `@deuz-sdk/core/mcp/server` | `createMcpServer` | Edge-safe (Web APIs only) |
+| `@deuz-sdk/core/mcp/server` | `createMcpServer`, `createInMemoryMcpTaskStore`, `MCP_TASKS_EXTENSION` | Edge-safe (Web APIs only) |
 | `@deuz-sdk/core/mcp/server/stdio` | `serveMcpStdio` | Node-only |
 
 ## Quick start
@@ -91,7 +93,7 @@ A client launches it as a child process — for example in a desktop client's MC
 { "mcpServers": { "notes": { "command": "node", "args": ["/abs/path/notes-server.mjs"] } } }
 ```
 
-`serveMcpStdio` prepares every tool **before** reading the first byte, so a broken definition rejects instead of half-starting a server the client then waits on. The opening exchange pins the connection to one era: `server/discover` for an MCP 2026-07-28 client, `initialize` for a 2025-era one. `legacy: 'reject'` refuses 2025-era openings. `stdin`/`stdout` default to the process's own streams; pass other Node streams (a socket, a `PassThrough`) to serve elsewhere. The transport drives their whole stream API, so `serveMcpStdio` rejects when it cannot start on them rather than resolving a server that never reads a byte. `serveMcpStdio` also accepts the options object directly, building the server for you.
+`serveMcpStdio` prepares every tool **before** reading the first byte, so a broken definition rejects instead of half-starting a server the client then waits on. The opening exchange pins the connection to one era: `server/discover` for an MCP 2026-07-28 client, `initialize` for a 2025-era one. `legacy: 'reject'` refuses 2025-era openings. `stdin`/`stdout` default to the process's own streams; pass other Node streams (a socket, a `PassThrough`) to serve elsewhere. The transport drives their whole stream API, so `serveMcpStdio` rejects when it cannot start on them rather than resolving a server that never reads a byte. `serveMcpStdio` also accepts the options object directly, building the server for you. Its own options also take `maxSubscriptions` (2.5): the most `subscriptions/listen` streams one 2026-07-28 connection may hold open (SDK default 1024).
 
 <Callout type="warn" title="Never write to stdout from a stdio server">
 Every byte on stdout is protocol. A stray `console.log` corrupts the stream and the client drops the connection. Log to stderr.
@@ -107,6 +109,12 @@ Every byte on stdout is protocol. A stray `console.log` corrupts the stream and 
 | `agentTools` | `AgentToolSet` | — | Served with native semantics — see [Native agent tools](#native-agent-tools). |
 | `toolsContext` | record \| `(request) => record` | — | Per-tool context for `agentTools`; the function form runs per call. |
 | `agents` | `Record<string, McpServedAgent>` | — | Agents published as `{ prompt }` tools — see [Agents as tools](#agents-as-tools). |
+| `resources` | `Record<string, McpServedResource>` | — | 2.5. Static resources by name — see [Resources](#resources). Passing it at all, even `{}`, advertises `resources`. |
+| `resourceTemplates` | `Record<string, McpServedResourceTemplate>` | — | 2.5. URI-template resources by name; also advertises `resources`. |
+| `prompts` | `Record<string, McpServedPrompt>` | — | 2.5. Prompts by name — see [Prompts](#prompts). Passing it at all, even `{}`, advertises `prompts`. |
+| `eventBus` | `McpServerEventBus` | in-process | 2.5. The bus behind HTTP `subscriptions/listen`; share one across processes — see [Where notifications arrive](#where-notifications-arrive). |
+| `maxSubscriptions` | `number` | 1024 (SDK) | 2.5. Most `subscriptions/listen` streams open at once on the HTTP face. |
+| `tasks` | `McpServerTasksOptions` | — | 2.5. Serve the named tools as MCP tasks — see [Tasks](#tasks). Passing it at all, even `{}`, advertises task support. |
 | `toolAnnotations` | `Record<string, McpToolAnnotations>` | — | MCP hints (`readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`, `title`). |
 | `approve` | `'elicit'` \| `(request) => boolean` | `'elicit'` | Who approves a `needsApproval` call — see [Approval](#approval). |
 | `guardrails` | `{ onToolCall?, onToolResult? }` | — | The loop's tool guardrails, applied to every served call. |
@@ -116,6 +124,7 @@ Every byte on stdout is protocol. A stray `console.log` corrupts the stream and 
 | `maxRequestBodySize` | `number` | 4 MiB | Largest POST body read. |
 | `onError` | `(error) => void` | — | Out-of-band failures (rejected requests, a missing peer, a throwing `approve`). Reporting only. |
 | `clock` | `Clock` | host clock | Time source for `Tool.timeoutMs`. |
+| `generateId` | `() => string` | `crypto.randomUUID()` | 2.5. Names each serving unit, which qualifies the served `toolCallId` — see [What a served call runs](#what-a-served-call-runs). Must return a new, unique id on every call. |
 
 Construction rejects what can never be served, while the stack still points at your definition: a client tool (no `execute` — it runs in the caller's UI), a provider-executed tool, the same name twice across `tools`/`agentTools`/`agents`, and `toolAnnotations` for a name that is not served.
 
@@ -138,7 +147,7 @@ A served call runs the pipeline a loop call runs, in the loop's order — so a t
 2. **`guardrails.onToolCall`** — `block` answers the loop's denial (`Blocked by guardrail 'name': reason`); `rewrite` swaps the arguments.
 3. **The approval gate**, when the tool's `needsApproval` holds — see [Approval](#approval).
 4. **Validation, exactly as the loop does it.** A Standard Schema's transform applies here, **once** — step 1 only checks.
-5. **`execute`**, with a context carrying a `toolCallId` (`mcp-<request id>`), the request's abort signal (a client cancellation aborts it), an empty `messages` array and the `runtimeContext`. A throw — or a `Tool.timeoutMs` expiry, which aborts the tool's signal — becomes an error result carrying the message: the loop's self-heal.
+5. **`execute`**, with a context carrying a `toolCallId` (`mcp-<unit>-<request id>`, below), the request's abort signal (a client cancellation aborts it), an empty `messages` array and the `runtimeContext`. A throw — or a `Tool.timeoutMs` expiry, which aborts the tool's signal — becomes an error result carrying the message: the loop's self-heal.
 6. **`guardrails.onToolResult`**, for results `execute` produced.
 7. **The result**, mapped as below.
 
@@ -150,6 +159,13 @@ A served call runs the pipeline a loop call runs, in the loop's order — so a t
 | `undefined` | no content |
 | anything, when the tool has an `outputSchema` | `structuredContent`, validated by the SDK (a mismatch is an error result) |
 | a throw / timeout / denial / guardrail block | `isError: true` with the message as text |
+
+The served `toolCallId` (2.5) is `mcp-<unit>-<JSON-RPC id>`, where `<unit>` is a fresh `generateId()` per serving unit, so unrelated calls never share an id and a tool that keys idempotent writes on it (such as the [versioned memory tools](/docs/modules/versioned-memory)) is safe to serve:
+
+- **Over HTTP** (2026-07-28, and the stateless fallback for 2025-era clients) the unit is one HTTP request. Nothing on the wire ties a retried POST to the first one, so a client's retry is a new call with a new id.
+- **Over stdio** the unit is the connection. MCP forbids reusing a request id within a session, so a request id resent on the same connection keeps its `toolCallId` and an idempotent tool replays it; a new connection is a new unit.
+
+A 2026-07-28 approval round trip is two requests, so an `onToolCall` guardrail sees two different ids, but the tool runs only in the second. Before 2.5 the id was `mcp-<request id>`, which collided across connections; a host that parsed it must adapt.
 
 Only the error **message** crosses the wire, never a stack — but it does cross it, so do not put secrets in error messages of a server facing clients you do not trust.
 
@@ -236,7 +252,272 @@ console.log(await client.callTool('researcher', { prompt: 'What is the capital o
 | `stopped` | an error result naming the reason, with any partial text |
 | `failed` | an error result with the run's error message |
 
-`agent` may be a function `(input, request) => options`, called per call — use it to mint a fresh durable `session` per call (a fixed `runId` makes concurrent calls collide) or to pick a per-tenant model. The call's abort signal is combined with any `signal` in the options, so a client cancellation stops the run; the call's `runtimeContext` reaches the run unless the options set their own. `needsApproval: true` on the entry gates the agent call itself.
+`agent` may be a function `(input, request) => options`, called per call — use it to mint a fresh durable `session` per call (a fixed `runId` makes concurrent calls collide) or to pick a per-tenant model. The call's abort signal is combined with any `signal` in the options, so a client cancellation stops the run; the call's `runtimeContext` reaches the run unless the options set their own. `needsApproval: true` on the entry gates the agent call itself, and `task: true` serves it as an [MCP task](#tasks) to clients that support tasks.
+
+## Resources
+
+`resources` (2.5) publishes data a client can list and read: a file, a
+configuration, a record. `resourceTemplates` publishes a family of them behind
+an [RFC 6570](https://www.rfc-editor.org/rfc/rfc6570) URI template. This example
+runs keyless, in process:
+
+```ts title="mcp-resources.ts"
+import { createMcpServer } from '@deuz-sdk/core/mcp/server';
+import { createMcpClient } from '@deuz-sdk/core/mcp';
+
+const notes: Record<string, Record<string, string>> = {
+  acme: { n1: 'Ship the release on Friday.' },
+};
+
+const server = createMcpServer({
+  name: 'notes',
+  runtimeContext: ({ authInfo }) => ({ tenant: authInfo?.clientId ?? 'acme' }),
+  resources: {
+    readme: { uri: 'docs://readme', mimeType: 'text/markdown', read: () => '# Notes' },
+  },
+  resourceTemplates: {
+    note: {
+      uriTemplate: 'notes://{id}',
+      mimeType: 'text/plain',
+      // Per request, so a tenant lists only its own notes.
+      list: ({ runtimeContext }) => {
+        const { tenant } = runtimeContext as { tenant: string };
+        return Object.keys(notes[tenant] ?? {}).map((id) => ({ uri: `notes://${id}`, name: id }));
+      },
+      // null answers "resource not found".
+      read: ({ variables, runtimeContext }) => {
+        const { tenant } = runtimeContext as { tenant: string };
+        return notes[tenant]?.[String(variables.id)] ?? null;
+      },
+    },
+  },
+});
+
+const client = await createMcpClient({
+  transport: { type: 'http', url: 'http://notes.local/mcp', fetch: (i, init) => server.fetch(new Request(i, init)) },
+});
+console.log((await client.listResources()).map((r) => r.uri)); // ['docs://readme', 'notes://n1']
+console.log(await client.readResource('notes://n1'));          // [{ uri: 'notes://n1', mimeType: 'text/plain', text: 'Ship the release on Friday.' }]
+await client.close();
+await server.close();
+```
+
+- **`read(context)`** returns a string (one text block), a `Uint8Array` (one
+  binary block, sent as base64), a `{ text }` or `{ blob }` block, or an array
+  of blocks. A string `blob` must already be base64. A block's `mimeType`
+  defaults to the declared one, else `application/octet-stream` for binary.
+  `null` or `undefined` answers the SDK's resource-not-found error
+  (`InvalidParams`, `Resource not found: <uri>`, with `data.uri`); return it
+  when the entity does not exist or is not this caller's to see.
+- **The context** carries `uri` (parsed), `variables` (the template's
+  variables, `{}` for a static resource), `request` (with `authInfo`),
+  `runtimeContext` (evaluated per request) and `signal`.
+- **Template variables are decoded and checked** before `read` runs, by their
+  RFC 6570 operator. `{x}`, `{.x}` and `{/x}` are one segment: no `/`, `\`,
+  `?` or `#` (literal or percent-encoded), and not `.` or `..`. `{+x}` may span
+  `/` but stops at the URI's query and fragment (no literal `?` or `#`). `{#x}`
+  is a fragment (it may hold `/` and `?`, not a second `#`). `{?x}` and `{&x}`
+  hold one query value. Every operator also refuses a `.` or `..` segment,
+  control characters and invalid percent-encoding (a stray `%`, bytes that are
+  not UTF-8). A refused value answers resource-not-found and `read` never
+  runs, so `notes://42?tenant=x` or `notes://..%2F..%2Fetc` never reaches
+  `notes://{id}`. Values arrive percent-decoded (`notes://hello%20world` gives
+  `{ id: 'hello world' }`). `rawVariables: true` on a template hands over the
+  SDK's raw match instead, for you to validate. When two templates overlap, the
+  first that matches decides, and a refused value does not fall through to the
+  next.
+- **A template's `list`** enumerates concrete resources for `resources/list`,
+  per request. Without it, the template is listed only in
+  `resources/templates/list`. Static resources are listed to every caller, so
+  scope a per-tenant listing with a template's `list`.
+- **`complete`** maps a template variable to an autocomplete callback
+  (`completion/complete`). The SDK does not pass these callbacks the request,
+  so they see no identity: never complete from tenant-private data.
+- **Metadata**: `title`, `description`, `mimeType`, `size` (static only),
+  `annotations` (`audience`, `priority`, `lastModified`) and `cacheHint`
+  (`ttlMs`, `cacheScope`). `cacheHint` applies only to 2026-07-28
+  `resources/read` results; the SDK default is
+  `{ ttlMs: 0, cacheScope: 'private' }`, and `'private'` is the right value for
+  anything scoped to a caller.
+- **URIs** are normalized with `new URL(uri).href`. A relative URI throws
+  `InvalidRequestError` at construction, and a duplicate URI is rejected at
+  construction and by `catalog.setResource`. A malformed `uriTemplate` rejects
+  `ready()` or `catalog.setResourceTemplate`.
+- A throw from `read`, `list` or `runtimeContext` becomes that request's
+  JSON-RPC error carrying its message; `onError` is not called.
+
+## Prompts
+
+`prompts` (2.5) publishes prompt templates a client can list and fill in:
+
+```ts
+createMcpServer({
+  name: 'review',
+  prompts: {
+    review: {
+      description: 'Review a diff.',
+      arguments: {
+        diff: { description: 'The diff to review.', required: true },
+        tone: { description: 'friendly or strict' },
+      },
+      get: ({ diff, tone }, { request }) => ({
+        description: `Review for ${request.authInfo?.clientId ?? 'anonymous'}`,
+        messages: [{ role: 'user', content: `Review this (${tone ?? 'friendly'}):\n${diff}` }],
+      }),
+    },
+  },
+});
+```
+
+`get(args, context)` returns a string (one user text message), an array of
+`{ role, content }` messages, or `{ description?, messages }`. A message's
+content is a string, a text block, an image or audio block (`data` as bytes or
+base64, plus `mimeType`), or an embedded resource. A Deuz client reads it with
+`client.getPrompt('review', { diff })`.
+
+Validation is strict. A `prompts/get` is rejected with `InvalidParams`, before
+`get` runs, when it names an argument that is not declared, passes a value that
+is not a string, misses a required argument, or fails the optional `schema` (any
+Standard Schema, for an enum or a pattern). `schema` only validates: `get` still
+receives the strings as sent, not the schema's transformed output.
+
+Guardrails and `approve` do not apply to resources or prompts; they gate tool
+calls only.
+
+## The mutable catalog
+
+`server.catalog` (2.5) changes what the server publishes while it runs. Each
+change is prepared like a construction-time entry, applied in call order, served
+to every request from then on, and announced with the matching
+`notifications/{tools,resources,prompts}/list_changed` wherever the client can
+receive one. A broken definition rejects and changes nothing.
+
+```ts
+await server.catalog.setTool('forecast', forecast);               // add or replace; tools/list_changed
+await server.catalog.removeTool('legacy_search');                 // false when nothing was served
+await server.catalog.setPrompt('triage', { get: () => 'Triage the inbox.' }); // prompts/list_changed
+await server.catalog.resourceUpdated('notes://n1');               // resources/updated, to subscribers only
+```
+
+| Method | Does |
+| --- | --- |
+| `setTool(name, tool, annotations?)` | Publishes or replaces a tool. It replaces any served tool of that name: a `tools`, `agentTools` or `agents` entry alike. `annotations` default to `toolAnnotations[name]`. |
+| `setAgent(name, agent, annotations?)` | Publishes or replaces an agent as a `{ prompt }` tool. |
+| `removeTool(name)` | Stops serving a tool of any kind; resolves `false` when none was served. |
+| `setResource` / `removeResource` | A static resource. `setResource` rejects when another resource already serves the URI. |
+| `setResourceTemplate` / `removeResourceTemplate` | A URI template. |
+| `setPrompt` / `removePrompt` | A prompt. |
+| `resourceUpdated(uri)` | Sends `notifications/resources/updated` to subscribers of that URI whose identity the resource's `read` answers. No subscriber is not an error. |
+
+Every method returns a promise: preparing a Standard Schema is async and needs
+the lazily loaded SDK peer, so the methods reject with the missing-peer
+`InvalidRequestError` when `@modelcontextprotocol/server` is not installed.
+There is no `setAgentTool`: a native `agentTools` entry can be removed at
+runtime, not added. Removing and adding in the same tick is coalesced into one
+notification. On a live stdio session a replaced entry moves to the end of that
+session's list.
+
+<Callout type="warn" title="Capabilities are fixed at a session's handshake">
+`resources` is advertised only when `resources` or `resourceTemplates` was
+passed (even `{}`) or the catalog holds some; `prompts` likewise. An HTTP request
+always sees the current catalog, but a stdio session that started without the
+capability never learns of resources or prompts added later. Build the server
+with `resources: {}` / `prompts: {}` if you will add the first one at runtime. A
+template added at runtime to a stdio session that started without the
+completions capability is served without its `complete` callbacks.
+</Callout>
+
+### Where notifications arrive
+
+| Client | Change notifications |
+| --- | --- |
+| MCP 2026-07-28 over HTTP | Only on a `subscriptions/listen` stream the client opens. The bus is in-process; pass `eventBus` to share it across processes, so a change in one process reaches listeners connected to another. |
+| MCP 2026-07-28 over stdio | On its listen streams. |
+| 2025-era over stdio | Pushed as unsolicited notifications; `resources/subscribe` and `resources/unsubscribe` are served. |
+| 2025-era over stateless HTTP | **Never.** Each request runs on a fresh instance with no session and no stream (GET is 405). The client sees a change the next time it lists, and is not offered `resources.subscribe`. |
+
+`resourceUpdated(uri)` reaches 2026-07-28 listeners whose filter names the URI
+and 2025-era stdio sessions that subscribed to it. When `new URL(uri).href`
+differs from the URI given (`https://example.com` against
+`https://example.com/`), both forms are announced. A subscriber gets the
+notification only when the resource's `read` answers that subscriber's
+identity (its `authInfo` and `runtimeContext`): a `null`, a throw or a URI no
+resource serves drops it for that subscriber. The check runs per notification,
+so `read` runs once per HTTP listen stream that would carry the update and
+once per stdio connection and update; keep it cheap or cached. On HTTP, frames
+on one listen stream are judged in order, so a slow `read` delays that
+stream's later notifications. The listen acknowledgment still lists every URI
+the client asked for; only delivery is filtered. A 2025-era stdio session may
+hold at most 10,000 subscribed URIs.
+
+A 2025-era client over stateless HTTP still sees `listChanged: true` in its
+capabilities, the SDK default, as 2.4 already advertised for tools.
+
+## Tasks
+
+A long-running served tool or agent can answer `tools/call` with a **task
+handle** instead of its result (2.5). The run continues in the background; the
+client polls for it, reads the result later, and can cancel it. Tasks are a
+preview: their options can still change in 2.6. Opt in per name with
+`tasks.tools`, or with `task: true` on an agent:
+
+```ts
+import { createMcpServer } from '@deuz-sdk/core/mcp/server';
+
+const server = createMcpServer({
+  name: 'research',
+  tools: { crawl },
+  agents: {
+    researcher: { description: 'Answers research questions with sources.', agent: researcherOptions, task: true },
+  },
+  tasks: { tools: ['crawl'], ttlMs: 15 * 60_000 },
+});
+```
+
+The server speaks the task format of the request's protocol era:
+
+- **MCP 2026-07-28**: the official Tasks extension
+  (`io.modelcontextprotocol/tasks`, `MCP_TASKS_EXTENSION`), advertised under
+  `capabilities.extensions`. The server decides: a call becomes a task only
+  when the request envelope declares the extension. Methods: `tasks/get` (the
+  result or error inlined once the task ends), `tasks/update` and
+  `tasks/cancel`. There is no `tasks/list` or `tasks/result` in this era, and a
+  client that did not declare the extension is refused with -32021.
+- **MCP 2025-11-25**: that revision's core tasks. The client decides by sending
+  `params.task`; each task tool lists `execution.taskSupport: 'optional'`.
+  Methods: `tasks/get`, the blocking `tasks/result`, `tasks/list` and
+  `tasks/cancel` (a finished task is refused).
+
+Guardrails and the approval gate run inside the `tools/call`, before a task
+exists, so a blocked or denied call answers its plain result and creates no
+task. Validation, `execute` (with `Tool.timeoutMs`), the agent run with its
+budgets and receipts, and `onToolResult` then run in the background on the
+task's own signal; `tasks/cancel` aborts it, which stops a served agent's
+`runAgent`. A 2026-07-28 `isError` result is a completed task; on 2025-11-25 it
+shows as `failed` and `tasks/result` still returns it.
+
+| Option (`tasks`) | Default | Notes |
+| --- | --- | --- |
+| `tools` | — | Served names (`tools`, `agentTools` or `agents`) that run as tasks. A name that is not served is rejected. |
+| `store` | `createInMemoryMcpTaskStore()` | A `McpTaskStore`. The in-memory one keeps at most `maxTasks` (default 1000), evicting the oldest finished task; when all are running it refuses with status 503. |
+| `ttlMs` | 3,600,000 (1 hour) | How long a task is kept from creation; `null` keeps it until the store evicts it. A 2025-11-25 client may ask for less. An expired task is not found; expiry does not abort a run still in progress. |
+| `pollIntervalMs` | 1000 | The polling interval suggested to clients. |
+| `owner` | `client:<authInfo.clientId>` over HTTP, one per connection over stdio | The identity a task is bound to; another caller's task is not found. Return a per-user key when one OAuth client serves many users. An HTTP caller without `authInfo` is anonymous: the unguessable task id is the only key, and `tasks/list` answers an empty page. |
+| `generateTaskId` | `crypto.randomUUID()` | Ids must be unguessable. |
+
+| Transport and era | Tasks | Status notifications |
+| --- | --- | --- |
+| HTTP, 2026-07-28 | yes | no: poll `tasks/get` |
+| stdio, 2026-07-28 | yes | no: poll `tasks/get` |
+| stdio, 2025-11-25 | yes | `notifications/tasks/status`, pushed |
+| HTTP, 2025-11-25 (stateless) | yes | no: no session, no stream |
+
+A server with no `tasks` option and no agent with `task: true` advertises and
+serves exactly what it did before. Verified on 2026-11-24 with
+`@modelcontextprotocol/server` 2.3.1 (2.4.0 behaves the same) and
+`@modelcontextprotocol/sdk` 1.29 as the 2025-era client, through the test
+suite, and the 2026-07-28 responses validated against the Tasks extension's
+published schema.
 
 ## Protocol eras
 
@@ -249,11 +530,19 @@ Both eras run the same definition, so they cannot drift apart. Over stateless HT
 
 ## Limits
 
-- **Tools only.** The server publishes tools; it serves no resources or prompts, and its catalog is fixed at construction (no `tools/list_changed`).
-- **No conversation.** `messages` is `[]` and `toolCallId` is per JSON-RPC request — a 2026-07-28 approval retry is a new request with a new id.
+- **Tasks: `optional` only, and no 2026-07-28 status notifications.** The SDK answers any throw inside a tool call as an `isError` result, so `taskSupport: 'required'` (which needs a protocol error for a non-task call) is not offered. Its listen router has no `taskIds` filter, so 2026-07-28 clients must poll `tasks/get`.
+- **A task tool cannot declare an `outputSchema`.** The SDK requires `structuredContent` on every non-error result of such a tool, which would turn the task handle into an error; `ready()` and `catalog.setTool` reject the combination. Agents never have one.
+- **Task results carry an extra `content: []`** (the SDK adds it to every `tools/call` result); both specs allow it.
+- **A shared task store does not carry the abort.** A cancel served by another process marks the task cancelled and discards the late result, but cannot stop the run. There is no per-owner limit on concurrent tasks, only the in-memory store's total cap.
+- **No notifications over stateless HTTP.** A 2025-era client over HTTP never receives `list_changed` or `resources/updated`; it sees changes when it lists again. Every other combination receives them only where described in [Where notifications arrive](#where-notifications-arrive).
+- **Capabilities are fixed per session.** A stdio session learns of resources or prompts only if the server advertised them at its handshake; pass `resources: {}` / `prompts: {}` to add the first ones later.
+- **Resources and prompts are not gated.** Guardrails and `approve` apply to tool calls only. Scope reads and prompts to the caller yourself, through `request.authInfo` and `runtimeContext`; static resources are listed to every caller, and completion callbacks see no identity.
+- **Update delivery costs a read.** `resources/updated` is filtered by calling the resource's own `read` for each subscriber, which is exactly the `resources/read` rule but costs a full read. On a 2026-07-28 stdio connection the check runs even when no listen stream names the URI.
+- **An empty tool list is `[]`.** Since 2.5 a server with zero tools answers `tools/list` with `[]` instead of method-not-found; any advertised but empty kind lists `[]` too.
+- **No conversation.** `messages` is `[]`, and `toolCallId` names one call within its serving unit (one HTTP request, or one stdio connection) — a 2026-07-28 approval round trip and an HTTP retry are new requests with new ids, and there is no idempotency key for HTTP retries.
 - **Per-tool timeouts only.** `Tool.timeoutMs` is honored (`0` or `Infinity` means no cap, as in the loop); the loop's call-level `timeout` has no counterpart. A client's own request timeout and cancellation bound every call.
 - **No usage reporting.** An agent's token usage stays on the server (observe it with `deps.onUsage`); MCP has no field for it.
-- **Not live-verified against third-party hosts.** The server is verified offline, in-process, against the Deuz client on both SDK lines and the official v1 and v2 SDK clients (HTTP and a real stdio child) — not against hosted MCP clients.
+- **Not live-verified against third-party hosts.** The server is verified offline, in-process, against the Deuz client on both SDK lines and the official v1 and v2 SDK clients (HTTP and a real stdio child) — not against hosted MCP clients. The 2.5 resources, prompts and notifications are verified the same way, against the official v1 and v2 SDK clients over HTTP and an in-process stdio pipe.
 
 ## See also
 
@@ -261,3 +550,5 @@ Both eras run the same definition, so they cannot drift apart. Over stateless HT
 - [Guardrails](/docs/agents/guardrails) — the hooks a served call runs.
 - [Native agents](/docs/modules/native-agents) — `runAgent`, `AgentToolSet` and tool contexts.
 - [Tool loop](/docs/agents/tool-loop) — the pipeline a served call mirrors.
+- [MCP ledger](/docs/modules/mcp-ledger) — a ready-made server built on `createMcpServer`: memory, an advisory budget and receipts.
+- [ACP](/docs/modules/acp) — serve a native agent to editors over the Agent Client Protocol instead.

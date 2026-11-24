@@ -35,7 +35,7 @@ import {
 import { budgetStoreContracts } from './fixtures/budget-store-conformance';
 import { initialSnapshot, swarmStoreContracts } from './fixtures/swarm-store-conformance';
 import { SLOW_HOOK_TIMEOUT_MS, SLOW_TEST_TIMEOUT_MS } from './fixtures/timeouts';
-import { postgresUrl } from './fixtures/services';
+import { PG_REPEATABLE_READ_OPTIONS, postgresUrl } from './fixtures/services';
 import { estimateClockSkew } from './fixtures/clock-skew';
 
 const url = postgresUrl();
@@ -43,11 +43,9 @@ const url = postgresUrl();
 if (url) vi.setConfig({ testTimeout: SLOW_TEST_TIMEOUT_MS, hookTimeout: SLOW_HOOK_TIMEOUT_MS });
 /** Enough for the contention cases below plus a connection to watch them with. */
 const POOL_SIZE = 6;
-const REPEATABLE_READ =
-  'SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL REPEATABLE READ';
 
 let pool: pg.Pool | undefined;
-/** What the pool reported outside a query: a failed session setup, an idle connection's error. */
+/** What the pool reported outside a query: an idle connection's error. */
 const poolErrors: unknown[] = [];
 /** Database clock minus host clock, so `now()` reads the stores' own time. */
 let skew = 0;
@@ -98,10 +96,11 @@ function freshSwarmStore(): SwarmStore {
 
 describe.skipIf(!url)('Postgres stores on a live server (REPEATABLE READ, pooled)', () => {
   beforeAll(async () => {
-    pool = new pg.Pool({ connectionString: url, max: POOL_SIZE });
-    // A new connection runs this before any statement the pool hands it.
-    pool.on('connect', (connection) => {
-      connection.query(REPEATABLE_READ).catch((error: unknown) => poolErrors.push(error));
+    // Every connection opens at REPEATABLE READ, before any statement the pool hands it.
+    pool = new pg.Pool({
+      connectionString: url,
+      max: POOL_SIZE,
+      options: PG_REPEATABLE_READ_OPTIONS,
     });
     pool.on('error', (error) => poolErrors.push(error));
     // Best of several round trips: the first query also opens the connection.

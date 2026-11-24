@@ -45,6 +45,11 @@ The descriptor `{ provider: 'anthropic', modelId, surface: 'anthropic' }` is res
 
 | Model | Vision | Tools | Thinking | Caching | Context | Max output |
 | --- | --- | --- | --- | --- | --- | --- |
+| `claude-fable-5-1` | yes | yes | yes (adaptive) | yes | 1,000,000 | 128,000 |
+| `claude-opus-5-5` | yes | yes | yes (adaptive) | yes | 1,000,000 | 128,000 |
+| `claude-sonnet-5-5` | yes | yes | yes (adaptive) | yes | 1,000,000 | 128,000 |
+| `claude-haiku-5-5` | yes | yes | yes (adaptive) | yes | 1,000,000 | 128,000 |
+| `claude-opus-5` | yes | yes | yes (adaptive) | yes | 1,000,000 | 128,000 |
 | `claude-fable-5` | yes | yes | yes (adaptive) | yes | 1,000,000 | 128,000 |
 | `claude-sonnet-5` | yes | yes | yes (adaptive) | yes | 1,000,000 | 128,000 |
 | `claude-opus-4-8` | yes | yes | yes | yes | 1,000,000 | 128,000 |
@@ -52,8 +57,10 @@ The descriptor `{ provider: 'anthropic', modelId, surface: 'anthropic' }` is res
 | `claude-opus-4-6` | yes | yes | yes | yes | 1,000,000 | 128,000 |
 | `claude-sonnet-4-6` | yes | yes | yes | yes | 1,000,000 | 64,000 |
 | `claude-haiku-4-5` | yes | yes | yes | yes | 200,000 | 64,000 |
+| `claude-opus-4-5` | yes | yes | yes | yes | 200,000 | 64,000 |
+| `claude-sonnet-4-5` | yes | yes | yes | yes | 200,000 | 64,000 |
 
-On Opus 4.7+, Sonnet 5 and Fable 5 the registry also flags `samplingRestrictions` — non-default `temperature`/`top_p`/`top_k` return HTTP 400 on those models, so the adapter never sends them.
+On Opus 4.7 and 4.8 and every Claude 5.x model the registry also flags `samplingRestrictions` — non-default `temperature`/`top_p`/`top_k` return HTTP 400 on those models, so the adapter never sends them.
 
 Unknown slugs do not throw. A future `claude-opus-4-9` falls back to conservative `anthropic`-surface defaults (tools/reasoning/structured-output off, `max_tokens` 4,096) and logs a warning via `deps.logger`, so new releases work without an SDK upgrade — pin a known slug to keep the full capability matrix.
 
