@@ -1,0 +1,424 @@
+---
+title: What is new in 2.5
+description: A distribution release — a budget meter for coding harnesses, the deuz CLI, harnesses as budgeted sub-agents, ACP on both sides, budget- and policy-aware tool search, MCP resources and prompts, a Vercel AI SDK provider and a ready-made MCP ledger, with the upgrade notes and the known limits of all eight.
+---
+
+2.5 adds few new ideas. It takes the guarantees Deuz already had (a persistent
+token and USD budget, receipts, and HMAC-signed approvals) to the places where
+developers already work:
+
+- **Coding harnesses.** A local [meter](/docs/modules/meter) charges Claude
+  Code's or Codex's own model traffic to a persistent budget and refuses it
+  with 402 at the ceiling. The [`deuz` CLI](/docs/modules/cli) starts it in one
+  line, and [`runHarness`](/docs/modules/harness) runs a harness as a budgeted
+  sub-agent whose permission requests Deuz decides.
+- **Editors.** [ACP](/docs/modules/acp) serves a native Deuz agent to Zed or a
+  JetBrains IDE, and drives any ACP agent from code.
+- **Vercel AI SDK code.** [`@deuz-sdk/ai-sdk-provider`](/docs/modules/ai-sdk-provider)
+  wraps an AI SDK 7 model in one line and adds a Deuz budget, fail-over and a
+  circuit breaker.
+- **MCP clients.** The [MCP server](/docs/modules/mcp-server) publishes
+  resources and prompts and changes its catalog at runtime, and
+  [`@deuz-sdk/mcp-ledger`](/docs/modules/mcp-ledger) is a ready-made server
+  that gives Claude Desktop or Cursor memory, a spend ledger and receipts.
+- **Large tool catalogs.** [Tool search](/docs/modules/tool-search) hides a
+  catalog behind one search tool that respects the run's budget and policy.
+
+2.5 is additive. Every change to the public API of `@deuz-sdk/core` is new
+surface, so 2.4 code compiles against 2.5 unchanged. Nothing new runs until you
+import it, and the provider requests of existing calls are unchanged. Two
+behaviours of the MCP server change on purpose; read
+[Upgrading from 2.4](#upgrading-from-24) if you serve tools over MCP.
+
+<Callout type="info" title="What was verified live">
+On 2026-11-24 (Windows 11, Node 26.13.0) part of 2.5 ran against real
+software:
+
+- **Claude Code 2.1.331** behind the built `deuz meter` and through
+  `runHarness` (`@agentclientprotocol/claude-agent-acp` 0.110.1), on a
+  claude.ai subscription login: its traffic was measured and priced, measured
+  and declared cost agreed within $0.000001, and a 402 ended the turn after one
+  request without a retry. With the preset's session-mode fix, `runHarness`
+  got Claude Code's edit permission request, a deny-writes policy refused it
+  and the file was not written; measured $0.011074 against declared
+  $0.01107382.
+- **Codex** (CLI 0.166.0, and `@agentclientprotocol/codex-acp` 2.10.0) on a
+  ChatGPT login reaches the meter only through a custom model provider. In the
+  live run the meter charged its estimate, because the backend sends no
+  `content-type`; the meter now measures those replies, which a unit test
+  covers but no live run has confirmed. API-key mode was not tried.
+- **ACP** on both sides passed a conformance run against the official
+  `@agentclientprotocol/sdk` 2.9.1 and its published schema, including the
+  built `deuz acp`.
+
+No real editor, no Gemini CLI or OpenCode, and no live model provider for the
+other modules. The meter, the CLI and the harness runner are tested against a
+fake upstream on `127.0.0.1` with real SSE streams. The AI SDK provider is
+tested through `ai` 7's own `generateText`, `streamText` and
+`wrapLanguageModel` over its mock models. The MCP server is tested against the
+official v1 and v2 SDK clients, and the MCP ledger was also run once as a real
+stdio child process. Where a page says **not live-verified**, make one real
+call, with a small budget, before you depend on it.
+</Callout>
+
+## Install and choose an entry
+
+```bash
+npm install @deuz-sdk/core@2.5.0
+```
+
+`@deuz-sdk/react` gains nothing in 2.5. Core still has no runtime dependency,
+and no optional peer is added or changed.
+
+| Entry | New surface | Runtime |
+| --- | --- | --- |
+| `@deuz-sdk/core/meter` | `createMeterHandler`, `declaredReceipt`, `DEFAULT_METER_UPSTREAMS`, `estimatePromptTokens`, `MeterError` | Edge-safe |
+| `@deuz-sdk/core/meter/node` | `createMeterProxy`, `createJsonlReceiptSink` | Node |
+| `@deuz-sdk/core/acp` | `serveAcpAgent`, `connectAcpAgent`, `createAcpPeer`, `createNdjsonTransport`, `createInMemoryAcpTransportPair`, `createInMemoryAcpSessionStore`, `AcpError`, the `ACP_*` constants and the `Acp*` wire types | Edge-safe |
+| `@deuz-sdk/core/acp/stdio` | `serveAcpAgentStdio`, `spawnAcpAgent`, `nodeStreamsToAcpTransport` | Node |
+| `@deuz-sdk/core/harness` | `runAcpHarness`, `createHarnessReceiptCollector`, `compareHarnessCost`, `evaluateHarnessPolicy`, `matchHarnessPath`, `normalizeHarnessPath`, `HARNESS_PRESETS` and the four presets, `defaultHarnessEnv`, `CLAUDE_CODE_PROVIDER_SWITCHES` | Edge-safe |
+| `@deuz-sdk/core/harness/node` | `runHarness`, `harnessTool` | Node |
+| `@deuz-sdk/core/tool-search` | `createToolSearch`, `searchTools`, `withSearchMeta`, `searchMetaOf`, `remainingFromBudgetStore`, `remainingFromExecution`, `createToolIndex`, `tokenizeForSearch`, `TOOL_SEARCH_NAME`, `ToolSearchError` | Edge-safe |
+| `@deuz-sdk/core/errors` | Every core error class (`DeuzError`, `isDeuzError`, `BreakerOpenError`, `RateLimitError`, `InvalidRequestError` and the rest), for a package that needs them without loading the root entry. It also holds the five classes the root does not export (`ContextBudgetExceededError` from `/context`; `RevisionConflictError`, `OperationConflictError`, `EmbeddingMismatchError` from `/memory/versioned`; `UnsupportedStoreError` from `/agent`). They are the same class objects as on those entries, so `instanceof` works across them | Edge-safe |
+
+`@deuz-sdk/core/mcp/server` and `/mcp/server/stdio` grow in place: resources,
+resource templates, prompts, `server.catalog`, MCP tasks
+(`createInMemoryMcpTaskStore`, `MCP_TASKS_EXTENSION` and the `McpTask*`
+types), and the options `resources`, `resourceTemplates`, `prompts`, `tasks`,
+`eventBus`, `maxSubscriptions` and `generateId`.
+
+Three packages are new. Each depends on `@deuz-sdk/core` and keeps whatever it
+needs out of core:
+
+| Package | What it is | Needs |
+| --- | --- | --- |
+| [`@deuz-sdk/cli`](/docs/modules/cli) | The `deuz` command: `deuz meter` and `deuz acp` | Node 22; Node 22.13 for `--store` |
+| [`@deuz-sdk/ai-sdk-provider`](/docs/modules/ai-sdk-provider) | `deuz(model, options)` and `deuzMiddleware(options)` for Vercel AI SDK 7 | `ai@7`, `@ai-sdk/provider@4`, Node 22 |
+| [`@deuz-sdk/mcp-ledger`](/docs/modules/mcp-ledger) | `npx @deuz-sdk/mcp-ledger`: memory, an advisory budget and receipts over MCP | Node 22.13 (`node:sqlite`) |
+
+## Stability
+
+| Label | What it covers |
+| --- | --- |
+| **Stable** | Tool search, the MCP server's resources, prompts and catalog, the meter (handler, proxy and receipt shape), the AI SDK provider and the MCP ledger's tools and storage |
+| **Preview** | ACP, the harness runner and the CLI. They have met Claude Code and Codex in live trials, but not a real editor, and their API can still change in 2.6 |
+
+## Meter
+
+`@deuz-sdk/core/meter` is a budget proxy for traffic you do not write yourself.
+Point a harness's base URL at it, and every request is admitted against a
+persistent `BudgetStore` on a conservative estimate, forwarded to the provider
+(streams pass through byte for byte), settled with the usage the provider
+reported, and recorded as one receipt with no prompt, response or credential
+in it. At the ceiling it answers 402 in the provider's own error JSON. It
+routes Anthropic Messages, OpenAI Chat Completions and OpenAI Responses, and
+any OpenAI-compatible base URL. Its usage mapping is the adapters' own, so it
+bills exactly as a Deuz call to the same model would.
+→ [Meter](/docs/modules/meter)
+
+## The deuz CLI (preview)
+
+`npx @deuz-sdk/cli meter --budget-usd 5 -- claude` runs Claude Code behind the
+meter: it sets `ANTHROPIC_BASE_URL`, `OPENAI_BASE_URL` and `DEUZ_METER_URL` for
+the command, passes stdio through, prints a spend summary and exits with the
+command's code. Without a command it serves on `127.0.0.1:8787` and logs each
+request with its cost and the budget left. `deuz acp ./agent.js` serves a Deuz
+agent to an editor. Both take a USD or token ceiling, a rolling window, a key
+and a SQLite store. The CLI is the first part of what 2.4 listed as "a CLI and
+TUI"; there is no TUI. → [CLI](/docs/modules/cli)
+
+## Harnesses as sub-agents (preview)
+
+`runHarness` starts a meter bound to your budget, points a harness at it,
+spawns the harness over ACP and sends one prompt. It decides each permission
+request (a policy by tool kind and path, then a callback, then the parent's
+approver, then deny), cancels the turn at the first budget 402, and reports
+the measured and the declared cost side by side, flagging a divergence. Presets
+cover Claude Code, Codex, Gemini CLI and OpenCode; the Claude Code preset is
+verified live and switches each session to the mode where Claude Code asks
+before its tool calls. Permission paths are resolved to real paths (symlinks,
+junctions, Windows short names) before the policy sees them, and a budgeted
+run refuses to start while a Claude Code provider switch such as
+`CLAUDE_CODE_USE_BEDROCK` would send traffic around the meter. `harnessTool`
+makes the same run a tool for `generateText`, `streamText` and `runAgent`. The
+result counts the tool calls that went through a Deuz decision apart from
+those Deuz only observed, because a harness asks only when it chooses to.
+→ [Harness](/docs/modules/harness)
+
+## ACP on both sides (preview)
+
+`serveAcpAgent` serves a native Deuz run to an [Agent Client
+Protocol](https://agentclientprotocol.com) client (protocol version 1, schema
+1.34.1). Text, reasoning, tool calls and the plan stream to the editor; a tool
+that needs approval becomes the editor's permission dialog, answered through
+the run's own HMAC-signed token, which the editor never sees; cost goes to a
+persistent budget and is shown as the session's cost, in `_meta` fields and,
+optionally, in a plain-text footer. `connectAcpAgent` and `spawnAcpAgent`
+drive any ACP agent from code. Both sides passed a conformance run against the
+official ACP SDK. → [ACP](/docs/modules/acp)
+
+## Tool search
+
+`createToolSearch` puts a large catalog behind one `tool_search` tool, over a
+dependency-free BM25 index. Tools the execution policy would refuse are never
+returned, tools that do not fit the remaining budget are left out or labelled,
+and approval-gated or expensive tools are labelled. `search.apply(options)`
+plugs into the loops' existing `prepareStep` → `activeTools` seam, so it works
+in `generateText`, `streamChat` and native `runAgent` alike:
+
+```ts
+const result = await generateText(search.apply({ model, prompt, maxSteps: 8 }));
+const run = await runAgent(search.apply({ model, prompt, checkpointVersion: 3, session }));
+```
+
+`apply` returns your options with their own types, except `tools`,
+`prepareStep` (always the composed one) and `guardrails`
+(`ToolSearchApplied<O, T>`), so the V3 `runAgent` overload resolves without
+`as const`. With `enforce` on, its guardrail refuses a deferred tool the model
+never surfaced and any tool the step never offered, such as a hidden MCP tool
+from the call's `mcp` entries. → [Tool search](/docs/modules/tool-search)
+
+## MCP server: resources, prompts and a catalog
+
+`createMcpServer` serves static resources and RFC 6570 URI templates (text or
+binary), and prompts with declared arguments and strict validation. A resource
+read and a prompt `get` see the same per-request identity a tool call does.
+`server.catalog` adds, replaces and removes tools, agents, resources, templates
+and prompts at runtime and sends the matching `list_changed` notification;
+`catalog.resourceUpdated(uri)` notifies only the subscribers whose identity
+the resource's `read` answers. Template variables reach `read` percent-decoded
+and checked against their RFC 6570 operator. Notifications reach 2026-07-28
+clients on their `subscriptions/listen` streams (with an optional shared
+`eventBus` across processes) and 2025-era clients over stdio, never 2025-era
+clients over stateless HTTP. Opted-in tools and agents run as MCP tasks: the
+official Tasks extension on 2026-07-28 and core tasks on 2025-11-25, over HTTP
+and stdio. A tools-only server advertises exactly what it did in 2.4.
+→ [MCP server](/docs/modules/mcp-server)
+
+## AI SDK provider
+
+```ts
+import { deuz } from '@deuz-sdk/ai-sdk-provider';
+
+const model = deuz(openai('gpt-5-mini'), { budget: { usd: 5 } });
+```
+
+`deuz(model, options)` returns an AI SDK 7 `LanguageModelV4` that checks the
+breaker, reserves against a Deuz budget (in process, or a persistent
+`BudgetStore` shared across processes), calls the model, settles the reported
+usage and emits a cost receipt. It fails over to fallback models before the
+first content byte. At the ceiling it throws `DeuzBudgetError`, which the AI
+SDK does not retry. `deuzMiddleware(options)` gives the budget, breaker and
+receipts to `wrapLanguageModel`, which also takes AI SDK 5 and 6 models and
+upgrades them.
+→ [AI SDK provider](/docs/modules/ai-sdk-provider)
+
+## MCP ledger
+
+`npx @deuz-sdk/mcp-ledger` is a stdio MCP server, with an optional loopback
+HTTP mode, that serves nine tools: `memory_remember`, `memory_recall`,
+`memory_revise`, `memory_forget`, `memory_history`, `budget_status`,
+`budget_record_spend`, `receipt_record` and `receipt_list`. Memory is Deuz's
+versioned memory with lexical search and no API key; the budget is a ledger the
+model reports to; receipts go to an append-only, hash-chained log. All of it
+sits in three SQLite files in one directory. → [MCP ledger](/docs/modules/mcp-ledger)
+
+## Bug fixes
+
+- **Served tool call ids no longer collide across MCP connections.**
+  `createMcpServer` gave a served call the `toolCallId` `mcp-<JSON-RPC id>`.
+  JSON-RPC ids restart with every connection, so a tool that derives an
+  operation id from `toolCallId`, such as the
+  [versioned memory](/docs/modules/versioned-memory) tools, saw a second
+  connection's first call as a replay of the first connection's (a false
+  `'replayed'`), or failed with `OperationConflictError` when the content
+  differed. The id is now `mcp-<unit>-<JSON-RPC id>`, where `<unit>` is a fresh
+  `generateId()` per serving unit; see [Behaviour changes](#behaviour-changes).
+  `createVersionedMemoryTools` is now safe to serve over MCP.
+
+## What the 2.4 notes listed for 2.5, and where it landed
+
+| Listed for 2.5 | In 2.5 |
+| --- | --- |
+| A CLI and TUI on top of the headless preview | The [`deuz` CLI](/docs/modules/cli) shipped as a preview with `deuz meter` and `deuz acp`. No TUI, and the CLI does not wrap the headless preview yet |
+| A local daemon and a control server | Not in 2.5 |
+| Realtime voice over WebRTC | Not in 2.5 |
+| Lazy tool search | Shipped: [tool search](/docs/modules/tool-search), budget- and policy-aware |
+| A local plugin lifecycle | Not in 2.5 |
+| Dynamic agent tasks with a durable mailbox | Not in 2.5 (served tools and agents can run as [MCP tasks](/docs/modules/mcp-server#tasks), which is not a mailbox) |
+| A worktree integrator | Not in 2.5 |
+| An optional LSP or ACP preview | [ACP](/docs/modules/acp) shipped as a preview, on both sides; no LSP |
+
+[Known gaps](/docs/reference/known-gaps) lists the areas where Deuz is still
+behind other SDKs, and what to use there instead.
+
+## Upgrading from 2.4
+
+Code upgrades in place. The new subpaths and packages do nothing until you
+import them. The changes below concern only hosts that serve tools with
+`createMcpServer`.
+
+### Behaviour changes
+
+- **An empty kind lists `[]`.** A server with zero tools now answers
+  `tools/list` with an empty list where 2.4 answered method-not-found. Any kind
+  that is advertised but empty, including `resources: {}` and `prompts: {}`,
+  also lists `[]`. A client that took method-not-found to mean "no tools" sees
+  an empty list instead.
+- **The served `toolCallId` is `mcp-<unit>-<JSON-RPC id>`.** 2.4 used
+  `mcp-<JSON-RPC id>`, as its MCP server page stated. A string JSON-RPC id is
+  JSON-quoted. The unit decides when two requests are the same call:
+  - Over HTTP (2026-07-28, and the stateless fallback for 2025-era clients)
+    every request is its own unit. A client that retries the same POST makes a
+    **new** call: nothing on the wire ties the retry to the first one, and the
+    protocol has no idempotency key.
+  - Over stdio the unit is the connection. MCP forbids reusing a request id
+    within a session, so an id resent on the same connection keeps its
+    `toolCallId`, and an idempotent tool replays it. A new connection never
+    collides with an earlier one.
+  - A 2026-07-28 approval round trip is two requests, so `onToolCall`
+    guardrails see two different `toolCallId` values; the tool runs only in
+    the second.
+
+  A host that parsed the old format must adapt. `McpServerOptions.generateId`
+  names the units (default `crypto.randomUUID()`).
+- **Capabilities of a tools-only server are unchanged.** `resources` and
+  `prompts` are advertised only when you pass `resources`,
+  `resourceTemplates` or `prompts` (even `{}`), or the catalog holds some.
+
+### New members
+
+`DeuzMcpServer` gains `catalog`, and `McpServerOptions` gains `resources`,
+`resourceTemplates`, `prompts`, `tasks`, `eventBus`, `maxSubscriptions` and
+`generateId`; `McpServedAgent` gains `task`; `serveMcpStdio` takes
+`maxSubscriptions`. Callers are unaffected.
+Code that implements `DeuzMcpServer` itself, rather than calling
+`createMcpServer`, needs the new `catalog` member. No other 2.4 type changes,
+and no union is widened.
+
+### The new packages
+
+`@deuz-sdk/cli`, `@deuz-sdk/ai-sdk-provider` and `@deuz-sdk/mcp-ledger` start
+at 2.5.0 and need `@deuz-sdk/core` 2.5. `@deuz-sdk/mcp-ledger` requires Node
+22.13 or later, for `node:sqlite`.
+
+## Known limits
+
+Every new page has a Limits section; these are the ones to know before you
+deploy.
+
+**Across the release**
+
+- **Mostly not live-verified.** Only the meter, the harness runner and the CLI
+  met real harnesses (Claude Code and Codex), and ACP was checked against the
+  reference SDK; nothing met a real editor (see the callout at the top).
+
+**Meter and CLI**
+
+- **The ceiling can be overshot by up to one request** per request in flight
+  at the ceiling: admission is on an estimate, settlement on the measured
+  cost.
+- **The default estimate is pessimistic** (3 characters per token, the dearest
+  prompt rate, a 32,000-token output cap when the request sets none), so the
+  last part of a small budget can be refused early. There is no calibration
+  from settled usage yet.
+- **For Claude Code traffic the estimate ran 4 to 130 times the measured
+  cost**, so roughly the last $0.07 of a budget is refused early with `haiku`.
+- **Codex retries a 402** five times before exiting; Claude Code does not
+  retry. Nothing refused is forwarded or charged.
+- **Codex with a ChatGPT login needs a custom model provider.**
+  `deuz meter -- codex` meters nothing in that mode (Codex ignores
+  `OPENAI_BASE_URL`); a custom Codex model provider reaches the meter. The
+  backend's replies carry no `content-type`; the meter reads them as SSE, which
+  a unit test covers but no live run has confirmed. Subscription traffic
+  (Claude Code on claude.ai, a ChatGPT plan) is priced at API rates.
+- **Unmetered billable routes are refused with 404** by default, so an
+  unknown endpoint such as Codex's `/responses/compact` fails until you allow
+  forwarding.
+- **`injectStreamUsage`** adds a final chunk with empty `choices` to streaming
+  Chat Completions responses; a client that reads `choices[0]` unguarded may
+  break.
+- **`deuz meter -- <command>` refuses any wrapped command while a
+  `CLAUDE_CODE_USE_*` provider switch is on**, Claude Code or not, and does not
+  read Claude Code's settings files. The Zed and JetBrains configurations
+  follow those editors' docs without having been tried.
+  With `--store`, each run of `deuz meter` or `deuz acp` leaves one released
+  zero-amount probe record in the store.
+
+**Harness runner**
+
+- **Deuz decides only what the harness asks about.** A harness in an
+  auto-accept mode asks nothing; a call it never reports is invisible. Read
+  `toolCalls.decided` against `toolCalls.observedOnly`.
+- **Only the Claude Code preset is verified live** (`verifiedLive: true`).
+  Codex was run live before the meter fix for its ChatGPT-login replies, so
+  its measurement is confirmed by unit test only; the OpenCode preset is
+  documentation only; Gemini CLI cannot be metered at all.
+- **Settings files are not read.** The provider-switch refusal checks the
+  environment only; Claude Code's settings files can set the same variables.
+- **Mid-turn permission decisions are synchronous**, not resumable approvals;
+  native `runAgent` tools pass no approver to `harnessTool`.
+- **A shared meter is approximate**, and a gateway URL in your environment is
+  not followed. The Windows process-tree kill has no automated test.
+
+**ACP**
+
+- **Not tried in a real editor.** How an editor renders the session cost or the
+  footer is unknown, and the `_meta` budget is invisible in a stock editor.
+- **Checked against the reference SDK, not an editor.** The conformance run
+  used `@agentclientprotocol/sdk` 2.9.1; `spawnAcpAgent` drove the real Claude
+  Code and Codex adapters through `runHarness`.
+- **Protocol coverage** is version 1 without `session/list`, `session/close`,
+  `session/resume`, session modes, terminals or elicitation; `write_text_file`
+  sends no diff; sessions are in memory unless you pass a store.
+
+**Tool search**
+
+- **Lexical only**: BM25 with no embeddings and no fuzzy or prefix matching.
+- **Not evaluated against a real model.** Whether a model finds the right tool
+  through search as reliably as with the full catalog has not been measured.
+- **Budget filtering happens at search time**, a surfaced tool stays loaded, and
+  a result pruned by compaction is recomputed without the budget filter. With
+  `enforce` and `overBudget: 'exclude'` a call is re-checked against
+  `budget.remaining`, but not against the execution context's ledger.
+- **MCP tools from the call's `mcp` entries are not indexed**, the catalog is
+  fixed at creation, and resuming a durable run with search active is reasoned
+  from the code, not tested. Enforcement lets a sub-agent's calls and every
+  call after a handoff through unchecked against the offered set.
+- **One type check is loose.** `apply({ prepareStep: () => 42 })` does not
+  report the bad return type of your own `prepareStep`.
+
+**MCP server**
+
+- **MCP tasks are `optional` only.** No `taskSupport: 'required'`, no
+  2026-07-28 task status notifications (clients poll), and a task tool cannot
+  declare an `outputSchema`.
+- **Update delivery costs a read.** `resources/updated` is filtered per
+  subscriber by calling the resource's `read`.
+- **No notifications to 2025-era clients over stateless HTTP**, and a stdio
+  session learns of resources or prompts only if they were advertised at its
+  handshake.
+- **Resources and prompts are not gated** by guardrails or `approve`;
+  completion callbacks see no caller identity.
+
+**AI SDK provider**
+
+- **AI SDK 7 only** for `deuz()`; AI SDK 5 and 6 models go through
+  `deuzMiddleware`, which has no fail-over.
+- **Admission is by character estimate**, with output reserved at
+  `maxOutputTokens` or 4,096; a ceiling can be overshot by up to one call.
+- **Tested with the AI SDK's mock models only.**
+
+**MCP ledger**
+
+- **The budget is advisory**: a record the model reports to, not a ceiling.
+  Enforce with the meter.
+- **Memory search is lexical**, and remember never reconciles a reworded fact.
+- **Receipts record what the model reported**, not proof that it happened; the
+  hash chain detects later edits but does not prevent a rewrite.
+- **HTTP mode has no authentication** beyond loopback and Host/Origin checks,
+  and the ledger was not run inside Claude Desktop or Cursor.
+
+Previous releases remain documented in
+[What is new in 2.4](/docs/reference/whats-new-2-4) and the
+[Changelog](/docs/changelog).

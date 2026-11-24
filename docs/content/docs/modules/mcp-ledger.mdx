@@ -1,0 +1,226 @@
+---
+title: MCP ledger
+description: A ready-made MCP server for Claude Desktop, Cursor and other MCP clients — versioned memory, an advisory spend budget and a hash-chained receipt log in local SQLite files, started with npx (2.5).
+---
+
+`@deuz-sdk/mcp-ledger` (2.5) is a ready-made [MCP](https://modelcontextprotocol.io)
+server. Add one line to an MCP client's configuration and its model gets three
+things from Deuz, with no API key, no embedding model and no code to write:
+
+- **Memory** that persists between conversations, with revisions you can
+  inspect and a real forget. It is built on Deuz
+  [versioned memory](/docs/modules/versioned-memory).
+- **A spend budget**: a ledger of USD and tokens spent against a ceiling over a
+  rolling window, on a Deuz [`BudgetStore`](/docs/modules/budgets).
+- **A receipt log** of actions with effects outside the conversation (a sent
+  email, a changed file, a purchase): append-only and hash-chained, so a later
+  edit can be detected.
+
+Everything is stored in three SQLite files in one local directory. The server
+is built on [`createMcpServer`](/docs/modules/mcp-server) and serves stdio by
+default, with an optional loopback Streamable HTTP mode.
+
+<Callout type="warn" title="The budget is a record, not an enforced ceiling">
+An MCP server only learns what the model chooses to tell it. The ledger's budget
+is a record **the model reports to**: if the model never calls
+`budget_record_spend`, or spends anyway after `budget_status` says a cost will
+not fit, nothing stops it. `budget_status` always reports
+`enforcement: 'advisory'`. To enforce a ceiling, the spending has to pass
+through something the model cannot skip: put the [meter](/docs/modules/meter) in
+front of the provider API.
+</Callout>
+
+## Add it to a client
+
+It needs Node.js 22.13 or later (for `node:sqlite`).
+
+### Claude Desktop
+
+In *Settings → Developer → Edit Config* (`claude_desktop_config.json`):
+
+```json
+{
+  "mcpServers": {
+    "deuz-ledger": {
+      "command": "npx",
+      "args": ["-y", "@deuz-sdk/mcp-ledger", "--budget-usd", "20", "--window", "month"]
+    }
+  }
+}
+```
+
+### Cursor
+
+In `~/.cursor/mcp.json` (all projects) or `.cursor/mcp.json` (one project):
+
+```json
+{
+  "mcpServers": {
+    "deuz-ledger": {
+      "command": "npx",
+      "args": ["-y", "@deuz-sdk/mcp-ledger", "--budget-usd", "20", "--namespace", "my-project"]
+    }
+  }
+}
+```
+
+### Other clients
+
+Any client that launches stdio servers can run `npx -y @deuz-sdk/mcp-ledger`.
+A client that connects over HTTP can use `npx -y @deuz-sdk/mcp-ledger --http`,
+which serves Streamable HTTP at `http://127.0.0.1:3741/mcp`.
+
+On Windows, if a client cannot spawn `npx`, use `"command": "cmd"` with
+`"args": ["/c", "npx", "-y", "@deuz-sdk/mcp-ledger"]`.
+
+These configurations follow the clients' documented formats. The server's
+tests call its tools in process; it was also checked once by hand, outside the
+test suite, as a real stdio child process with a Deuz MCP client. It has not
+been run inside Claude Desktop, Cursor or Goose.
+
+## Tools
+
+| Tool | What it does |
+| --- | --- |
+| `memory_remember` | Saves one fact. An exact duplicate (ignoring case and whitespace) among the top 5 matches returns the saved one instead. |
+| `memory_recall` | Searches saved memories by words. An empty query lists the most recent ones. |
+| `memory_revise` | Corrects a memory. The old wording stays in its history. |
+| `memory_forget` | Permanently deletes a memory, its revisions and its search entries. |
+| `memory_history` | Lists every revision of one memory. |
+| `budget_status` | Spend and what is left in the window. Pass an estimate to get `fits: true/false`. |
+| `budget_record_spend` | Records USD (and optionally tokens) spent. Always recorded, even past the ceiling. A repeated `id` is counted once. |
+| `receipt_record` | Logs an action and its outcome: `succeeded`, `failed` or `unknown`. A repeated `id` is recorded once. |
+| `receipt_list` | Reads the log, newest first, with filters. `verify: true` checks the whole hash chain. |
+
+The server also sends the client short instructions on when to use each group
+of tools (`LEDGER_INSTRUCTIONS`). Whether the model follows them depends on the
+model and the client.
+
+`budget_status` returns the window, its start, what was spent (in total and per
+model), the ceiling, what remains, the percent used, and a `state` of
+`no_ceiling`, `ok`, `warning` (at 80% by default) or `exceeded`.
+
+## Options
+
+Each flag has an environment variable, convenient in a client's `env` block. A
+flag overrides its variable.
+
+| Flag | Environment | Default |
+| --- | --- | --- |
+| `--data-dir <path>` | `DEUZ_LEDGER_DIR` | a per-user directory, below |
+| `--budget-usd <n>` (or `--budget`) | `DEUZ_LEDGER_BUDGET_USD` | no ceiling |
+| `--budget-tokens <n>` | `DEUZ_LEDGER_BUDGET_TOKENS` | no ceiling |
+| `--window <spec>` | `DEUZ_LEDGER_WINDOW` | `month` |
+| `--namespace <name>` | `DEUZ_LEDGER_NAMESPACE` | `default` |
+| `--http [port]` | | stdio; HTTP port 3741 |
+| `-h`, `--help` / `-v`, `--version` | | |
+
+`--window` takes `day`, `week`, `month`, `lifetime`, or a count with a unit
+(`12h`, `7d`, `2w`). Windows are rolling: `month` means the last 30 days.
+
+The default data directory is `%LOCALAPPDATA%\deuz\mcp-ledger` on Windows,
+`~/Library/Application Support/deuz/mcp-ledger` on macOS, and
+`$XDG_DATA_HOME/deuz/mcp-ledger` (or `~/.local/share/deuz/mcp-ledger`) on Linux.
+It holds `memory.sqlite`, `budget.sqlite` and `receipts.sqlite`. Several clients
+may share one directory at once: every write runs in `BEGIN IMMEDIATE`.
+
+A namespace separates memory only. Budget and receipts are shared by every
+namespace in a directory.
+
+## Embed it
+
+The package also exports the server for a host that wants to serve it itself,
+or use the stores from its own code:
+
+```ts title="ledger-server.ts"
+import { createMcpLedger } from '@deuz-sdk/mcp-ledger';
+import { serveMcpStdio } from '@deuz-sdk/core/mcp/server/stdio';
+
+const ledger = createMcpLedger({
+  dataDir: '/var/lib/my-app/ledger',
+  budget: { usd: 50, window: '7d' },
+  namespace: 'team-a',
+});
+
+await serveMcpStdio(ledger.server); // or route HTTP requests to ledger.server.fetch
+```
+
+- `createMcpLedger({ dataDir, budget?, namespace?, name?, clock?, generateId? })`
+  is synchronous: it creates `dataDir` now and opens the databases on first use.
+  `budget` takes `usd`, `tokens`, `window` (a spec such as `'month'`, the
+  default) and `warnAtPercent` (default 80).
+- The result has `server` (a `DeuzMcpServer`), `tools` (the same tools as a Deuz
+  `ToolSet`, for your own agent loop), `memory` (a `MemorySession` scoped
+  `{ userId: namespace }`), `budget` (`status(estimate?)`, `record(spend)`),
+  `receipts` (`record`, `list`, `verify`) and `close()`.
+- `serveMcpLedgerHttp(ledger.server, { port, host?, path? })` starts the same
+  loopback HTTP listener the CLI uses.
+- `createReceiptLog({ path })` is the receipt log on its own, and
+  `runLedgerCli(argv)` is the CLI as a function that returns its exit code.
+- Errors are `McpLedgerError`, a `DeuzError` with a `code` such as
+  `invalid_option`, `receipt_conflict` or `sqlite_unavailable`.
+
+## How it relates to the rest of Deuz
+
+- **Budget.** Every recorded spend goes to one lifetime `BudgetStore` key
+  (`SPEND_KEY`, `'mcp-ledger:spend'`) with no limits; the window and ceiling
+  are applied when the status is read. Changing `--window` or the ceiling
+  between runs therefore never conflicts with or loses history. The store is
+  not used for admission here, which is why the budget cannot refuse anything.
+  For an enforced ceiling over the same kind of spending, use the
+  [meter](/docs/modules/meter) (harness traffic) or the
+  [AI SDK provider](/docs/modules/ai-sdk-provider) and native agents (your own
+  code), whose admission runs before the provider is called.
+- **Receipts.** The ledger's receipts are a log the model writes to. They are
+  not the effect receipts of a native run, which the runtime itself records for
+  every tool call, and not the meter's receipts, which measure model calls on
+  the wire.
+- **Memory.** Writes go through a `MemorySession` over the SQLite versioned
+  memory store, so revisions, history and forget behave as on the
+  [versioned memory](/docs/modules/versioned-memory) page.
+- **Approvals.** The ledger has no approval gate. Its tools carry MCP
+  annotations (`LEDGER_TOOL_ANNOTATIONS`); whether a client asks the user before
+  a call is the client's choice.
+
+## Limits
+
+- **The budget is advisory.** It is a record the model reports to, not an
+  enforced ceiling. Use the meter to enforce.
+- **Spend past the ceiling is still recorded.** Refusing to record money already
+  spent would make the ledger wrong. The status then shows `state: 'exceeded'`.
+- **Windows are rolling, at one-hour precision.** Spend history sits in
+  one-hour buckets, so the start of a window may count up to one extra hour.
+- **Memory search is lexical.** SQLite FTS5, or `LIKE` on a Node whose SQLite
+  lacks FTS5 (Node 22.14, for example). No embeddings: a search for "car" does
+  not find "automobile".
+- **Remember adds and never reconciles.** It dedupes only an exact fact among
+  the top 5 lexical hits; a reworded fact is a new memory.
+- **Origin labels.** Tool writes are labelled `origin: 'inferred'` with an
+  `'assistant'` source. A memory a host wrote as `asserted` through the API
+  cannot be revised through the tools, but `memory_forget` can delete it,
+  because deletion follows the user's request.
+- **Forget and free pages.** Forget deletes content, revisions and search
+  entries, but SQLite free pages can keep the bytes until `VACUUM`. Run
+  `VACUUM` on `memory.sqlite` while the server is stopped if that matters.
+- **Receipts record what the model reported**, not proof that the action
+  happened. The hash chain makes later edits detectable; it does not stop
+  someone who can write the file from rebuilding the chain from the edited row
+  on. The chain's head is kept beside it, so deleting the newest receipts is
+  detected too, unless the head is rewritten as well.
+- **Input sizes are capped.** `budget_record_spend` refuses `usd` above
+  1,000,000,000, and every string field has a length cap (memory text 4,000,
+  ids and model names 200, queries 1,000), enforced in code as well as in the
+  tool schema.
+- **A receipt's `costUsd` is not charged to the budget**, to avoid double
+  counting with `budget_record_spend`.
+- **HTTP mode has no authentication.** It listens on loopback only and refuses
+  a non-loopback `Host` or browser `Origin` (DNS-rebinding protection), but any
+  program on the same machine can call it.
+- **Not run inside a desktop client.** See [Add it to a client](#add-it-to-a-client).
+
+## See also
+
+- [Meter](/docs/modules/meter) — an enforced ceiling for harness traffic.
+- [MCP server](/docs/modules/mcp-server) — `createMcpServer`, which the ledger is built on.
+- [Versioned memory](/docs/modules/versioned-memory) — the memory model behind the memory tools.
+- [Budgets](/docs/modules/budgets) — the `BudgetStore` the spend is recorded in.

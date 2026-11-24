@@ -1,13 +1,13 @@
 <!-- GENERATED FILE — do not hand-edit.
      regenerate: node packages/core/tooling/skills/generate-api-index.mjs --date YYYY-MM-DD
      source: packages/core/{package.json exports, tsup.config.ts} + src walk (export * followed)
-     verified: 2026-10-16 against @deuz-sdk/core@2.4.0 · api-contract sha256:da3643f44edc -->
+     verified: 2026-11-24 against @deuz-sdk/core@2.5.0 · api-contract sha256:cd3d4f48e5a3 -->
 
 # API index — every subpath, every export
 
 **Load when:** checking whether a name exists, finding which subpath exports it, or exploring an unfamiliar module.
 
-`@deuz-sdk/core@2.4.0` ships **80 subpaths**; `@deuz-sdk/react` ships one. Names marked under **Types** are type-only — import them with `import type`, or a bundler-free runtime will crash looking for a value that was erased at compile time.
+`@deuz-sdk/core@2.5.0` ships **88 subpaths**; `@deuz-sdk/react`, `@deuz-sdk/ai-sdk-provider`, `@deuz-sdk/mcp-ledger` and `@deuz-sdk/cli` ship one each. Names marked under **Types** are type-only — import them with `import type`, or a bundler-free runtime will crash looking for a value that was erased at compile time.
 
 If anything here disagrees with `packages/core/package.json` `exports` or `tooling/api-contract.json`, those win — and this file is stale; regenerate it.
 
@@ -543,9 +543,9 @@ Node OAuth helpers for MCP: file token store, loopback redirect.
 
 Serve Deuz tools, native agent tools and whole agents as an MCP server over Streamable HTTP.
 
-**Values** (1): createMcpServer
+**Values** (3): createInMemoryMcpTaskStore, createMcpServer, MCP_TASKS_EXTENSION
 
-**Types** (9): DeuzMcpServer, McpAgentRunOptions, McpAuthInfo, McpServedAgent, McpServerFetchOptions, McpServerOptions, McpServerRequest, McpToolAnnotations, McpToolApprovalRequest
+**Types** (33): DeuzMcpServer, InMemoryMcpTaskStoreOptions, McpAgentRunOptions, McpAuthInfo, McpListedResource, McpPromptArgument, McpPromptContent, McpPromptMessage, McpPromptResult, McpResourceContent, McpResourceMetadata, McpResourceReadContext, McpResourceReadResult, McpServedAgent, McpServedContext, McpServedPrompt, McpServedResource, McpServedResourceTemplate, McpServerCatalog, McpServerEvent, McpServerEventBus, McpServerFetchOptions, McpServerOptions, McpServerRequest, McpServerTasksOptions, McpTaskError, McpTaskPage, McpTaskRecord, McpTaskStatus, McpTaskStore, McpTaskUpdate, McpToolAnnotations, McpToolApprovalRequest
 
 ## `@deuz-sdk/core/mcp/server/stdio`
 
@@ -553,7 +553,7 @@ The same MCP server over stdio (Node only).
 
 **Values** (1): serveMcpStdio
 
-**Types** (12): DeuzMcpServer, McpAgentRunOptions, McpAuthInfo, McpServedAgent, McpServerOptions, McpServerRequest, McpStdioReadable, McpStdioServeOptions, McpStdioServerHandle, McpStdioWritable, McpToolAnnotations, McpToolApprovalRequest
+**Types** (35): DeuzMcpServer, McpAgentRunOptions, McpAuthInfo, McpListedResource, McpPromptArgument, McpPromptContent, McpPromptMessage, McpPromptResult, McpResourceContent, McpResourceMetadata, McpResourceReadContext, McpResourceReadResult, McpServedAgent, McpServedContext, McpServedPrompt, McpServedResource, McpServedResourceTemplate, McpServerCatalog, McpServerEvent, McpServerEventBus, McpServerOptions, McpServerRequest, McpServerTasksOptions, McpStdioReadable, McpStdioServeOptions, McpStdioServerHandle, McpStdioWritable, McpTaskError, McpTaskPage, McpTaskRecord, McpTaskStatus, McpTaskStore, McpTaskUpdate, McpToolAnnotations, McpToolApprovalRequest
 
 ## `@deuz-sdk/core/stores/sqlite`
 
@@ -651,6 +651,70 @@ File-backed chat store (Node only).
 
 **Types** (1): JsonlChatStoreOptions
 
+## `@deuz-sdk/core/tool-search`
+
+Budget- and policy-aware tool search (2.5): a BM25 tool index and a search tool that surfaces deferred tools through prepareStep.
+
+**Values** (10): createToolIndex, createToolSearch, remainingFromBudgetStore, remainingFromExecution, searchMetaOf, searchTools, tokenizeForSearch, TOOL_SEARCH_NAME, ToolSearchError, withSearchMeta
+
+**Types** (24): ToolApprovalLabel, ToolBudgetRemaining, ToolBudgetSource, ToolCostEstimate, ToolIndex, ToolIndexEntry, ToolSearch, ToolSearchApplied, ToolSearchAppliedFields, ToolSearchArgs, ToolSearchBudgetOptions, ToolSearchCallOptions, ToolSearchCatalogTool, ToolSearchContext, ToolSearchErrorCode, ToolSearchExecuteContext, ToolSearchHit, ToolSearchMeta, ToolSearchOptions, ToolSearchQueryOptions, ToolSearchResult, ToolSearchTool, ToolSearchToolEntry, ToolSearchToolResult
+
+## `@deuz-sdk/core/meter`
+
+Budget proxy for harness traffic (2.5): a fetch-style handler for Anthropic and OpenAI wires, 402 at the ceiling, measured and declared receipts.
+
+**Values** (7): createMeterHandler, declaredReceipt, DEFAULT_METER_CHARS_PER_TOKEN, DEFAULT_METER_MAX_OUTPUT_TOKENS, DEFAULT_METER_UPSTREAMS, estimatePromptTokens, MeterError
+
+**Types** (23): DeclaredReceiptInput, DeclaredReceiptOptions, MeterBudgetOptions, MeterErrorCode, MeterErrorStage, MeterEstimate, MeterEstimateOptions, MeterEstimator, MeterHandler, MeterModelStats, MeterOptions, MeterOutcome, MeterProtocol, MeterReceipt, MeterReceiptSink, MeterReceiptSource, MeterRefusal, MeterRequestInfo, MeterSettlement, MeterStats, MeterUpstream, MeterUpstreamKind, MeterWarning
+
+## `@deuz-sdk/core/meter/node`
+
+The meter as a loopback node:http proxy, and a JSONL receipt sink (Node only, 2.5).
+
+**Values** (2): createJsonlReceiptSink, createMeterProxy
+
+**Types** (25): JsonlReceiptSink, JsonlReceiptSinkOptions, MeterBudgetOptions, MeterErrorStage, MeterEstimate, MeterEstimateOptions, MeterEstimator, MeterHandler, MeterModelStats, MeterOptions, MeterOutcome, MeterProtocol, MeterProxy, MeterProxyAddress, MeterProxyOptions, MeterReceipt, MeterReceiptSink, MeterReceiptSource, MeterRefusal, MeterRequestInfo, MeterSettlement, MeterStats, MeterUpstream, MeterUpstreamKind, MeterWarning
+
+## `@deuz-sdk/core/acp`
+
+Agent Client Protocol (2.5): serve a native run as an ACP agent for editors, or drive an ACP agent as a client.
+
+**Values** (18): ACP_AGENT_METHODS, ACP_CANCEL_REQUEST_METHOD, ACP_CLIENT_METHODS, ACP_DEUZ_BUDGET_METHOD, ACP_DEUZ_META, ACP_DEUZ_NAMESPACE, ACP_ERROR_CODES, ACP_PROTOCOL_VERSION, ACP_SCHEMA_VERSION, AcpError, acpInvalidParams, connectAcpAgent, createAcpPeer, createInMemoryAcpSessionStore, createInMemoryAcpTransportPair, createNdjsonTransport, formatUsd, serveAcpAgent
+
+**Types** (76): AcpAgentBudgetOptions, AcpAgentCapabilities, AcpAgentConnection, AcpAgentEngine, AcpAgentOptions, AcpAgentRunOptions, AcpAgentTurnContext, AcpAnnotations, AcpAuthenticateRequest, AcpAuthMethod, AcpCancelNotification, AcpClientCapabilities, AcpClientConnection, AcpClientFileSystem, AcpClientOptions, AcpClientSession, AcpContentBlock, AcpContentChunk, AcpCost, AcpDeclaredUsage, AcpDeuzBudget, AcpDeuzReceipt, AcpEmbeddedResourceResource, AcpErrorKind, AcpErrorObject, AcpErrorOptions, AcpFileSystemCapabilities, AcpImplementation, AcpInitializeRequest, AcpInitializeResponse, AcpJsonRpcMessage, AcpLoadSessionRequest, AcpLoadSessionResponse, AcpMcpServer, AcpMeta, AcpNameValue, AcpNewSessionRequest, AcpNewSessionResponse, AcpNotificationHandler, AcpPeer, AcpPeerOptions, AcpPermissionDecision, AcpPermissionHandler, AcpPermissionOption, AcpPermissionOptionKind, AcpPlanEntry, AcpPromptCapabilities, AcpPromptOptions, AcpPromptRequest, AcpPromptResponse, AcpPromptResult, AcpPromptTurn, AcpReadTextFileRequest, AcpReadTextFileResponse, AcpRequestContext, AcpRequestHandler, AcpRequestId, AcpRequestPermissionOutcome, AcpRequestPermissionRequest, AcpRequestPermissionResponse, AcpSessionNotification, AcpSessionRecord, AcpSessionStore, AcpSessionUpdate, AcpStopReason, AcpToolCall, AcpToolCallContent, AcpToolCallLocation, AcpToolCallState, AcpToolCallStatus, AcpToolCallUpdate, AcpToolKind, AcpTransport, AcpWriteTextFileRequest, AcpWriteTextFileResponse, NdjsonTransportOptions
+
+## `@deuz-sdk/core/acp/stdio`
+
+ACP over stdio: serve an agent on the process streams, or spawn an ACP agent process (Node only, 2.5).
+
+**Values** (3): nodeStreamsToAcpTransport, serveAcpAgentStdio, spawnAcpAgent
+
+**Types** (9): AcpAgentConnection, AcpAgentOptions, AcpClientConnection, AcpClientOptions, AcpNodeReadable, AcpNodeWritable, AcpSpawnedAgent, AcpSpawnOptions, AcpStdioServeOptions
+
+## `@deuz-sdk/core/harness`
+
+Coding-harness runs over ACP (2.5): presets, a path and tool-kind permission policy, signed decisions, measured versus declared cost.
+
+**Values** (13): CLAUDE_CODE_PROVIDER_SWITCHES, claudeCodeHarness, codexHarness, compareHarnessCost, createHarnessReceiptCollector, defaultHarnessEnv, evaluateHarnessPolicy, geminiCliHarness, HARNESS_PRESETS, matchHarnessPath, normalizeHarnessPath, opencodeHarness, runAcpHarness
+
+**Types** (18): HarnessCostComparison, HarnessDecider, HarnessDecision, HarnessDecisionOptions, HarnessDecisionRecord, HarnessMeasured, HarnessMeterLink, HarnessPermissionPolicy, HarnessPermissionRequest, HarnessPermissionRule, HarnessPreset, HarnessPresetName, HarnessResult, HarnessSpec, HarnessToolCallCounts, HarnessVerdict, HarnessVerification, RunAcpHarnessOptions
+
+## `@deuz-sdk/core/harness/node`
+
+runHarness and harnessTool: spawn a coding harness behind a budget meter (Node only, 2.5).
+
+**Values** (2): harnessTool, runHarness
+
+**Types** (21): HarnessCostComparison, HarnessDecider, HarnessDecision, HarnessDecisionOptions, HarnessDecisionRecord, HarnessMeasured, HarnessMeterLink, HarnessPermissionPolicy, HarnessPermissionRequest, HarnessPermissionRule, HarnessPreset, HarnessPresetName, HarnessResult, HarnessSpec, HarnessToolCallCounts, HarnessToolOptions, HarnessToolOutput, HarnessVerdict, HarnessVerification, RunAcpHarnessOptions, RunHarnessOptions
+
+## `@deuz-sdk/core/errors`
+
+The error taxonomy on its own (2.5): DeuzError, BreakerOpenError and the other error classes, without loading the root entry.
+
+**Values** (22): AbortError, APICallError, AuthenticationError, BreakerOpenError, ContextBudgetExceededError, ContextOverflowError, DeuzError, EmbeddingMismatchError, InvalidRequestError, isDeuzError, McpAuthorizationRequiredError, ModelNotFoundError, NetworkError, NoObjectGeneratedError, OperationConflictError, OverloadedError, RateLimitError, RevisionConflictError, TimeoutError, ToolExecutionError, UnsupportedCapabilityError, UnsupportedStoreError
+
+**Types** (4): APICallErrorOptions, ConflictSubsystem, DeuzErrorJSON, StoreFeature
+
 ## `@deuz-sdk/react`
 
 React hooks and components: useChat, useObject, approval card, cost badge, chat snapshots (2.4).
@@ -658,6 +722,30 @@ React hooks and components: useChat, useObject, approval card, cost badge, chat 
 **Values** (5): CostBadge, partsFromFiles, ToolApprovalCard, useChat, useObject
 
 **Types** (24): AssistantTurnState, ChatHistory, ChatInput, ChatSnapshotGateV1, ChatSnapshotV1, CostBadgeProps, DeuzUIPart, Message, ToolApprovalCardProps, ToolApprovalRequest, ToolApprovalResponse, UIMessage, UIMessagePart, UIToolCall, UseChatAgent, UseChatBudgetExceeded, UseChatCost, UseChatCursorStore, UseChatOptions, UseChatResult, UseChatResumeOptions, UseChatStopDetails, UseObjectOptions, UseObjectResult
+
+## `@deuz-sdk/ai-sdk-provider`
+
+Vercel AI SDK 7 models under a Deuz budget (2.5): deuz(model, options) and deuzMiddleware, with fail-over, a breaker and receipts.
+
+**Values** (12): DEFAULT_BREAKER_COOLDOWN_MS, DEFAULT_BREAKER_THRESHOLD, DEFAULT_OUTPUT_TOKENS, defaultPriceKey, defaultShouldFallback, deuz, DeuzBudgetError, deuzMiddleware, DeuzUnsupportedModelError, estimatePromptTokens, isProviderFailure, toDeuzUsage
+
+**Types** (11): DeuzBreakerOptions, DeuzBudgetErrorCode, DeuzBudgetOptions, DeuzCostReceipt, DeuzEstimateOptions, DeuzFallback, DeuzLanguageModel, DeuzMiddleware, DeuzModelOptions, DeuzModelRef, DeuzOptions
+
+## `@deuz-sdk/mcp-ledger`
+
+A ready-made MCP server for memory, budget and receipts (2.5): createMcpLedger, or npx @deuz-sdk/mcp-ledger.
+
+**Values** (18): createLedgerTools, createMcpLedger, createReceiptLog, DEFAULT_HTTP_PORT, defaultDataDir, LEDGER_FILES, LEDGER_HELP, LEDGER_INSTRUCTIONS, LEDGER_TOOL_ANNOTATIONS, LEDGER_TOOL_NAMES, MCP_LEDGER_VERSION, McpLedgerError, parseLedgerArgs, parseLedgerWindow, RECEIPT_STATUSES, runLedgerCli, serveMcpLedgerHttp, SPEND_KEY
+
+**Types** (24): BudgetStatus, DataDirHost, LedgerBudget, LedgerBudgetConfig, LedgerCliIo, LedgerCommand, LedgerHttpHandle, LedgerHttpOptions, LedgerToolDeps, LedgerToolName, LedgerWindow, McpLedger, McpLedgerErrorCode, McpLedgerOptions, Receipt, ReceiptChainCheck, ReceiptInput, ReceiptLog, ReceiptLogOptions, ReceiptPage, ReceiptQuery, ReceiptStatus, SpendAmounts, SpendInput
+
+## `@deuz-sdk/cli`
+
+The deuz command (2.5): deuz meter wraps a harness in a budget proxy, deuz acp serves an agent module to editors; runCli runs it in-process.
+
+**Values** (4): CLI_VERSION, defineAcpAgent, DeuzCliError, runCli
+
+**Types** (7): CliIo, CliSignal, CliSignals, DeuzAcpAgent, DeuzAcpAgentContext, DeuzAcpAgentModule, DeuzCliErrorCode
 
 ## Where a value lives (everything not exported from the root)
 
@@ -667,6 +755,17 @@ Reverse lookup for "which subpath do I import this from?". Root exports are omit
 - `_serializeRecord` — `memory/markdown`
 - `A2AError` — `a2a`
 - `a2aText` — `a2a`
+- `ACP_AGENT_METHODS` — `acp`
+- `ACP_CANCEL_REQUEST_METHOD` — `acp`
+- `ACP_CLIENT_METHODS` — `acp`
+- `ACP_DEUZ_BUDGET_METHOD` — `acp`
+- `ACP_DEUZ_META` — `acp`
+- `ACP_DEUZ_NAMESPACE` — `acp`
+- `ACP_ERROR_CODES` — `acp`
+- `ACP_PROTOCOL_VERSION` — `acp`
+- `ACP_SCHEMA_VERSION` — `acp`
+- `AcpError` — `acp`
+- `acpInvalidParams` — `acp`
 - `agentRunLeaseKey` — `ops`
 - `agentStateFromParts` — `ui`
 - `allTasksSettled` — `autonomy`
@@ -701,16 +800,22 @@ Reverse lookup for "which subpath do I import this from?". Root exports are omit
 - `chunkFixed` — `rag`
 - `chunkRecursive` — `rag`
 - `citationsFromHits` — `rag`
+- `CLAUDE_CODE_PROVIDER_SWITCHES` — `harness`
+- `claudeCodeHarness` — `harness`
+- `CLI_VERSION` — `@deuz-sdk/cli`
 - `clientToolResultMessage` — `chat`
 - `CLOUD_PLATFORM_SCOPE` — `vertex`
 - `codeActSystemPrompt` — `compute`
 - `codeActTool` — `compute`
+- `codexHarness` — `harness`
 - `cohere` — `providers`
 - `COHERE_RERANK_DEFAULT_MODEL` — `rag`
+- `compareHarnessCost` — `harness`
 - `compileContext` — `context`
 - `composeObservers` — `observe`
+- `connectAcpAgent` — `acp`
 - `connectDeuzStream` — `ui`
-- `ContextBudgetExceededError` — `context`
+- `ContextBudgetExceededError` — `context`, `errors`
 - `contextPackageBlob` — `context`
 - `contextWarnings` — `context`
 - `cosineSimilarity` — `memory`, `rag`
@@ -719,6 +824,7 @@ Reverse lookup for "which subpath do I import this from?". Root exports are omit
 - `createA2AAgentExecutor` — `a2a`
 - `createA2AClient` — `a2a`
 - `createA2AHandler` — `a2a`
+- `createAcpPeer` — `acp`
 - `createAdcKeyProvider` — `vertex/node`
 - `createAgent` — `agent`
 - `createAnthropic` — `anthropic`
@@ -760,9 +866,12 @@ Reverse lookup for "which subpath do I import this from?". Root exports are omit
 - `createGoogleEmbedding` — `google`
 - `createGoogleNative` — `google`
 - `createGroq` — `providers`
+- `createHarnessReceiptCollector` — `harness`
 - `createHyperbolic` — `providers`
 - `createImageProvider` — `image`
 - `createInMemoryA2ATaskStore` — `a2a`
+- `createInMemoryAcpSessionStore` — `acp`
+- `createInMemoryAcpTransportPair` — `acp`
 - `createInMemoryAgentRunStore` — `agent`
 - `createInMemoryAgentRunStoreV3` — `agent`
 - `createInMemoryBudgetStore` — `agent`
@@ -773,6 +882,7 @@ Reverse lookup for "which subpath do I import this from?". Root exports are omit
 - `createInMemoryGoalRuntimeStore` — `goal/runtime`
 - `createInMemoryGoalStore` — `goal`
 - `createInMemoryLeaseProvider` — `ops`
+- `createInMemoryMcpTaskStore` — `mcp/server`
 - `createInMemoryMemoryStore` — `memory`
 - `createInMemoryPopulationStore` — `evolve`
 - `createInMemoryProcessOperationStore` — `compute/docker`
@@ -785,12 +895,15 @@ Reverse lookup for "which subpath do I import this from?". Root exports are omit
 - `createInMemoryWorkspace` — `workspace`
 - `createJsonlChatStore` — `chat/node`
 - `createJsonlObserver` — `observe/node`
+- `createJsonlReceiptSink` — `meter/node`
 - `createKimi` — `providers`
+- `createLedgerTools` — `@deuz-sdk/mcp-ledger`
 - `createLMStudio` — `providers`
 - `createLoopbackRedirect` — `mcp/node`
 - `createManagedConnection` — `mcp`
 - `createMarkdownMemoryStore` — `memory/markdown`
 - `createMcpClient` — `mcp`
+- `createMcpLedger` — `@deuz-sdk/mcp-ledger`
 - `createMcpPool` — `mcp`
 - `createMcpServer` — `mcp/server`
 - `createMemoryBatchJobStore` — `batch`
@@ -799,12 +912,15 @@ Reverse lookup for "which subpath do I import this from?". Root exports are omit
 - `createMemorySession` — `memory/versioned`
 - `createMemoryTools` — `memory`
 - `createMemoryVectorStore` — `rag`
+- `createMeterHandler` — `meter`
+- `createMeterProxy` — `meter/node`
 - `createMidjourney` — `midjourney`
 - `createMiniMax` — `providers`
 - `createMistral` — `providers`
 - `createMockModel` — `testing`
 - `createMoonshot` — `providers`
 - `createNativeRunLauncher` — `goal/runtime`
+- `createNdjsonTransport` — `acp`
 - `createNodeSandbox` — `compute/node`
 - `createNvidia` — `providers`
 - `createOAuthProvider` — `mcp`
@@ -836,6 +952,7 @@ Reverse lookup for "which subpath do I import this from?". Root exports are omit
 - `createQwen` — `providers`
 - `createRagContextSource` — `context`
 - `createRealtimeSession` — `realtime`
+- `createReceiptLog` — `@deuz-sdk/mcp-ledger`
 - `createRedisBudgetStore` — `ops/redis`
 - `createRedisDurableStreamStateStore` — `stores/redis`
 - `createRedisOpsStore` — `ops/redis`
@@ -865,6 +982,8 @@ Reverse lookup for "which subpath do I import this from?". Root exports are omit
 - `createTaskList` — `autonomy`
 - `createTogether` — `providers`
 - `createTokenEstimator` — `context`
+- `createToolIndex` — `tool-search`
+- `createToolSearch` — `tool-search`
 - `createTranscriptContextSource` — `context`
 - `createUseChat` — `react`
 - `createVerifier` — `autonomy`
@@ -885,8 +1004,11 @@ Reverse lookup for "which subpath do I import this from?". Root exports are omit
 - `createYunwuImage` — `yunwu`
 - `createYunwuVideo` — `yunwu`
 - `csvToText` — `rag`
+- `declaredReceipt` — `meter`
 - `deepinfra` — `providers`
 - `deepseek` — `providers`
+- `DEFAULT_BREAKER_COOLDOWN_MS` — `@deuz-sdk/ai-sdk-provider`
+- `DEFAULT_BREAKER_THRESHOLD` — `@deuz-sdk/ai-sdk-provider`
 - `DEFAULT_CHUNK_OPTIONS` — `rag`
 - `DEFAULT_CONTEXT_BUDGET` — `context`
 - `DEFAULT_CONTEXT_REFRESH` — `context`
@@ -896,21 +1018,36 @@ Reverse lookup for "which subpath do I import this from?". Root exports are omit
 - `DEFAULT_DURABLE_STREAM_RETAIN_MS` — `ui`
 - `DEFAULT_GOAL_RUNTIME_POLICY` — `goal/runtime`
 - `DEFAULT_GOAL_SUPERVISOR` — `goal/runtime`
+- `DEFAULT_HTTP_PORT` — `@deuz-sdk/mcp-ledger`
+- `DEFAULT_METER_CHARS_PER_TOKEN` — `meter`
+- `DEFAULT_METER_MAX_OUTPUT_TOKENS` — `meter`
+- `DEFAULT_METER_UPSTREAMS` — `meter`
+- `DEFAULT_OUTPUT_TOKENS` — `@deuz-sdk/ai-sdk-provider`
 - `DEFAULT_SEPARATORS` — `rag`
+- `defaultDataDir` — `@deuz-sdk/mcp-ledger`
+- `defaultHarnessEnv` — `harness`
 - `defaultHashFn` — `memory`
 - `defaultMemoryScorer` — `memory`
 - `defaultNodeParserRegistry` — `rag/node`
+- `defaultPriceKey` — `@deuz-sdk/ai-sdk-provider`
+- `defaultShouldFallback` — `@deuz-sdk/ai-sdk-provider`
 - `defineAccountedEmbedder` — `rag`
 - `defineAccountedMemoryLLM` — `memory`, `memory/versioned`
+- `defineAcpAgent` — `@deuz-sdk/cli`
 - `deleteGeminiCache` — `google/extras`
 - `deserializeChatRecord` — `chat`
 - `deserializeCheckpoint` — `durable`
 - `detectToolDrift` — `mcp`
+- `deuz` — `@deuz-sdk/ai-sdk-provider`
 - `DEUZ_CAPABILITIES` — `ui`
 - `DEUZ_CAPABILITIES_HEADER` — `ui`
 - `DEUZ_CAPABILITY` — `ui`
 - `DEUZ_STREAM_VERSION` — `ui`
 - `DEUZ_STREAM_VERSIONS` — `ui`
+- `DeuzBudgetError` — `@deuz-sdk/ai-sdk-provider`
+- `DeuzCliError` — `@deuz-sdk/cli`
+- `deuzMiddleware` — `@deuz-sdk/ai-sdk-provider`
+- `DeuzUnsupportedModelError` — `@deuz-sdk/ai-sdk-provider`
 - `digestWorkspace` — `workspace`
 - `DockerSandboxError` — `compute/docker`
 - `doctor` — `headless`
@@ -918,14 +1055,16 @@ Reverse lookup for "which subpath do I import this from?". Root exports are omit
 - `downloadVideo` — `video`
 - `dropTrailingAssistant` — `chat`
 - `embeddingMatcher` — `skills`
-- `EmbeddingMismatchError` — `memory/versioned`
+- `EmbeddingMismatchError` — `memory/versioned`, `errors`
 - `emitActivity` — `runtime`
 - `emitPlanUpdate` — `runtime`
 - `estimatePdfTokens` — `rag`
+- `estimatePromptTokens` — `meter`, `@deuz-sdk/ai-sdk-provider`
 - `estimateRequestOverhead` — `context`
 - `estimateRequestTokens` — `context`
 - `estimateTextTokens` — `context`
 - `estimateTokens` — `rag`
+- `evaluateHarnessPolicy` — `harness`
 - `evolve` — `evolve`
 - `evolveCandidateId` — `evolve`
 - `EvolveConflictError` — `evolve`
@@ -947,6 +1086,8 @@ Reverse lookup for "which subpath do I import this from?". Root exports are omit
 - `fireworks` — `providers`
 - `formatDeuzCapabilities` — `ui`
 - `formatMemoriesForPrompt` — `memory`
+- `formatUsd` — `acp`
+- `geminiCliHarness` — `harness`
 - `generateImage` — `image`
 - `generateSpeech` — `speech`
 - `generateVideo` — `video`
@@ -969,6 +1110,8 @@ Reverse lookup for "which subpath do I import this from?". Root exports are omit
 - `googleNative` — `google`
 - `groq` — `providers`
 - `handleSignal` — `schedule`
+- `HARNESS_PRESETS` — `harness`
+- `harnessTool` — `harness/node`
 - `HEADLESS_EXIT_CODES` — `headless`
 - `htmlToBlocks` — `rag/node`
 - `hybridRetrieve` — `rag`
@@ -984,14 +1127,25 @@ Reverse lookup for "which subpath do I import this from?". Root exports are omit
 - `isAccounted` — `memory`, `memory/versioned`
 - `isConditionalChatStore` — `chat`
 - `isExpired` — `memory`
+- `isProviderFailure` — `@deuz-sdk/ai-sdk-provider`
 - `kimi` — `providers`
+- `LEDGER_FILES` — `@deuz-sdk/mcp-ledger`
+- `LEDGER_HELP` — `@deuz-sdk/mcp-ledger`
+- `LEDGER_INSTRUCTIONS` — `@deuz-sdk/mcp-ledger`
+- `LEDGER_TOOL_ANNOTATIONS` — `@deuz-sdk/mcp-ledger`
+- `LEDGER_TOOL_NAMES` — `@deuz-sdk/mcp-ledger`
 - `lexicalMatcher` — `skills`
 - `listGeminiCaches` — `google/extras`
 - `lmstudio` — `providers`
 - `loadProjectInstructions` — `headless`
 - `matchesScope` — `memory`
+- `matchHarnessPath` — `harness`
+- `MCP_LEDGER_VERSION` — `@deuz-sdk/mcp-ledger`
+- `MCP_TASKS_EXTENSION` — `mcp/server`
+- `McpLedgerError` — `@deuz-sdk/mcp-ledger`
 - `memoryEmbedderFromRag` — `memory`
 - `mergeSkillSources` — `skills`
+- `MeterError` — `meter`
 - `minimax` — `providers`
 - `mistral` — `providers`
 - `mockFetch` — `testing`
@@ -1003,6 +1157,8 @@ Reverse lookup for "which subpath do I import this from?". Root exports are omit
 - `nextPendingTask` — `autonomy`
 - `nextZonedOccurrence` — `schedule`
 - `nodeSkillSource` — `skills/node`
+- `nodeStreamsToAcpTransport` — `acp/stdio`
+- `normalizeHarnessPath` — `harness`
 - `normalizeResourcePath` — `skills`
 - `normalizeWorkspacePath` — `workspace`
 - `nvidia` — `providers`
@@ -1011,8 +1167,9 @@ Reverse lookup for "which subpath do I import this from?". Root exports are omit
 - `openai` — `openai`
 - `openaiEmbedding` — `openai`
 - `openaiResponses` — `openai`
+- `opencodeHarness` — `harness`
 - `openrouter` — `providers`
-- `OperationConflictError` — `compute/docker`, `memory/versioned`
+- `OperationConflictError` — `compute/docker`, `memory/versioned`, `errors`
 - `otelReady` — `otel`
 - `parallelAgents` — `autonomy`
 - `parse` — `rag`
@@ -1025,6 +1182,8 @@ Reverse lookup for "which subpath do I import this from?". Root exports are omit
 - `parseFacts` — `memory`
 - `parseGoal` — `goal`
 - `parseGoalEvent` — `goal`
+- `parseLedgerArgs` — `@deuz-sdk/mcp-ledger`
+- `parseLedgerWindow` — `@deuz-sdk/mcp-ledger`
 - `parseSearchReplace` — `evolve`
 - `parseSkill` — `skills`
 - `parseTaskList` — `autonomy`
@@ -1045,11 +1204,14 @@ Reverse lookup for "which subpath do I import this from?". Root exports are omit
 - `RealtimeError` — `realtime`
 - `realtimePriceTable` — `realtime`
 - `recall` — `memory`
+- `RECEIPT_STATUSES` — `@deuz-sdk/mcp-ledger`
 - `reciprocalRankFusion` — `rag`
 - `reconcileAgentRun` — `agent`
 - `registerElicitation` — `mcp`
 - `registerSamplingAndRoots` — `mcp`
 - `registerToolListChanged` — `mcp`
+- `remainingFromBudgetStore` — `tool-search`
+- `remainingFromExecution` — `tool-search`
 - `remember` — `memory`
 - `renderRunReport` — `observe`
 - `renderSkillCatalog` — `skills`
@@ -1062,23 +1224,32 @@ Reverse lookup for "which subpath do I import this from?". Root exports are omit
 - `resumeStreamAgent` — `agent`
 - `resumeStreamFromCheckpoint` — `durable`
 - `retrieve` — `rag`
-- `RevisionConflictError` — `memory/versioned`, `chat`
+- `RevisionConflictError` — `memory/versioned`, `chat`, `errors`
+- `runAcpHarness` — `harness`
 - `runAgent` — `agent`
+- `runCli` — `@deuz-sdk/cli`
 - `runEval` — `testing`
 - `runEvalSuite` — `testing`
 - `runGradedEval` — `testing`
+- `runHarness` — `harness/node`
 - `runHeadless` — `headless`
+- `runLedgerCli` — `@deuz-sdk/mcp-ledger`
 - `RUNS_V3_SCHEMA_NAME` — `ops/sqlite`
 - `RUNS_V3_SCHEMA_VERSION` — `ops/sqlite`
 - `sambanova` — `providers`
 - `scopeToolsToSkill` — `skills`
 - `sealAssistantTurn` — `chat`
+- `searchMetaOf` — `tool-search`
+- `searchTools` — `tool-search`
 - `selfConsistency` — `autonomy`
 - `serializeChatRecord` — `chat`
 - `serializeCheckpoint` — `durable`
 - `serializeGoal` — `goal`
 - `serializeGoalEvent` — `goal`
 - `serializeTaskList` — `autonomy`
+- `serveAcpAgent` — `acp`
+- `serveAcpAgentStdio` — `acp/stdio`
+- `serveMcpLedgerHttp` — `@deuz-sdk/mcp-ledger`
 - `serveMcpStdio` — `mcp/server/stdio`
 - `setTaskStatus` — `autonomy`
 - `settleGoalEvent` — `goal/runtime`
@@ -1086,6 +1257,8 @@ Reverse lookup for "which subpath do I import this from?". Root exports are omit
 - `shouldSendWhole` — `rag`
 - `SkillLearningError` — `skills/learning`
 - `sniffMime` — `rag`
+- `spawnAcpAgent` — `acp/stdio`
+- `SPEND_KEY` — `@deuz-sdk/mcp-ledger`
 - `splitFrontmatter` — `skills`
 - `sseEvents` — `testing`
 - `sseResponse` — `testing`
@@ -1106,15 +1279,19 @@ Reverse lookup for "which subpath do I import this from?". Root exports are omit
 - `toDeuzObjectStreamResponse` — `ui`
 - `toDeuzStreamResponse` — `ui`
 - `toDeuzTextStreamResponse` — `ui`
+- `toDeuzUsage` — `@deuz-sdk/ai-sdk-provider`
 - `together` — `providers`
 - `tokenize` — `rag`
+- `tokenizeForSearch` — `tool-search`
 - `toNativeDocumentPart` — `rag`
 - `toNodeHandler` — `goal/runtime`
+- `TOOL_SEARCH_NAME` — `tool-search`
 - `ToolApprovalCard` — `@deuz-sdk/react`
+- `ToolSearchError` — `tool-search`
 - `transcribe` — `transcription`
 - `transitionGoal` — `goal`
 - `uiFromMessages` — `chat`
-- `UnsupportedStoreError` — `agent`
+- `UnsupportedStoreError` — `agent`, `errors`
 - `updateConditionalChat` — `chat`
 - `updateTask` — `autonomy`
 - `uploadFile` — `google/extras`
@@ -1133,6 +1310,7 @@ Reverse lookup for "which subpath do I import this from?". Root exports are omit
 - `waitForFileActive` — `google/extras`
 - `waitForTask` — `midjourney`
 - `waitForVideo` — `video`
+- `withSearchMeta` — `tool-search`
 - `workingMemoryTools` — `context`
 - `wrapIoredisClient` — `swarm/redis`, `ops/redis`, `stores/redis`
 - `writeRunReport` — `observe/node`

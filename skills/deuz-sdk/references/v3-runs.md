@@ -1,4 +1,4 @@
-<!-- verified: 2026-10-16 against @deuz-sdk/core@2.4.0 · api-contract sha256:da3643f44edc
+<!-- verified: 2026-11-24 against @deuz-sdk/core@2.5.0 · api-contract sha256:cd3d4f48e5a3
      sources: packages/core/src/types/agent-run-v3.ts, packages/core/src/types/agent-run.ts,
      packages/core/src/{agent-run,agent-run-v3,agent-run-v3-run,agent-run-v3-context,agent-run-v3-store}.ts,
      packages/core/src/node/{runs-v3-sqlite,runs-v3-postgres,headless}.ts, packages/core/src/agent.ts,

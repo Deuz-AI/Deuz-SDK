@@ -19,6 +19,22 @@
  * user here (the SDK sends a real `elicitation/create`), which stateless HTTP
  * cannot.
  *
+ * Resources, URI templates and prompts (2.5) are served here exactly as over
+ * HTTP, and a stdio connection is long-lived, so `server.catalog` changes reach
+ * it: a 2025-era session gets the `list_changed` notifications pushed and may
+ * `resources/subscribe`; a 2026-07-28 session receives them on the
+ * `subscriptions/listen` streams it opens. A `resources/updated` goes out only
+ * when the resource's `read` answers this connection's identity (its
+ * `runtimeContext`): a `null` or a throw keeps the update from the client.
+ *
+ * MCP tasks (2.5, `tasks` / an agent's `task: true`) work on both eras here.
+ * A 2025-11-25 session also gets `notifications/tasks/status` pushed as its
+ * tasks change; a 2026-07-28 session polls `tasks/get` (its listen streams
+ * cannot carry task notifications — see the `tasks` module of
+ * `@deuz-sdk/core/mcp/server`). Tasks belong to the connection that created
+ * them unless `tasks.owner` says otherwise, so a new connection cannot see an
+ * earlier one's tasks.
+ *
  * Never write to stdout from a stdio server: every byte there is protocol. Log
  * to stderr. Node-only (process streams), so it lives under `src/node/` and is
  * exempt from the edge-safety lint; the peer is a computed specifier.
@@ -26,16 +42,40 @@
 import { InvalidRequestError } from '../errors';
 import { createMcpServer, type DeuzMcpServer, type McpServerOptions } from '../mcp/server';
 import { readServerInternals } from '../mcp/server-internals';
+import { liftLegacyTaskParam } from '../mcp/tasks';
 
 export type {
   DeuzMcpServer,
   McpAgentRunOptions,
   McpAuthInfo,
+  McpListedResource,
+  McpPromptArgument,
+  McpPromptContent,
+  McpPromptMessage,
+  McpPromptResult,
+  McpResourceContent,
+  McpResourceMetadata,
+  McpResourceReadContext,
+  McpResourceReadResult,
   McpServedAgent,
+  McpServedContext,
+  McpServedPrompt,
+  McpServedResource,
+  McpServedResourceTemplate,
+  McpServerCatalog,
+  McpServerEvent,
+  McpServerEventBus,
   McpServerOptions,
   McpServerRequest,
   McpToolAnnotations,
   McpToolApprovalRequest,
+  McpServerTasksOptions,
+  McpTaskError,
+  McpTaskPage,
+  McpTaskRecord,
+  McpTaskStatus,
+  McpTaskStore,
+  McpTaskUpdate,
 } from '../mcp/server';
 
 /**
@@ -72,6 +112,11 @@ export interface McpStdioServeOptions {
   stdin?: McpStdioReadable;
   /** Write responses here instead of `process.stdout`. */
   stdout?: McpStdioWritable;
+  /**
+   * Most `subscriptions/listen` streams a 2026-07-28 connection may hold open
+   * at once (2.5). SDK default 1024.
+   */
+  maxSubscriptions?: number;
 }
 
 /** A running stdio server. */
@@ -135,6 +180,7 @@ export async function serveMcpStdio(
   // before it returns but only REPORTS a failed start, which would resolve a
   // handle to a server that never reads a byte.
   const transport = new stdio.StdioServerTransport(options.stdin, options.stdout);
+  liftTaskParams(transport);
   let starting: Promise<void> | undefined;
   const start = transport.start.bind(transport);
   transport.start = () => (starting = start());
@@ -142,6 +188,9 @@ export async function serveMcpStdio(
     legacy: options.legacy ?? 'serve',
     onerror: internals.report,
     transport,
+    ...(options.maxSubscriptions !== undefined
+      ? { maxSubscriptions: options.maxSubscriptions }
+      : {}),
   });
   try {
     await starting;
@@ -156,6 +205,27 @@ export async function serveMcpStdio(
     });
   }
   return { close: () => served.close() };
+}
+
+type MessageHandler = (message: unknown, extra?: unknown) => void;
+
+/**
+ * Hand a 2025-era `tools/call`'s `params.task` to the served tool: the SDK
+ * passes a tool only its arguments and `_meta`, so every inbound message goes
+ * through `liftLegacyTaskParam` (a copy into `_meta`; anything else unchanged)
+ * on its way to whatever `serveStdio` installs as the transport's `onmessage`.
+ */
+function liftTaskParams(transport: V2StdioTransport): void {
+  let inner: MessageHandler | undefined;
+  Object.defineProperty(transport, 'onmessage', {
+    configurable: true,
+    enumerable: true,
+    get: (): MessageHandler | undefined =>
+      inner && ((message, extra) => inner!(liftLegacyTaskParam(message), extra)),
+    set: (handler: MessageHandler | undefined) => {
+      inner = handler;
+    },
+  });
 }
 
 /** Options build a server; anything else (a foreign handle) is refused by the caller. */

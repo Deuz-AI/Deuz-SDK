@@ -195,7 +195,13 @@ for (const m of tsup
 }
 
 const corePkg = JSON.parse(readFileSync(join(CORE, 'package.json'), 'utf8'));
-const moduleToSrc = new Map([['@deuz-sdk/react', join(ROOT, 'packages/react/src/index.ts')]]);
+// The single-entry workspace packages: react, and the three 2.5 packages.
+const moduleToSrc = new Map(
+  ['react', 'ai-sdk-provider', 'mcp-ledger', 'cli'].map((name) => [
+    `@deuz-sdk/${name}`,
+    join(ROOT, 'packages', name, 'src/index.ts'),
+  ]),
+);
 for (const [subpath, value] of Object.entries(corePkg.exports)) {
   if (subpath === './package.json') continue;
   const specifier = subpath === '.' ? '@deuz-sdk/core' : `@deuz-sdk/core/${subpath.slice(2)}`;
@@ -299,7 +305,9 @@ for (const file of proseFiles) {
 
   // A quoted/backticked subpath mention anywhere in prose (delimiters bound the
   // match, so trailing punctuation cannot produce a phantom path).
-  for (const m of code.matchAll(/(['"`])(@deuz-sdk\/(?:core|react)(?:\/[\w./-]+)?)\1/g)) {
+  for (const m of code.matchAll(
+    /(['"`])(@deuz-sdk\/(?:core|react|ai-sdk-provider|mcp-ledger|cli)(?:\/[\w./-]+)?)\1/g,
+  )) {
     if (!moduleToSrc.has(m[2])) fail(file, lineOf(m.index), `mentions unknown subpath "${m[2]}"`);
   }
 }

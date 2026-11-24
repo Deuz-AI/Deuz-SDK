@@ -96,6 +96,9 @@ A few feature surfaces genuinely need the filesystem, a child process, or a Node
 | `@deuz-sdk/core/memory/versioned/sqlite` · `/goal/runtime/sqlite` | lazy `node:sqlite` (or an injected handle) | a database file (2.4) |
 | `@deuz-sdk/core/memory/versioned/postgres` · `/goal/runtime/postgres` | a pool with `connect()` you pass in (`pg.Pool` or compatible), or the lazy `pg` peer with `connectionString` | a TCP client (2.4) |
 | `@deuz-sdk/core/compute/docker` | lazy `node:child_process`, the Docker CLI (`dockerPath`, default `docker`); its SQLite process store, lazy `node:sqlite` | starts and inspects local Docker containers (2.4 preview) |
+| `@deuz-sdk/core/meter/node` | lazy `node:http`, `node:fs/promises` | the meter as a local HTTP proxy, and the JSONL receipt sink (2.5) |
+| `@deuz-sdk/core/acp/stdio` | lazy `node:process`, `node:child_process` | serves ACP over a process's standard streams, and spawns an ACP agent as a child process (2.5) |
+| `@deuz-sdk/core/harness/node` | lazy `node:child_process`, `node:http`, `node:process` | spawns a coding harness behind a local meter (2.5 preview) |
 
 The edge-safe counterparts of these features stay on the Web-APIs-only path: `@deuz-sdk/core/rag` (text/markdown/CSV parsing in core), `@deuz-sdk/core/skills` (parse `SKILL.md` you already loaded), `@deuz-sdk/core/memory` (the cosine vector backend), and `@deuz-sdk/core/mcp` (HTTP/SSE transport). Use those at the edge and reserve the `…/node` subpaths for your Node server.
 
@@ -119,6 +122,18 @@ The two store packs that take an **injected client** (`stores/redis`, `stores/po
 - **Existing Node-only entries grow.** `/ops/sqlite` and `/ops/postgres` add the V3 run stores, `/stores/sqlite` and `/stores/postgres` the conditional chat stores (each with its transcript index) and the durable stream stores, and `/stores/redis` the Redis durable stream store. Each new store borrows a handle, pool or client you pass in, or opens its own from a path, connection string or URL (lazy `node:sqlite`, or the `pg` or `redis` peer).
 
 The durable stores of every 2.4 feature are on Node-only subpaths, and the edge-safe entries ship only in-memory stores, which live as long as the isolate. The store contracts (`VersionedMemoryStore`, `GoalRuntimeStore`, `AgentRunStoreV3`, `ConditionalChatStore`, `TranscriptIndex`, `DurableStreamStateStore`) are plain interfaces: a store backed by a driver your edge runtime has can implement one in your own module, as the injected-client paragraph above describes for the 2.3 stores.
+
+## The 2.5 subpaths
+
+2.5 adds eight subpaths: five edge-safe, three Node-only (in the table above). `npm run verify:runtime` checks them the same way as the 2.4 ones. None of them is re-exported from `/edge`; import each from its own subpath.
+
+| Edge-safe subpath | What it holds |
+| --- | --- |
+| [`@deuz-sdk/core/tool-search`](/docs/modules/tool-search) | `createToolSearch`, `searchTools`, `createToolIndex`, `tokenizeForSearch`, `withSearchMeta`, `searchMetaOf`, `remainingFromExecution`, `remainingFromBudgetStore`, `ToolSearchError` |
+| [`@deuz-sdk/core/meter`](/docs/modules/meter) | `createMeterHandler`, a fetch-style handler that reaches the upstream through `deps.fetch`, plus `declaredReceipt`, `estimatePromptTokens` and `MeterError` |
+| [`@deuz-sdk/core/acp`](/docs/modules/acp) | `serveAcpAgent`, `connectAcpAgent`, the in-memory and NDJSON transports over Web Streams, `createAcpPeer`, `AcpError` |
+| [`@deuz-sdk/core/harness`](/docs/modules/harness) | `runAcpHarness` over an ACP connection you open, the presets, the permission policy and cost comparison |
+| `@deuz-sdk/core/errors` | every core error class (`DeuzError`, `isDeuzError`, `BreakerOpenError`, `APICallError` and the rest, plus the 2.4 conflict and budget errors), without the rest of the root entry; the same class objects the other entries export |
 
 ## Per-runtime notes
 

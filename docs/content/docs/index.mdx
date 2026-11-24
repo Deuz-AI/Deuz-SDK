@@ -6,7 +6,7 @@ icon: BookOpen
 
 `@deuz-sdk/core` is a from-scratch TypeScript AI SDK that talks to Anthropic, OpenAI, xAI Grok, Google Gemini, Vertex AI, Azure, Bedrock and Yunwu through **one canonical streaming protocol**. It depends on no other AI SDK, ships **zero runtime dependencies**, and runs anywhere `fetch` runs — Node, Deno, Bun, and Vercel/Cloudflare Edge.
 
-Reach for it when you want full control over the wire, deterministic and replayable behaviour in tests, and no vendor lock-in at the streaming or UI layer. Reach for something else if you want a hosted agent platform, a prompt IDE, or a batteries-included RAG-as-a-service — this is a library, and everything stateful is a seam you fill.
+Reach for it when you want full control over the wire, deterministic and replayable behaviour in tests, and no vendor lock-in at the streaming or UI layer. Reach for something else if you want a hosted agent platform, a prompt IDE, or a batteries-included RAG-as-a-service — this is a library, and everything stateful is a seam you fill. [Known gaps](/docs/reference/known-gaps) lists where Deuz is behind and what to use there instead.
 
 ## 60 seconds to your first result
 
@@ -78,6 +78,9 @@ Pick the row that matches what you are building. Each is two or three pages, not
 | **An agent other systems call**           | [MCP server](/docs/modules/mcp-server) → [A2A](/docs/modules/a2a)                                                                                |
 | **A voice agent**                         | [Realtime voice](/docs/modules/realtime) → [Tools](/docs/agents/tools)                                                                           |
 | **A port from another SDK**               | [Migrating from the Vercel AI SDK](/docs/migration/from-vercel-ai-sdk)                                                                           |
+| **A budget for Claude Code or Codex**     | [CLI](/docs/modules/cli) → [Meter](/docs/modules/meter) → [Harness](/docs/modules/harness)                                                       |
+| **An agent inside an editor**             | [ACP](/docs/modules/acp) → [CLI](/docs/modules/cli#deuz-acp)                                                                                      |
+| **A budget under Vercel AI SDK code**     | [AI SDK provider](/docs/modules/ai-sdk-provider) → [Budgets](/docs/modules/budgets)                                                              |
 
 Whatever you build, two pages pay for themselves early: [Error handling](/docs/core/errors) (the taxonomy you branch on) and [Dependencies & clients](/docs/core/dependencies) (how you make any of it testable).
 
@@ -147,6 +150,35 @@ Many AI integrations become hard to test because runtime state, provider-specifi
 | **Zero deps**          | The chat core ships nothing in `dependencies`. Heavy or stateful things are optional peers or injected seams.                                                                                                                          |
 | **No vendor lock**     | Our own canonical delta stream and our own versioned UI wire. The SDK never proxies a provider's raw SSE bytes to your client.                                                                                                         |
 | **Secrets never leak** | API keys are masked in every log, error, and span path. This is a regression-tested invariant — see [secret redaction](/docs/core/errors#secret-redaction-p0).                                                                         |
+
+## New in 2.5
+
+2.5 takes Deuz's budgets, receipts and signed approvals to where developers
+already work: coding harnesses, editors, Vercel AI SDK code and MCP clients.
+Everything is additive, and nothing runs until you import it.
+
+- **Meter and CLI** — a local proxy that charges Claude Code's or Codex's model
+  traffic to a persistent budget and answers 402 at the ceiling:
+  `npx @deuz-sdk/cli meter --budget-usd 5 -- claude`
+  → [Meter](/docs/modules/meter) · [CLI](/docs/modules/cli)
+- **Harnesses as sub-agents (preview)** — run Claude Code, Codex, Gemini CLI or
+  OpenCode under a budget, with their permission requests decided by a Deuz
+  policy → [Harness](/docs/modules/harness)
+- **ACP (preview)** — serve a native agent to Zed or a JetBrains IDE, or drive
+  any ACP agent from code → [ACP](/docs/modules/acp)
+- **Tool search** — a large tool catalog behind one search tool that respects
+  the run's budget and policy → [Tool search](/docs/modules/tool-search)
+- **MCP resources and prompts** — and a catalog you change at runtime
+  → [MCP server](/docs/modules/mcp-server)
+- **Two more packages** — a Deuz budget under Vercel AI SDK 7 models, and a
+  ready-made MCP server with memory, a spend ledger and receipts
+  → [AI SDK provider](/docs/modules/ai-sdk-provider) ·
+  [MCP ledger](/docs/modules/mcp-ledger)
+
+Nothing in 2.5 was run against a live provider, a real harness or a real
+editor. Start with [What is new in 2.5](/docs/reference/whats-new-2-5) for the
+upgrade notes and known limits, and see [Known gaps](/docs/reference/known-gaps)
+for where Deuz is behind and what to use instead.
 
 ## New in 2.4
 
@@ -252,6 +284,13 @@ known limits. Previous releases: [2.2](/docs/reference/whats-new-2-2),
 | Goal runtime (2.4)            | A goal supervisor, a durable time-zone scheduler, a webhook inbox and acceptance on evidence                         | [Goal runtime](/docs/modules/goal-runtime)                                    |
 | Docker runner (2.4 preview)   | A local Docker sandbox and a process runner that reconnects after a restart (Node-only)                              | [Docker runner](/docs/modules/docker)                                         |
 | Chat durability (2.4)         | Compare-and-set chat stores, durable streams (preview), the capability handshake and chat snapshots                  | [Chat and stream durability](/docs/modules/chat-durability)                   |
+| Meter (2.5)                   | A budget proxy for harness traffic: admission, settlement, 402 at the ceiling and one receipt per request            | [Meter](/docs/modules/meter)                                                  |
+| CLI (2.5 preview)             | `deuz meter` in front of a harness, `deuz acp` to serve an agent to an editor (`@deuz-sdk/cli`)                      | [CLI](/docs/modules/cli)                                                      |
+| Harness (2.5 preview)         | Claude Code, Codex, Gemini CLI or OpenCode as a budgeted sub-agent, permissions decided by policy (Node-only spawn)  | [Harness](/docs/modules/harness)                                              |
+| ACP (2.5 preview)             | The Agent Client Protocol on both sides: serve an agent to an editor, or drive an ACP agent                          | [ACP](/docs/modules/acp)                                                      |
+| Tool search (2.5)             | Budget- and policy-aware BM25 search over a large tool catalog                                                       | [Tool search](/docs/modules/tool-search)                                      |
+| AI SDK provider (2.5)         | A Deuz budget, fail-over and breaker under Vercel AI SDK 7 models (`@deuz-sdk/ai-sdk-provider`)                      | [AI SDK provider](/docs/modules/ai-sdk-provider)                              |
+| MCP ledger (2.5)              | `npx @deuz-sdk/mcp-ledger`: memory, an advisory spend ledger and receipts for MCP clients                            | [MCP ledger](/docs/modules/mcp-ledger)                                        |
 
 ## Supported providers
 

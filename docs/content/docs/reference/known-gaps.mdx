@@ -1,0 +1,350 @@
+---
+title: "Known gaps: when not to use Deuz"
+description: The areas where Deuz 2.5 is behind other TypeScript AI SDKs and platforms, and what to use there instead — model wires, workflow graphs, durable platforms, hosted runtimes, RAG, hosted tools, sandboxes, UI, realtime, observability, evals, devtools and runtime coverage.
+---
+
+Deuz is a library with a narrow focus: persistent token and USD budgets, effect
+receipts, signed approvals, durable native runs and versioned memory, in one
+package with no runtime dependencies. It is not the right tool for everything.
+This page lists where it is behind, and for each gap names what to use instead.
+
+The comparison comes from a competitive review dated **16 November 2026**.
+Facts about other projects carry the date the review recorded; they change
+quickly, so check the project before you decide. Facts about Deuz come from its
+own source and documentation as of 2.5.
+
+<Callout type="info" title="Deuz and another SDK can share one budget">
+Several gaps below do not force a choice. With
+[`@deuz-sdk/ai-sdk-provider`](/docs/modules/ai-sdk-provider) you keep Vercel AI
+SDK code and its integrations, and put a Deuz budget, fail-over and breaker
+under the model. The [meter](/docs/modules/meter) puts a budget in front of any
+Anthropic or OpenAI client, and the [harness runner](/docs/modules/harness) in
+front of a coding harness. All of them can charge the same `BudgetStore`.
+</Callout>
+
+## What 2.5 closed
+
+These were gaps in 2.4 and are not listed below:
+
+- **Tool search.** [Tool search](/docs/modules/tool-search) ships, with budget
+  and policy filters. It is lexical (BM25) and runs in your process; provider-
+  hosted tool search (`defer_loading`) is still not wrapped.
+- **MCP server resources, prompts and tasks.** The [MCP server](/docs/modules/mcp-server)
+  publishes resources, URI templates and prompts, sends `list_changed`
+  notifications, and serves opted-in tools and agents as MCP tasks (the Tasks
+  extension on 2026-07-28, core tasks on 2025-11-25). The MCP client has no
+  tasks yet (see [MCP and A2A](#mcp-and-a2a)).
+- **A CLI.** [`deuz meter` and `deuz acp`](/docs/modules/cli) ship as a preview.
+  There is still no TUI, studio or scaffolder (see
+  [Devtools and scaffolding](#devtools-studio-and-scaffolding)).
+- **Editors and harnesses.** [ACP](/docs/modules/acp) and the
+  [harness runner](/docs/modules/harness) are new, as previews. The harness
+  runner met real Claude Code and Codex on 2026-11-24 and ACP passed a
+  conformance run against the official ACP SDK; neither has been tried in a
+  real editor.
+
+## At a glance
+
+| Area | Gap in Deuz 2.5 | Use instead |
+| --- | --- | --- |
+| [Adoption](#adoption-and-ecosystem) | A small user base | The Vercel AI SDK |
+| [Model wires](#model-wires-and-gateways) | No native Bedrock Converse, Mistral or Cohere wire; no gateway provider | AI SDK or LangChain.js provider packages; a gateway |
+| [Workflow graphs](#workflow-and-graph-engines) | No graph or step DSL | LangGraph.js, Mastra workflows, Google ADK TS 2.0 |
+| [Durable platforms](#queues-serverless-and-deployment) | No queue, serverless or workflow-platform adapter; no control plane | Temporal, Trigger.dev, Inngest, Vercel Workflow, Cloudflare Agents, Mastra |
+| [Hosted runtimes](#provider-hosted-agent-runtimes) | No adapter for provider-hosted agent sessions | The providers' own clients |
+| [RAG](#rag-infrastructure) | No external vector DB adapters, web loaders or OCR | Mastra RAG, LangChain.js |
+| [Hosted tools](#provider-hosted-tools-and-computer-use) | Web search only | AI SDK, OpenAI Agents SDK |
+| [Sandboxes](#remote-sandboxes) | Local Docker only (preview) | OpenAI Agents SDK sandbox clients, Mastra sandboxes |
+| [UI](#ui-frameworks-protocols-and-generative-ui) | React only; own wire protocol; no generative UI | AI SDK UI, TanStack AI, CopilotKit (AG-UI) |
+| [Realtime voice](#realtime-voice-and-streaming-media) | WebSocket only; never run live | OpenAI Agents SDK, TanStack AI, LiveKit |
+| [Observability](#observability-integrations) | OTel traces only; no exporter integrations | AI SDK with `@ai-sdk/otel`, Langfuse, Braintrust |
+| [Evals](#evals) | No LLM judge, scorers or datasets | Mastra, LangSmith, Promptfoo |
+| [Devtools](#devtools-studio-and-scaffolding) | No studio, dev server, TUI or scaffolder | AI SDK DevTools, Mastra Studio, Genkit, ADK |
+| [Runtimes and live tests](#runtime-coverage-and-live-testing) | Bun, Deno and Workers not tested in CI; little live testing | OpenAI Agents SDK |
+| [MCP and A2A](#mcp-and-a2a) | No MCP tasks in the client, no MCP Apps; A2A without push or gRPC | Mastra MCPServer, `@a2a-js/sdk` |
+| [Agent loop details](#agent-loop-details) | No typed sub-agent output, handoff filters or permission modes | Claude Agent SDK for permission modes |
+
+## Adoption and ecosystem
+
+**Deuz.** In the week of 9–15 November 2026, `@deuz-sdk/core` was downloaded
+132 times from npm. The first npm release was on 2 June 2026. There are few
+third-party examples, answers or integrations.
+
+**Use instead.** If a large community, many integrations and hiring for the
+stack matter more than Deuz's guarantees, use the **Vercel AI SDK** (`ai`,
+45,776,702 downloads the same week). You can still add a Deuz budget under its
+models with the [AI SDK provider](/docs/modules/ai-sdk-provider).
+
+## Model wires and gateways
+
+**Deuz.** Every call goes to one of four wires: Anthropic Messages, OpenAI Chat
+Completions, OpenAI Responses and Gemini `generateContent`.
+
+- Mistral, Cohere, Groq, DeepSeek and the other hosts are OpenAI-compatible
+  factories only.
+- Bedrock is the OpenAI-compatible Mantle endpoint with a bearer key: no
+  Converse API, no SigV4, no Claude through Bedrock's own API.
+- OpenAI Responses is not available on Azure.
+- There is no gateway-specific provider (provider order, routing metadata,
+  gateway cost records), no client-side rate limiter, and `seed`,
+  `presencePenalty`, `frequencyPenalty`, `topK` and `logprobs` go only through
+  `providerOptions`.
+
+**Use instead.**
+
+- **AI SDK** ships Bedrock, Mistral and Cohere as separate first-party provider
+  packages; **LangChain.js** has `ChatBedrockConverse`, `ChatMistralAI` and
+  `ChatCohere`.
+- For routing and fallback across providers, a gateway: **Vercel AI Gateway**
+  (no markup on token prices, BYOK included), **OpenRouter**, **LiteLLM** or
+  **Cloudflare AI Gateway**. Deuz reaches an OpenAI-compatible gateway through
+  `createOpenAICompatible`, without gateway-specific features.
+
+## Workflow and graph engines
+
+**Deuz.** There is no graph or step DSL (no `StateGraph`-like builder).
+[Swarm](/docs/modules/swarm) runs a DAG from a task array, and a native run is
+a tool loop with checkpoints. The legacy durable resume has no automatic step
+retry; you schedule the resume.
+
+**Use instead.** **LangGraph.js** (`@langchain/langgraph` 1.7.4, 12 November
+2026) for explicit graphs with `interrupt()` and checkpointers; **Mastra**
+workflows (`.then()`, `.parallel()`, `.branch()`, `suspend()`); **Google ADK
+TypeScript 2.0** (GA 21 August 2026), whose agents and tools are nodes of a
+graph.
+
+## Queues, serverless and deployment
+
+**Deuz.** The goal supervisor, the scheduler and the webhook inbox are library
+loops in your own process: when the process is down, nothing runs. There is
+no BullMQ, Inngest, Temporal, Trigger.dev, QStash or SQS integration, no
+Durable Objects or Lambda adapter, no deploy command, and no hosted control
+plane or dashboard. The 2.4 plan's local daemon and control server did not
+ship in 2.5.
+
+**Use instead.**
+
+- **Temporal**, with `@temporalio/vercel-ai-sdk` (AI SDK integration, 20
+  January 2026), which wraps model calls in Activities.
+- **Trigger.dev** v4.5.0, whose AI Agents feature is GA since 2 July 2026: one
+  long-running task per chat.
+- **Inngest** `step.run()` steps.
+- **Vercel Workflow** with AI SDK 7's `WorkflowAgent`, and its "world" adapters
+  for other runtimes.
+- **Cloudflare Agents** in Durable Objects.
+- **Mastra**, for deployers to Vercel, Netlify and Cloudflare and guides for
+  Lambda, Kubernetes, Inngest and Temporal.
+
+Deuz's stores (`AgentRunStore`, `LeaseProvider`) are the seams such an adapter
+would use; none is shipped.
+
+## Provider-hosted agent runtimes
+
+**Deuz.** Deuz runs the agent loop in your process. It has no adapter for the
+provider-hosted runtimes, where the provider runs the loop and you open a
+session and read its events: **OpenAI Agents API** (public beta, 10 September
+2026), **Claude Managed Agents** (launched 8 April 2026, beta) and **Gemini API
+Managed Agents** (preview, 19 May 2026). The [harness runner](/docs/modules/harness)
+drives local harnesses over ACP, not these hosted sessions.
+
+**Use instead.** The providers' own clients for those sessions. Deuz's
+checkpoints, approvals and budgets are the local counterpart, not a wrapper.
+
+## RAG infrastructure
+
+**Deuz.** Versioned memory and the context compiler are deep, but the RAG
+layer around them is thin:
+
+- no adapters for external vector databases (Pinecone, Qdrant, Weaviate,
+  Chroma, Milvus, LanceDB, turbopuffer, Upstash Vector); the built-in backends
+  are in-memory, SQLite, Postgres/pgvector and Redis;
+- no web, HTML or URL loaders, no OCR, and no PPTX or EPUB parsing;
+- no semantic or markdown-aware chunking, and no HyDE, MMR or contextual
+  retrieval;
+- no graph memory or entity extraction, no memory consolidation, and no
+  connector to Mem0, Zep or Letta.
+
+**Use instead.** **Mastra**'s RAG lists 17 vector databases (a count derived
+from its docs, among them PgVector, Pinecone, Qdrant, MongoDB and S3 Vectors);
+**LangChain.js** lists 19 vector stores and has loaders for files and the web.
+Note that **LlamaIndex.TS** is no longer an option: its repository was archived
+on 30 April 2026.
+
+## Provider-hosted tools and computer use
+
+**Deuz.** Of the tools a provider runs on its side, Deuz wraps web search only
+(`anthropicWebSearch`, `openaiWebSearch`, `googleSearch`). Code execution,
+file search, provider-side MCP connectors and computer use are not wrapped.
+
+**Use instead.** The **AI SDK** (code execution, file search, provider MCP and
+computer toolsets in its Anthropic and OpenAI providers) or the **OpenAI Agents
+SDK** (`codeInterpreterTool`, `fileSearchTool`, `hostedMcpTool`,
+`computerTool`).
+
+## Remote sandboxes
+
+**Deuz.** `codeActTool` and `shellTool` sit on a `ComputeSandbox` interface.
+The only backend that isolates is the local [Docker runner](/docs/modules/docker),
+a preview that starts a fresh container per run. The Node backend is not a
+security boundary. There is no E2B, Daytona, Modal, Vercel Sandbox or
+Cloudflare Sandbox adapter, no microVM backend, and no stateful session reused
+across calls.
+
+**Use instead.** The **OpenAI Agents SDK for TypeScript** (v0.9.0, 5 May 2026)
+has sandbox clients for Blaxel, Cloudflare, Daytona, E2B, Modal, Runloop and
+Vercel; **Mastra** lists sandbox adapters for most of the same. You can also
+implement `ComputeSandbox` over one of those services yourself.
+
+## UI: frameworks, protocols and generative UI
+
+**Deuz.** Only `@deuz-sdk/react` ships (`useChat` and `useObject`, no
+`useCompletion`). There are no Vue, Svelte, Solid, Angular or React Native
+bindings, no component kit beyond `ToolApprovalCard` and `CostBadge`, and no
+generative UI. The wire is Deuz's own versioned SSE protocol; there is no
+AG-UI endpoint and no MCP Apps support.
+
+**Use instead.**
+
+- **AI SDK UI** for React, Svelte, Vue, Angular and SolidJS (community).
+- **TanStack AI** for React, Vue, Solid, Svelte, Preact and Angular, or no
+  framework.
+- **CopilotKit** and the **AG-UI** protocol to connect an agent to an app.
+- **assistant-ui** for React Native and terminal UIs (both announced 9 March
+  2026).
+- **MCP Apps** or Google's **A2UI** (v1.0, 11 November 2026) for UI
+  described as data.
+
+## Realtime voice and streaming media
+
+**Deuz.** [Realtime](/docs/modules/realtime) speaks OpenAI Realtime and Gemini
+Live over WebSocket only, and was never run against a live provider. There is
+no WebRTC, no OpenAI Live sessions (`v1/live/sessions`), no SIP, no Vertex
+Live, no React voice hook, and no realtime price table. Speech returns one
+finished file, transcription is batch only, image generation does not stream,
+and video works only through a relay.
+
+**Use instead.**
+
+- The **OpenAI Agents SDK for TypeScript**: WebRTC by default in the browser,
+  plus WebSocket, SIP and Twilio transports.
+- **TanStack AI**, with WebRTC by default for OpenAI.
+- For Gemini Live over WebRTC, Google points to **LiveKit** (with ADK).
+- The **AI SDK** for streaming speech and transcription
+  (`experimental_streamSpeech`, `experimental_streamTranscribe`).
+
+## Observability integrations
+
+**Deuz.** The [OpenTelemetry bridge](/docs/modules/observability) emits traces
+with the GenAI span names (`invoke_agent`, `chat`, `execute_tool`,
+`embeddings`), with content capture off by default. It emits no metrics (no
+`gen_ai.client.*` histograms) and does not propagate `traceparent` across
+services, and steps are attributes, not spans. There is no integration with
+Langfuse, LangSmith, Braintrust, Datadog, Sentry, Arize Phoenix, Helicone or
+Honeycomb: you wire the bridge to your backend yourself.
+
+**Use instead.** The **AI SDK** with **`@ai-sdk/otel`** (1.0.0 on 25 June
+2026), which also records an inference duration histogram; **Langfuse**'s AI
+SDK 7 integration (`@langfuse/vercel-ai-sdk` 5.9.0, stable 26 June 2026);
+**Braintrust**, which supports AI SDK v3 to v7.
+
+## Evals
+
+**Deuz.** `runEval`, `runGradedEval` and `runEvalSuite` are deterministic and
+record cost, tokens and rescues per attempt. There is no LLM-as-judge helper,
+no scorer library, no dataset or experiment management, no regression diff and
+no score threshold that fails CI. The real-model eval tasks are defined but
+have never been run.
+
+**Use instead.** **Mastra** (scorers, versioned datasets, experiments,
+`trajectory-accuracy`); **LangSmith** `evaluate()` with `openevals`'
+`createLLMAsJudge`; **Promptfoo**, which OpenAI recommends as its Evals
+dashboard and API close on 30 November 2026.
+
+## Devtools, studio and scaffolding
+
+**Deuz.** 2.5 adds the `deuz` CLI with two commands (`meter`, `acp`). There is
+still no TUI, no dev server or studio, and no playground; the only viewer is the
+static HTML of `renderRunReport`. There is no `create` scaffolder or starter
+template, and the examples cover Next.js and plain Node scripts only (no
+Express, Hono, Fastify, SvelteKit, Nuxt, Remix or TanStack Start).
+
+**Use instead.**
+
+| Tool | Start |
+| --- | --- |
+| AI SDK DevTools | `npx @ai-sdk/devtools@latest` |
+| Mastra Studio | `mastra dev` |
+| Genkit Developer UI | `genkit start` |
+| ADK TypeScript web UI | `npx adk web` |
+| LangGraph Studio | `langgraph dev` (needs a LangSmith API key) |
+
+To scaffold a project: `create-mastra`, or Cloudflare's
+`npm create cloudflare@latest -- my-agent --type=hello-world --lang=ts`.
+
+## Runtime coverage and live testing
+
+**Deuz.** CI runs Node 22 and 24 on Ubuntu and Node 22 on Windows, plus React
+18, Postgres 16, Redis 7 and Docker jobs. There is no macOS leg. Bun, Deno,
+Cloudflare Workers and Vercel Edge are claimed from Web-API-only code and a
+browser bundle check, but no test runs on them. The opt-in live tests cover
+only DeepSeek, Gemini and xAI. Nothing added in 2.3 or 2.4 was run against a
+live provider. In 2.5 only the meter and the harness runner were, by hand,
+through Claude Code and Codex on 2026-11-24. There is no live Anthropic or
+OpenAI chat test.
+
+**Use instead.** If you need a tested Bun, Deno or Workers story, the **OpenAI
+Agents SDK** supports Node 22+, Deno 2.35+ and Bun 1.2.5+ (Workers with
+limits), and its integration tests run on Node, Bun and Deno against a real
+API key. Otherwise, make one live call with a small budget before you rely on a
+Deuz feature marked not live-verified.
+
+## MCP and A2A
+
+**Deuz.** The MCP client speaks 2026-07-28 and 2025-11-25 with OAuth,
+sampling, roots and elicitation, and the server now publishes resources and
+prompts and serves opted-in tools and agents as MCP tasks. Missing:
+
+- MCP **tasks** in the client, and on the server `taskSupport: 'required'` and
+  2026-07-28 task status notifications (the SDK cannot send them; clients
+  poll);
+- **MCP Apps** (`ui://` resources);
+- a WebSocket client transport, provider-side MCP connectors, and
+  `logging/setLevel`.
+
+For A2A 1.0: no push notifications, `ListTasks`, gRPC binding, A2A 0.3
+compatibility or signed agent card verification, and no adapter that makes a
+remote A2A agent a loop tool.
+
+**Use instead.** **Mastra**'s `MCPServer` serves resources, prompts and
+`ui://` MCP Apps. The official **`@a2a-js/sdk`** 1.0 supports JSON-RPC, REST
+and gRPC, with a push-notification sample and persistent stores.
+
+## Agent loop details
+
+**Deuz.** A sub-agent takes text and returns text (no typed output). A handoff
+carries the whole history unfiltered. There is no tool-call repair hook:
+invalid arguments only self-heal as an error result. There are no ready-made
+permission modes or model-classified auto-approval, and guardrails run in
+sequence at loop boundaries rather than in parallel. There is no run fork or
+time travel.
+
+**Use instead.** For permission modes, the **Claude Agent SDK** has six
+(`default`, `dontAsk`, `acceptEdits`, `bypassPermissions`, `plan` and a
+model-classified `auto`). The **OpenAI Agents SDK** runs input guardrails in
+parallel with the agent by default.
+
+## Where Deuz is not behind
+
+For balance, the same review found Deuz level or ahead on: persistent token and
+USD budgets and a bundled price table in the SDK itself, effect receipts for
+interrupted tool calls, versioned memory with provenance and forget, the MCP
+client, A2A 1.0 on both sides, durable building blocks that need no vendor
+runtime, and supply-chain exposure (zero runtime dependencies). Signed approvals
+are no longer unique to Deuz: AI SDK 7 (25 June 2026) offers optional
+HMAC-signed approvals too.
+
+## See also
+
+- [What is new in 2.5](/docs/reference/whats-new-2-5) — what 2.5 added and its known limits.
+- [Support matrix](/docs/reference/support-matrix) — how far each surface is verified.
+- [Migrating from the Vercel AI SDK](/docs/migration/from-vercel-ai-sdk) — what maps, and what does not.

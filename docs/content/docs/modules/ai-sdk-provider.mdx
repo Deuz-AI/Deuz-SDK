@@ -1,0 +1,297 @@
+---
+title: AI SDK provider
+description: Keep your Vercel AI SDK 7 code and add a persistent, cross-process Deuz budget, fail-over and a circuit breaker by wrapping the model in one line — @deuz-sdk/ai-sdk-provider (2.5).
+---
+
+`@deuz-sdk/ai-sdk-provider` (2.5) is for code that already uses the
+[Vercel AI SDK](https://ai-sdk.dev) and should stay that way. Wrap the model in
+one line and keep calling `generateText`, `streamText`, `generateObject` and
+agents as before. Every call is then:
+
+1. **reserved** against a Deuz budget before the provider is called: in process,
+   or in a persistent [`BudgetStore`](/docs/modules/budgets) shared by every
+   process that points at it;
+2. **settled** with the usage the provider reports, priced by Deuz's
+   [price table](/docs/modules/pricing);
+3. **guarded** by Deuz's circuit breaker and, with `deuz()`, fail-over to other
+   models before the first content byte;
+4. **recorded** as a cost receipt.
+
+At the ceiling the call throws `DeuzBudgetError` and the provider is never
+called. The AI SDK does not retry it.
+
+It is a separate package, so `@deuz-sdk/core` stays zero-dependency.
+
+```bash
+npm install @deuz-sdk/ai-sdk-provider @deuz-sdk/core @ai-sdk/provider ai
+```
+
+It requires **AI SDK 7** (`ai@7`, `@ai-sdk/provider@4`, language-model spec
+`'v4'`) and Node 22 or later. At runtime it imports only `@deuz-sdk/core`;
+`@ai-sdk/provider` is used for types.
+
+<Callout type="warn" title="Not live-verified">
+The package is tested against the AI SDK's own mock models
+(`MockLanguageModelV4` from `ai/test`) through `generateText`, `streamText` and
+`wrapLanguageModel`, not against live providers.
+</Callout>
+
+## One line
+
+```ts
+import { generateText } from 'ai';
+import { openai } from '@ai-sdk/openai';
+import { deuz } from '@deuz-sdk/ai-sdk-provider';
+
+const model = deuz(openai('gpt-5-mini'), { budget: { usd: 5 } });
+
+const { text } = await generateText({ model, prompt: 'Summarise the ticket.' });
+console.log(model.ledger.totals()); // what this wrapper has spent
+```
+
+`budget: { usd, tokens }` on its own is an **in-process** budget: it counts the
+calls through this wrapped model value, in this process, for as long as the
+value lives.
+
+## A persistent, shared ceiling
+
+Give the budget a store and scopes. Every process that uses the same store
+shares the same scopes, and admission is all-or-none across them.
+
+```ts title="app/api/chat/route.ts"
+import { streamText } from 'ai';
+import { anthropic } from '@ai-sdk/anthropic';
+import { deuz } from '@deuz-sdk/ai-sdk-provider';
+import { createSqliteBudgetStore } from '@deuz-sdk/core/ops/sqlite';
+
+const store = createSqliteBudgetStore({ path: './budgets.sqlite' });
+
+export async function POST(request: Request) {
+  const { userId, messages } = await request.json();
+  // Wrapping is cheap: wrap per request to bind per-user scopes.
+  const model = deuz(anthropic('claude-sonnet-4-5'), {
+    budget: {
+      store,
+      scopes: [
+        { key: `user:${userId}`, limits: { usd: 2 }, window: { ms: 86_400_000 } },
+        { key: 'org:acme', limits: { usd: 500 } },
+      ],
+      warnAtPercent: 80,
+      onWarning: (warning) => console.warn(warning),
+    },
+    onCost: (receipt) => console.log(receipt.priceKey, receipt.usd, receipt.source),
+  });
+  return streamText({ model, messages }).toUIMessageStreamResponse();
+}
+```
+
+The stores are core's: `createInMemoryBudgetStore` (`@deuz-sdk/core/agent`),
+`createSqliteBudgetStore` (`@deuz-sdk/core/ops/sqlite`),
+`createPostgresBudgetStore` (`@deuz-sdk/core/ops/postgres`) and
+`createRedisBudgetStore` (`@deuz-sdk/core/ops/redis`). Scopes, windows, warnings,
+holds, `sweep` and `prune` behave exactly as on the [budgets page](/docs/modules/budgets).
+
+Scopes are fixed when the wrapper's ledger is created. For per-user scopes,
+wrap per request, as above.
+
+The same store can back the [meter](/docs/modules/meter) in front of a coding
+harness and the native agents of a Deuz app, so all three draw on one ceiling.
+
+## At the ceiling
+
+Before the call is sent, Deuz reserves an estimate. When it does not fit, the
+call fails with `DeuzBudgetError`, before the provider is called:
+
+| `code` | Meaning |
+| --- | --- |
+| `'budget_exceeded'` | The estimate does not fit a token or USD bound. |
+| `'unpriced_model'` | The model has no price and the budget says `unknownPrice: 'reject'`. |
+| `'missing_reservation'` | A USD bound applies but the price lookup threw; an outage fails closed. |
+| `'admission_failed'` | The store itself failed; nothing was admitted. |
+
+`DeuzBudgetError` has `isRetryable: false` and is not an `APICallError`, so the
+AI SDK does not retry it. `generateText` rejects with it; `streamText` delivers
+it as an `error` part on `fullStream` and to your `onError`. It also carries
+`provider`, `modelId`, `priceKey` and, as `cause`, core's `BudgetLedgerError`.
+`DeuzBudgetError.isInstance(value)` works across duplicate package copies.
+
+```ts
+import { generateText } from 'ai';
+import { DeuzBudgetError } from '@deuz-sdk/ai-sdk-provider';
+
+try {
+  await generateText({ model, prompt });
+} catch (error) {
+  if (DeuzBudgetError.isInstance(error) && error.code === 'budget_exceeded') {
+    return new Response('Budget reached', { status: 402 });
+  }
+  throw error;
+}
+```
+
+## Options
+
+`deuz(model, options)` and `deuzMiddleware(options)` share these:
+
+| Option | Default | Notes |
+| --- | --- | --- |
+| `budget` | — | `{ usd?, tokens?, unknownPrice?, store?, scopes?, warnAtPercent?, onWarning? }`, or an existing core `BudgetLedger` to share one in-process budget between wrappers. `store` and `scopes` require each other. |
+| `priceProvider` | `createPriceProvider()` | From `@deuz-sdk/core/pricing`. |
+| `priceKey` | the AI SDK `modelId`, cleaned up | A string, or `({ provider, modelId }) => string \| undefined`. |
+| `estimate` | `{ outputTokens: 4096, capOutputTokens: false }` | Plus `promptTokens(params)` to replace the prompt estimate. |
+| `breaker` | core's defaults | `{ store?, threshold?, cooldownMs? }`, or `false` to turn it off. |
+| `onCost` | — | One `DeuzCostReceipt` per completed call. |
+| `onAccountingError` | — | `(error, requestId)`: a settlement the store could not record. |
+| `clock`, `generateId` | host clock, `crypto.randomUUID` | Injected, as everywhere in Deuz. |
+
+`deuz()` also takes `fallbackModels`, `shouldFallback` and `onFallback`; see
+[Fail-over](#fail-over-and-circuit-breaker).
+
+The wrapped model keeps the original's `provider`, `modelId` and
+`supportedUrls`, and adds `ledger`. `deuz()` throws `DeuzUnsupportedModelError`
+for a model whose `specificationVersion` is not `'v4'`.
+
+## Prices and models without one
+
+The price key is the AI SDK `modelId`, with Vertex `@version` suffixes, Bedrock
+region and vendor prefixes and Bedrock `-vN:M` suffixes removed
+(`defaultPriceKey`). Deuz's lookup also drops a `vendor/` prefix and a trailing
+snapshot date. Azure deployment names and other custom ids need `priceKey`:
+
+```ts
+deuz(azure('prod-gpt-deployment'), { priceKey: 'gpt-5-mini' });
+```
+
+A string `priceKey` applies to the wrapped model only. Give fallbacks their own
+with `{ model, priceKey }`, or use the function form.
+
+A model with no price follows `budget.unknownPrice`:
+
+- `'warn'` (default): the call runs, its tokens are reserved, bounded and
+  recorded, its USD cost is left out of every USD total, and the first call per
+  price key per wrapper reports one AI SDK warning of type `'other'`;
+- `'reject'`: refused with `unpriced_model` under a USD bound. A scope's own
+  `limits.unknownPrice: 'reject'` refuses too.
+
+## Fail-over and circuit breaker
+
+```ts
+import { anthropic } from '@ai-sdk/anthropic';
+import { openai } from '@ai-sdk/openai';
+import { deuz } from '@deuz-sdk/ai-sdk-provider';
+
+const model = deuz(openai('gpt-5-mini'), {
+  budget: { usd: 5 },
+  fallbackModels: [anthropic('claude-haiku-4-5')],
+  onFallback: ({ from, to, error }) => console.warn(`${from.modelId} -> ${to.modelId}`, error),
+});
+```
+
+- The next model is tried only while the current one has produced **no
+  content**: any part other than stream-start, response-metadata, ping, raw,
+  error and finish counts as content. A stream is buffered until then. An error
+  after content is final.
+- By default a hop happens on an open breaker, a retryable error or a 5xx
+  (`defaultShouldFallback`). Client errors, aborts and budget refusals never
+  hop. Override with `shouldFallback`.
+- Each attempt is reserved, priced and settled separately.
+- Each model has a breaker keyed `provider:modelId` with core's defaults: 5
+  consecutive retryable or 5xx failures (`isProviderFailure`) open it for 30
+  seconds, during which calls fail fast with core's `BreakerOpenError`; then one
+  call is let through. The default breaker store is in memory, one per wrapper;
+  pass `breaker.store` to share it.
+
+## Cost receipts
+
+`onCost` receives one receipt per completed call, for the model that answered.
+The same summary is set as `providerMetadata.deuz` on the result, or on the
+`finish` part of a stream.
+
+```ts
+{
+  requestId: '…', operation: 'stream', provider: 'openai.responses', modelId: 'gpt-5-mini',
+  priceKey: 'gpt-5-mini',
+  source: 'measured',          // 'estimated' when no usage came back or pricing failed
+  tokens: 1500, usd: 0.00125,  // what the budget was charged
+  unpriced: false,
+  estimate: { tokens: 4110, usd: 0.0082 },
+  usage: { inputTokens: 1000, outputTokens: 500, … }, // Deuz canonical usage
+  settled: true,               // false: the store failed to settle; the estimate stays held
+  failedOver: { from: 'openai.responses:gpt-5-mini', reason: 'http_503' }, // only after a hop
+  at: 1763251200000,
+}
+```
+
+Failed attempts are recorded in the ledger but get no receipt. These are cost
+receipts for model calls, not effect receipts for tool calls: tool approvals
+and effect receipts stay with your AI SDK code.
+
+## Middleware form
+
+The budget, breaker and receipts are also an AI SDK middleware, to compose with
+other middleware or to guard an older-spec (v2 or v3) model, which
+`wrapLanguageModel` upgrades first. Fail-over is not part of it: a middleware
+wraps exactly one model.
+
+```ts
+import { wrapLanguageModel } from 'ai';
+import { openai } from '@ai-sdk/openai';
+import { deuzMiddleware } from '@deuz-sdk/ai-sdk-provider';
+
+const budget = deuzMiddleware({ budget: { usd: 5 } });
+const model = wrapLanguageModel({ model: openai('gpt-5-mini'), middleware: budget });
+console.log(budget.ledger.totals());
+```
+
+One middleware value holds one ledger and one breaker store, shared by every
+model it wraps.
+
+## Other exports
+
+- `estimatePromptTokens(params)`: the prompt estimate (3.6 characters per token,
+  plus 4 tokens per message and 1 600 per file part; tool definitions and the
+  JSON schema count).
+- `toDeuzUsage(usage)`: AI SDK usage to Deuz canonical `Usage`.
+- `defaultPriceKey`, `defaultShouldFallback`, `isProviderFailure`.
+- `DEFAULT_OUTPUT_TOKENS` (4096), `DEFAULT_BREAKER_THRESHOLD` (5),
+  `DEFAULT_BREAKER_COOLDOWN_MS` (30000).
+
+## Limits
+
+- **AI SDK 7 only.** `deuz()` takes `'v4'` models. For AI SDK 5 or 6 models,
+  use `wrapLanguageModel` with `deuzMiddleware`, which handles the upgrade.
+- **Admission runs on estimates and is not enforced by the provider.** The
+  prompt is estimated from characters; there is no tokenizer, so dense code,
+  non-Latin text and PDFs can be under-estimated. The output is reserved at
+  `maxOutputTokens`, or 4 096 when the call sets none, and a provider can bill
+  more. Set `maxOutputTokens`, or `estimate: { capOutputTokens: true }` to send
+  the reserved amount as the cap, with a warning; it is off by default because
+  it can cut long answers short. Core sends such a cap automatically for models
+  that document no output limit; this package does not.
+- **A ceiling can be overshot by up to one call.** The actual usage replaces the
+  estimate only after the call, and concurrent calls are each admitted against
+  what was committed when they started.
+- **Streams settle at `finish`.** A stream that ends, errors or is cancelled
+  before its `finish` part keeps its estimate charged (fail closed).
+- **Failed calls.** Status 400, 401, 403, 404, 422 or 429 releases the hold; any
+  other failure (5xx, network, abort) keeps the estimate held. Reconcile those
+  holds with the store's `holds()` and `sweep()`.
+- **Settlement failures do not fail the call.** After core's 3 retries, the
+  estimate stays held, `receipt.settled` is `false`, and `onAccountingError`
+  fires.
+- **Per-wrapper state.** The in-process budget, the default breaker store and
+  the unpriced-model warning are per wrapped model value. Use a store and a
+  shared `breaker.store` to share them. A `BudgetLedger` you pass is charged at
+  ledger level and is never compacted.
+- **AI SDK retries happen outside the wrapper.** Each retry is a separately
+  admitted call.
+- **`supportedUrls` comes from the primary model.** A fallback that does not
+  support a URL the first model does receives it unchanged.
+- **Tested with mock models only**, not live providers.
+
+## See also
+
+- [Migrating from the Vercel AI SDK](/docs/migration/from-vercel-ai-sdk) — when you do want to port.
+- [Budgets](/docs/modules/budgets) — scopes, windows, holds and the durable stores.
+- [Meter](/docs/modules/meter) — the same budget for coding-harness traffic.
+- [Pricing](/docs/modules/pricing) — the price table calls are settled with.

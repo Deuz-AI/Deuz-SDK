@@ -1,11 +1,11 @@
-<!-- verified: 2026-10-16 against @deuz-sdk/core@2.4.0 · api-contract sha256:da3643f44edc
+<!-- verified: 2026-11-24 against @deuz-sdk/core@2.5.0 · api-contract sha256:cd3d4f48e5a3
      sources: packages/core/src/mcp/server.ts, packages/core/src/mcp/server-internals.ts,
      packages/core/src/node/mcp-server.ts, packages/core/src/a2a/{index,agent,client,handler,runtime,protocol,errors,task-store,types}.ts,
-     docs/content/docs/modules/{mcp-server,a2a}.mdx -->
+     docs/content/docs/modules/{mcp-server,a2a}.mdx, docs/content/docs/reference/whats-new-2-5.mdx -->
 
 # Serving and calling agents across processes: the MCP server and A2A
 
-**Load when:** publishing your tools, native agent tools or whole agents to MCP clients (a desktop assistant, another framework's agent, a hosted host), serving an agent over the Agent2Agent (A2A) protocol (a native agent run as a task included), or calling another team's A2A agent. Both arrived in 2.3. *Consuming* MCP servers is `references/mcp.md`.
+**Load when:** publishing your tools, native agent tools, whole agents, resources or prompts to MCP clients, changing that catalog at runtime or serving long calls as MCP tasks (2.5) (a desktop assistant, another framework's agent, a hosted host), serving an agent over the Agent2Agent (A2A) protocol (a native agent run as a task included), or calling another team's A2A agent. Both arrived in 2.3; the MCP server's resources, prompts, catalog and tasks in 2.5. A ready-made MCP server with memory, a spend ledger and receipts is `@deuz-sdk/mcp-ledger` (`references/distribution.md`). *Consuming* MCP servers is `references/mcp.md`.
 
 | You want to | Use | Subpath | Runtime |
 | --- | --- | --- | --- |
@@ -19,7 +19,7 @@ Pick MCP when the caller wants **tools** its own model decides when to call. Pic
 
 ## The MCP server
 
-`createMcpServer(options)` publishes three kinds of entries under one definition and serves them two ways: `server.fetch(request, { authInfo? })` is a fetch-native Streamable HTTP handler (Workers, Deno, Bun, route handlers), and `serveMcpStdio(server)` serves the **same handle** over stdin/stdout. It answers MCP 2026-07-28 clients and, by default, 2025-era clients through a stateless fallback. It is built on the v2 SDK, an optional peer imported lazily: `npm i @modelcontextprotocol/server` (`^2.3.1`, Node 20+ or a fetch-native runtime).
+`createMcpServer(options)` publishes tools, native agent tools and agents (and, since 2.5, resources, resource templates and prompts) under one definition and serves them two ways: `server.fetch(request, { authInfo? })` is a fetch-native Streamable HTTP handler (Workers, Deno, Bun, route handlers), and `serveMcpStdio(server)` serves the **same handle** over stdin/stdout. It answers MCP 2026-07-28 clients and, by default, 2025-era clients through a stateless fallback. It is built on the v2 SDK, an optional peer imported lazily: `npm i @modelcontextprotocol/server` (`^2.3.1`, Node 20+ or a fetch-native runtime).
 
 ```ts
 import { tool } from '@deuz-sdk/core';
@@ -72,10 +72,14 @@ await server.close();
 | `name`, `version`, `instructions` | — / `'0.0.0'` / — | The server's identity, and how to use it (shown to the client's model). |
 | `tools` | — | A `ToolSet`, served with the loop's semantics. Every tool needs an `execute`. |
 | `agentTools`, `toolsContext` | — | A native `AgentToolSet` with native semantics: the tool context is validated, the result is validated (`outputSchema` / `validateResult`), and the client gets the `toModelOutput` projection. `toolsContext` is a record (validated once by `ready()`) or `(request) => record` per call. |
-| `agents` | — | `{ [name]: { description, agent, needsApproval? } }`: each becomes a tool taking `{ prompt }`, one `runAgent` per call. `agent` is `runAgent` options without `messages` / `prompt`, or `(input, request) => options` per call (mint a fresh durable `session` there: a fixed `runId` makes concurrent calls collide). |
+| `agents` | — | `{ [name]: { description, agent, needsApproval?, task? } }`: each becomes a tool taking `{ prompt }`, one `runAgent` per call. `agent` is `runAgent` options without `messages` / `prompt`, or `(input, request) => options` per call (mint a fresh durable `session` there: a fixed `runId` makes concurrent calls collide). |
 | `approve` | `'elicit'` | Who approves a `needsApproval` call: `'elicit'` asks the client's user through an MCP elicitation, a function `(request) => boolean` decides on the server. |
 | `guardrails` | — | `{ onToolCall?, onToolResult? }`, the loop's tool guardrails, applied to every served call. |
 | `runtimeContext` | — | `(request) => unknown` per call, e.g. a tenant read from `request.authInfo`. |
+| `resources`, `resourceTemplates`, `prompts` | — | 2.5. Static resources, RFC 6570 URI-template resources and prompts by name; see [Resources, prompts, the catalog and tasks](#resources-prompts-the-catalog-and-tasks-25). Passing one at all, even `{}`, advertises that capability. |
+| `tasks` | — | 2.5. `{ tools, store?, ttlMs?, pollIntervalMs?, owner?, generateTaskId? }`: the served names that run as MCP tasks. Passing it, even `{}`, advertises task support. |
+| `eventBus`, `maxSubscriptions` | in-process / 1024 | 2.5. The bus behind 2026-07-28 `subscriptions/listen` (share one across processes), and the cap on open listen streams. |
+| `generateId` | `crypto.randomUUID()` | 2.5. Names each serving unit, which qualifies the served `toolCallId`. |
 | `toolAnnotations` | — | MCP hints per tool name (`title`, `readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`). |
 | `legacy` | `'stateless'` | HTTP: serve 2025-era clients statelessly, or `'reject'` them (a 2026-07-28-only endpoint). |
 | `responseMode` | `'auto'` | 2026-07-28 exchanges: JSON, upgraded to SSE when a call streams; or always `'sse'` / `'json'`. |
@@ -89,7 +93,7 @@ Construction rejects what can never be served: a client tool (no `execute`), a p
 2. `guardrails.onToolCall`: `block` answers the loop's denial, `rewrite` swaps the arguments.
 3. The approval gate, when `needsApproval` holds.
 4. Validation exactly as the loop does it.
-5. `execute`, with a `toolCallId` of `mcp-<request id>`, the request's abort signal (a client cancellation aborts it), `messages: []` and the `runtimeContext`. A throw, or a `Tool.timeoutMs` expiry, becomes an error result carrying the message.
+5. `execute`, with a `toolCallId` of `mcp-<unit>-<JSON-RPC id>` (2.5; it was `mcp-<request id>` in 2.4, which collided across connections), the request's abort signal (a client cancellation aborts it), `messages: []` and the `runtimeContext`. A throw, or a `Tool.timeoutMs` expiry, becomes an error result carrying the message.
 6. `guardrails.onToolResult`, then the result: a string is one text block; a plain object travels as `structuredContent` plus its JSON text (so a Deuz client gets the object back); an array, number, boolean or `null` as JSON text; with an `outputSchema`, `structuredContent` the SDK validates. A throw, a timeout, a denial or a block is `isError: true` with the message. Only the message crosses the wire, never a stack, so keep secrets out of error messages.
 
 **Approval.** A function `approve` is a server-side verdict, the counterpart of the loop's `approveToolCall` (`false` or a throw denies). `'elicit'` asks the client's user through a yes/no form elicitation: on a 2026-07-28 client that declared form elicitation, and on a 2025-era client over stdio. A 2025-era client over stateless HTTP has no session to ask on, and a client without form elicitation cannot be asked: both are **denied**. A call nobody can approve never runs. `'elicit'` takes the client's word for it; when the server must not, decide on the server from `authInfo`. There is no client-mode suspension: an MCP call cannot be resumed across requests.
@@ -98,7 +102,70 @@ Construction rejects what can never be served: a client tool (no `execute`), a p
 
 **stdio.** `serveMcpStdio(server, { legacy?, stdin?, stdout? })` (Node) prepares every tool before reading the first byte, so a broken definition rejects instead of half-starting; it resolves a handle whose `close()` stops serving. The opening exchange pins the connection to one era (`server/discover` or `initialize`); `legacy: 'reject'` refuses a 2025-era opening. It also takes the options object directly. **Never write to stdout** from a stdio server: every byte there is protocol, so log to stderr.
 
-**Limits.** Tools only (no resources or prompts), a catalog fixed at construction (no `tools/list_changed`), `Tool.timeoutMs` but no call-level `timeout`, no usage reporting to the client (observe it with `deps.onUsage`), and no live verification against third-party hosts: the server is verified offline against the Deuz client on both SDK lines and the official v1 and v2 SDK clients, over HTTP and a real stdio child process.
+**The served `toolCallId` (2.5).** `<unit>` is a fresh `generateId()` per serving unit: one HTTP request (so a client's retried POST is a **new** call; there is no idempotency key), or one stdio connection (MCP forbids reusing a request id within a session, so a resent id keeps its `toolCallId` and an idempotent tool replays it). A 2026-07-28 approval round trip is two requests, so `onToolCall` sees two ids; the tool runs only in the second. This makes `createVersionedMemoryTools` safe to serve. A host that parsed the 2.4 format must adapt.
+
+### Resources, prompts, the catalog and tasks (2.5)
+
+```ts
+import { createMcpServer } from '@deuz-sdk/core/mcp/server';
+import { createMcpClient } from '@deuz-sdk/core/mcp';
+
+const notes: Record<string, Record<string, string>> = { acme: { n1: 'Ship the release on Friday.' } };
+
+const server = createMcpServer({
+  name: 'notes',
+  runtimeContext: ({ authInfo }) => ({ tenant: authInfo?.clientId ?? 'acme' }),
+  resources: { readme: { uri: 'docs://readme', mimeType: 'text/markdown', read: () => '# Notes' } },
+  resourceTemplates: {
+    note: {
+      uriTemplate: 'notes://{id}',
+      mimeType: 'text/plain',
+      // Per request, so a tenant lists only its own notes.
+      list: ({ runtimeContext }) => {
+        const { tenant } = runtimeContext as { tenant: string };
+        return Object.keys(notes[tenant] ?? {}).map((id) => ({ uri: `notes://${id}`, name: id }));
+      },
+      // null answers "resource not found": also the answer for another tenant's note.
+      read: ({ variables, runtimeContext }) => {
+        const { tenant } = runtimeContext as { tenant: string };
+        return notes[tenant]?.[String(variables.id)] ?? null;
+      },
+    },
+  },
+  prompts: {
+    review: {
+      description: 'Review a diff.',
+      arguments: { diff: { description: 'The diff to review.', required: true } },
+      get: ({ diff }) => `Review this diff:\n${diff}`,
+    },
+  },
+});
+
+const client = await createMcpClient({
+  transport: {
+    type: 'http',
+    url: 'http://notes.local/mcp',
+    fetch: (input, init) => server.fetch(new Request(input, init)),
+  },
+});
+console.log((await client.listResources()).map((r) => r.uri)); // ['docs://readme', 'notes://n1']
+console.log(await client.readResource('notes://n1'));
+console.log(await client.getPrompt('review', { diff: '- a\n+ b' }));
+
+await server.catalog.setPrompt('triage', { get: () => 'Triage the inbox.' }); // prompts/list_changed
+await server.catalog.resourceUpdated('notes://n1'); // resources/updated, to subscribers whose identity read() answers
+await client.close();
+await server.close();
+```
+
+- **Resources.** `read(context)` returns a string, a `Uint8Array` (sent as base64), `{ text }` / `{ blob }` blocks or an array of them; `null`/`undefined` is resource-not-found. The context carries `uri`, `variables`, `request` (with `authInfo`), `runtimeContext` and `signal`. Template variables arrive percent-decoded and checked against their RFC 6570 operator (`{x}` is one segment: no `/`, `?`, `#`, `.` or `..`), so `notes://..%2F..%2Fetc` never reaches `read`; `rawVariables: true` opts out. Static resources are listed to every caller: scope per-tenant listings with a template's `list`. `complete` callbacks see no caller identity.
+- **Prompts.** `get(args, context)` returns a string, `{ role, content }` messages, or `{ description?, messages }`. A `prompts/get` with an undeclared argument, a non-string value, a missing required argument or a failing `schema` is rejected before `get` runs.
+- **`server.catalog`**: `setTool`, `setAgent`, `removeTool`, `setResource` / `removeResource`, `setResourceTemplate` / `removeResourceTemplate`, `setPrompt` / `removePrompt` and `resourceUpdated(uri)` all return promises, apply in call order and send the matching `list_changed`. There is no `setAgentTool`. Notifications reach 2026-07-28 clients on their `subscriptions/listen` streams (HTTP and stdio) and 2025-era clients over stdio, **never** 2025-era clients over stateless HTTP. Capabilities are fixed at a session's handshake: pass `resources: {}` / `prompts: {}` if the first ones are added at runtime.
+- **Tasks.** `tasks: { tools: ['crawl'], ttlMs }`, or `task: true` on an agent, makes a call answer with a task handle while the run continues in the background: the official Tasks extension (`MCP_TASKS_EXTENSION`, `io.modelcontextprotocol/tasks`) on 2026-07-28, core tasks on 2025-11-25, over HTTP and stdio. Guardrails and the approval gate run before a task exists; `tasks/cancel` aborts the run. The default store is `createInMemoryMcpTaskStore()` (at most 1000 tasks); a task is bound to `owner` (`client:<authInfo.clientId>` over HTTP).
+
+**Behaviour changes in 2.5:** besides the `toolCallId`, an advertised but empty kind now lists `[]` (a server with zero tools answered method-not-found in 2.4). A tools-only server advertises exactly what it did in 2.4. Code that implements `DeuzMcpServer` itself needs the new `catalog` member.
+
+**Limits.** Tasks are `optional` only (no `taskSupport: 'required'`), 2026-07-28 clients get no task status notifications (they poll `tasks/get`), and a task tool cannot declare an `outputSchema`; a shared task store cannot carry a cancel's abort to another process. Resources and prompts are not gated by guardrails or `approve`. `resources/updated` is filtered by calling the resource's `read` per subscriber. `Tool.timeoutMs` but no call-level `timeout`, no usage reporting to the client (observe it with `deps.onUsage`), and no live verification against third-party hosts: the server, including the 2.5 resources, prompts, notifications and tasks, is verified offline against the Deuz client and the official v1 and v2 SDK clients, over HTTP and stdio.
 
 ## A2A: serving an agent
 
@@ -275,6 +342,6 @@ Every failure is an `A2AError` (`code: 'a2a_error'`) with a `kind`: `'protocol'`
 
 ## Deep dive
 
-- [/docs/modules/mcp-server](/docs/modules/mcp-server) — every option, the served-call pipeline, approval per era, agents as tools, stdio, limits.
+- [/docs/modules/mcp-server](/docs/modules/mcp-server) — every option, the served-call pipeline, approval per era, agents as tools, stdio, resources, prompts, the catalog, tasks, limits.
 - [/docs/modules/a2a](/docs/modules/a2a) — the card as routing table, the executor and its turns, streaming, cancellation, task stores, errors per binding, and serving a native agent (`createA2AAgentExecutor`).
 - [/docs/modules/mcp](/docs/modules/mcp) — the client side of MCP (`references/mcp.md`).

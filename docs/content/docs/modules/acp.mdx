@@ -1,0 +1,412 @@
+---
+title: ACP
+description: The Agent Client Protocol on both sides — serve a native Deuz agent to ACP editors with signed approvals and a persistent budget, or drive any ACP agent from code, in process or as a child process (2.5).
+---
+
+`@deuz-sdk/core/acp` (2.5) speaks the [Agent Client Protocol](https://agentclientprotocol.com),
+the JSON-RPC protocol editors use to run coding agents. It works on both sides:
+
+- **Agent side.** `serveAcpAgent` serves an ordinary native Deuz run to an ACP
+  client (an editor). Each prompt is one `streamAgent` run; its text, reasoning,
+  tool calls and plan stream to the editor as `session/update` notifications. A
+  tool whose `needsApproval` holds becomes a `session/request_permission`
+  dialog, and the answer resumes the run through its own HMAC-signed approval.
+  Cost goes to a persistent `BudgetStore`.
+- **Client side.** `connectAcpAgent` drives any ACP agent from code: open a
+  session, send a prompt, read the updates, answer permission requests, and get
+  a typed result. `spawnAcpAgent` starts the agent as a child process first.
+
+The JSON-RPC layer is written by hand, with no dependencies, against ACP
+protocol version 1 (schema release 1.34.1), not the v2 beta.
+
+| Subpath | Exports | Runtime |
+| --- | --- | --- |
+| `@deuz-sdk/core/acp` | `serveAcpAgent`, `connectAcpAgent`, `createInMemoryAcpTransportPair`, `createNdjsonTransport`, `createAcpPeer`, `createInMemoryAcpSessionStore`, `AcpError`, the `ACP_*` constants and the `Acp*` wire types | Edge-safe (web streams) |
+| `@deuz-sdk/core/acp/stdio` | `serveAcpAgentStdio`, `spawnAcpAgent`, `nodeStreamsToAcpTransport` | Node-only |
+
+<Callout type="warn" title="Checked against the reference SDK, not a real editor">
+Both sides passed a conformance run against the official ACP SDK on 2026-11-24
+(see [Conformance](#conformance)), and `spawnAcpAgent` drove the real Claude
+Code and Codex ACP adapters through [`runHarness`](/docs/modules/harness) that
+day. The agent side has not been tried in a real editor (Zed, JetBrains or
+others), so nobody has checked yet how an editor renders the cost or the
+budget footer. The test suite runs both sides offline over an in-memory
+transport pair and Node `PassThrough` streams, with a deterministic model.
+</Callout>
+
+## Serve an agent, in process
+
+This complete example runs without a key: the agent uses a deterministic model,
+and the client is on the other end of an in-memory transport pair, reading the
+wire as an editor would. The agent writes a file through a gated tool, so the
+client is asked for permission first.
+
+```ts title="acp-in-process.ts"
+import {
+  createInMemoryAgentRunStore,
+  resumeStreamAgent,
+  streamAgent,
+} from '@deuz-sdk/core/agent';
+import {
+  connectAcpAgent,
+  createInMemoryAcpTransportPair,
+  serveAcpAgent,
+} from '@deuz-sdk/core/acp';
+import { createApprovalSigner } from '@deuz-sdk/core/durable';
+import { createMockModel } from '@deuz-sdk/core/testing';
+
+const [agentSide, clientSide] = createInMemoryAcpTransportPair();
+
+serveAcpAgent({
+  transport: agentSide,
+  agent: { streamAgent, resumeStreamAgent },
+  store: createInMemoryAgentRunStore(),
+  approvalSigner: createApprovalSigner({ secret: 'replace-with-a-real-secret' }),
+  run: {
+    model: createMockModel({
+      responses: [
+        { toolCalls: [{ toolName: 'write', args: { path: '/work/repo/a.ts' } }] },
+        { text: 'Wrote a.ts.' },
+      ],
+    }),
+    maxSteps: 5,
+    tools: {
+      write: {
+        description: 'Write a file.',
+        parameters: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] },
+        needsApproval: true,
+        execute: async (args: { path: string }) => ({ written: args.path }),
+      },
+    },
+  },
+  toolKinds: { write: 'edit' },
+});
+
+const client = await connectAcpAgent({
+  transport: clientSide,
+  // The editor's dialog: here, allow once.
+  onPermissionRequest: (request) => {
+    const allow = request.options.find((option) => option.kind === 'allow_once');
+    return allow ? { outcome: 'selected', optionId: allow.optionId } : { outcome: 'cancelled' };
+  },
+});
+
+const session = await client.newSession({ cwd: '/work/repo' });
+const turn = session.prompt('Create a.ts.');
+for await (const update of turn) console.log(update.sessionUpdate); // tool_call, tool_call_update, agent_message_chunk, …
+const result = await turn.result;
+console.log(result.stopReason); // 'end_turn'
+console.log(result.text);       // 'Wrote a.ts.'
+console.log(result.receipts);   // [{ toolCallId, toolName: 'write', stage: 'completed', approval: 'allowed' }]
+await client.close();
+```
+
+## Serve an agent to an editor
+
+An editor launches an ACP agent as a child process and talks to it over
+stdin/stdout, one JSON message per line. `serveAcpAgentStdio` takes the same
+options as `serveAcpAgent`, without `transport`:
+
+```ts title="agent.mjs"
+#!/usr/bin/env node
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+import {
+  createInMemoryAgentRunStore,
+  createInMemoryBudgetStore,
+  resumeStreamAgent,
+  streamAgent,
+} from '@deuz-sdk/core/agent';
+import { serveAcpAgentStdio } from '@deuz-sdk/core/acp/stdio';
+import { createApprovalSigner } from '@deuz-sdk/core/durable';
+import { tools } from './tools.mjs'; // your ToolSet; mark risky tools needsApproval
+
+const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+// stdout carries the protocol, so fail on stderr before serving anything.
+const approvalSecret = process.env.APPROVAL_SECRET;
+if (!approvalSecret) throw new Error('APPROVAL_SECRET is not set: it signs tool approvals.');
+
+await serveAcpAgentStdio({
+  agent: { streamAgent, resumeStreamAgent },
+  store: createInMemoryAgentRunStore(),
+  run: { model: anthropic('claude-sonnet-5-5'), instructions: 'A careful coding agent.', tools, maxSteps: 20 },
+  approvalSigner: createApprovalSigner({ secret: approvalSecret }),
+  budget: { store: createInMemoryBudgetStore(), scopes: [{ key: 'user:me', limits: { usd: 5 } }] },
+  budgetFooter: true,
+  clientFsTools: true,
+});
+```
+
+Register the script as a custom agent in your editor's agent settings, with
+`node` as the command and the script's absolute path as its argument. The
+exact settings key differs per editor, and this has not been tried in one.
+
+<Callout type="warn" title="Never write to stdout from a stdio agent">
+Every byte on stdout is protocol. A stray `console.log` corrupts the stream.
+Log to stderr.
+</Callout>
+
+`deuz acp` in the `deuz` CLI serves an agent the same way from the command
+line; see [CLI](/docs/modules/cli#deuz-acp).
+
+### Agent options
+
+| Option | Default | Notes |
+| --- | --- | --- |
+| `transport` | — | An in-memory pair, `createNdjsonTransport`, or set for you by `serveAcpAgentStdio`. |
+| `agent` | — | `{ streamAgent, resumeStreamAgent }` from `@deuz-sdk/core/agent`. The engine is injected, so the ACP subpath does not bundle it. |
+| `store` | — | An `AgentRunStore`. Each turn's run id is `<sessionId>:<turn>`. |
+| `run` | — | The run's options, or a function of the turn (`{ sessionId, cwd, turn, clientCapabilities, clientInfo?, mcpServers, signal }`). Throw an `AcpError` in it to refuse the prompt. |
+| `info` | `{ name: 'deuz-agent', version: '0.0.0' }` | `agentInfo` in `initialize`. |
+| `sessions` | per connection, in memory | An `AcpSessionStore`; enables `session/load` with history replay. `createInMemoryAcpSessionStore()` is one. |
+| `budget` | — | `{ store, scopes, turn?, warnAtPercent?, onWarning? }`; see [Budget](#budget). |
+| `budgetFooter` | `false` | `true` or a function: a plain-text cost line appended to the reply. |
+| `approvalSigner` | the run's, else a random per-server secret | See [Permissions](#permissions). |
+| `toolKinds` | `'other'` | ACP tool kind per tool name (or a function), for the editor's icon. |
+| `toolTitle` | the tool name | Title of a tool call in the editor. |
+| `mcpServers` | `'accept'` | The client's MCP servers are added to the run's `mcp`, namespaced by server name. `'ignore'` drops them. |
+| `clientFsTools` | `false` | Adds `read_text_file` and `write_text_file` (gated) backed by the editor's `fs/*` methods, when the client advertised them. |
+| `auth` | — | `{ methods, authenticate(methodId, { signal }) }`. Session methods answer -32000 until it succeeds. |
+| `contextWindow` | the model registry | For `usage_update.size`. When it resolves to nothing, no `usage_update` is sent. |
+| `failureMessage` | a fixed text naming the error code | The text a failed turn shows; the error's message stays on this side. |
+| `deps` | host | `generateId` (session ids) and `clock`. |
+| `onError` | — | Errors the server could not report to the client. |
+
+`AcpAgentRunOptions` is the native run options without `session`, `signal`,
+`messages`, `prompt` and the resume fields, which the server owns.
+
+### What a turn sends
+
+- `agent_message_chunk` and `agent_thought_chunk` (encrypted or redacted
+  reasoning is skipped);
+- `tool_call` (pending, with `rawInput`, `kind`, and `locations` taken from
+  `input.path`), then `tool_call_update` (in progress, then completed or failed,
+  with `rawOutput`);
+- `plan`, from the run's plan updates;
+- finally `usage_update` with `cost: { amount, currency: 'USD' }`, the
+  cumulative session cost.
+
+The prompt's response carries the stop reason and, under `_meta`, the Deuz
+budget and receipts. A completed run ends `end_turn`; a stopped run ends
+`cancelled`, `max_turn_requests`, `refusal` or `max_tokens` by its reason, or
+`end_turn` with a line saying why. A turn refused by the budget ends `end_turn`
+with the line `The budget is exhausted: the turn was not run.` Any other failure
+is a JSON-RPC error -32603 with a safe message. A tool call whose permission
+request was still pending, or not yet asked, when the turn was cancelled gets
+the receipt `{ stage: 'not-run', approval: 'cancelled' }`.
+
+The next turn's history is the run's messages without system messages, so
+`instructions` and memory recall are rebuilt every turn. A failed turn leaves
+the history unchanged; a cancelled turn closes dangling tool calls with an error
+result.
+
+## Permissions
+
+A tool whose `needsApproval` holds (client-mode approval) becomes a
+`session/request_permission` request with four options: allow once, allow
+always, reject once and reject always. Each option id is a one-time value.
+
+- **The editor never sees the approval token.** The run's signed token stays on
+  the agent side. An approving answer resumes the run with that token, and the
+  token is verified for this approval and this run before the resume.
+- **Only offered option ids count.** An option id that was not offered, a failed
+  request, or a token that does not verify is a denial. A `cancelled` outcome
+  cancels the turn.
+- **"Always" is remembered** per session and per tool name, and answered
+  automatically from then on, still through the signed token. It persists across
+  connections only with a `sessions` store.
+- **Server-side approval bypasses the editor.** A run option `approveToolCall`
+  decides on the server, and the editor is not asked.
+- **Client tools are not available.** ACP has none, so a pending client-tool
+  call is answered with an error result.
+
+The default signer's secret lives only in this process. Pass an explicit
+`approvalSigner` (from `createApprovalSigner` in `@deuz-sdk/core/durable`) when
+another process must resume the same runs. The guarantee is about integrity,
+not policy: the editor can still approve anything it is shown. Use the run's
+execution policy and guardrails for what must never run.
+
+## Budget
+
+With `budget`, each turn runs under its own execution context admitted against
+the persistent scopes, exactly as a native run with
+[admission](/docs/modules/budgets#how-admission-works). `turn` adds a cap for one
+turn on top. Setting both `budget` and `run.execution` is rejected.
+
+What the editor can see:
+
+- `usage_update.cost`: the cumulative session cost in USD, a standard ACP field;
+- the `budgetFooter` line, opt-in plain text such as
+  `— budget: turn $0.0100 · session $0.0100 · remaining $0.0050`;
+- under `_meta`, keyed `io.github.deuz-ai/budget` and `io.github.deuz-ai/receipts`
+  (`ACP_DEUZ_META`): `{ turnUsd, sessionUsd, remainingUsd?, scopes?, unpriced?, exhausted? }`
+  and the turn's tool receipts. A stock editor shows no custom field, so these
+  are for Deuz clients and your own tooling;
+- the extension request `_io.github.deuz-ai/budget` (`ACP_DEUZ_BUDGET_METHOD`),
+  which takes `{ sessionId }` and returns the same budget object.
+
+`turnUsd` is the ledger's spent USD. Without `budget`, it comes from the run's
+cost parts, which need `deps.priceProvider`; otherwise it is 0. `remainingUsd`
+is the tightest USD scope's limit minus its stored usage, never below 0.
+
+## Drive an ACP agent from code
+
+`connectAcpAgent` is the client side. It sends `initialize` (and `authenticate`
+when `authMethodId` is set) and rejects with an `AcpError` of kind `protocol`
+when the agent answers with a version other than 1.
+
+```ts
+const session = await client.newSession({ cwd: process.cwd() });
+const turn = session.prompt('Run the tests and fix what fails.', {
+  onUpdate: (update) => render(update),
+});
+const { stopReason, text, toolCalls, permissions, cost, budget } = await turn.result;
+```
+
+- `prompt` returns an `AcpPromptTurn`: iterate it for the updates, await
+  `result` for the outcome, or `cancel()` it. Only one turn per session runs at
+  a time; a second `prompt` rejects.
+- `result` has `stopReason`, `text`, `thought`, `toolCalls` (each `tool_call`
+  with its updates folded in), `plan`, `permissions`, `cost`, `usage`, and
+  `budget` and `receipts` when the agent is a Deuz agent.
+- `onPermissionRequest` answers permission requests. Without it, the client picks
+  reject once, else reject always, else cancelled. Cancelling a turn answers a
+  pending request `cancelled` at once and aborts the handler's `signal`.
+- `fs: { readTextFile?, writeTextFile? }` serves the agent's file requests; only
+  the methods you give are advertised.
+- `onSessionUpdate` receives every update, including those outside a turn.
+- `loadSession({ sessionId, cwd })` needs `agent.agentCapabilities.loadSession`;
+  the replayed updates are in `session.history`. Loading a session that is
+  already open on the same connection reuses it: earlier handles keep working
+  and `history` holds the latest replay. It rejects with an `AcpError` of kind
+  `'protocol'` while a turn is running in that session.
+
+<Callout type="warn" title="A client-side cost is declared, not measured">
+`result.cost` is the growth of the agent's own `usage_update.cost` over the turn,
+marked `declared: true`. Deuz did not measure it, and an external harness may
+report none. To measure what a harness spends, put the [meter](/docs/modules/meter)
+in front of its provider traffic. `declaredReceipt` from `@deuz-sdk/core/meter`
+records a declared cost in the meter's receipt shape.
+</Callout>
+
+### As a child process
+
+```ts
+import { spawnAcpAgent } from '@deuz-sdk/core/acp/stdio';
+
+const harness = await spawnAcpAgent({
+  command: 'npx',
+  args: ['-y', '@agentclientprotocol/claude-agent-acp'],
+  shell: process.platform === 'win32',
+  onPermissionRequest: (request) => decide(request),
+});
+const session = await harness.newSession({ cwd: process.cwd() });
+const { text, cost } = await session.prompt('Fix the failing test.').result;
+await harness.close();
+```
+
+`spawnAcpAgent` takes the client options plus `command`, `args`, `cwd`, `env`
+(merged over this process's environment), `shell`, `stderr` (`'inherit'`, the
+default, `'ignore'` or a line callback), `killTimeoutMs` (default 2000) and
+`maxMessageBytes`. It rejects, and kills the child, when the child cannot start
+or exits before `initialize` completes. `close()` closes the child's stdin,
+waits up to `killTimeoutMs`, then kills it. The result also has `pid`, `exited`
+and `kill(signal?)`.
+
+- **A write that races the child's exit** fails the send instead of crashing
+  your process: the child's stdin has an `error` listener, so an `EPIPE` is not
+  an uncaught exception, and the exit closes the connection.
+- **On Windows with `shell: true`** the child is `cmd.exe`, so `kill()` and the
+  kill in `close()` end the whole process tree with `taskkill /pid <pid> /T /F`
+  (the `signal` is ignored). Killing only the shell would leave the harness it
+  started (`npx`, then `node`) running, and spending. This path is typechecked
+  but has no automated test.
+
+The command above is the package the [Claude Code harness preset](/docs/modules/harness#presets)
+launches (formerly `@zed-industries/claude-code-acp`). `spawnAcpAgent` has driven
+it, and the Codex adapter, live through `runHarness` (2026-11-24, Windows 11); a
+bare `spawnAcpAgent` call as written here has no automated test. For a metered,
+policy-checked harness run, use `runHarness` from
+[`@deuz-sdk/core/harness/node`](/docs/modules/harness) instead.
+
+## Lower level
+
+- `createNdjsonTransport({ readable, writable, maxMessageBytes? })` is ACP's
+  stdio framing: newline-delimited JSON, CRLF tolerated, and a line over
+  `maxMessageBytes` (default 64 MiB) is answered -32600 instead of being
+  buffered.
+- `nodeStreamsToAcpTransport(readable, writable)` adapts Node streams.
+- `createAcpPeer({ transport, requests?, notifications?, fallback?, guard?, onError? })`
+  is the symmetric JSON-RPC peer both sides are built on. Notifications are
+  handled one at a time in arrival order; requests run concurrently.
+  `$/cancel_request` works in both directions: an aborted `signal` on
+  `peer.request` sends it, and a received one aborts the handler's `signal`
+  and answers -32800. A late answer to a request the peer cancelled itself is
+  dropped quietly; an answer to an id it never sent still reaches `onError`.
+- `AcpError` has `kind` (`'rpc' | 'closed' | 'cancelled' | 'protocol'`),
+  `rpcCode` and `data`. A handler that throws an `rpc` `AcpError` is answered
+  with that error; any other throw is answered -32603 and its message stays local.
+
+## Conformance
+
+On 2026-11-24 (Windows 11, Node 26.13.0) both sides were checked against the
+official `@agentclientprotocol/sdk` 2.9.1, and every message in both directions
+passed the SDK's own parsing and a strict check against the schema it bundles
+(`schema/v1/schema.json`, newer than the 1.34.1 schema release named above),
+with no violations and no `session/update` after a prompt's answer:
+
+- **Agent side.** The SDK's client against the built `deuz acp` and against
+  `serveAcpAgentStdio`: `initialize`, `session/new`, `session/prompt` with
+  streamed message, plan, tool-call and `usage_update` updates,
+  `session/request_permission` allowed, rejected and cancelled,
+  `session/cancel`, `$/cancel_request` on a running prompt (answered -32800),
+  `session/load` replay, -32002 for an unknown session, -32601 for
+  `session/set_mode`, and the `io.github.deuz-ai` budget and receipts in
+  `_meta`.
+- **Client side.** `spawnAcpAgent` against a reference agent built on the SDK:
+  streamed updates in order, declared cost, permissions through
+  `onPermissionRequest`, `cancel()` during a tool and during a pending
+  permission, an aborted prompt signal, and `session/load` replay.
+
+`session/load` replays tool calls under ids it assigns at load time, so they
+can differ from the ids the client saw live; they are consistent within the
+replay and valid per the schema.
+
+## Limits
+
+- **Not tried against a real editor.** How Zed, JetBrains or any other editor
+  renders `usage_update.cost` or the budget footer is unknown. The `_meta`
+  budget and receipts are invisible in a stock editor. Conformance was checked
+  against the reference SDK only.
+- **`spawnAcpAgent` met two real harnesses, through `runHarness`.** The Claude
+  Code adapter (`@agentclientprotocol/claude-agent-acp` 0.110.1) and the Codex
+  adapter (`@agentclientprotocol/codex-acp` 2.10.0) started on Windows through
+  a shell. The Windows process-tree kill has no automated test.
+- **Protocol coverage.** ACP version 1 only. Implemented on the agent side:
+  `initialize`, `authenticate`, `session/new`, `session/load` (only with
+  `sessions`), `session/prompt`, `session/cancel` and `$/cancel_request`. Not
+  implemented, answered -32601 and not advertised: `session/list`,
+  `session/delete`, `session/resume`, `session/close`, `session/set_mode`,
+  `session/set_config_option`, `logout`, `terminal/*`, `elicitation/*`, and the
+  notice, compaction, subagent and `plan_update` updates.
+- **Prompts.** Audio is refused with -32602; images and embedded text resources
+  are accepted.
+- **`write_text_file` sends no diff**, only `locations`.
+- **Durability.** Sessions live in memory per connection unless you pass
+  `sessions`, and a durable session store needs a durable run store too.
+- **MCP servers from the client** need the optional MCP SDK peer; stdio servers
+  also need Node.
+- **Windows.** `spawnAcpAgent` needs `shell: true` (or `npx.cmd`) for `.cmd`
+  launchers, and it does not escape arguments. With `shell: true` a kill ends
+  the whole process tree.
+- **Client side.** Updates that arrive outside a turn (such as
+  `available_commands_update` after `session/new`) reach only
+  `onSessionUpdate`; they are not buffered on the session.
+- **The `_meta` namespace** is `io.github.deuz-ai`. Changing it later would
+  break clients that read the keys.
+
+## See also
+
+- [Native agents](/docs/modules/native-agents) — the run each turn is, with checkpoints and signed approvals.
+- [Budgets](/docs/modules/budgets) — the persistent scopes a turn is admitted against.
+- [Meter](/docs/modules/meter) — measured cost for harness traffic, and declared receipts.
+- [MCP server](/docs/modules/mcp-server) — the other way to publish Deuz tools and agents to editors.

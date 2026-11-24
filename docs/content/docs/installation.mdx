@@ -16,9 +16,22 @@ and since 2.3 the [MCP server](/docs/modules/mcp-server), [A2A](/docs/modules/a2
 and since 2.4 [versioned memory](/docs/modules/versioned-memory), the
 [context compiler](/docs/modules/context), the
 [goal runtime](/docs/modules/goal-runtime) and the
-[Docker runner](/docs/modules/docker) (a preview). Existing generation APIs
-remain available. See [What is new in 2.4](/docs/reference/whats-new-2-4) for
-upgrade notes.
+[Docker runner](/docs/modules/docker) (a preview), and since 2.5 the
+[meter](/docs/modules/meter), [tool search](/docs/modules/tool-search), and
+[ACP](/docs/modules/acp) and the [harness runner](/docs/modules/harness) (both
+previews). Existing generation APIs remain available. See
+[What is new in 2.5](/docs/reference/whats-new-2-5) for upgrade notes.
+
+Three companion packages ship next to it in 2.5, each installed on its own:
+
+```bash
+npx @deuz-sdk/cli meter --budget-usd 5 -- claude        # the deuz CLI (preview)
+npm install @deuz-sdk/ai-sdk-provider @ai-sdk/provider ai  # a Deuz budget under AI SDK 7 models
+npx -y @deuz-sdk/mcp-ledger                              # an MCP server for Claude Desktop, Cursor…
+```
+
+See [CLI](/docs/modules/cli), [AI SDK provider](/docs/modules/ai-sdk-provider)
+and [MCP ledger](/docs/modules/mcp-ledger).
 
 ## Install
 
@@ -61,7 +74,7 @@ The browser guarantee is checked, not asserted: a release-gate step (`tooling/ch
   build step.
 </Callout>
 
-Node-only capabilities (filesystem skill sources, document parsers, the markdown memory vault, MCP stdio transport, the stdio MCP server, file workspace, compute sandbox, Playwright browser, JSONL run store, database store packs, the swarm and ops stores on SQLite, Postgres and Redis, evolve's SQLite store and the headless preview) live behind dedicated subpaths and never leak `node:*` imports into the edge-safe core.
+Node-only capabilities (filesystem skill sources, document parsers, the markdown memory vault, MCP stdio transport, the stdio MCP server, file workspace, compute sandbox, Playwright browser, JSONL run store, database store packs, the swarm and ops stores on SQLite, Postgres and Redis, evolve's SQLite store, the headless preview, and since 2.5 the meter's listener, ACP on stdio and the harness spawner) live behind dedicated subpaths and never leak `node:*` imports into the edge-safe core.
 
 ## Optional peer dependencies
 
@@ -166,6 +179,10 @@ Capabilities use separate subpaths as part of the tree-shaking contract. Every s
 | `@deuz-sdk/core/mcp/server` · `/mcp/server/stdio` | Publish Deuz tools and agents as an MCP server over Streamable HTTP; the stdio half is Node-only (2.3) |
 | `@deuz-sdk/core/a2a` | Agent2Agent v1.0.0: call other agents (`createA2AClient`) and serve your own (`createA2AHandler`), a native agent run included (`createA2AAgentExecutor`), edge-safe (2.3) |
 | `@deuz-sdk/core/batch` | Single-turn requests on the OpenAI, Anthropic and Gemini batch APIs, priced on the batch tier (2.3) |
+| `@deuz-sdk/core/tool-search` | A large tool catalog behind one budget- and policy-aware search tool (2.5) |
+| `@deuz-sdk/core/meter` · `/meter/node` | A budget proxy for coding-harness traffic: the fetch-style handler, edge-safe; the Node half listens on a port and writes JSONL receipts (2.5) |
+| `@deuz-sdk/core/acp` · `/acp/stdio` | The Agent Client Protocol on both sides, edge-safe; the Node half serves on stdio and spawns ACP agents (2.5 preview) |
+| `@deuz-sdk/core/harness` · `/harness/node` | Coding harnesses as budgeted sub-agents: presets and the permission policy, edge-safe; the Node half spawns the harness behind a meter (2.5 preview) |
 | `@deuz-sdk/core/durable`                       | Runs must survive a process restart: checkpoint/resume, signed approvals                   |
 | `@deuz-sdk/core/autonomy`                      | Planner → executor → verifier: `planTasks`, `bestOfN`, `selfConsistency`, `parallelAgents` |
 | `@deuz-sdk/core/runtime`                       | Background runs with a live plan/activity feed + steering (`RunStore`, `createRunManager`) |
@@ -267,7 +284,7 @@ const { generateText } = require('@deuz-sdk/core');
 
 ## Next steps
 
-- [What is new in 2.4](/docs/reference/whats-new-2-4) — release scope, upgrade notes and known limits.
+- [What is new in 2.5](/docs/reference/whats-new-2-5) — release scope, upgrade notes and known limits.
 - [Native agents](/docs/modules/native-agents) and [Swarm](/docs/modules/swarm) — opt-in validated runs and durable DAG scheduling.
 - [streamChat](/docs/core/stream-chat) — the synchronous, never-throws streaming entry point.
 - [generateText](/docs/core/generate-text) — buffered text plus the agentic tool loop.

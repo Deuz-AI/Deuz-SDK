@@ -1,4 +1,4 @@
-<!-- verified: 2026-10-16 against @deuz-sdk/core@2.4.0 · api-contract sha256:da3643f44edc
+<!-- verified: 2026-11-24 against @deuz-sdk/core@2.5.0 · api-contract sha256:cd3d4f48e5a3
      sources: packages/core/src/internal/telemetry.ts, packages/core/src/types/{observe,methods,stream-durable,agent-run-v3,chat-conditional}.ts,
      packages/core/src/{otel,observe}.ts, packages/core/src/memory/versioned/types.ts, packages/core/src/goal/runtime/store-types.ts,
      packages/core/src/compute/docker/types.ts, packages/core/src/context/compiler.ts,

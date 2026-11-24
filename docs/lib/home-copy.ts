@@ -84,7 +84,7 @@ export const homeCopy: Record<Locale, HomeCopy> = {
     skillsList: [
       {
         name: 'deuz-sdk',
-        body: 'The whole surface: the invariants, a task-to-file router, and twenty-five reference files loaded only when a task needs them.',
+        body: 'The whole surface: the invariants, a task-to-file router, and twenty-six reference files loaded only when a task needs them.',
       },
       {
         name: 'migrate-from-ai-sdk',
@@ -560,7 +560,7 @@ export const homeCopy: Record<Locale, HomeCopy> = {
     skillsList: [
       {
         name: 'deuz-sdk',
-        body: '表面のすべて: 不変条件、タスクからファイルへのルーター、必要なときだけ読み込まれる 25 個のリファレンス。',
+        body: '表面のすべて: 不変条件、タスクからファイルへのルーター、必要なときだけ読み込まれる 26 個のリファレンス。',
       },
       {
         name: 'migrate-from-ai-sdk',
@@ -627,7 +627,7 @@ export const homeCopy: Record<Locale, HomeCopy> = {
     skillsList: [
       {
         name: 'deuz-sdk',
-        body: '표면 전체: 불변 조건, 작업에서 파일로 가는 라우터, 필요할 때만 로드되는 25개의 레퍼런스 파일.',
+        body: '표면 전체: 불변 조건, 작업에서 파일로 가는 라우터, 필요할 때만 로드되는 26개의 레퍼런스 파일.',
       },
       {
         name: 'migrate-from-ai-sdk',

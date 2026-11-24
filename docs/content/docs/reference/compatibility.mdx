@@ -11,11 +11,48 @@ description: Supported runtimes, package formats, browser/edge guarantees, and t
 | ESM (`import`) | Every exported JavaScript target is imported from the built package |
 | CommonJS (`require`) | Every exported CJS target is required from the built package |
 | TypeScript bundler / Node resolution | Checked by publint and Are the Types Wrong |
-| Browser / edge bundlers | Consumers of the root, `/edge`, the Anthropic and OpenAI factories, `/agent`, `/swarm`, `/ops`, `/goal`, `/evolve`, `/schedule`, `/mcp/server`, `/realtime`, `/batch`, `/a2a`, `/testing`, `/skills`, and the 2.4 entries `/memory/versioned`, `/context`, `/goal/runtime` and `/skills/learning` and the 2.4 parts of `/chat` and `/ui` bundle with esbuild `platform: 'browser'`; the swarm, ops and evolve store entries, `/mcp/server/stdio`, `/headless`, `/skills/node` and the five Node-only 2.4 entries must fail that boundary |
+| Browser / edge bundlers | Consumers of the root, `/edge`, the Anthropic and OpenAI factories, `/agent`, `/swarm`, `/ops`, `/goal`, `/evolve`, `/schedule`, `/mcp/server`, `/realtime`, `/batch`, `/a2a`, `/testing`, `/skills`, and the 2.4 entries `/memory/versioned`, `/context`, `/goal/runtime` and `/skills/learning` and the 2.4 parts of `/chat` and `/ui`, and the 2.5 entries `/tool-search`, `/meter`, `/acp`, `/harness` and `/errors` bundle with esbuild `platform: 'browser'`; the swarm, ops and evolve store entries, `/mcp/server/stdio`, `/headless`, `/skills/node`, the five Node-only 2.4 entries and the three Node-only 2.5 entries (`/meter/node`, `/acp/stdio`, `/harness/node`) must fail that boundary |
 | React 18 / 19 | `@deuz-sdk/react` and the frozen `@deuz-sdk/core/react` hook are typechecked and tested on React 19 in every check run, and on React 18 in a CI job of their own (2.3) |
 | Redis 7 / Postgres 16 | The Redis stores and the Postgres stores run against real servers in a CI job (2.3; the 2.4 stores too); without a server those tests skip |
 | Docker | The Docker runner's tests run against a real Docker Engine with Linux containers in a CI job of their own (2.4); elsewhere they run against a scripted Docker CLI, and against a real Engine only with `DEUZ_TEST_DOCKER=1` |
 | Windows / Linux | Runtime suite runs on both operating systems |
+
+## What changed in 2.5
+
+`engines` is still `node >= 22`, every 2.4 subpath is still exported, the
+package still has no runtime `dependencies`, and no peer is added or changed.
+Nothing new runs until you import it. [What is new in 2.5](/docs/reference/whats-new-2-5)
+has the features and the upgrade notes.
+
+**New subpaths.** Five are edge-safe: they import no Node built-in, and take
+what they talk to (an HTTP upstream through `deps.fetch`, an ACP transport, a
+connection) as an argument. Three are Node-only. The release gate
+(`npm run verify:runtime`) bundles a consumer of each edge-safe one for the
+browser, and checks that each Node-only one fails that boundary.
+
+| Subpath | Runtime | Needs |
+| --- | --- | --- |
+| [`@deuz-sdk/core/tool-search`](/docs/modules/tool-search) | edge-safe | nothing; Standard Schema tool parameters are indexed through the optional peer `@standard-community/standard-json` when it is installed |
+| [`@deuz-sdk/core/meter`](/docs/modules/meter) | edge-safe | the runtime's `fetch`, or `deps.fetch` |
+| [`@deuz-sdk/core/meter/node`](/docs/modules/meter) | Node-only | `node:http`, `node:fs` |
+| [`@deuz-sdk/core/acp`](/docs/modules/acp) | edge-safe | Web Streams; the client's MCP servers need the optional MCP SDK peer |
+| [`@deuz-sdk/core/acp/stdio`](/docs/modules/acp#as-a-child-process) | Node-only | `process.stdin` / `process.stdout`, or `node:child_process` for `spawnAcpAgent` |
+| [`@deuz-sdk/core/harness`](/docs/modules/harness) | edge-safe | an ACP connection you open |
+| [`@deuz-sdk/core/harness/node`](/docs/modules/harness) | Node-only | `node:child_process`, `node:http`, and the harness's own executable |
+| `@deuz-sdk/core/errors` | edge-safe | nothing; every core error class, without the root entry |
+
+**Existing subpaths.** `/mcp/server` and `/mcp/server/stdio` gain resources,
+prompts and the mutable catalog, on the same optional peer
+`@modelcontextprotocol/server` (`^2.3.1`).
+
+**New packages.** Each is published separately at the same version as core,
+and ships ESM, CommonJS and declarations like core.
+
+| Package | `engines` | Depends on | Needs |
+| --- | --- | --- | --- |
+| [`@deuz-sdk/cli`](/docs/modules/cli) | `node >= 22` | `@deuz-sdk/core` ^2.5.0 | `node:sqlite` (Node 22.13+) for `--store`; a type-stripping Node (22.18+ or 23.6+) to load a `.ts` agent module |
+| [`@deuz-sdk/ai-sdk-provider`](/docs/modules/ai-sdk-provider) | `node >= 22` | peers `@deuz-sdk/core` ^2.5.0 and `@ai-sdk/provider` ^4.0.0 | AI SDK 7 (`ai@7`) in your app |
+| [`@deuz-sdk/mcp-ledger`](/docs/modules/mcp-ledger) | `node >= 22.13` | `@deuz-sdk/core` ^2.5.0 and `@modelcontextprotocol/server` ^2.3.1 | `node:sqlite`; SQLite FTS5 for full-text recall, with a `LIKE` fallback where Node's SQLite lacks it |
 
 ## What changed in 2.4
 

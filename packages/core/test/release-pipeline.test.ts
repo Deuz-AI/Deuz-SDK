@@ -260,8 +260,10 @@ describe.skipIf(!bashWorks())(
       return { status: result.status, output: `${result.stdout}${result.stderr}`, lookups };
     }
 
-    it("passes when both packages are on npm at the tag's version", () => {
-      const { status, lookups } = confirm('@deuz-sdk/core@9.8.7=1 @deuz-sdk/react@9.8.7=1');
+    it("passes when every package is on npm at the tag's version", () => {
+      const { status, lookups } = confirm(
+        '@deuz-sdk/core@9.8.7=1 @deuz-sdk/react@9.8.7=1 @deuz-sdk/ai-sdk-provider@9.8.7=1 @deuz-sdk/mcp-ledger@9.8.7=1 @deuz-sdk/cli@9.8.7=1',
+      );
       expect(status).toBe(0);
       expect(lookups.some((line) => line.includes(' @deuz-sdk/core@9.8.7 '))).toBe(true);
       expect(lookups.some((line) => line.includes(' @deuz-sdk/react@9.8.7 '))).toBe(true);
@@ -270,7 +272,9 @@ describe.skipIf(!bashWorks())(
     });
 
     it('waits out registry lag: a package that shows up on the third look still passes', () => {
-      const { status, lookups } = confirm('@deuz-sdk/core@9.8.7=1 @deuz-sdk/react@9.8.7=3');
+      const { status, lookups } = confirm(
+        '@deuz-sdk/core@9.8.7=1 @deuz-sdk/react@9.8.7=3 @deuz-sdk/ai-sdk-provider@9.8.7=1 @deuz-sdk/mcp-ledger@9.8.7=1 @deuz-sdk/cli@9.8.7=1',
+      );
       expect(status).toBe(0);
       expect(lookups.filter((line) => line.includes('@deuz-sdk/react@')).length).toBe(3);
     });

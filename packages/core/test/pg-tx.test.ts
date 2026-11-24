@@ -22,7 +22,7 @@ import {
 } from '../src/node/pg-tx';
 import type { PgClientLike } from '../src/node/store-postgres';
 import { pglitePool } from './fixtures/pg-pool';
-import { postgresUrl } from './fixtures/services';
+import { PG_REPEATABLE_READ_OPTIONS, postgresUrl } from './fixtures/services';
 import { SLOW_HOOK_TIMEOUT_MS, SLOW_TEST_TIMEOUT_MS } from './fixtures/timeouts';
 
 const pgError = (code: string, message = `pg error ${code}`) =>
@@ -413,14 +413,9 @@ describe.skipIf(!url)('withPgTransaction on a live server (REPEATABLE READ, pool
   };
 
   beforeAll(() => {
-    pool = new pg.Pool({ connectionString: url, max: 8 });
     // As in postgres-live: every pooled connection defaults to REPEATABLE READ,
     // so a concurrent write fails with 40001 instead of waiting.
-    pool.on('connect', (connection) => {
-      void connection.query(
-        'SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL REPEATABLE READ',
-      );
-    });
+    pool = new pg.Pool({ connectionString: url, max: 8, options: PG_REPEATABLE_READ_OPTIONS });
   });
 
   afterAll(async () => {

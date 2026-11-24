@@ -1,6 +1,6 @@
 {
   "name": "@deuz-sdk/core",
-  "version": "2.4.0",
+  "version": "2.5.0",
   "description": "Pure, web-first, multi-provider TypeScript AI SDK (Anthropic, OpenAI, xAI, Gemini, Azure, Bedrock, …).",
   "license": "MIT",
   "author": "Umutcan Edizaslan (U-C4N)",
@@ -824,6 +824,86 @@
       "require": {
         "types": "./dist/chat/node.d.cts",
         "default": "./dist/chat/node.cjs"
+      }
+    },
+    "./tool-search": {
+      "import": {
+        "types": "./dist/tool-search.d.ts",
+        "default": "./dist/tool-search.js"
+      },
+      "require": {
+        "types": "./dist/tool-search.d.cts",
+        "default": "./dist/tool-search.cjs"
+      }
+    },
+    "./meter": {
+      "import": {
+        "types": "./dist/meter.d.ts",
+        "default": "./dist/meter.js"
+      },
+      "require": {
+        "types": "./dist/meter.d.cts",
+        "default": "./dist/meter.cjs"
+      }
+    },
+    "./meter/node": {
+      "import": {
+        "types": "./dist/meter/node.d.ts",
+        "default": "./dist/meter/node.js"
+      },
+      "require": {
+        "types": "./dist/meter/node.d.cts",
+        "default": "./dist/meter/node.cjs"
+      }
+    },
+    "./acp": {
+      "import": {
+        "types": "./dist/acp.d.ts",
+        "default": "./dist/acp.js"
+      },
+      "require": {
+        "types": "./dist/acp.d.cts",
+        "default": "./dist/acp.cjs"
+      }
+    },
+    "./acp/stdio": {
+      "import": {
+        "types": "./dist/acp/stdio.d.ts",
+        "default": "./dist/acp/stdio.js"
+      },
+      "require": {
+        "types": "./dist/acp/stdio.d.cts",
+        "default": "./dist/acp/stdio.cjs"
+      }
+    },
+    "./harness": {
+      "import": {
+        "types": "./dist/harness.d.ts",
+        "default": "./dist/harness.js"
+      },
+      "require": {
+        "types": "./dist/harness.d.cts",
+        "default": "./dist/harness.cjs"
+      }
+    },
+    "./harness/node": {
+      "import": {
+        "types": "./dist/harness/node.d.ts",
+        "default": "./dist/harness/node.js"
+      },
+      "require": {
+        "types": "./dist/harness/node.d.cts",
+        "default": "./dist/harness/node.cjs"
+      }
+    },
+    "./errors": {
+      "import": {
+        "types": "./dist/errors.d.ts",
+        "default": "./dist/errors.js"
+      },
+      "require": {
+        "types": "./dist/errors.d.cts",
+        "default": "./dist/errors.cjs"
       }
     },
     "./package.json": "./package.json"

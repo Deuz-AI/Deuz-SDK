@@ -1,0 +1,74 @@
+{
+  "name": "@deuz-sdk/cli",
+  "version": "2.5.0",
+  "description": "The deuz command line: budget meter proxy, ACP agent server and other Deuz SDK entry points.",
+  "license": "MIT",
+  "author": "Umutcan Edizaslan (U-C4N)",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Deuz-AI/Deuz-SDK.git",
+    "directory": "packages/cli"
+  },
+  "homepage": "https://github.com/Deuz-AI/Deuz-SDK#readme",
+  "bugs": "https://github.com/Deuz-AI/Deuz-SDK/issues",
+  "type": "module",
+  "sideEffects": false,
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "files": [
+    "dist"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      }
+    },
+    "./package.json": "./package.json"
+  },
+  "bin": {
+    "deuz": "./dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsup",
+    "test": "vitest run",
+    "lint": "eslint .",
+    "typecheck": "tsc --noEmit",
+    "verify:package": "publint --strict && attw --pack . && node dist/cli.js --version",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "ai",
+    "cli",
+    "budget",
+    "proxy",
+    "acp",
+    "deuz"
+  ],
+  "dependencies": {
+    "@deuz-sdk/core": "^2.5.0"
+  },
+  "devDependencies": {
+    "@arethetypeswrong/cli": "^0.18.0",
+    "@types/node": "^22.10.0",
+    "eslint": "^9.18.0",
+    "eslint-config-prettier": "^9.1.0",
+    "publint": "^0.3.0",
+    "tsup": "^8.5.0",
+    "typescript": "^5.7.0",
+    "typescript-eslint": "^8.20.0",
+    "vitest": "^4.0.0"
+  }
+}

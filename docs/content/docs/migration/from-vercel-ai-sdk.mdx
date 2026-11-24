@@ -9,6 +9,33 @@ This page maps the Vercel AI SDK (`ai` + `@ai-sdk/*`) onto `@deuz-sdk/core`. Bot
 Every Deuz name on this page is verified against the source in this repository. Every AI SDK name is verified against the live docs at `ai-sdk.dev` on **2026-07-28**, against **`ai@7.0.40`** (AI SDK 7 was published 2026-06-25). That project renames aggressively across majors — a name in the left column may have moved again by the time you read this. Re-check the [AI SDK 7 migration guide](https://ai-sdk.dev/docs/migration-guides/migration-guide-7-0) before you trust a left-hand cell, and treat this page as a map of *concepts*, not a compiler. Where a left-hand cell could not be verified it says so; nothing is guessed.
 </Callout>
 
+## Not porting? Keep the AI SDK and add a Deuz budget
+
+If what you want from Deuz is its budget, not a rewrite, you do not have to port
+at all. `@deuz-sdk/ai-sdk-provider` (2.5) wraps an AI SDK 7 model in one line;
+`generateText`, `streamText` and your agents stay exactly as they are:
+
+```ts
+import { generateText } from 'ai';
+import { openai } from '@ai-sdk/openai';
+import { deuz } from '@deuz-sdk/ai-sdk-provider';
+import { createSqliteBudgetStore } from '@deuz-sdk/core/ops/sqlite';
+
+const store = createSqliteBudgetStore({ path: './budgets.sqlite' });
+const model = deuz(openai('gpt-5-mini'), {
+  budget: { store, scopes: [{ key: 'user:42', limits: { usd: 2 }, window: { ms: 86_400_000 } }] },
+});
+
+const { text } = await generateText({ model, prompt: 'Hello' });
+```
+
+Every call is reserved against a persistent, cross-process `BudgetStore` before
+the provider is called, settled with the reported usage, and refused with a
+non-retryable `DeuzBudgetError` at the ceiling. It also adds Deuz's circuit
+breaker and fail-over. It covers model calls only: the loop, tool approvals and
+the UI stay the AI SDK's. It requires AI SDK 7 and is tested against the AI
+SDK's mock models, not live providers. See [AI SDK provider](/docs/modules/ai-sdk-provider).
+
 ## Prefer to port with an agent?
 
 This repo ships a skill for it. Point a coding agent at your app and it will do the mechanical part — imports, route handlers, tool literals, hook call sites — while flagging the cases that need a decision:
@@ -123,7 +150,7 @@ AI SDK 7 is **ESM-only** — its announcement states that `require()` is not sup
 | `resumeStream` | `resume: { endpoint, auto?, cursor? }` + `reconnect()` | `auto` fires once per mounted hook and fails silently by design. |
 | `regenerate` / `stop` / `clearError` | `regenerate` / `stop` / `clearError` | Same names. Deuz also has `editAndResend(messageId, input)`. |
 | `onToolCall` / `onData` / `onError` | same names | Deuz's `onData` receives the **raw** frame, before reconciliation. |
-| `convertToModelMessages(messages)` | `canonicalFromUI(ui)` — or don't | Deuz's `useChat` already holds the canonical history and POSTs it, so a route normally reads `Message[]` directly. `canonicalFromUI` is the lossy inverse for apps that own the UI array. |
+| `await convertToModelMessages(messages)` | `canonicalFromUI(ui)` — or don't | Deuz's `useChat` already holds the canonical history and POSTs it, so a route normally reads `Message[]` directly. `canonicalFromUI` is the lossy inverse for apps that own the UI array. |
 | — (no equivalent) | [`validateChatRequest(body)`](/docs/modules/request-validation) | Deuz's route receives a canonical `Message[]`, which includes `role: 'system'` — so it ships a structural validator. Use it. |
 | `useObject` | [`useObject`](/docs/modules/react-hooks#useobject) | Reads `object-delta` parts from `toDeuzObjectStreamResponse`. |
 | `useCompletion` | — | Not implemented. Use `useChat` against a single-turn route. |
@@ -335,7 +362,7 @@ export async function POST(req: Request) {
   const { messages }: { messages: UIMessage[] } = await req.json();
   const result = streamText({
     model: anthropic('claude-sonnet-4-5'),
-    messages: convertToModelMessages(messages),
+    messages: await convertToModelMessages(messages),
   });
   return result.toUIMessageStreamResponse();
 }
@@ -481,6 +508,7 @@ Not a competition — just the parts of a port where you get to *delete* code:
 
 ## See also
 
+- [AI SDK provider](/docs/modules/ai-sdk-provider) — keep the AI SDK and add a persistent Deuz budget instead of porting.
 - [Quickstart](/docs/quickstart) — the shortest path to a running stream.
 - [Prompts, instructions and timeouts](/docs/core/prompts-and-timeouts) — the 1.9 call-shape ergonomics.
 - [createAgent](/docs/agents/create-agent) — the reusable-agent value.

@@ -19,6 +19,12 @@ import ts from 'typescript';
 export const CORE_DIR = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 export const REPO_ROOT = resolve(CORE_DIR, '../..');
 
+/**
+ * The workspace packages (beside core and react) that publish one root entry
+ * (2.5). Their names are modules of the table like `@deuz-sdk/react`.
+ */
+export const SINGLE_ENTRY_PACKAGES = ['ai-sdk-provider', 'mcp-ledger', 'cli'];
+
 const collators = new Map();
 
 /**
@@ -117,10 +123,17 @@ export function loadExportTable({ core = CORE_DIR, react = join(core, '../react'
     specifierToSrc.set(specifier, src);
     modules.push({ specifier, label: subpath === '.' ? '' : subpath.slice(2), src });
   }
-  const reactSrc = ['src/index.ts', 'src/index.tsx'].map((p) => join(react, p)).find(existsSync);
-  if (reactSrc) {
-    specifierToSrc.set('@deuz-sdk/react', reactSrc);
-    modules.push({ specifier: '@deuz-sdk/react', label: '@deuz-sdk/react', src: reactSrc });
+  // The single-entry packages of the workspace, in this order. A package that is
+  // not there (another checkout, an older tree) is skipped.
+  const singleEntry = [
+    ['@deuz-sdk/react', react],
+    ...SINGLE_ENTRY_PACKAGES.map((name) => [`@deuz-sdk/${name}`, join(core, '..', name)]),
+  ];
+  for (const [specifier, dir] of singleEntry) {
+    const src = ['src/index.ts', 'src/index.tsx'].map((p) => join(dir, p)).find(existsSync);
+    if (!src) continue;
+    specifierToSrc.set(specifier, src);
+    modules.push({ specifier, label: specifier, src });
   }
 
   const memo = new Map();

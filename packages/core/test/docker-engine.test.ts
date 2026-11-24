@@ -19,7 +19,7 @@ describe('deuz.sdk-version label', () => {
     const [major, minor] = pkg.version.split('.').map(Number);
     const [labelMajor, labelMinor] = DOCKER_LABEL_SDK_VERSION.split('.').map(Number);
     expect(DOCKER_LABEL_SDK_VERSION).toMatch(/^\d+\.\d+\.\d+$/);
-    // Equal after the 2.4.0 version bump; a later minor must update the label.
+    // Equal after the 2.5.0 version bump; a later minor must update the label.
     expect(labelMajor! * 1000 + labelMinor!).toBeGreaterThanOrEqual(major! * 1000 + minor!);
     expect(labelMajor! * 1000 + labelMinor!).toBeLessThanOrEqual(major! * 1000 + minor! + 1);
   });

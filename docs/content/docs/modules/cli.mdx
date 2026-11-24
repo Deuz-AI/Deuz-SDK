@@ -1,0 +1,369 @@
+---
+title: CLI
+description: The deuz command line — `deuz meter` puts an enforced token/USD budget in front of Claude Code, Codex or any Anthropic or OpenAI client, and `deuz acp` serves a Deuz agent to Zed or a JetBrains IDE over ACP (2.5).
+---
+
+`@deuz-sdk/cli` (2.5) is the `deuz` command. It has two commands:
+
+- **`deuz meter`** runs the [meter](/docs/modules/meter) as a local proxy in
+  front of a coding harness such as Claude Code or Codex, or any Anthropic or
+  OpenAI client. Each request is charged to a budget that can persist across
+  runs and processes, refused with 402 once the ceiling is reached, and can
+  leave a receipt.
+- **`deuz acp`** serves a Deuz agent to an editor over the
+  [Agent Client Protocol](/docs/modules/acp) on stdio, with signed approvals
+  and a budget.
+
+```bash
+# Run Claude Code with a $5 ceiling
+npx @deuz-sdk/cli meter --budget-usd 5 -- claude
+
+# Serve your agent to an editor, with a $10/day budget that persists
+npx @deuz-sdk/cli acp ./agent.js --budget-usd 10 --window day --store ~/.deuz/budget.sqlite
+```
+
+It needs Node.js 22 or later. A persistent budget (`--store`) also needs
+`node:sqlite`, which ships unflagged from Node 22.13. Install it globally with
+`npm i -g @deuz-sdk/cli` to get a plain `deuz` command. It is a separate
+package that depends on `@deuz-sdk/core`, so core stays dependency-free.
+
+<Callout type="warn" title="What was tried live, and what was not">
+On 2026-11-24 (Windows 11, Node 26.13.0) the built `deuz` binary ran for real:
+
+- `deuz meter --budget-usd 0.5 -- claude -p …` in front of Claude Code
+  2.1.331 on a claude.ai subscription login: the request was measured, priced
+  and receipted, and the summary line reported it. At a ceiling below one
+  request's estimate Claude Code showed `API Error: 402 deuz meter: …` and
+  exited 1 after one request, without retrying.
+- `deuz meter -- codex exec …` with a ChatGPT login metered nothing: Codex
+  ignores `OPENAI_BASE_URL` in that mode. The recipe that reaches the meter is
+  in [Meter](/docs/modules/meter#codex-with-a-chatgpt-login). In that run the
+  meter charged the estimate; it now measures that traffic, which a unit test
+  covers but no live run has confirmed. Codex retries a 402 five times before
+  exiting 1.
+- `deuz acp` against the official ACP reference client
+  (`@agentclientprotocol/sdk` 2.9.1): every message in both directions
+  validated against the published ACP schema. See
+  [ACP](/docs/modules/acp#conformance).
+
+No editor has launched `deuz acp` yet: the Zed and JetBrains configurations
+below follow those editors' current documentation and have not been tried.
+The tests drive the CLI in process through `runCli`.
+</Callout>
+
+## deuz meter
+
+```text
+deuz meter [options]                  serve until Ctrl+C, log each request
+deuz meter [options] -- <command...>  run <command> through the meter
+```
+
+The meter routes Anthropic Messages (`POST …/messages`), OpenAI Chat
+Completions (`POST …/chat/completions`) and OpenAI Responses
+(`POST …/responses`). Each request is admitted against the budget on a
+deliberately pessimistic estimate, forwarded unchanged with your own API key
+(streams pass through chunk by chunk), and charged the usage the provider
+reports, priced with Deuz's [price table](/docs/modules/pricing). At the
+ceiling it answers 402 in the provider's own error format (`billing_error` for
+Anthropic, `insufficient_quota` for OpenAI), and nothing is forwarded.
+
+### Wrap a command
+
+With a command after `--`, the meter listens on a free port and starts the
+command with three variables set:
+
+| Variable | Value |
+| --- | --- |
+| `ANTHROPIC_BASE_URL` | `http://127.0.0.1:<port>` |
+| `OPENAI_BASE_URL` | `http://127.0.0.1:<port>/v1` |
+| `DEUZ_METER_URL` | `http://127.0.0.1:<port>` |
+
+If your environment already sets `ANTHROPIC_BASE_URL` or `OPENAI_BASE_URL` to
+another endpoint (a gateway, OpenRouter, a local server), the meter refuses to
+start the command (exit 2) unless `--anthropic-upstream` or
+`--openai-upstream` names where that traffic goes. Otherwise the harness's key
+for that endpoint would be sent to the default provider. The message names the
+variable and the flag, never the URL.
+
+It also refuses to start the command (exit 2) while one of Claude Code's
+provider switches is on: `CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_MANTLE`,
+`CLAUDE_CODE_USE_VERTEX`, `CLAUDE_CODE_USE_FOUNDRY`,
+`CLAUDE_CODE_USE_ANTHROPIC_AWS` or `CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD`.
+With one of them set, Claude Code sends its model traffic to that provider
+instead of the meter, so nothing would be measured or capped. The values `''`,
+`0`, `false`, `no` and `off` count as off. The message names the variables,
+never their values. The check applies to every wrapped command, budget or not,
+and there is no flag to skip it: unset the variable for that command.
+
+- Standard input, output and error pass straight through, so a full-screen
+  harness works as usual. No per-request lines are printed in this mode, so a
+  terminal UI is not corrupted: one startup line and the spend summary go to
+  stderr.
+- The meter exits with the command's exit code: 127 if it cannot be found, 126
+  if it cannot be executed, 128 + the signal number if a signal killed it.
+- Ctrl+C reaches the harness directly from the terminal, so the meter ignores
+  it and waits for the harness to exit. A `SIGTERM` or `SIGHUP` sent to the
+  meter is forwarded to the harness.
+- On Windows the command is found on `PATH` through `PATHEXT`. A `.exe` runs
+  directly; a `.cmd` or `.bat` shim, such as an npm-installed `claude.cmd`,
+  runs through `cmd.exe` with every argument quoted and escaped, twice, because
+  a batch file that forwards `%*` parses its arguments again. `cmd.exe` cannot
+  pass a line break, so an argument that contains one is refused (exit 2) for
+  such a shim.
+
+### Serve
+
+Without a command, the meter listens on `127.0.0.1:8787`, prints the variables
+to set for each harness (`export` lines, or PowerShell and `cmd.exe` lines in a
+Windows shell), and logs one line per request to stderr with its cost and the
+budget left:
+
+```text
+14:02:11 POST /v1/messages · claude-opus-5-5 · 200 completed · 2,000 tok · $0.0240 · $4.98 of $5.00 left
+14:02:40 POST /v1/messages · claude-opus-5-5 · 402 refused · budget deuz:meter exhausted (usd) · $0.00 of $5.00 left
+```
+
+The first Ctrl+C lets the requests in flight finish and prints a summary; a
+second one cuts them off. Amounts under $1 print with four decimals, so a
+$0.01 budget shows as `$0.0100`.
+
+### Options
+
+| Flag | Meaning |
+| --- | --- |
+| `--budget-usd <n>` (alias `--budget`) | USD ceiling. |
+| `--budget-tokens <n>` | Token ceiling. With `--budget-usd`, a request must fit both. |
+| `--window <spec>` | `lifetime` (default), `day`, `week`, `month` (a rolling 30 days), or a count with `h`, `d` or `w` (`12h`, `7d`, `2w`). Every window is rolling. |
+| `--key <name>` | The budget key. Default `deuz:meter`, or `deuz:meter:<window>` for a windowed budget. Processes that share a store and a key share one budget. |
+| `--store <file>` | A SQLite file that keeps the budget across runs and across processes running at once. Without it, the budget lives in memory for this run only. |
+| `--port <n>` | Port on 127.0.0.1. Default 8787 without a command, a free port with one. |
+| `--receipts <file>` | Append one JSON receipt per request: model, usage, cost, settlement and refusal reason. Never an API key, a prompt or a response. |
+| `--anthropic-upstream <url>` | Where Anthropic traffic goes. Default `https://api.anthropic.com`. |
+| `--openai-upstream <url>` | Where OpenAI traffic goes. Default `https://api.openai.com`; any OpenAI-compatible base URL works. |
+| `--forward-unmetered` | Forward billable routes the meter cannot price (batches, embeddings…) uncharged instead of refusing them with 404. |
+| `-h`, `--help` | Show help. |
+
+Without `--budget-usd` or `--budget-tokens` the meter only measures: it still
+logs requests and writes receipts. A leading `~` in `--store` and `--receipts`
+means your home directory, so editor configurations work without a shell.
+
+A store fixes a key's window the first time the key is used. The default key
+carries the window, so changing `--window` simply uses another key. With an
+explicit `--key` and a different window, the meter stops at startup (exit 1)
+with a message: pass the original window or a new key. That check is a
+zero-amount reserve and release at startup, which leaves one released request
+record (`deuz-cli:probe:<uuid>`) in the store each run.
+
+```bash
+# A daily $20 budget shared by every terminal using the same store
+deuz meter --budget-usd 20 --window day --store ~/.deuz/budget.sqlite -- claude
+
+# Codex in API-key mode (not verified live; a ChatGPT login ignores OPENAI_BASE_URL)
+deuz meter --budget-usd 5 -- codex
+
+# One meter for several tools, with receipts
+deuz meter --budget-usd 50 --window week --store ~/.deuz/budget.sqlite --receipts ~/.deuz/meter.jsonl
+```
+
+## deuz acp
+
+```text
+deuz acp <module> [options] [-- <args for the module>]
+```
+
+`deuz acp` loads a module that describes your agent and serves it with
+[`serveAcpAgentStdio`](/docs/modules/acp#serve-an-agent-to-an-editor) (ACP
+protocol version 1). In the editor, the agent's turns stream into the chat
+panel, a tool that needs approval becomes the editor's permission prompt, and
+each answer is checked against the run's own HMAC-signed approval token, which
+the editor never sees. Spend is charged to the budget and shown as the
+session's cost.
+
+Standard output carries the protocol only. Every log line goes to stderr, and
+while the agent is serving, `console.log`, `console.info`, `console.debug`,
+`console.dir` and `console.dirxml` are redirected to stderr too, so a stray log cannot corrupt the protocol.
+
+### The module
+
+`<module>` is a file path, or a package name resolved from the current
+directory. Its default export, or the export named by `--export`, is either the
+options of `serveAcpAgentStdio` without `stdin` and `stdout`, or a function
+(possibly async) that returns them. The function receives
+`{ argv, cwd, env }`, where `argv` holds the arguments after `--`.
+
+- `run` is required: the run options of each turn (`model`, `instructions`,
+  `tools`, `maxSteps`…), or a function returning them.
+- `agent` defaults to `{ streamAgent, resumeStreamAgent }` from
+  `@deuz-sdk/core/agent`, and `store` to an in-memory run store.
+- Every other `serveAcpAgentStdio` option is accepted: `info`,
+  `approvalSigner`, `sessions`, `toolKinds`, `clientFsTools`, `budget` and the
+  rest.
+
+```ts title="agent.ts"
+import { defineAcpAgent } from '@deuz-sdk/cli';
+import { anthropic } from '@deuz-sdk/core/anthropic';
+
+export default defineAcpAgent({
+  info: { name: 'my-agent', version: '1.0.0' },
+  run: {
+    model: anthropic('claude-opus-5-5'),
+    instructions: 'You are a careful coding agent.',
+    maxSteps: 20,
+  },
+});
+```
+
+`defineAcpAgent` only types the export. A `.ts` module runs directly on a Node
+that strips types (22.18 and later, or 23.6 and later); otherwise compile it to
+`.js` first. A module that cannot be found, fails to load, lacks the export or
+has the wrong shape exits with code 1 and a one-line message on stderr; for a
+missing export, the message lists the exports the module has.
+
+### Options
+
+| Flag | Meaning |
+| --- | --- |
+| `--export <name>` | The export to use. Default `default`. |
+| `--footer` | Append a plain-text line with the turn's cost, the session's cost and the budget left to each reply. Stock editors show none of the `_meta` budget fields, so this line may be the only place the budget appears. |
+| `--budget-usd <n>` (alias `--budget`) | USD ceiling for every turn. An exhausted budget ends the turn with a reply that says so. |
+| `--budget-tokens <n>` | Token ceiling. |
+| `--window <spec>` | As for `deuz meter`. |
+| `--key <name>` | Budget key. Default `deuz:acp`, or `deuz:acp:<window>`. |
+| `--store <file>` | A SQLite file that keeps the budget across sessions and editor restarts. |
+| `-h`, `--help` | Show help. |
+
+The budget flags are refused when the module sets `budget` itself.
+
+### Register it in an editor
+
+**Zed.** Open the Agent Panel's settings, then **External Agents → Add Agent →
+Add Custom Agent**; Zed opens `settings.json` at `agent_servers`:
+
+```json
+{
+  "agent_servers": {
+    "My Deuz agent": {
+      "type": "custom",
+      "command": "npx",
+      "args": ["-y", "@deuz-sdk/cli", "acp", "/absolute/path/to/agent.js", "--budget-usd", "10", "--store", "~/.deuz/budget.sqlite"],
+      "env": { "ANTHROPIC_API_KEY": "…" }
+    }
+  }
+}
+```
+
+**JetBrains IDEs.** In the AI Chat tool window, open the **⋯** menu and choose
+**Add Custom Agent**; the IDE opens `~/.jetbrains/acp.json`:
+
+```json
+{
+  "default_mcp_settings": {},
+  "agent_servers": {
+    "My Deuz agent": {
+      "command": "/full/path/to/npx",
+      "args": ["-y", "@deuz-sdk/cli", "acp", "/absolute/path/to/agent.js", "--budget-usd", "10"],
+      "env": { "ANTHROPIC_API_KEY": "…" }
+    }
+  }
+}
+```
+
+JetBrains needs the full path of the executable (`which npx`, or `where npx` on
+Windows), and ACP agents are not supported under WSL. On Windows, if an editor
+cannot start `npx` directly, use `"command": "cmd"` with
+`"args": ["/c", "npx", "-y", "@deuz-sdk/cli", "acp", …]`. The formats come
+from [Zed's external agents documentation](https://zed.dev/docs/ai/external-agents)
+and [JetBrains' ACP documentation](https://www.jetbrains.com/help/ai-assistant/acp.html).
+
+## Exit codes
+
+| Code | Meaning |
+| --- | --- |
+| 0 | Success. |
+| 1 | A runtime failure: a store that cannot be opened, a budget key conflict, or a bad agent module. |
+| 2 | An unknown command, an unknown flag or a bad flag value, with a one-line hint on stderr. |
+| *n* | Under `deuz meter -- <command>`, the command's own code: 127 not found, 126 not executable, 128 + the signal number when a signal killed it. |
+
+## Programmatic use
+
+```ts
+import { runCli } from '@deuz-sdk/cli';
+
+const code = await runCli(['meter', '--budget-usd', '5', '--', 'claude']);
+```
+
+`runCli(argv, io?)` runs the CLI in process and resolves the exit code; it
+never calls `process.exit`. `io` overrides any of `stdin`, `stdout`, `stderr`,
+`env`, `cwd`, `platform` and `signals` (each defaults to the process's own),
+and `untilStopped`, called once a long-running mode is ready. Errors are
+`DeuzCliError` (a `DeuzError`) with a `code` of `'usage'`,
+`'budget_conflict'`, `'store_unavailable'`, `'module_not_found'`,
+`'module_load_failed'` or `'module_export'`. `CLI_VERSION` is the package
+version.
+
+## Limits
+
+- **The ceiling can be overshot by up to one request.** Admission checks a
+  request's estimate against what is left, and the request is then charged its
+  measured cost. Sequential traffic overshoots by at most one request; with
+  several requests in flight at the ceiling, each can overshoot. See
+  [Meter limits](/docs/modules/meter#limits).
+- **The estimate is pessimistic.** The prompt is counted at 3 characters per
+  token and priced at the model's dearest prompt rate, plus the output cap
+  (32,000 tokens when the request sets none), so the last part of a small
+  budget can be refused early. It can still be low for CJK-heavy prompts,
+  large inline images or PDFs, and hidden provider framing.
+- **Unmetered billable routes are refused** with 404 by default (batches,
+  embeddings, Codex's `/responses/compact`…); `--forward-unmetered` forwards
+  them uncharged, with a receipt. Token counting and non-POST requests pass
+  through free.
+- **Codex retries a refusal.** Claude Code shows the 402 and exits without
+  retrying; Codex sent each refused request six times before exiting 1. None
+  was forwarded or charged.
+- **Codex with a ChatGPT login is not metered by `deuz meter -- codex`.** It
+  ignores `OPENAI_BASE_URL`; the custom-provider recipe in
+  [Meter](/docs/modules/meter#codex-with-a-chatgpt-login) reaches the meter,
+  which measures the replies. That measurement is covered by a unit test, not a
+  live run.
+- **Subscription logins are priced at API rates.** Claude Code on a claude.ai
+  subscription goes through the meter with its own login; the meter prices it
+  as API traffic, although the subscription is not billed per token.
+- **Settings files are not read.** The provider-switch check reads the
+  environment only; Claude Code's settings files can set the same variables
+  (`env`), or `ANTHROPIC_BASE_URL`.
+- **The provider-switch check is not Claude-specific.** A wrapped command that
+  is not Claude Code (for example `codex`) is refused too while a
+  `CLAUDE_CODE_USE_*` switch is on.
+- **Missing usage is charged at the estimate** (a broken stream, a
+  disconnect), fail-closed. Streaming Chat Completions requests get
+  `stream_options.include_usage` added, so the client receives one extra final
+  chunk with empty `choices`.
+- **Unpriced models** are admitted and charged tokens only; the log and the
+  summary say so.
+- **Loopback only.** The meter binds to 127.0.0.1 and relays your API keys
+  unchanged; it never logs or stores them.
+- **ACP coverage.** Protocol version 1: sessions, prompts, cancel,
+  permissions, `session/load` (only when the module passes `sessions`) and the
+  client's MCP servers. No terminals, session modes, `session/list` or
+  `session/close`. Conformance was checked against the reference SDK, not a
+  real editor. See [ACP limits](/docs/modules/acp#limits).
+- **Editors show little of the budget.** The budget, receipts and
+  signed-approval flag travel in `_meta` fields under `io.github.deuz-ai`, which
+  stock editors do not display; what they show is the session cost and, with
+  `--footer`, the reply line. How Zed and JetBrains render either has not been
+  checked.
+- **An editor can approve anything it is shown.** Signed approvals guarantee
+  that an answer belongs to this run and this call; they do not decide what is
+  allowed.
+- **Two copies of core.** If your agent module imports its own copy of
+  `@deuz-sdk/core`, the default engine and run store still come from the CLI's
+  copy. Export `agent` (and `store`) explicitly in that case.
+- **Node versions.** `--store` needs Node 22.13 or later; a `.ts` module needs
+  a Node that strips types.
+
+## See also
+
+- [Meter](/docs/modules/meter) — the proxy behind `deuz meter`, its options and receipts.
+- [ACP](/docs/modules/acp) — the protocol behind `deuz acp`, and serving an agent from your own script.
+- [Harness](/docs/modules/harness) — the same meter, plus permission decisions, from code.
+- [Budgets](/docs/modules/budgets) — keys, windows and the SQLite store.

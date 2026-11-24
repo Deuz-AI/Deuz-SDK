@@ -2,7 +2,15 @@
   "$schema": "https://unpkg.com/@changesets/config@3.1.1/schema.json",
   "changelog": "@changesets/cli/changelog",
   "commit": false,
-  "fixed": [["@deuz-sdk/core", "@deuz-sdk/react"]],
+  "fixed": [
+    [
+      "@deuz-sdk/core",
+      "@deuz-sdk/react",
+      "@deuz-sdk/ai-sdk-provider",
+      "@deuz-sdk/mcp-ledger",
+      "@deuz-sdk/cli"
+    ]
+  ],
   "linked": [],
   "access": "public",
   "baseBranch": "main",

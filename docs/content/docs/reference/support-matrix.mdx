@@ -1,6 +1,6 @@
 ---
 title: Support Matrix
-description: How far each model row and protocol that 2.3 added is verified — documented, fixture-tested, live-verified — kept apart, and what the 2.4 stores and runners were tested against.
+description: How far each model row and protocol that 2.3 added is verified — documented, fixture-tested, live-verified — kept apart, what the 2.4 stores and runners were tested against, and what the 2.5 meter, harnesses, ACP and packages were tested against.
 ---
 
 A model in the registry, or a protocol in a module, is not a promise that it works against the provider's live API. This page says, for every model row and every protocol 2.3 added, which of three levels of verification it has reached. The levels are kept apart on purpose: a documented rule that is tested offline is still not live-verified.
@@ -77,6 +77,29 @@ Deuz reads a stop explanation from Anthropic (`stop_details`, with a refusal's c
 | Time zone schedules | The host's `Intl` time zone data, across DST gaps and overlaps | Not applicable |
 
 Golden fixtures recorded with 2.3.0 (179 scenarios across the provider factories) check in every run that, with the 2.4 features off, the provider requests (method, URL, headers and body bytes) are the ones 2.3.0 sent. See [What is new in 2.4](/docs/reference/whats-new-2-4#known-limits) for the release's known limits.
+
+## 2.5
+
+2.5 adds no model row. Its new protocols and integrations meet the other side
+in the forms below. The meter, the CLI and the harness runner were run against
+real Claude Code and Codex on 2026-11-24 (Windows 11, Node 26.13.0), and ACP
+against the official ACP SDK; nothing was run in a real editor or against
+Gemini CLI or OpenCode. Test files named without a path are in
+`packages/core/test`.
+
+| Surface | Documented | Tested against (offline) | Live |
+| --- | --- | --- | --- |
+| Meter: Anthropic Messages, OpenAI Chat Completions and Responses, streamed and not ([Meter](/docs/modules/meter)) | The providers' error and usage shapes; usage is read with the adapters' own mappers | A fake upstream on a `127.0.0.1` port with real SSE streams: `meter` | Claude Code 2.1.331 on a claude.ai subscription login, 2026-11-24: measured, priced and receipted; a 402 shown and not retried. Codex on a ChatGPT login (CLI 0.166.0): reached only through a custom model provider; that run was charged its estimate because the backend sends no `content-type`, and the meter now measures such replies (unit test `meter`, not re-run live); a 402 retried five times. Codex API-key mode not tried |
+| `deuz` CLI ([CLI](/docs/modules/cli)) | Zed's and JetBrains' agent registration formats, from their current docs | `deuz meter` against the same kind of fake upstream, including a real child process launched through `meter -- node …`; `deuz acp` against `connectAcpAgent` over `PassThrough` streams: `packages/cli/test/cli` | The built `deuz meter -- claude -p …` with Claude Code 2.1.331, and `deuz acp` against `@agentclientprotocol/sdk` 2.9.1's client, 2026-11-24. No editor has launched `deuz acp` |
+| Harness runner ([Harness](/docs/modules/harness)) | Each preset's launch command and base URL variables, from the harness's docs read on 2026-11-23 (each preset's `verification`) | A real child process running a scripted ACP agent that calls a fake Anthropic upstream through the meter: `harness` | `claude-code` (`verifiedLive: true`): `@agentclientprotocol/claude-agent-acp` 0.110.1, 2026-11-24, including `runHarness` with its session-mode fix (the edit request arrived and a deny-writes policy refused it). `codex`: `@agentclientprotocol/codex-acp` 2.10.0 on a ChatGPT login ran but was charged its estimate, before the meter fix for replies with no `content-type` (`verifiedLive: false`). Gemini CLI and OpenCode: no |
+| ACP version 1, schema 1.34.1 ([ACP](/docs/modules/acp)) | The ACP v1 JSON schema, release 1.34.1 | A served agent and `connectAcpAgent` over an in-memory transport pair and Node `PassThrough` streams: `acp` | Conformance in both directions against `@agentclientprotocol/sdk` 2.9.1 and its bundled schema, 2026-11-24. Not in Zed, JetBrains or any other editor |
+| MCP server resources, prompts, notifications and tasks ([MCP server](/docs/modules/mcp-server)) | `@modelcontextprotocol/server` 2.3.1 (2.4.0 probed, identical); the MCP Tasks extension's 2026-07-28 schema | The official v1 and v2 SDK clients over HTTP and an in-process stdio pipe: `mcp-server-resources`, `mcp-server-operation-ids`, `mcp-server-tasks` (2025-11-25 tasks through `@modelcontextprotocol/sdk` 1.29's client) | No: not against third-party MCP hosts |
+| AI SDK provider ([AI SDK provider](/docs/modules/ai-sdk-provider)) | `@ai-sdk/provider` 4.0.39 (`LanguageModelV4`) | `generateText`, `streamText` and `wrapLanguageModel` from `ai` 7.0.180 over its `MockLanguageModelV4`: `packages/ai-sdk-provider/test` | No |
+| MCP ledger ([MCP ledger](/docs/modules/mcp-ledger)) | Claude Desktop's and Cursor's MCP configuration formats | Its tools in process: `packages/mcp-ledger/test`. Once, by hand and outside the test suite, as a real stdio child process called by Deuz's own MCP client | No: not inside Claude Desktop or Cursor |
+| Tool search ([Tool search](/docs/modules/tool-search)) | — | `generateText` and a native `runAgent` over `createMockModel`, checking the tools offered at each step: `tool-search` | No: no real model was asked to search |
+
+See [What is new in 2.5](/docs/reference/whats-new-2-5#known-limits) for the
+release's known limits.
 
 ## Related
 

@@ -41,7 +41,6 @@ describe.skipIf(!apiKey)(`deepseek — live (${MODEL})`, () => {
     expect(result.text.toLowerCase()).toContain('pong');
     expect(result.usage.inputTokens).toBeGreaterThan(0);
     expect(result.usage.outputTokens).toBeGreaterThan(0);
-    // eslint-disable-next-line no-console
     console.log(
       `[deepseek ${fingerprint(apiKey!)}] text=${JSON.stringify(result.text)} ` +
         `usage=${result.usage.inputTokens}/${result.usage.outputTokens} ` +
@@ -102,7 +101,6 @@ describe.skipIf(!apiKey)(`deepseek — live (${MODEL})`, () => {
     expect(observed.city).toBeTruthy();
     expect(result.steps?.length ?? 0).toBeGreaterThan(1);
     expect(result.text).toMatch(/31|clear/i);
-    // eslint-disable-next-line no-console
     console.log(
       `[deepseek] tool arg=${JSON.stringify(observed)} steps=${result.steps?.length ?? 0}`,
     );

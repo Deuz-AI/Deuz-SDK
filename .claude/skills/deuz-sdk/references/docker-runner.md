@@ -1,4 +1,4 @@
-<!-- verified: 2026-10-16 against @deuz-sdk/core@2.4.0 · api-contract sha256:da3643f44edc
+<!-- verified: 2026-11-24 against @deuz-sdk/core@2.5.0 · api-contract sha256:cd3d4f48e5a3
      sources: packages/core/src/compute/docker/{index,types,errors,engine,sandbox,runner,memory-store,store-shared}.ts,
      packages/core/src/node/{process-ops-sqlite,compute}.ts, packages/core/src/types/compute.ts, packages/core/src/compute.ts,
      .changeset/{2-4-l6,2-4-fc}.md, docs/content/docs/modules/docker.mdx (lane D1) -->

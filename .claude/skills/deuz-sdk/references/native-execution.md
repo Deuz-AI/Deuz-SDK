@@ -1,4 +1,4 @@
-<!-- verified: 2026-10-16 against @deuz-sdk/core@2.4.0 · api-contract sha256:da3643f44edc
+<!-- verified: 2026-11-24 against @deuz-sdk/core@2.5.0 · api-contract sha256:cd3d4f48e5a3
      sources: packages/core/src/{agent-run,execution-policy,budget-ledger,ops}.ts,
        src/types/{agent-run,execution,swarm,lease}.ts, src/inference/{agent-tools,loop-shared,native-mcp}.ts,
        src/internal/{agent-run-lease,native-memory,native-chat,native-fallback,native-request,native-retry}.ts,

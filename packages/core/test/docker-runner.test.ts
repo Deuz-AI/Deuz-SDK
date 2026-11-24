@@ -223,7 +223,7 @@ describe('createDockerProcessRunner: start', () => {
     expect(container!.labels).toMatchObject({
       'deuz.operation-id': 'op-1',
       'deuz.scope': 'tenant-a',
-      'deuz.sdk-version': '2.4.0',
+      'deuz.sdk-version': '2.5.0',
       'deuz.kind': 'process',
     });
     expect(container!.startCount).toBe(1);
