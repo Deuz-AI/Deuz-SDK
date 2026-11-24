@@ -312,10 +312,17 @@ function spec(schema: string, version: 1 | 2 | 3, extra: Partial<PgSchemaSpec> =
 }
 
 describe('ensurePgSchema (PGlite)', () => {
-  const db = new PGlite();
-  const pool = pglitePool(db);
-  // Start-up is slow under load; keep it out of the first test's time budget.
-  beforeAll(() => db.waitReady, SLOW_HOOK_TIMEOUT_MS);
+  // PGlite starts in the hook, not while the file is collected. Its start-up
+  // blocks the event loop, for seconds on a loaded machine, and a database
+  // created at collection time started up underneath the scripted retry tests
+  // above: one of them, waiting on a 10 ms timer, then ran into its timeout.
+  let db: PGlite;
+  let pool: ReturnType<typeof pglitePool>;
+  beforeAll(async () => {
+    db = new PGlite();
+    pool = pglitePool(db);
+    await db.waitReady;
+  }, SLOW_HOOK_TIMEOUT_MS);
   afterAll(() => db.close());
 
   let schemas = 0;
